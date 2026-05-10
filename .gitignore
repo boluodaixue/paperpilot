@@ -58,7 +58,6 @@ cover/
 *.pot
 
 # Django / Flask
-*.log
 local_settings.py
 db.sqlite3
 db.sqlite3-journal
@@ -156,9 +155,7 @@ checkpoints/
 *.safetensors
 
 # 输出与日志
-outputs/
 logs/
-*.log
 
 # 实验记录
 experiments/*/results/
@@ -184,9 +181,7 @@ temp/
 *~
 
 # 实验运行时产生的大文件
-outputs/
 logs/
-*.log
 
 # 本地数据库与数据文件
 data/
@@ -214,3 +209,7 @@ htmlcov/
 
 # mypy
 .mypy_cache/
+# 忽略所有日志文件（包括 outputs 子目录中的）
+*.log
+# 保留 outputs 目录下的报告文件，只忽略日志
+outputs/**/*.log
