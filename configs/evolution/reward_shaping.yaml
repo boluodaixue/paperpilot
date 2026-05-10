@@ -1,0 +1,109 @@
+# =============================================================================
+# Reward Shaping (奖励塑造) 配置
+# =============================================================================
+# 定义自进化训练（M6）中 GRPO 使用的奖励函数结构、多维度权重及 shaping 参数。
+# 奖励 = Σ(weight_i * score_i) + efficiency_bonus + length_penalty
+# =============================================================================
+
+reward:
+  name: "research_reward"
+  description: "多维度研究质量奖励函数，用于 GRPO 策略梯度优化"
+
+  # ---------------------------------------------------------------------------
+  # 五维度评分权重（需与 Red Agent 的五个维度对齐）
+  # ---------------------------------------------------------------------------
+  dimensions:
+    factual_accuracy:
+      name: "事实准确性"
+      # 该维度在总奖励中的权重
+      weight: 0.25
+      # 评分来源：red_agent / judge_model / exact_match
+      scorer: "red_agent"
+      # 评分范围
+      min_score: 0.0
+      max_score: 10.0
+
+    logical_consistency:
+      name: "逻辑一致性"
+      weight: 0.20
+      scorer: "red_agent"
+      min_score: 0.0
+      max_score: 10.0
+
+    citation_coverage:
+      name: "引用覆盖与质量"
+      weight: 0.20
+      scorer: "red_agent"
+      min_score: 0.0
+      max_score: 10.0
+
+    bias:
+      name: "偏见与片面性"
+      weight: 0.20
+      scorer: "red_agent"
+      # 注意：偏见维度得分越高表示偏见越少（即越客观）
+      min_score: 0.0
+      max_score: 10.0
+
+    comprehensiveness:
+      name: "完备性与深度"
+      weight: 0.15
+      scorer: "red_agent"
+      min_score: 0.0
+      max_score: 10.0
+
+  # ---------------------------------------------------------------------------
+  # Shaping 公式参数
+  # ---------------------------------------------------------------------------
+  shaping:
+    # 是否启用奖励塑形（避免稀疏奖励）
+    enabled: true
+    # 中间步骤奖励系数：每完成一个子任务给予的微弱正奖励
+    step_bonus: 0.05
+    # 完成奖励系数：成功生成最终报告时的额外奖励
+    completion_bonus: 1.0
+    # 重复/循环惩罚系数：检测到重复动作时扣除
+    repetition_penalty: -0.2
+    # 格式错误惩罚：报告格式不符合要求时扣除
+    format_penalty: -0.5
+
+  # ---------------------------------------------------------------------------
+  # Efficiency Sigmoid 参数
+  # ---------------------------------------------------------------------------
+  efficiency:
+    # 是否启用效率奖励（鼓励用更少的工具调用/轮次完成高质量报告）
+    enabled: true
+    # sigmoid 中心点：期望的理想轮次数（低于此值奖励高，高于此值奖励衰减）
+    sigmoid_center: 8.0
+    # sigmoid 斜率：控制衰减速度（越大衰减越快）
+    sigmoid_slope: 0.5
+    # 最大效率奖励上限（避免过度追求短轨迹而牺牲质量）
+    max_efficiency_bonus: 0.5
+    # 效率奖励公式：
+    # efficiency_bonus = max_efficiency_bonus * sigmoid(sigmoid_slope * (sigmoid_center - actual_turns))
+    # 当 actual_turns < center 时获得正奖励，actual_turns > center 时奖励趋近于 0
+
+  # ---------------------------------------------------------------------------
+  # 长度惩罚参数（防止过度冗长）
+  # ---------------------------------------------------------------------------
+  length_penalty:
+    enabled: true
+    # 期望的报告 token 长度（约）
+    target_length: 2048
+    # 超出目标长度后的线性惩罚系数
+    over_length_coef: -0.0001
+    # 低于目标长度的惩罚系数（鼓励充分分析，不宜过短）
+    under_length_coef: -0.0002
+
+  # ---------------------------------------------------------------------------
+  # 奖励归一化
+  # ---------------------------------------------------------------------------
+  normalization:
+    # 是否对组内奖励进行归一化（零均值单位方差）
+    enabled: true
+    # 归一化方式：z_score / min_max / rank
+    method: "z_score"
+    # 是否对异常值进行裁剪
+    clip_outliers: true
+    # 裁剪阈值（标准差倍数）
+    clip_threshold: 3.0

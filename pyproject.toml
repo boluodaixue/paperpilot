@@ -1,0 +1,109 @@
+[build-system]
+requires = ["setuptools>=61.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "deep-research-agent"
+version = "0.1.0"
+description = "基于自进化+对抗降噪的DeepResearch Agent"
+readme = "README.md"
+license = {text = "MIT"}
+requires-python = ">=3.10"
+authors = [
+    {name = "DeepResearch Team"},
+]
+keywords = ["deep-research", "agent", "llm", "self-evolution", "adversarial", "multi-agent"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Science/Research",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
+
+dependencies = [
+    # 核心依赖
+    "openai>=1.0",
+    "transformers>=4.40",
+    "torch>=2.0",
+    "numpy",
+    "aiohttp",
+    "pyyaml",
+    "python-dotenv>=1.0",  # 多后端 .env 配置支持
+    "sentence-transformers",
+    "networkx",           # 用于 TextRank 等图算法
+    "scikit-learn",
+    "tqdm",
+    "datasets",
+    "pandas",
+    "matplotlib",
+    # vLLM 推理服务（可选，本地部署时安装）
+    # "vllm",
+    # PEFT / LoRA 微调（自进化模块需要）
+    # "peft",
+    # "accelerate",
+    # "deepspeed",
+]
+
+[project.optional-dependencies]
+# vLLM 推理服务依赖
+serve = [
+    "vllm>=0.4.0",
+]
+# 自进化训练依赖
+train = [
+    "peft>=0.11.0",
+    "accelerate>=0.30.0",
+    "deepspeed>=0.14.0",
+    "wandb",
+]
+# 开发依赖
+dev = [
+    "pytest>=7.0",
+    "pytest-asyncio",
+    "black",
+    "isort",
+    "mypy",
+    "flake8",
+]
+# 全部可选依赖
+all = [
+    "deep-research-agent[serve,train,dev]",
+]
+
+[project.scripts]
+# 命令行快捷入口
+run-research = "scripts.run_single:main"
+run-eval = "scripts.run_eval:main"
+run-ablation = "scripts.run_ablation:main"
+run-benchmark = "scripts.run_benchmark:main"
+run-judge = "scripts.run_judge:main"
+run-evolution = "scripts.run_evolution:main"
+
+[project.urls]
+Homepage = "https://github.com/your-org/deep-research-agent"
+Repository = "https://github.com/your-org/deep-research-agent"
+Issues = "https://github.com/your-org/deep-research-agent/issues"
+
+[tool.setuptools]
+packages = ["src", "evaluation", "scripts", "configs"]
+
+[tool.setuptools.package-data]
+configs = ["*.yaml", "**/*.yaml"]
+
+[tool.black]
+line-length = 120
+target-version = ["py310", "py311", "py312"]
+
+[tool.isort]
+profile = "black"
+line_length = 120
+
+[tool.mypy]
+python_version = "3.10"
+warn_return_any = true
+warn_unused_configs = true
+disallow_untyped_defs = false

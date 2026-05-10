@@ -1,0 +1,102 @@
+# =============================================================================
+# 在线 GRPO (Group Relative Policy Optimization) 进化训练配置
+# =============================================================================
+# 本配置复用并适配自项目一 (week3_vanilla_grpo.yaml) 的结构，
+# 用于 DeepResearch Agent 的在线自进化训练（M6: Self-Evolution Engine）。
+# =============================================================================
+
+model:
+  # 基座模型路径，支持 HuggingFace model_id 或本地路径
+  path: "Qwen/Qwen2.5-7B-Instruct"
+  # 模型加载精度
+  torch_dtype: "bfloat16"
+  # 是否启用 flash_attention_2 加速
+  attn_implementation: "flash_attention_2"
+
+training:
+  # 训练算法：grpo / ppo / dpo 等
+  algorithm: "grpo"
+  # 进化总迭代轮数
+  num_iterations: 20
+  # 每轮采样的 query（研究问题）数量
+  batch_size: 32
+  # 每个 query 对应的采样组大小（GRPO 组内采样数）
+  group_size: 8
+  # 单条轨迹（研究过程）允许的最大交互轮数
+  max_turns: 15
+  # 梯度累积步数
+  gradient_accumulation_steps: 1
+  # 是否启用混合精度训练
+  mixed_precision: true
+  # 随机种子（便于实验复现）
+  seed: 42
+
+optimizer:
+  # 优化器类型
+  type: "adamw"
+  # 学习率
+  lr: 5.0e-6
+  # 权重衰减
+  weight_decay: 0.01
+  # Adam beta 参数
+  betas: [0.9, 0.999]
+  # epsilon
+  eps: 1.0e-8
+  # 学习率预热步数比例
+  warmup_ratio: 0.05
+  # 学习率衰减策略
+  lr_scheduler_type: "cosine"
+
+grpo:
+  # KL 散度惩罚系数，防止策略偏离参考模型太远
+  kl_coef: 0.01
+  # PPO 风格策略裁剪阈值
+  clip_eps: 0.2
+  # 优势函数计算方式：grpo / gae
+  advantage_estimator: "grpo"
+  # 是否使用基线（组内均值）进行归一化
+  use_baseline: true
+  # 奖励缩放因子
+  reward_scale: 1.0
+
+lora:
+  # 是否启用 LoRA 高效微调
+  enabled: true
+  # LoRA 低秩维度 r
+  rank: 16
+  # LoRA 缩放系数 alpha
+  alpha: 32
+  # LoRA dropout
+  dropout: 0.05
+  # 目标模块（ attention 层的 q_proj / v_proj 等）
+  target_modules:
+    - "q_proj"
+    - "v_proj"
+    - "k_proj"
+    - "o_proj"
+  # 是否微调 embedding 层和 lm_head
+  modules_to_save: []
+
+reference_model:
+  # 参考模型是否固定（不更新权重），用于计算 KL 散度
+  freeze: true
+  # 参考模型路径，默认与训练模型相同（加载后冻结）
+  path: null
+
+logging:
+  # 日志记录间隔（步数）
+  log_interval: 10
+  # 评估间隔（迭代轮数）
+  eval_interval: 5
+  # 检查点保存间隔（迭代轮数）
+  save_interval: 5
+  # 输出目录
+  output_dir: "checkpoints/evolution"
+
+hardware:
+  # 训练用 GPU 数量
+  num_gpus: 4
+  # 是否启用 DeepSpeed / FSDP
+  distributed_backend: "deepspeed"
+  # DeepSpeed 配置文件路径
+  deepspeed_config: "configs/deepspeed/ds_config_zero2.json"

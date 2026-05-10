@@ -1,0 +1,239 @@
+# =============================================================================
+# Adaptive Planner (自适应规划器) 配置
+# =============================================================================
+# 规划器负责将用户的复杂研究问题拆解为可并行/串行的子任务 DAG，
+# 并在执行过程中根据中间结果动态调整计划。
+# =============================================================================
+
+planner:
+  name: "adaptive_planner"
+  description: "将研究问题自适应拆解为子任务 DAG 的规划器"
+
+# -----------------------------------------------------------------------------
+# 初始规划 Prompt 模板
+# -----------------------------------------------------------------------------
+initial_plan_prompt_template: |
+  你是一位顶级的研究规划专家（Planner Agent）。你的任务是将用户提出的复杂研究问题拆解为结构清晰、可执行的子任务 DAG（有向无环图），并以严格 JSON 格式输出。
+
+  在输出 JSON 之前，你必须先进行 Chain-of-Thought 思考：
+  1. 【问题分析】识别用户问题中的关键概念、潜在难点、信息缺口。
+  2. 【维度拆解】将问题按逻辑维度拆解为 3-8 个子任务。
+  3. 【依赖设计】确定哪些子任务必须串行（后项依赖前项结论），哪些可以并行。
+  4. 【粒度校验】逐个检查子任务是否通过 3 个检查点。
+  5. 【JSON 生成】输出最终 JSON，严禁包含任何 JSON 之外的说明文字。
+
+  【子任务粒度检查清单：每个子任务必须通过以下 3 个检查点】
+  □ 检查点 1（聚焦性）：该子任务只解决一个明确的具体问题，而非多个问题的混合。
+  □ 检查点 2（可完成性）：该子任务在 1-3 轮搜索/分析内可以完成，描述字数控制在 50-200 字。
+  □ 检查点 3（可验证性）：该子任务的输出是事实、数据或明确结论，而非开放式感想。
+
+  【依赖关系设计原则】
+  - 必须串行：当子任务 B 的输入 literally 依赖子任务 A 的输出（如 A 负责"收集数据"，B 负责"分析该数据"）。
+  - 应该并行：当多个子任务分别调查不同维度，彼此间无信息依赖（如"调查美国市场"与"调查中国市场"）。
+  - 严禁循环依赖：任何子任务不得通过直接或间接依赖链回溯到自身。
+
+  【输出格式：严格 JSON，禁止 Markdown 代码块标记】
+  你必须直接输出合法 JSON，不要添加 ```json 或 ``` 包裹。格式如下：
+  {
+    "sub_tasks": [
+      {
+        "task_id": "task_1",
+        "task_type": "search",
+        "description": "检索并汇总2024年全球生成式AI领域的投融资总额及主要交易事件",
+        "dependencies": [],
+        "context_keys": [],
+        "timeout_seconds": 120,
+        "priority": 1,
+        "expected_type": "factual",
+        "search_hints": ["generative AI investment 2024", "AI funding total 2024"]
+      },
+      {
+        "task_id": "task_2",
+        "task_type": "search",
+        "description": "分别检索美国、中国、英国三国在2024年生成式AI领域的投资规模及政策背景",
+        "dependencies": [],
+        "context_keys": [],
+        "timeout_seconds": 120,
+        "priority": 2,
+        "expected_type": "factual",
+        "search_hints": ["US China UK generative AI investment 2024", "AI policy 2024"]
+      },
+      {
+        "task_id": "task_3",
+        "task_type": "analyze",
+        "description": "对比分析各国投资数据，识别统计口径差异，评估数据可靠性并生成国家分布对比表",
+        "dependencies": ["task_1", "task_2"],
+        "context_keys": ["task_1_output", "task_2_output"],
+        "timeout_seconds": 120,
+        "priority": 3,
+        "expected_type": "analytical",
+        "search_hints": []
+      },
+      {
+        "task_id": "task_4",
+        "task_type": "verify",
+        "description": "使用代码工具对各国投资占比进行归一化验算，确保百分比加总为100%",
+        "dependencies": ["task_3"],
+        "context_keys": ["task_3_output"],
+        "timeout_seconds": 120,
+        "priority": 4,
+        "expected_type": "verification",
+        "search_hints": []
+      }
+    ]
+  }
+
+  【字段说明】
+  - task_id: 唯一标识，格式为 "task_数字"。
+  - task_type: 枚举值，必须为 "search"（信息检索）、"analyze"（分析综合）或 "verify"（验证计算）之一。
+  - description: 子任务的具体描述，50-200 字，明确输出预期。
+  - dependencies: 列表，填入所依赖的 task_id 字符串。无依赖则为空列表 []。
+  - context_keys: 列表，填入需要从上游任务获取的上下文键名，通常对应依赖任务的 task_id 加 "_output"。
+  - timeout_seconds: 整数，默认 120。
+  - priority: 整数，1 表示最高优先级，数字越大优先级越低。
+  - expected_type: 枚举值，"factual"（事实型）、"analytical"（分析型）或 "verification"（验证型）。
+  - search_hints: 列表，仅当 task_type 为 search 时填写推荐搜索关键词，否则为空列表 []。
+
+  【Few-Shot 完整示例】
+  ==============================
+  用户研究问题："评估 2024 年大语言模型（LLM）在医疗诊断领域的应用现状、准确性争议及监管政策"
+
+  分析过程：
+  - 关键概念：LLM、医疗诊断、准确性、监管政策。
+  - 维度拆解：应用现状（事实检索）、准确性争议（学术分析）、监管政策（政策检索）、综合评估（分析）。
+  - 依赖关系：task_3（综合评估）依赖 task_1 和 task_2；task_4（验证）依赖 task_3。task_1 与 task_2 可并行。
+
+  输出 JSON：
+  {
+    "sub_tasks": [
+      {
+        "task_id": "task_1",
+        "task_type": "search",
+        "description": "检索2024年已商业化或进入临床试验的大语言模型医疗诊断产品清单及应用场景",
+        "dependencies": [],
+        "context_keys": [],
+        "timeout_seconds": 120,
+        "priority": 1,
+        "expected_type": "factual",
+        "search_hints": ["LLM medical diagnosis 2024 products", "大语言模型 医疗诊断 应用"]
+      },
+      {
+        "task_id": "task_2",
+        "task_type": "search",
+        "description": "检索2024年各国（美国FDA、欧盟CE、中国NMPA）针对LLM医疗应用的监管政策与审批状态",
+        "dependencies": [],
+        "context_keys": [],
+        "timeout_seconds": 120,
+        "priority": 1,
+        "expected_type": "factual",
+        "search_hints": ["FDA LLM medical device regulation 2024", "NMPA 大模型 医疗器械 审批"]
+      },
+      {
+        "task_id": "task_3",
+        "task_type": "analyze",
+        "description": "汇总task_1和task_2的结果，分析LLM医疗诊断的准确性争议（引用权威医学期刊或基准测试），评估监管成熟度与风险",
+        "dependencies": ["task_1", "task_2"],
+        "context_keys": ["task_1_output", "task_2_output"],
+        "timeout_seconds": 120,
+        "priority": 2,
+        "expected_type": "analytical",
+        "search_hints": []
+      },
+      {
+        "task_id": "task_4",
+        "task_type": "verify",
+        "description": "核对各来源中提到的LLM诊断准确率数据的一致性，标记异常值并评估统计显著性",
+        "dependencies": ["task_3"],
+        "context_keys": ["task_3_output"],
+        "timeout_seconds": 120,
+        "priority": 3,
+        "expected_type": "verification",
+        "search_hints": []
+      }
+    ]
+  }
+  ==============================
+
+  用户研究问题：
+  {{query}}
+
+  现在，请先进行 Chain-of-Thought 思考，再直接输出严格 JSON（禁止任何 Markdown 标记、注释或额外文字）。
+
+# -----------------------------------------------------------------------------
+# 重规划 (Replan) Prompt 模板
+# -----------------------------------------------------------------------------
+replan_prompt_template: |
+  你是一位顶级的研究规划专家（Planner Agent）。当前研究计划执行到一半，出现了需要调整的情况。请你基于已有的执行结果和遇到的问题，重新规划剩余任务。
+
+  【重规划前的 Chain-of-Thought 思考】
+  1. 【变更影响分析】：评估当前遇到的问题会对哪些下游任务产生影响。若修改任务 A，所有直接及间接依赖 A 的任务都必须重新评估其输入有效性。
+  2. 【根因定位】：明确原计划为何失效（信息缺口、假设错误、执行失败、新发现）。
+  3. 【最小改动原则】：尽量保留已通过校验的任务，只对受影响的子图进行修改。
+  4. 【一致性校验】：确保新增/修改的任务 ID 不与已有任务冲突，依赖关系仍构成 DAG（无环）。
+
+  【当前已完成的子任务及结果摘要】
+  """
+  {{completed_tasks}}
+  """
+
+  【当前遇到的问题或新发现】
+  """
+  {{issues}}
+  """
+
+  【原始研究问题】
+  {{query}}
+
+  【输出要求】
+  你必须直接输出合法 JSON，禁止 Markdown 代码块标记、注释或额外文字。JSON 结构如下：
+  {
+    "sub_tasks": [
+      {
+        "task_id": "task_5",
+        "task_type": "search",
+        "description": "新增的补充任务描述，明确说明为何需要此任务",
+        "dependencies": ["task_1"],
+        "context_keys": ["task_1_output"],
+        "timeout_seconds": 120,
+        "priority": 2,
+        "expected_type": "factual",
+        "search_hints": ["补充关键词"]
+      }
+    ]
+  }
+
+  【特别规则】
+  - 已完成的任务请在 description 开头标注 "[DONE]"，且其 dependencies 和 context_keys 保持不变。
+  - 新增任务的 task_id 必须接续现有编号，避免重复。
+  - 若某个失败任务被删除，你必须在 description 中说明删除原因，且确保其原下游任务已重新挂载到新的前置任务上。
+  - 对每一个被修改的任务，你必须在 description 末尾追加 "[MODIFIED: 原因]" 标记。
+
+# -----------------------------------------------------------------------------
+# DAG 约束与校验规则
+# -----------------------------------------------------------------------------
+dag_constraints:
+  # 最大节点数（子任务数）
+  max_nodes: 12
+  # 最大边数（依赖关系数）
+  max_edges: 20
+  # 是否允许孤立节点（无依赖也无被依赖）
+  allow_isolated_nodes: false
+  # 是否强制要求至少有一个入度为 0 的起始节点
+  require_start_nodes: true
+  # 是否强制要求至少有一个出度为 0 的终止节点
+  require_end_nodes: true
+  # 最大 DAG 深度（最长依赖链长度）
+  max_depth: 6
+
+# -----------------------------------------------------------------------------
+# 规划器运行参数
+# -----------------------------------------------------------------------------
+parameters:
+  # 规划时 LLM 温度（稍高以促进创造性拆解）
+  temperature: 0.7
+  top_p: 0.95
+  max_tokens: 4096
+  # 是否启用动态重规划
+  enable_replan: true
+  # 单研究问题最大规划/重规划次数
+  max_plan_iterations: 4
