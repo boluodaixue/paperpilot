@@ -146,7 +146,7 @@ model:
 
 ```bash
 # 1. 克隆项目
-git clone <repo-url>
+git clone https://github.com/qiqihezh/deepresearch-agent.git
 cd deep_research_agent
 
 # 2. 创建 uv 虚拟环境并激活
