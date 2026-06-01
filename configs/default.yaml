@@ -92,6 +92,9 @@ model:
       compressor:
         temperature: 0.1       # 摘要是结构化任务
         max_tokens: 2048
+      extractor:
+        temperature: 0.1       # 证据提取：确定性 JSON 输出
+        max_tokens: 1024
 
   # ---------------------------------------------------------------------------
   # 后端分工映射（哪个模块用哪个后端）
@@ -105,6 +108,7 @@ model:
     red_agent: "mimo"         # 对抗攻击：Xiaomi MiMo 2.5 Pro（OpenAI 兼容）
     blue_agent: "mimo"        # 对抗修复：Xiaomi MiMo 2.5 Pro
     compressor: "mimo"        # 上下文压缩：MiMo（摘要任务成本低）
+    extractor: "deepseek"     # 证据提取：DeepSeek（JSON 结构化）
 
 orchestrator:
   # M1: Multi-Agent Orchestrator 配置
@@ -159,6 +163,15 @@ memory:
   evict_interval: 100
   # 是否启用向量化索引（加速相似度检索）
   enable_vector_index: true
+
+evidence:
+  # PaperPilot: Evidence 提取层配置
+  # 总开关：启用后从 arxiv 论文摘要提取结构化证据并写入报告证据索引
+  enabled: false
+  # 每个子任务结果最多收割的论文数（控制 token 成本）
+  max_papers_per_result: 3
+  # 每篇论文最多提取的 claim 数
+  max_claims_per_paper: 5
 
 adversarial:
   # M5: Red-Blue Adversarial Loop 配置

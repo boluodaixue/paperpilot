@@ -210,6 +210,26 @@ def initialize_modules(config: dict, session_id: str = "") -> dict[str, Any]:
     modules["memory_store"] = memory_store
     logger.info(f"[M4] Memory Store 模块已初始化 (session={session_id})")
 
+    # PaperPilot: Evidence 提取层（可选增强，默认关闭）
+    from src.evidence.store import EvidenceStore
+    from src.evidence.extractor import EvidenceExtractor
+
+    evidence_cfg = config.get("evidence", {})
+    if evidence_cfg.get("enabled", False):
+        evidence_store = EvidenceStore(
+            db_path=memory_cfg.get("db_path", "data/memory.db"),
+            session_id=session_id,
+            embedder=memory_store.embedder,
+        )
+        evidence_extractor = EvidenceExtractor(
+            policy=modules.get("extractor_policy", default_policy),
+            max_claims_per_paper=evidence_cfg.get("max_claims_per_paper", 5),
+            max_papers_per_result=evidence_cfg.get("max_papers_per_result", 3),
+        )
+        modules["evidence_store"] = evidence_store
+        modules["evidence_extractor"] = evidence_extractor
+        logger.info("[Evidence] Evidence 层已启用")
+
     # Tools（真实工具或 Mock 工具）
     tools_list = _create_tools_factory(config)
     modules["tools"] = tools_list
@@ -256,6 +276,8 @@ def initialize_modules(config: dict, session_id: str = "") -> dict[str, Any]:
         adversarial_loop=adversarial_loop,
         memory_store=memory_store,
         summarizer_policy=modules.get("summarizer_policy", default_policy),
+        evidence_extractor=modules.get("evidence_extractor"),
+        evidence_store=modules.get("evidence_store"),
     )
     modules["orchestrator"] = orchestrator
     logger.info("[M1] Orchestrator 模块已初始化")
@@ -376,6 +398,25 @@ def _format_report(report, elapsed: float) -> str:
             url = src.get("url", "")
             snippet = src.get("snippet", "")
             lines.append(f"{i}. [{title}]({url}) — {snippet}")
+        lines.append("")
+
+    # PaperPilot: 证据索引（从 report.evidence 渲染，不依赖 LLM 正文，抗对抗改写）
+    evidence = getattr(report, "evidence", None) or []
+    if evidence:
+        cited_ids: set[str] = set()
+        for m in re.finditer(r"\[E-(\d+)\]", content):
+            cited_ids.add(f"E-{m.group(1)}")
+        lines.append("## 证据索引")
+        lines.append("")
+        for ev in evidence:
+            eid = ev.get("evidence_id", "")
+            claim = ev.get("claim", "")
+            title = ev.get("paper_title", "")
+            url = ev.get("source_url", "")
+            conf = ev.get("confidence", 0.0)
+            cited = "已引用" if eid in cited_ids else "未引用"
+            link = f"[{url}]({url})" if url else url
+            lines.append(f"- [{eid}] {claim} — *{title}* ({link}) 置信度: {conf:.2f} ({cited})")
         lines.append("")
 
     return "\n".join(lines)

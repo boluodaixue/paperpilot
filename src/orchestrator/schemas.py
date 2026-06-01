@@ -131,6 +131,7 @@ class ResearchReport:
     num_replan: int = 0
     adversarial_rounds: int = 0
     final_score: float = 0.0
+    evidence: list[dict] = field(default_factory=list)
 
 
 @dataclass

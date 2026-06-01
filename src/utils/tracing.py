@@ -35,7 +35,7 @@ logger = logging.getLogger(__name__)
 def is_tracing_enabled() -> bool:
     """检查 LangSmith 追踪是否启用。"""
     from .env_config import get_env
-    return get_env("LANGSMITH_TRACING", "").lower() in ("true", "1", "yes")
+    return (get_env("LANGSMITH_TRACING", "") or "").lower() in ("true", "1", "yes")
 
 
 # ---------------------------------------------------------------------------

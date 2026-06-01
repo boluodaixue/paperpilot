@@ -59,6 +59,8 @@ class Orchestrator:
         adversarial_loop: Any | None = None,
         memory_store: Any | None = None,
         summarizer_policy: Any | None = None,
+        evidence_extractor: Any | None = None,
+        evidence_store: Any | None = None,
     ) -> None:
         self.planner = planner
         self.agent_pool = agent_pool
@@ -67,6 +69,8 @@ class Orchestrator:
         self.adversarial_loop = adversarial_loop
         self.memory_store = memory_store
         self.summarizer_policy = summarizer_policy
+        self.evidence_extractor = evidence_extractor
+        self.evidence_store = evidence_store
 
         # 运行时状态（保留 dict 作为快速缓存，M4 提供持久化 + 语义检索）
         self._memory_store: dict[str, Any] = {}
@@ -79,6 +83,7 @@ class Orchestrator:
         self._start_time: float = 0.0
         self._replan_count: int = 0
         self._adversarial_count: int = 0
+        self._seen_papers: set[str] = set()
 
         # 状态机处理器映射
         self._state_handlers: dict[OrchestratorState, Callable[[], asyncio.Future[OrchestratorState]]] = {
@@ -117,6 +122,7 @@ class Orchestrator:
         self._results.clear()
         self._dag = None
         self._task_map.clear()
+        self._seen_papers.clear()
         self._current_state = OrchestratorState.IDLE
 
         # 状态机主循环
@@ -318,6 +324,10 @@ class Orchestrator:
                 if r.status == AgentStatus.SUCCESS and r.output:
                     self._sync_result_to_memory_store(r)
 
+        # PaperPilot: 从子任务轨迹中的论文提取证据（可选增强层）
+        if self.evidence_extractor is not None:
+            await self._extract_evidence()
+
         success_count = sum(1 for r in self._results if r.status == AgentStatus.SUCCESS)
         total_count = len(self._results)
         fail_count = total_count - success_count
@@ -368,6 +378,53 @@ class Orchestrator:
         except Exception as e:
             print(f"[M4] Failed to store memory for {result.task_id}: {e}")
 
+    async def _extract_evidence(self) -> None:
+        """从子任务轨迹中的 arxiv 论文提取证据并持久化。
+
+        可选增强层：任何失败只记录日志，绝不中断主流程。
+        """
+        from ..evidence.extractor import extract_papers_from_result
+        from ..evidence.schemas import Evidence
+
+        try:
+            max_papers = getattr(self.evidence_extractor, "max_papers_per_result", 3)
+            for r in self._results:
+                if r.status != AgentStatus.SUCCESS:
+                    continue
+                papers = extract_papers_from_result(r, max_papers=max_papers)
+                for paper in papers:
+                    pid = paper.get("id", "")
+                    if not pid or pid in self._seen_papers:
+                        continue
+                    self._seen_papers.add(pid)
+                    try:
+                        claims = await self.evidence_extractor.extract_from_paper(
+                            paper, self._query
+                        )
+                    except Exception as e:
+                        print(f"[Evidence] 提取异常跳过 {pid}: {e}")
+                        continue
+                    for c in claims:
+                        try:
+                            self.evidence_store.put(
+                                Evidence(
+                                    evidence_id="",  # store 内生成
+                                    query=self._query,
+                                    paper_id=pid,
+                                    paper_title=paper.get("title", ""),
+                                    source_url=paper.get("pdf_url", ""),
+                                    claim=c["claim"],
+                                    evidence_text=c["evidence_text"],
+                                    confidence=c.get("confidence", 0.5),
+                                    topic=self._query[:50],
+                                    session_id=self.evidence_store.session_id,
+                                )
+                            )
+                        except Exception as e:
+                            print(f"[Evidence] 存储失败跳过: {e}")
+        except Exception as e:
+            print(f"[Evidence] 证据提取整体失败，跳过: {e}")
+
     async def _do_synthesizing(self) -> OrchestratorState:
         """调用 SummarizerAgent 合成研究报告。"""
         # 创建合成任务
@@ -381,6 +438,7 @@ class Orchestrator:
         context = {
             "query": self._query,
             "results": self._results,
+            "evidence": self.evidence_store.get_all() if self.evidence_store else [],
         }
 
         agent = await self.agent_pool.get_agent(TaskType.ANALYZE)
