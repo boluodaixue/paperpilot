@@ -132,6 +132,7 @@ class ResearchReport:
     adversarial_rounds: int = 0
     final_score: float = 0.0
     evidence: list[dict] = field(default_factory=list)
+    evidence_relations: list[dict] = field(default_factory=list)
 
 
 @dataclass

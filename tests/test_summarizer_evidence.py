@@ -62,6 +62,41 @@ def test_build_synthesis_prompt_no_evidence():
     assert "# Evidence Items" not in prompt
 
 
+def _relation(eid1: str, eid2: str, relation: str = "CONTRADICTS") -> dict:
+    return {
+        "session_id": "s",
+        "source_id": eid1,
+        "target_id": eid2,
+        "relation": relation,
+        "weight": 0.87,
+        "source_claim": f"Claim of {eid1}",
+        "target_claim": f"Claim of {eid2}",
+        "source_paper": "Paper A",
+        "target_paper": "Paper B",
+    }
+
+
+def test_build_synthesis_prompt_injects_relations():
+    agent = SummarizerAgent(name="summarizer", policy=ReportPolicy(""))
+    relations = [_relation("E-1", "E-2")]
+    supports = [_relation("E-1", "E-3", relation="SUPPORTS")]
+    prompt = agent._build_synthesis_prompt(
+        "test query", [_result()], [], relations, supports
+    )
+    assert "# Known Contradictions" in prompt
+    assert "[E-1] vs [E-2] (weight 0.87)" in prompt
+    assert "# Supporting Relations" in prompt
+    assert "SUPPORTS" in prompt
+    assert "Explicitly address every item in Known Contradictions" in prompt
+
+
+def test_build_synthesis_prompt_skips_empty_relations():
+    agent = SummarizerAgent(name="summarizer", policy=ReportPolicy(""))
+    prompt = agent._build_synthesis_prompt("test query", [_result()], [], [], [])
+    assert "# Known Contradictions" not in prompt
+    assert "# Supporting Relations" not in prompt
+
+
 @pytest.mark.asyncio
 async def test_run_populates_report_evidence():
     content = (
@@ -87,6 +122,33 @@ async def test_run_populates_report_evidence():
     }
     # 置信度 = LLM 自评 × 成功率开根
     assert report.confidence == 0.85
+
+
+@pytest.mark.asyncio
+async def test_run_carries_evidence_relations():
+    content = (
+        "# Report\n\n"
+        "We resolve the contradiction: the newer evidence is better supported. [E-1]\n\n"
+        "Overall Confidence: 0.8"
+    )
+    agent = SummarizerAgent(name="summarizer", policy=ReportPolicy(content))
+    relations = [_relation("E-1", "E-2")]
+    task = SubTask(task_id="synthesize_final", task_type=TaskType.ANALYZE, description="synth")
+    result = await agent.run(
+        task,
+        {
+            "query": "q",
+            "results": [_result()],
+            "evidence": [],
+            "evidence_relations": relations,
+            "evidence_relations_supports": [],
+        },
+    )
+    assert result.status == AgentStatus.SUCCESS
+    report = result.output
+    assert len(report.evidence_relations) == 1
+    assert report.evidence_relations[0]["source_id"] == "E-1"
+    assert report.evidence_relations[0]["relation"] == "CONTRADICTS"
 
 
 def test_format_report_renders_evidence_index():
@@ -127,3 +189,40 @@ def test_format_report_without_evidence_no_crash():
     report = ResearchReport(query="q", content="no evidence", confidence=0.5)
     out = _format_report(report, elapsed=1.0)
     assert "证据索引" not in out
+
+
+def test_format_report_renders_relations():
+    report = ResearchReport(
+        query="q",
+        content="Statement [E-1].",
+        confidence=0.8,
+        evidence_relations=[
+            {
+                "source_id": "E-1",
+                "target_id": "E-2",
+                "relation": "CONTRADICTS",
+                "weight": 0.87,
+                "source_claim": "Model A is faster",
+                "target_claim": "Model B is slower",
+                "source_paper": "Paper A",
+                "target_paper": "Paper B",
+            },
+            {
+                "source_id": "E-1",
+                "target_id": "E-3",
+                "relation": "SUPPORTS",
+                "weight": 0.8,
+                "source_claim": "Claim one",
+                "target_claim": "Claim three",
+                "source_paper": "Paper A",
+                "target_paper": "Paper C",
+            },
+        ],
+    )
+    out = _format_report(report, elapsed=1.0)
+    assert "## 证据关系" in out
+    assert "### 矛盾 (1)" in out
+    assert "### 支持 (1)" in out
+    assert "[E-1] vs [E-2] (weight 0.87)" in out
+    assert "*Paper A* vs *Paper B*" in out
+    assert "[E-1] SUPPORTS [E-3]" in out

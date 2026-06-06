@@ -228,6 +228,17 @@ def initialize_modules(config: dict, session_id: str = "") -> dict[str, Any]:
         )
         modules["evidence_store"] = evidence_store
         modules["evidence_extractor"] = evidence_extractor
+        if evidence_cfg.get("enable_graph", True):
+            from src.evidence.graph import EvidenceGraph
+
+            evidence_graph = EvidenceGraph(
+                db_path=memory_cfg.get("db_path", "data/memory.db"),
+                embedder=memory_store.embedder,
+                session_id=evidence_store.session_id,  # 用 store 解析后的 session（空串时两者一致）
+                supports_threshold=evidence_cfg.get("supports_threshold", 0.75),
+            )
+            modules["evidence_graph"] = evidence_graph
+            logger.info("[Evidence] Evidence Graph 已启用")
         logger.info("[Evidence] Evidence 层已启用")
 
     # Tools（真实工具或 Mock 工具）
@@ -278,6 +289,7 @@ def initialize_modules(config: dict, session_id: str = "") -> dict[str, Any]:
         summarizer_policy=modules.get("summarizer_policy", default_policy),
         evidence_extractor=modules.get("evidence_extractor"),
         evidence_store=modules.get("evidence_store"),
+        evidence_graph=modules.get("evidence_graph"),
     )
     modules["orchestrator"] = orchestrator
     logger.info("[M1] Orchestrator 模块已初始化")
@@ -418,6 +430,35 @@ def _format_report(report, elapsed: float) -> str:
             link = f"[{url}]({url})" if url else url
             lines.append(f"- [{eid}] {claim} — *{title}* ({link}) 置信度: {conf:.2f} ({cited})")
         lines.append("")
+
+    # PaperPilot: 证据关系（矛盾/支持，来自 Evidence Graph）
+    relations = getattr(report, "evidence_relations", None) or []
+    if relations:
+        contradictions = [r for r in relations if r.get("relation") == "CONTRADICTS"]
+        supports = [r for r in relations if r.get("relation") == "SUPPORTS"]
+        lines.append("## 证据关系")
+        lines.append("")
+        if contradictions:
+            lines.append(f"### 矛盾 ({len(contradictions)})")
+            lines.append("")
+            for r in contradictions:
+                lines.append(
+                    f"- [{r.get('source_id')}] vs [{r.get('target_id')}] "
+                    f"(weight {r.get('weight', 0):.2f}): "
+                    f"{r.get('source_claim', '')} — {r.get('target_claim', '')} "
+                    f"(*{r.get('source_paper', '')}* vs *{r.get('target_paper', '')}*)"
+                )
+            lines.append("")
+        if supports:
+            lines.append(f"### 支持 ({len(supports)})")
+            lines.append("")
+            for r in supports:
+                lines.append(
+                    f"- [{r.get('source_id')}] SUPPORTS [{r.get('target_id')}] "
+                    f"(weight {r.get('weight', 0):.2f}): "
+                    f"{r.get('source_claim', '')} — {r.get('target_claim', '')}"
+                )
+            lines.append("")
 
     return "\n".join(lines)
 

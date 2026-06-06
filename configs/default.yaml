@@ -168,6 +168,10 @@ evidence:
   # PaperPilot: Evidence 提取层配置
   # 总开关：启用后从 arxiv 论文摘要提取结构化证据并写入报告证据索引
   enabled: false
+  # Evidence Graph：构建证据关系图（矛盾/支持/扩展），并写入报告"证据关系"节
+  enable_graph: true
+  # SUPPORTS 相似度下界（0.65~0.92 之间的带：反义→CONTRADICTS，否则→EXTENDS）
+  supports_threshold: 0.75
   # 每个子任务结果最多收割的论文数（控制 token 成本）
   max_papers_per_result: 3
   # 每篇论文最多提取的 claim 数

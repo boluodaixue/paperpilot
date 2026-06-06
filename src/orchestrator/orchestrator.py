@@ -61,6 +61,7 @@ class Orchestrator:
         summarizer_policy: Any | None = None,
         evidence_extractor: Any | None = None,
         evidence_store: Any | None = None,
+        evidence_graph: Any | None = None,
     ) -> None:
         self.planner = planner
         self.agent_pool = agent_pool
@@ -71,6 +72,7 @@ class Orchestrator:
         self.summarizer_policy = summarizer_policy
         self.evidence_extractor = evidence_extractor
         self.evidence_store = evidence_store
+        self.evidence_graph = evidence_graph
 
         # 运行时状态（保留 dict 作为快速缓存，M4 提供持久化 + 语义检索）
         self._memory_store: dict[str, Any] = {}
@@ -406,20 +408,21 @@ class Orchestrator:
                         continue
                     for c in claims:
                         try:
-                            self.evidence_store.put(
-                                Evidence(
-                                    evidence_id="",  # store 内生成
-                                    query=self._query,
-                                    paper_id=pid,
-                                    paper_title=paper.get("title", ""),
-                                    source_url=paper.get("pdf_url", ""),
-                                    claim=c["claim"],
-                                    evidence_text=c["evidence_text"],
-                                    confidence=c.get("confidence", 0.5),
-                                    topic=self._query[:50],
-                                    session_id=self.evidence_store.session_id,
-                                )
+                            ev = Evidence(
+                                evidence_id="",  # store 内生成
+                                query=self._query,
+                                paper_id=pid,
+                                paper_title=paper.get("title", ""),
+                                source_url=paper.get("pdf_url", ""),
+                                claim=c["claim"],
+                                evidence_text=c["evidence_text"],
+                                confidence=c.get("confidence", 0.5),
+                                topic=self._query[:50],
+                                session_id=self.evidence_store.session_id,
                             )
+                            final_id = self.evidence_store.put(ev)
+                            if self.evidence_graph is not None:
+                                self.evidence_graph.add_evidence(ev, evidence_id=final_id)
                         except Exception as e:
                             print(f"[Evidence] 存储失败跳过: {e}")
         except Exception as e:
@@ -439,6 +442,12 @@ class Orchestrator:
             "query": self._query,
             "results": self._results,
             "evidence": self.evidence_store.get_all() if self.evidence_store else [],
+            "evidence_relations": [
+                r.to_dict() for r in self.evidence_graph.get_contradictions(limit=20)
+            ] if self.evidence_graph else [],
+            "evidence_relations_supports": [
+                r.to_dict() for r in self.evidence_graph.get_supports(limit=10)
+            ] if self.evidence_graph else [],
         }
 
         agent = await self.agent_pool.get_agent(TaskType.ANALYZE)
