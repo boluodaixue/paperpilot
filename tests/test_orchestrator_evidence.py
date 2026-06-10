@@ -22,6 +22,9 @@ class StubExtractor:
             {"claim": "Second claim", "evidence_text": "quote2", "confidence": 0.7},
         ]
 
+    async def fetch_papers(self, query, max_papers):
+        return []
+
 
 def _result(tid: str, status: AgentStatus, papers: list[dict]) -> AgentResult:
     trajectory = [{"role": "tool", "result": {"papers": papers}}] if papers else []
@@ -153,3 +156,33 @@ async def test_extract_evidence_graph_raises_does_not_break(tmp_path):
     await orch._extract_evidence()
     # 证据本身照常入库，图异常被吞掉
     assert store.count() == 2
+
+
+@pytest.mark.asyncio
+async def test_extract_evidence_fetches_papers_when_trajectory_empty(tmp_path):
+    """轨迹无论文时，按子任务主题补取论文再提取证据。"""
+
+    class FetchExtractor(StubExtractor):
+        def __init__(self):
+            self.fetched_queries = []
+
+        async def fetch_papers(self, query, max_papers):
+            self.fetched_queries.append(query)
+            return [_paper("p99"), _paper("p100")]
+
+    store = EvidenceStore(db_path=str(tmp_path / "e.db"), session_id="hook-test")
+    extractor = FetchExtractor()
+    orch = Orchestrator(
+        planner=None,
+        agent_pool=None,
+        evidence_extractor=extractor,
+        evidence_store=store,
+    )
+    orch._query = "fallback query"
+    orch._task_map = {"t1": type("T", (), {"description": "find memory papers", "search_hints": []})()}
+    orch._results = [_result("t1", AgentStatus.SUCCESS, [])]  # 空轨迹
+    await orch._extract_evidence()
+    # 补取的主题应来自任务描述
+    assert extractor.fetched_queries == ["find memory papers"]
+    # 补取到的 2 篇论文各产出 2 条 claim
+    assert store.count() == 4

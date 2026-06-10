@@ -31,10 +31,11 @@ def ensure_env_loaded() -> None:
     if _ENV_LOADED:
         return
 
-    # 1. 加载项目级 .env
+    # 1. 加载项目级 .env（override=True：.env 是唯一权威来源，
+    #    避免用户系统里遗留的同名环境变量（如旧的 DEEPSEEK_API_KEY）遮蔽 .env）
     env_path = os.path.join(os.getcwd(), ".env")
     if os.path.exists(env_path):
-        load_dotenv(dotenv_path=env_path)
+        load_dotenv(dotenv_path=env_path, override=True)
 
     # 2. 加载用户级 .env.local（优先级更高）
     local_env = os.path.join(os.getcwd(), ".env.local")

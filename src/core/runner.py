@@ -71,6 +71,19 @@ def load_config(config_path: str | None = None) -> dict:
 # ---------------------------------------------------------------------------
 # 工具工厂
 # ---------------------------------------------------------------------------
+def _build_paper_fetcher(config: dict):
+    """构建证据补取的论文检索器（基于 ArxivReaderTool，随 .env 后端切换）。"""
+    from src.tools.arxiv_reader import ArxivReaderTool
+
+    tool = ArxivReaderTool()
+
+    async def _fetch(query: str, max_results: int) -> list[dict]:
+        result = await tool.execute(query=query, max_results=max_results)
+        return result.get("papers", []) or []
+
+    return _fetch
+
+
 def _create_tools_factory(config: dict):
     """创建工具工厂函数，返回 Agent 可用的工具列表。"""
     tools_cfg = config.get("tools", {})
@@ -225,6 +238,7 @@ def initialize_modules(config: dict, session_id: str = "") -> dict[str, Any]:
             policy=modules.get("extractor_policy", default_policy),
             max_claims_per_paper=evidence_cfg.get("max_claims_per_paper", 5),
             max_papers_per_result=evidence_cfg.get("max_papers_per_result", 3),
+            paper_fetcher=_build_paper_fetcher(config),
         )
         modules["evidence_store"] = evidence_store
         modules["evidence_extractor"] = evidence_extractor

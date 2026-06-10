@@ -104,10 +104,10 @@ model:
     solver: "deepseek"        # 主研究 Agent：DeepSeek Flash（强推理）
     planner: "deepseek"       # 规划器：DeepSeek Flash
     summarizer: "deepseek"    # 合成器：DeepSeek Flash
-    judge: "mimo"            # 评分器：Xiaomi MiMo 2.5 Pro
-    red_agent: "mimo"         # 对抗攻击：Xiaomi MiMo 2.5 Pro（OpenAI 兼容）
-    blue_agent: "mimo"        # 对抗修复：Xiaomi MiMo 2.5 Pro
-    compressor: "mimo"        # 上下文压缩：MiMo（摘要任务成本低）
+    judge: "deepseek"         # 评分器（原 mimo，Cloudflare 403 不可用）
+    red_agent: "deepseek"     # 对抗攻击（原 mimo）
+    blue_agent: "deepseek"    # 对抗修复（原 mimo）
+    compressor: "deepseek"    # 上下文压缩（原 mimo）
     extractor: "deepseek"     # 证据提取：DeepSeek（JSON 结构化）
 
 orchestrator:
@@ -167,7 +167,7 @@ memory:
 evidence:
   # PaperPilot: Evidence 提取层配置
   # 总开关：启用后从 arxiv 论文摘要提取结构化证据并写入报告证据索引
-  enabled: false
+  enabled: true
   # Evidence Graph：构建证据关系图（矛盾/支持/扩展），并写入报告"证据关系"节
   enable_graph: true
   # SUPPORTS 相似度下界（0.65~0.92 之间的带：反义→CONTRADICTS，否则→EXTENDS）

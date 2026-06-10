@@ -40,6 +40,12 @@ def main() -> None:
 
     # 将终端输出同时保存到报告目录下的日志文件
     import datetime as _dt
+    # 中文 Windows 控制台默认 GBK，无法编码 ✓ 等字符；统一 UTF-8 避免 Tee 崩溃
+    for _stream in (sys.stdout, sys.stderr):
+        try:
+            _stream.reconfigure(encoding="utf-8", errors="replace")
+        except (AttributeError, ValueError):
+            pass
     os.makedirs(args.output_dir, exist_ok=True)
     log_filename = os.path.join(
         args.output_dir,
