@@ -69,7 +69,12 @@ model:
       top_p: 1.0
 
     # 模块级覆盖（优先级高于后端全局默认）
-    # 格式: 模块名 -> {temperature, max_tokens, top_p}
+    # 格式: 模块名 -> {temperature, max_tokens, top_p, model_name}
+    # model_name 可覆盖 .env 中的默认模型，实现"同端点多模型分工"。
+    # 注意：当前火山 coding 套餐 key 只支持 deepseek-v4-flash（实测其他模型均 404），
+    # 所以轻量模块默认也走 flash；将来有了快速模型再取消注释切换：
+    #   red_agent/blue_agent/judge/compressor/extractor:
+    #     model_name: "deepseek-chat"   # 或把 backend_mapping 对应模块改成 "mimo"
     modules:
       planner:
         temperature: 0.3       # 生成 JSON DAG 需要确定性
@@ -179,14 +184,16 @@ evidence:
 
 adversarial:
   # M5: Red-Blue Adversarial Loop 配置
-  # 总开关：是否启用对抗降噪流程
-  enabled: true
-  # Red-Blue 对抗最大轮数
-  max_rounds: 10
+  # 总开关：默认关闭（当前火山 key 只有 deepseek-v4-flash 推理模型，
+  # 单次调用 8-9 分钟；确认快速模型可用后再开启）。
+  # 开启后请把 judge/red_agent/blue_agent 切到快速后端（见 model.backend_sampling.modules 注释）。
+  enabled: false
+  # Red-Blue 对抗最大轮数（10 轮在慢模型上会跑数小时；2 轮通常已有主要收益）
+  max_rounds: 2
   # Blue Agent 输出质量分阈值，达到此分即可提前终止对抗
-  score_threshold: 9.5
+  score_threshold: 7.5
   # 相邻两轮评分差异阈值，低于此值视为收敛，提前终止
-  delta_threshold: 0.2
+  delta_threshold: 0.5
   # 是否保存每轮对抗日志
   # 注意：采样参数已移至 model.backend_sampling.modules，此处不再使用
   save_logs: true

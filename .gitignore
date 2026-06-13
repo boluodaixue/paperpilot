@@ -127,6 +127,9 @@ venv.bak/
 .dmypy.json
 dmypy.json
 
+# Claude Code 本地配置（权限模式等，不入库）
+.claude/
+
 # Pyre
 .pyre/
 

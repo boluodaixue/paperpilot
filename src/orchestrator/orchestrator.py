@@ -380,31 +380,52 @@ class Orchestrator:
         except Exception as e:
             print(f"[M4] Failed to store memory for {result.task_id}: {e}")
 
+    def _task_fetch_query(self, task) -> str:
+        """从子任务提取论文补取主题：search_hints[0] → description → 主查询。"""
+        if task and getattr(task, "search_hints", None):
+            return task.search_hints[0]
+        if task and getattr(task, "description", None):
+            return task.description
+        return self._query
+
     async def _extract_evidence(self) -> None:
         """从子任务轨迹中的 arxiv 论文提取证据并持久化。
 
         可选增强层：任何失败只记录日志，绝不中断主流程。
+        轨迹无论文时按子任务主题补取论文；补取主题先去重，减少重复 API 调用。
         """
         from ..evidence.extractor import extract_papers_from_result
         from ..evidence.schemas import Evidence
 
         try:
             max_papers = getattr(self.evidence_extractor, "max_papers_per_result", 3)
+            # 第一遍：收集各 result 的论文 + 需要补取的主题
+            per_result_papers: list[list[dict]] = []
+            fetch_queries: list[str] = []
             for r in self._results:
                 if r.status != AgentStatus.SUCCESS:
+                    per_result_papers.append([])
                     continue
                 papers = extract_papers_from_result(r, max_papers=max_papers)
-                # 轨迹中没有 arxiv 论文（Agent 常用 web_search）时，按子任务主题主动补取
+                per_result_papers.append(papers)
                 if not papers:
-                    task = self._task_map.get(r.task_id)
-                    query = ""
-                    if task and getattr(task, "search_hints", None):
-                        query = task.search_hints[0]
-                    if not query and task and getattr(task, "description", None):
-                        query = task.description
-                    if not query:
-                        query = self._query
-                    papers = await self.evidence_extractor.fetch_papers(query, max_papers)
+                    fetch_queries.append(self._task_fetch_query(self._task_map.get(r.task_id)))
+
+            # 补取主题去重后统一检索，论文缓存供所有 result 共享
+            fetched_by_query: dict[str, list[dict]] = {}
+            for query in dict.fromkeys(fetch_queries):
+                if query:
+                    fetched_by_query[query] = await self.evidence_extractor.fetch_papers(
+                        query, max_papers
+                    )
+
+            # 第二遍：统一提取 + 存储
+            for r, papers in zip(self._results, per_result_papers):
+                if r.status != AgentStatus.SUCCESS:
+                    continue
+                if not papers:
+                    query = self._task_fetch_query(self._task_map.get(r.task_id))
+                    papers = fetched_by_query.get(query, [])
                 for paper in papers:
                     pid = paper.get("id", "")
                     if not pid or pid in self._seen_papers:
@@ -521,8 +542,8 @@ class Orchestrator:
             return OrchestratorState.DONE
 
         # 置信度足够高时跳过对抗
-        if report.confidence >= 0.8:
-            print("[Adversarial] ✓ 报告置信度已达标 (≥0.8)，跳过对抗优化")
+        if report.confidence >= 0.7:
+            print("[Adversarial] ✓ 报告置信度已达标 (≥0.7)，跳过对抗优化")
             return OrchestratorState.DONE
 
         if self.adversarial_loop is None:

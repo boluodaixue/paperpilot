@@ -94,7 +94,14 @@ class SummarizerAgent(BaseAgent):
         token_usage = len(content) // 3  # 简化估算
 
         # 解析报告内容，提取来源和置信度
-        report = self._parse_report(query, content, results, evidence, evidence_relations)
+        # 矛盾 + 支持关系一并写入 report.evidence_relations（_format_report 按 relation 分节渲染）
+        report = self._parse_report(
+            query,
+            content,
+            results,
+            evidence,
+            [*evidence_relations, *evidence_relations_supports],
+        )
 
         return AgentResult(
             task_id=task.task_id,

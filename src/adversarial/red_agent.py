@@ -11,6 +11,7 @@ Red Agent 的职责是对研究报告进行多维度"攻击"，找出事实错�
 """
 from __future__ import annotations
 
+import asyncio
 import json
 import re
 from typing import Any
@@ -256,22 +257,70 @@ class RedAgent:
         max_tokens: 单维度评估的最大输出 token 数。
     """
 
-    def __init__(self, policy, max_tokens: int = 2048):
+    def __init__(self, policy, max_tokens: int = 2048, max_concurrency: int = 5):
         """初始化 Red Agent。
 
         Args:
             policy: 任意实现了 __call__(messages:list) -> OpenAICompatibleDict 的对象。
             max_tokens: 每个维度评估的最大输出长度。
+            max_concurrency: 5 个维度并行评估时的最大并发 LLM 调用数。
         """
         self.policy = policy
         self.max_tokens = max_tokens
+        self.max_concurrency = max(1, max_concurrency)
+        # 单次设置策略的 max_tokens，避免并行线程对共享 policy 的竞态改写
+        configured = getattr(policy, "max_tokens", None)
+        if configured is None or configured < max_tokens:
+            policy.max_tokens = max_tokens
+
+    async def _eval_dimension(
+        self,
+        dim: Dimension,
+        prompt_template: str,
+        query: str,
+        content: str,
+        sources_text: str,
+    ) -> tuple[Dimension, float, list[Issue], str]:
+        """评估单个维度（阻塞 LLM 调用在线程池中执行，实现真并行）。"""
+        # 使用安全替换，避免 report.content/sources_text 中的 { 被 format 误解析
+        prompt = prompt_template
+        prompt = prompt.replace("{query}", query)
+        prompt = prompt.replace("{content}", content)
+        prompt = prompt.replace("{sources}", sources_text)
+        messages = [
+            {"role": "system", "content": SYSTEM_RED_AGENT},
+            {"role": "user", "content": prompt},
+        ]
+
+        try:
+            # VLLMPolicy.__call__ 是同步阻塞调用，用 to_thread 跑进线程池
+            resp = await asyncio.to_thread(self.policy, messages)
+            raw = resp.content or ""
+            score, issues = self._parse_json_output(raw, dim)
+            return dim, score, issues, f"[{dim.value}]\n{raw}\n"
+        except Exception as e:
+            # 解析或调用失败时返回保守分数，避免循环崩溃
+            return (
+                dim,
+                5.0,
+                [
+                    Issue(
+                        severity=Severity.MINOR,
+                        dimension=dim,
+                        description=f"Red Agent 解析失败: {e}",
+                        location="",
+                        fix_type=FixType.IN_PLACE,
+                    )
+                ],
+                f"[{dim.value}]\nERROR: {e}\n",
+            )
 
     @trace_agent(name="red_agent.attack", tags=["m5", "red", "adversarial"])
     async def attack(self, report: ResearchReport) -> RedVerdict:
         """对研究报告执行五维度攻击。
 
         执行流程：
-        1. 并行（顺序 await 但可外部 gather）调用五个维度的评估 Prompt。
+        1. 并行调用五个维度的评估 Prompt（阻塞 LLM 调用走线程池）。
         2. 解析每个维度的 JSON 输出，提取分数和 issues。
         3. 汇总生成 RedVerdict。
 
@@ -289,47 +338,43 @@ class RedAgent:
         content_truncated = report.content[:4000] if len(report.content) > 4000 else report.content
         if len(report.content) > 4000:
             content_truncated += "\n\n[报告已截断，仅显示前 4000 字符]"
-        
+
         sources_text = self._format_sources(report.sources, max_items=15)
 
-        for dim, prompt_template in DIMENSION_PROMPTS.items():
-            # 使用安全替换，避免 report.content/sources_text 中的 { 被 format 误解析
-            prompt = prompt_template
-            prompt = prompt.replace("{query}", report.query)
-            prompt = prompt.replace("{content}", content_truncated)
-            prompt = prompt.replace("{sources}", sources_text)
-            messages = [
-                {"role": "system", "content": SYSTEM_RED_AGENT},
-                {"role": "user", "content": prompt},
-            ]
+        semaphore = asyncio.Semaphore(self.max_concurrency)
 
-            try:
-                # 临时调大 max_tokens 以容纳长输出
-                old_max = getattr(self.policy, "max_tokens", None)
-                if old_max is not None:
-                    self.policy.max_tokens = self.max_tokens
-                resp = self.policy(messages)
-                if old_max is not None:
-                    self.policy.max_tokens = old_max
+        async def _bounded(dim, tmpl):
+            async with semaphore:
+                return await self._eval_dimension(
+                    dim, tmpl, report.query, content_truncated, sources_text
+                )
 
-                raw = resp.content or ""
-                raw_feedbacks.append(f"[{dim.value}]\n{raw}\n")
-                score, issues = self._parse_json_output(raw, dim)
-                dimension_scores[dim] = score
-                all_issues.extend(issues)
-            except Exception as e:
-                # 解析或调用失败时返回保守分数，避免循环崩溃
+        tasks = [
+            _bounded(dim, tmpl)
+            for dim, tmpl in DIMENSION_PROMPTS.items()
+        ]
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+
+        for result in results:
+            if isinstance(result, Exception):
+                # 兜底：单个维度异常也保守处理
+                dim = Dimension.FACTUAL
                 dimension_scores[dim] = 5.0
-                raw_feedbacks.append(f"[{dim.value}]\nERROR: {e}\n")
+                raw_feedbacks.append(f"[{dim.value}]\nERROR: {result}\n")
                 all_issues.append(
                     Issue(
                         severity=Severity.MINOR,
                         dimension=dim,
-                        description=f"Red Agent 解析失败: {e}",
+                        description=f"Red Agent 维度评估失败: {result}",
                         location="",
                         fix_type=FixType.IN_PLACE,
                     )
                 )
+                continue
+            dim, score, issues, feedback = result
+            dimension_scores[dim] = score
+            all_issues.extend(issues)
+            raw_feedbacks.append(feedback)
 
         overall = VerdictEngine.compute_overall(dimension_scores)
         return RedVerdict(
