@@ -445,11 +445,12 @@ def _format_report(report, elapsed: float) -> str:
             lines.append(f"- [{eid}] {claim} — *{title}* ({link}) 置信度: {conf:.2f} ({cited})")
         lines.append("")
 
-    # PaperPilot: 证据关系（矛盾/支持，来自 Evidence Graph）
+    # PaperPilot: 证据关系（矛盾/支持/扩展，来自 Evidence Graph）
     relations = getattr(report, "evidence_relations", None) or []
     if relations:
         contradictions = [r for r in relations if r.get("relation") == "CONTRADICTS"]
         supports = [r for r in relations if r.get("relation") == "SUPPORTS"]
+        extends = [r for r in relations if r.get("relation") == "EXTENDS"]
         lines.append("## 证据关系")
         lines.append("")
         if contradictions:
@@ -469,6 +470,16 @@ def _format_report(report, elapsed: float) -> str:
             for r in supports:
                 lines.append(
                     f"- [{r.get('source_id')}] SUPPORTS [{r.get('target_id')}] "
+                    f"(weight {r.get('weight', 0):.2f}): "
+                    f"{r.get('source_claim', '')} — {r.get('target_claim', '')}"
+                )
+            lines.append("")
+        if extends:
+            lines.append(f"### 扩展 ({len(extends)})")
+            lines.append("")
+            for r in extends:
+                lines.append(
+                    f"- [{r.get('source_id')}] EXTENDS [{r.get('target_id')}] "
                     f"(weight {r.get('weight', 0):.2f}): "
                     f"{r.get('source_claim', '')} — {r.get('target_claim', '')}"
                 )

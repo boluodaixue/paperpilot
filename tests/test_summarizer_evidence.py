@@ -83,13 +83,16 @@ def test_build_synthesis_prompt_injects_relations():
     agent = SummarizerAgent(name="summarizer", policy=ReportPolicy(""))
     relations = [_relation("E-1", "E-2")]
     supports = [_relation("E-1", "E-3", relation="SUPPORTS")]
+    extends = [_relation("E-1", "E-4", relation="EXTENDS")]
     prompt = agent._build_synthesis_prompt(
-        "test query", [_result()], [], relations, supports
+        "test query", [_result()], [], relations, supports, extends
     )
     assert "# Known Contradictions" in prompt
     assert "[E-1] vs [E-2] (weight 0.87)" in prompt
     assert "# Supporting Relations" in prompt
     assert "SUPPORTS" in prompt
+    assert "# Related Extensions" in prompt
+    assert "EXTENDS" in prompt
     assert "Explicitly address every item in Known Contradictions" in prompt
 
 
@@ -98,6 +101,7 @@ def test_build_synthesis_prompt_skips_empty_relations():
     prompt = agent._build_synthesis_prompt("test query", [_result()], [], [], [])
     assert "# Known Contradictions" not in prompt
     assert "# Supporting Relations" not in prompt
+    assert "# Related Extensions" not in prompt
 
 
 @pytest.mark.asyncio
@@ -182,6 +186,35 @@ async def test_run_carries_supports_into_report():
     assert report.evidence_relations[0]["relation"] == "SUPPORTS"
 
 
+@pytest.mark.asyncio
+async def test_run_carries_extends_into_report():
+    """EXTENDS 关系也要写入 report.evidence_relations。"""
+
+    content = (
+        "# Report\n\n"
+        "The extension relation was noted. [E-1]\n\n"
+        "Overall Confidence: 0.8"
+    )
+    agent = SummarizerAgent(name="summarizer", policy=ReportPolicy(content))
+    extends = [_relation("E-1", "E-4", relation="EXTENDS")]
+    task = SubTask(task_id="synthesize_final", task_type=TaskType.ANALYZE, description="synth")
+    result = await agent.run(
+        task,
+        {
+            "query": "q",
+            "results": [_result()],
+            "evidence": [],
+            "evidence_relations": [],
+            "evidence_relations_supports": [],
+            "evidence_relations_extends": extends,
+        },
+    )
+    assert result.status == AgentStatus.SUCCESS
+    report = result.output
+    assert len(report.evidence_relations) == 1
+    assert report.evidence_relations[0]["relation"] == "EXTENDS"
+
+
 def test_format_report_renders_evidence_index():
     report = ResearchReport(
         query="q",
@@ -248,12 +281,24 @@ def test_format_report_renders_relations():
                 "source_paper": "Paper A",
                 "target_paper": "Paper C",
             },
+            {
+                "source_id": "E-1",
+                "target_id": "E-4",
+                "relation": "EXTENDS",
+                "weight": 0.7,
+                "source_claim": "Claim one",
+                "target_claim": "Claim four",
+                "source_paper": "Paper A",
+                "target_paper": "Paper D",
+            },
         ],
     )
     out = _format_report(report, elapsed=1.0)
     assert "## 证据关系" in out
     assert "### 矛盾 (1)" in out
     assert "### 支持 (1)" in out
+    assert "### 扩展 (1)" in out
     assert "[E-1] vs [E-2] (weight 0.87)" in out
     assert "*Paper A* vs *Paper B*" in out
     assert "[E-1] SUPPORTS [E-3]" in out
+    assert "[E-1] EXTENDS [E-4]" in out

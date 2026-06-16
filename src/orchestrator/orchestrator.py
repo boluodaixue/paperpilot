@@ -480,6 +480,9 @@ class Orchestrator:
             "evidence_relations_supports": [
                 r.to_dict() for r in self.evidence_graph.get_supports(limit=10)
             ] if self.evidence_graph else [],
+            "evidence_relations_extends": [
+                r.to_dict() for r in self.evidence_graph.get_extends(limit=10)
+            ] if self.evidence_graph else [],
         }
 
         agent = await self.agent_pool.get_agent(TaskType.ANALYZE)
