@@ -204,6 +204,9 @@ class EvidenceGraph:
                     (session_id,),
                 )
                 return cur.fetchall()
+            except sqlite3.OperationalError:
+                # 全新数据库还没有 evidence 表：视为无证据（Web 端直接查图时可能发生）
+                return []
             finally:
                 conn.close()
 
@@ -217,6 +220,8 @@ class EvidenceGraph:
                     (self.session_id,),
                 )
                 count = int(cur.fetchone()[0])
+            except sqlite3.OperationalError:
+                count = 0  # evidence 表不存在（全新 DB）
             finally:
                 conn.close()
         if count == self._index_count:

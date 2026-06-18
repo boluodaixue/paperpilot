@@ -62,6 +62,7 @@ class Orchestrator:
         evidence_extractor: Any | None = None,
         evidence_store: Any | None = None,
         evidence_graph: Any | None = None,
+        progress_callback: Callable[[dict], None] | None = None,
     ) -> None:
         self.planner = planner
         self.agent_pool = agent_pool
@@ -73,6 +74,7 @@ class Orchestrator:
         self.evidence_extractor = evidence_extractor
         self.evidence_store = evidence_store
         self.evidence_graph = evidence_graph
+        self._progress_callback = progress_callback
 
         # 运行时状态（保留 dict 作为快速缓存，M4 提供持久化 + 语义检索）
         self._memory_store: dict[str, Any] = {}
@@ -99,6 +101,23 @@ class Orchestrator:
             OrchestratorState.DONE: self._on_done,
             OrchestratorState.FAILED: self._on_failed,
         }
+
+    # ------------------------------------------------------------------
+    # 进度回调（Web 前端 SSE 用；任何异常不影响主流程）
+    # ------------------------------------------------------------------
+
+    def set_progress_callback(self, cb: Callable[[dict], None] | None) -> None:
+        """挂载进度回调（可在 run_research 前动态设置）。"""
+        self._progress_callback = cb
+
+    def _emit_progress(self, event: dict) -> None:
+        """发射结构化进度事件；回调异常一律吞掉。"""
+        if self._progress_callback is None:
+            return
+        try:
+            self._progress_callback(event)
+        except Exception:
+            pass
 
     # ------------------------------------------------------------------
     # 公共 API
@@ -150,6 +169,7 @@ class Orchestrator:
             self._current_state = next_state
 
             print(f"[Orchestrator] State transition: {self._current_state.value}")
+            self._emit_progress({"type": "state", "state": self._current_state.value})
 
         # 返回结果
         if self._current_state == OrchestratorState.DONE:
@@ -287,6 +307,12 @@ class Orchestrator:
                     finally:
                         await self.agent_pool.release_agent(agent)
 
+                    self._emit_progress({
+                        "type": "task_done",
+                        "task_id": task_id,
+                        "status": result.status.value,
+                        "confidence": round(result.confidence, 2),
+                    })
                     return result
 
             # 并发执行本层
@@ -455,6 +481,13 @@ class Orchestrator:
                             final_id = self.evidence_store.put(ev)
                             if self.evidence_graph is not None:
                                 self.evidence_graph.add_evidence(ev, evidence_id=final_id)
+                            self._emit_progress({
+                                "type": "evidence",
+                                "evidence_id": final_id,
+                                "paper_id": pid,
+                                "total": self.evidence_store.count(),
+                                "claim": c["claim"][:60],
+                            })
                         except Exception as e:
                             print(f"[Evidence] 存储失败跳过: {e}")
         except Exception as e:
@@ -528,6 +561,14 @@ class Orchestrator:
                 ),
             )
 
+        report_obj = self._memory_store.get("final_report")
+        self._emit_progress({
+            "type": "synthesis",
+            "confidence": round(report_obj.confidence, 2) if report_obj else 0.0,
+            "evidence_count": len(self.evidence_store.get_all()) if self.evidence_store else 0,
+            "adversarial_next": bool(self._config.enable_adversarial),
+        })
+
         if self._config.enable_adversarial:
             print("[Synthesize] ✓ 报告合成完成，进入对抗优化")
             return OrchestratorState.ADVERSARIAL
@@ -555,12 +596,20 @@ class Orchestrator:
 
         try:
             print(f"[Adversarial] ▶ 启动 Red-Blue 对抗优化 (当前置信度={report.confidence:.2f})")
+            self._emit_progress({"type": "adversarial", "phase": "start", "confidence": round(report.confidence, 2)})
             optimized_report, history = await self.adversarial_loop.run(report)
             self._memory_store["final_report"] = optimized_report
             self._adversarial_count += len(history)
             print(f"[Adversarial] ✓ 对抗优化完成: {len(history)} 轮, 最终置信度={optimized_report.confidence:.2f}")
+            self._emit_progress({
+                "type": "adversarial",
+                "phase": "done",
+                "rounds": len(history),
+                "confidence": round(optimized_report.confidence, 2),
+            })
         except Exception as e:
             print(f"[Adversarial] ✗ 对抗优化失败: {e}，使用原始报告")
+            self._emit_progress({"type": "adversarial", "phase": "error", "message": str(e)[:200]})
 
         return OrchestratorState.DONE
 
