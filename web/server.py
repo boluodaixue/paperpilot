@@ -37,6 +37,15 @@ if str(PROJECT_ROOT) not in sys.path:
 # 无论服务器从哪里启动都正确解析（否则 data/memory.db 会落到别的目录）
 os.chdir(PROJECT_ROOT)
 
+# 中文 Windows 控制台默认 GBK：orchestrator 打印的 ✓/✗ 字符会触发
+# UnicodeEncodeError，导致整个研究任务崩溃（和 run_single.py 同因）。
+# 统一重配为 UTF-8，errors='replace' 兜底。
+for _stream in (sys.stdout, sys.stderr):
+    try:
+        _stream.reconfigure(encoding="utf-8", errors="replace")
+    except (AttributeError, ValueError):
+        pass
+
 from fastapi import FastAPI, HTTPException  # noqa: E402
 from fastapi.responses import HTMLResponse, StreamingResponse  # noqa: E402
 from pydantic import BaseModel  # noqa: E402
@@ -50,7 +59,25 @@ STATIC_DIR = Path(__file__).resolve().parent / "static"
 _config = load_config()
 DB_PATH = _config.get("memory", {}).get("db_path", "data/memory.db")
 
+from src.memory.chat_store import KIND_PROPOSAL, KIND_REPORT, ChatStore  # noqa: E402
+
 app = FastAPI(title="PaperPilot", version="0.1.0")
+
+
+def get_chat_store() -> ChatStore:
+    """惰性单例 ChatStore（db 锚定到项目根，chdir 已在上方执行）。"""
+    store = getattr(get_chat_store, "_store", None)
+    if store is None:
+        store = ChatStore(DB_PATH)
+        get_chat_store._store = store
+    return store
+
+
+def _get_clarifier_policy():
+    """澄清用的 LLM policy（短 prompt，max_tokens 收紧）。"""
+    from src.models.model_router import ModelRouter
+
+    return ModelRouter.create_backend("deepseek", max_tokens=800, temperature=0.1)
 
 
 # ---------------------------------------------------------------------------
@@ -131,6 +158,11 @@ async def _run_research_task(task: ResearchTask) -> None:
             task.result = result
             task.status = "done"
             await task.events.put({"type": "done", "session_id": task.session_id})
+            # 研究报告持久化到会话消息（重启服务器后可回溯历史）
+            try:
+                get_chat_store().add(task.session_id, "assistant", KIND_REPORT, report_md)
+            except Exception as e:
+                print(f"[Chat] 报告落盘失败: {e}")
     except Exception as e:
         task.status = "error"
         task.error = str(e)
@@ -209,10 +241,109 @@ async def task_result(task_id: str) -> dict:
 
 @app.get("/api/sessions")
 async def list_sessions() -> list:
-    from src.memory.memory_store import SharedMemoryStore
+    """侧边栏会话列表：优先聊天记录（含首条消息预览），补老会话（仅有记忆/证据）。"""
+    sessions = get_chat_store().list_sessions()
+    known = {s["session_id"] for s in sessions}
+    try:
+        from src.memory.memory_store import SharedMemoryStore
 
-    store = SharedMemoryStore(db_path=DB_PATH, session_id="")
-    return store.list_sessions()
+        legacy = SharedMemoryStore(db_path=DB_PATH, session_id="")
+        for s in legacy.list_sessions():
+            if s["session_id"] not in known:
+                sessions.append({
+                    "session_id": s["session_id"],
+                    "title": s["session_id"],
+                    "last_update": s["last_update"],
+                    "count": s["count"],
+                })
+    except Exception:
+        pass
+    sessions.sort(key=lambda x: x.get("last_update", 0), reverse=True)
+    return sessions
+
+
+class ClarifyRequest(BaseModel):
+    session_id: str | None = None
+    message: str
+
+
+@app.post("/api/clarify")
+async def clarify(req: ClarifyRequest) -> dict:
+    """研究前澄清：追加用户消息，调 clarifier，返回 ask（追问）或 confirm（研究方案）。"""
+    message = (req.message or "").strip()
+    if not message:
+        raise HTTPException(status_code=400, detail="消息不能为空")
+
+    session_id = (req.session_id or "").strip() or f"web-{uuid.uuid4().hex[:8]}"
+    store = get_chat_store()
+    store.add(session_id, "user", "chat", message)
+    history = store.get_messages(session_id)
+
+    from web.clarifier import run_clarifier
+
+    try:
+        result = await asyncio.to_thread(
+            run_clarifier, _get_clarifier_policy(), history, message
+        )
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"澄清失败: {e}")
+
+    if result["action"] == "confirm":
+        plan = result.get("plan") or {}
+        proposal = {
+            "topic": plan.get("topic", ""),
+            "scope": plan.get("scope", ""),
+            "angle": plan.get("angle", ""),
+            "depth": plan.get("depth", ""),
+            "focus_areas": plan.get("focus_areas") or [],
+        }
+        research_query = result.get("research_query", message)
+        store.add(
+            session_id,
+            "assistant",
+            KIND_PROPOSAL,
+            json.dumps({"plan": proposal, "research_query": research_query}, ensure_ascii=False),
+        )
+        return {
+            "session_id": session_id,
+            "action": "confirm",
+            "plan": proposal,
+            "research_query": research_query,
+        }
+
+    store.add(session_id, "assistant", "chat", result["question"])
+    return {"session_id": session_id, "action": "ask", "question": result["question"]}
+
+
+@app.get("/api/sessions/{sid}/messages")
+async def session_messages(sid: str) -> list:
+    """返回某会话的完整消息历史（含研究报告留档）。"""
+    return get_chat_store().get_messages(sid)
+
+
+@app.get("/api/sessions/{sid}/evidence")
+async def session_evidence(sid: str) -> dict:
+    """某会话的结构化证据 + 关系（供历史报告卡渲染，不依赖内存任务态）。"""
+    from src.evidence.graph import EvidenceGraph
+    from src.evidence.store import EvidenceStore
+
+    try:
+        store = EvidenceStore(db_path=DB_PATH, session_id=sid)
+        evidence = [ev.to_report_dict() for ev in store.get_all()]
+    except Exception:
+        evidence = []
+    relations: list = []
+    try:
+        graph = EvidenceGraph(db_path=DB_PATH, session_id=sid)
+        for r in graph.get_contradictions(limit=20):
+            relations.append(r.to_dict())
+        for r in graph.get_supports(limit=10):
+            relations.append(r.to_dict())
+        for r in graph.get_extends(limit=10):
+            relations.append(r.to_dict())
+    except Exception:
+        pass
+    return {"evidence": evidence, "evidence_relations": relations, "session_id": sid}
 
 
 @app.get("/api/sessions/{sid}/graph")

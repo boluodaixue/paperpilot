@@ -22,6 +22,13 @@ if str(PROJECT_ROOT) not in sys.path:
 
 
 def main() -> None:
+    # 中文 Windows 控制台默认 GBK，先重配为 UTF-8，避免 ✓/✗ 打印崩溃
+    for _stream in (sys.stdout, sys.stderr):
+        try:
+            _stream.reconfigure(encoding="utf-8", errors="replace")
+        except (AttributeError, ValueError):
+            pass
+
     parser = argparse.ArgumentParser(description="启动 PaperPilot Web 服务器")
     parser.add_argument("--host", default="127.0.0.1", help="监听地址（默认 127.0.0.1）")
     parser.add_argument("--port", type=int, default=8000, help="端口（默认 8000）")
