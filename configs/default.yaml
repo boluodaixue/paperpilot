@@ -119,8 +119,11 @@ orchestrator:
   # M1: Multi-Agent Orchestrator 配置
   # 同时运行的最大子 Agent 数量
   max_concurrent: 5
-  # 全局超时时间（秒），超过则强制终止整个研究流程
-  global_timeout_seconds: 600
+  # 全局超时时间（秒）：火山推理模型单次调用可达 8-9 分钟，
+  # 9 子任务的完整研究需 20-30 分钟，给足预算
+  global_timeout_seconds: 2400
+  # 单次报告合成超时（秒）：合成 prompt 大，慢模型可能超过 5 分钟
+  synthesis_timeout_seconds: 900
   # 最大重规划（replan）轮数，防止无限循环
   max_replan_rounds: 3
   # 单次规划最多拆分的子问题数量

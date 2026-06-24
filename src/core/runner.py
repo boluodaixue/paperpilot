@@ -360,7 +360,8 @@ async def run_research(
 
     run_cfg = RunConfig(
         max_concurrent=config.get("orchestrator", {}).get("max_concurrent", 5),
-        global_timeout_seconds=config.get("orchestrator", {}).get("global_timeout_seconds", 600),
+        global_timeout_seconds=config.get("orchestrator", {}).get("global_timeout_seconds", 1800),
+        synthesis_timeout_seconds=config.get("orchestrator", {}).get("synthesis_timeout_seconds", 600),
         max_replan_rounds=config.get("orchestrator", {}).get("max_replan_rounds", 3),
         max_sub_questions=config.get("orchestrator", {}).get("max_sub_questions", 8),
         enable_adversarial=config.get("adversarial", {}).get("enabled", True),
