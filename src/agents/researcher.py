@@ -74,7 +74,8 @@ class ResearcherAgent(BaseAgent):
                 {"role": "user", "content": task_desc},
             ]
             try:
-                response = self.policy(messages)
+                # 同步 LLM 调用放入线程池，避免阻塞 asyncio 事件循环
+                response = await asyncio.to_thread(self.policy, messages)
                 content = response.get("content", "") or ""
                 return AgentResult(
                     task_id=task.task_id,

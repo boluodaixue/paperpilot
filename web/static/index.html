@@ -139,8 +139,8 @@
 // ------------------------------------------------------------------
 let currentSessionId = null;   // 当前会话
 let currentProposal = null;    // {plan, research_query} 待确认方案
-let currentReportData = null;  // {report_md, evidence, evidence_relations, session_id} 当前报告
-let currentTaskId = null;
+let currentReportData = null;  // 当前报告数据
+let runningTask = null;        // {task_id, session_id} 正在运行的研究
 let eventSource = null;
 let network = null;
 
@@ -172,7 +172,7 @@ function fmtTime(ts) {
   return `${String(d.getMonth()+1).padStart(2,'0')}-${String(d.getDate()).padStart(2,'0')} ${String(d.getHours()).padStart(2,'0')}:${String(d.getMinutes()).padStart(2,'0')}`;
 }
 function newSession() {
-  currentSessionId = null; currentProposal = null; currentReportData = null; currentTaskId = null;
+  currentSessionId = null; currentProposal = null; currentReportData = null; runningTask = null;
   if (eventSource) { eventSource.close(); eventSource = null; }
   $('messages').innerHTML = '';
   $('proposalCard').style.display = 'none';
@@ -186,7 +186,7 @@ function newSession() {
 // 会话选择（历史）
 // ------------------------------------------------------------------
 async function selectSession(sid) {
-  currentSessionId = sid; currentProposal = null; currentReportData = null; currentTaskId = null;
+  currentSessionId = sid; currentProposal = null; currentReportData = null;
   if (eventSource) { eventSource.close(); eventSource = null; }
   $('messages').innerHTML = '';
   $('proposalCard').style.display = 'none';
@@ -197,6 +197,24 @@ async function selectSession(sid) {
   if (!msgs.length) { loadSessions(); return; }
   // 跳过 proposal/report（单独卡片渲染），其余当气泡显示
   for (const m of msgs) renderStoredMessage(m);
+
+  // 该会话是否有进行中的研究？本地 runningTask 优先，其次向服务器查询
+  let task = (runningTask && runningTask.session_id === sid) ? runningTask : null;
+  if (!task) {
+    try {
+      const tr = await fetch(`/api/sessions/${encodeURIComponent(sid)}/active-task`);
+      const td = await tr.json();
+      if (td.task_id) { task = { task_id: td.task_id, session_id: sid }; runningTask = task; }
+    } catch (e) { /* 忽略 */ }
+  }
+  if (task) {
+    // 研究中：重连 SSE 进度（服务器队列会回放已产生的事件）
+    appendProgress({ type: 'state', state: '研究进行中（已恢复连接）' });
+    openEventStream(task.task_id);
+    loadSessions();
+    return;
+  }
+
   // 按最后一条消息决定尾部状态：proposal → 恢复确认卡；report → 恢复报告卡
   const last = msgs[msgs.length - 1];
   if (last.kind === 'proposal') {
@@ -336,7 +354,7 @@ async function startResearch() {
   });
   const data = await r.json();
   if (!r.ok) { appendProgress({ type: 'error', message: data.detail || '启动失败' }); return; }
-  currentTaskId = data.task_id;
+  runningTask = { task_id: data.task_id, session_id: currentSessionId };
   openEventStream(data.task_id);
 }
 
@@ -352,9 +370,11 @@ function openEventStream(task_id) {
     appendProgress(ev);
     if (ev.type === 'done') {
       eventSource.close(); eventSource = null;
+      runningTask = null;
       fetchResult(task_id);
     } else if (ev.type === 'error') {
       eventSource.close(); eventSource = null;
+      runningTask = null;
     }
   };
   eventSource.onerror = () => { eventSource.close(); eventSource = null; };

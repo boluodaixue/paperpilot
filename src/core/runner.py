@@ -72,14 +72,29 @@ def load_config(config_path: str | None = None) -> dict:
 # 工具工厂
 # ---------------------------------------------------------------------------
 def _build_paper_fetcher(config: dict):
-    """构建证据补取的论文检索器（基于 ArxivReaderTool，随 .env 后端切换）。"""
+    """构建证据补取的论文检索器。
+
+    用配置的后端（.env ARXIV_READER_BACKEND）检索；若返回空（如 arxiv 国内
+    不可达/被限流），自动回退 openalex，保证证据管线有论文可用。
+    """
     from src.tools.arxiv_reader import ArxivReaderTool
 
     tool = ArxivReaderTool()
+    fallback = ArxivReaderTool(backend="openalex")
 
     async def _fetch(query: str, max_results: int) -> list[dict]:
-        result = await tool.execute(query=query, max_results=max_results)
-        return result.get("papers", []) or []
+        try:
+            result = await tool.execute(query=query, max_results=max_results)
+            papers = result.get("papers", []) or []
+            if papers:
+                return papers
+        except Exception:
+            pass
+        try:
+            result = await fallback.execute(query=query, max_results=max_results)
+            return result.get("papers", []) or []
+        except Exception:
+            return []
 
     return _fetch
 
