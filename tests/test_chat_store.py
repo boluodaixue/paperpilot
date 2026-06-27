@@ -62,3 +62,61 @@ def test_persistence_across_instances(tmp_path):
     msgs = second.get_messages("s1")
     assert len(msgs) == 1
     assert msgs[0]["content"] == "问题"
+
+
+# ---------------------------------------------------------------------------
+# 会话管理：重命名 / 置顶 / 排序 / 删除
+# ---------------------------------------------------------------------------
+
+def test_set_meta_rename(tmp_path):
+    store = _new_store(tmp_path)
+    store.add("s1", "user", "chat", "首条消息")
+    store.set_meta("s1", title="自定义标题")
+    sessions = store.list_sessions()
+    assert sessions[0]["title"] == "自定义标题"
+
+
+def test_meta_title_overrides_first_message(tmp_path):
+    store = _new_store(tmp_path)
+    store.add("s1", "user", "chat", "很长的第一条消息内容超过十五个字了")
+    store.set_meta("s1", title="短标题")
+    sessions = store.list_sessions()
+    assert sessions[0]["title"] == "短标题"
+
+
+def test_pin_puts_session_on_top(tmp_path):
+    store = _new_store(tmp_path)
+    store.add("s1", "user", "chat", "旧会话")
+    store.add("s2", "user", "chat", "新会话")  # s2 更新，默认排前
+    assert store.list_sessions()[0]["session_id"] == "s2"
+    store.set_meta("s1", pinned=True)
+    sessions = store.list_sessions()
+    assert sessions[0]["session_id"] == "s1"
+    assert sessions[0]["pinned"] is True
+    # 取消置顶恢复原排序
+    store.set_meta("s1", pinned=False)
+    assert store.list_sessions()[0]["session_id"] == "s2"
+
+
+def test_sort_order_drives_drag_reorder(tmp_path):
+    store = _new_store(tmp_path)
+    for sid in ("a", "b", "c"):
+        store.add(sid, "user", "chat", f"消息{sid}")
+    store.set_sort_order(["c", "a", "b"])
+    sessions = store.list_sessions()
+    assert [s["session_id"] for s in sessions] == ["c", "a", "b"]
+
+
+def test_delete_session_removes_chat_and_meta(tmp_path):
+    store = _new_store(tmp_path)
+    store.add("s1", "user", "chat", "消息1")
+    store.add("s1", "assistant", "chat", "回复")
+    store.add("s2", "user", "chat", "其他会话")
+    store.set_meta("s1", title="标题", pinned=True)
+    n = store.delete_session("s1")
+    assert n == 2
+    assert store.get_messages("s1") == []
+    assert store.get_messages("s2")  # 其他会话不受影响
+    sessions = store.list_sessions()
+    assert len(sessions) == 1
+    assert sessions[0]["session_id"] == "s2"

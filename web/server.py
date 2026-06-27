@@ -270,12 +270,19 @@ async def list_sessions() -> list:
                 sessions.append({
                     "session_id": s["session_id"],
                     "title": s["session_id"],
+                    "pinned": False,
+                    "sort_order": 0.0,
                     "last_update": s["last_update"],
                     "count": s["count"],
                 })
     except Exception:
         pass
-    sessions.sort(key=lambda x: x.get("last_update", 0), reverse=True)
+    # 与 ChatStore.list_sessions 同款排序：置顶优先 → 拖拽顺序 → 更新时间兜底
+    sessions.sort(key=lambda s: (
+        not s.get("pinned", False),
+        s.get("sort_order", 0.0),
+        -s.get("last_update", 0),
+    ))
     return sessions
 
 
@@ -361,6 +368,79 @@ async def session_evidence(sid: str) -> dict:
     except Exception:
         pass
     return {"evidence": evidence, "evidence_relations": relations, "session_id": sid}
+
+
+class SessionRename(BaseModel):
+    title: str
+
+
+@app.patch("/api/sessions/{sid}")
+async def session_rename(sid: str, req: SessionRename) -> dict:
+    """重命名会话（侧边栏标题）。"""
+    title = (req.title or "").strip()
+    if not title:
+        raise HTTPException(status_code=400, detail="标题不能为空")
+    get_chat_store().set_meta(sid, title=title)
+    return {"session_id": sid, "title": title}
+
+
+class SessionPin(BaseModel):
+    pinned: bool
+
+
+@app.post("/api/sessions/{sid}/pin")
+async def session_pin(sid: str, req: SessionPin) -> dict:
+    """置顶 / 取消置顶会话。"""
+    get_chat_store().set_meta(sid, pinned=bool(req.pinned))
+    return {"session_id": sid, "pinned": bool(req.pinned)}
+
+
+class SessionOrder(BaseModel):
+    session_ids: list[str]
+
+
+@app.post("/api/sessions/order")
+async def session_order(req: SessionOrder) -> dict:
+    """拖拽排序：session_ids 为新的展示顺序。"""
+    get_chat_store().set_sort_order(req.session_ids)
+    return {"ok": True, "count": len(req.session_ids)}
+
+
+@app.delete("/api/sessions/{sid}")
+async def session_delete(sid: str) -> dict:
+    """全量删除会话：聊天记录 + 报告 + 证据 + 关系边 + 记忆 + 冲突。"""
+    import sqlite3 as _sqlite3
+
+    deleted = {"chat": 0, "evidence": 0, "edges": 0, "entries": 0, "conflicts": 0}
+    with _sqlite3.connect(DB_PATH) as conn:
+        tables = {r[0] for r in conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='table'"
+        )}
+        if "entries" in tables:
+            entry_ids = [r[0] for r in conn.execute(
+                "SELECT entry_id FROM entries WHERE session_id = ?", (sid,)
+            )]
+            if entry_ids and "conflicts" in tables:
+                placeholders = ",".join("?" * len(entry_ids))
+                deleted["conflicts"] = conn.execute(
+                    f"DELETE FROM conflicts WHERE entry_id_1 IN ({placeholders}) "
+                    f"OR entry_id_2 IN ({placeholders})",
+                    [*entry_ids, *entry_ids],
+                ).rowcount
+            deleted["entries"] = conn.execute(
+                "DELETE FROM entries WHERE session_id = ?", (sid,)
+            ).rowcount
+        if "evidence" in tables:
+            deleted["evidence"] = conn.execute(
+                "DELETE FROM evidence WHERE session_id = ?", (sid,)
+            ).rowcount
+        if "evidence_edges" in tables:
+            deleted["edges"] = conn.execute(
+                "DELETE FROM evidence_edges WHERE session_id = ?", (sid,)
+            ).rowcount
+        conn.commit()
+    deleted["chat"] = get_chat_store().delete_session(sid)
+    return {"session_id": sid, "deleted": deleted}
 
 
 @app.get("/api/sessions/{sid}/graph")

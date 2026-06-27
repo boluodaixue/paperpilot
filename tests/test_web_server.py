@@ -181,3 +181,108 @@ def test_research_persists_report_to_chat(tmp_path, monkeypatch):
     msgs = server.get_chat_store().get_messages("sess-x")
     assert msgs[-1]["kind"] == "report"
     assert "报告正文" in msgs[-1]["content"]
+
+
+# ---------------------------------------------------------------------------
+# 会话管理：重命名 / 置顶 / 排序 / 删除
+# ---------------------------------------------------------------------------
+
+def test_session_rename(client, monkeypatch):
+    monkeypatch.setattr(server, "_get_clarifier_policy",
+                        lambda: _stub_policy('{"action":"ask","question":"q?"}'))
+    client.post("/api/clarify", json={"session_id": "s1", "message": "hi"})
+    r = client.patch("/api/sessions/s1", json={"title": "新名字"})
+    assert r.status_code == 200
+    assert r.json()["title"] == "新名字"
+    sessions = client.get("/api/sessions").json()
+    titles = {s["session_id"]: s.get("title", "") for s in sessions}
+    assert titles["s1"] == "新名字"
+
+
+def test_session_rename_empty_rejected(client):
+    r = client.patch("/api/sessions/s1", json={"title": "   "})
+    assert r.status_code == 400
+
+
+def test_session_pin_toggle(client, monkeypatch):
+    monkeypatch.setattr(server, "_get_clarifier_policy",
+                        lambda: _stub_policy('{"action":"ask","question":"q?"}'))
+    client.post("/api/clarify", json={"session_id": "s1", "message": "hi"})
+    r = client.post("/api/sessions/s1/pin", json={"pinned": True})
+    assert r.json()["pinned"] is True
+    sessions = client.get("/api/sessions").json()
+    s1 = next(s for s in sessions if s["session_id"] == "s1")
+    assert s1["pinned"] is True
+    assert sessions[0]["session_id"] == "s1"  # 置顶排最前
+    client.post("/api/sessions/s1/pin", json={"pinned": False})
+    sessions = client.get("/api/sessions").json()
+    assert next(s for s in sessions if s["session_id"] == "s1")["pinned"] is False
+
+
+def test_session_order(client, monkeypatch):
+    monkeypatch.setattr(server, "_get_clarifier_policy",
+                        lambda: _stub_policy('{"action":"ask","question":"q?"}'))
+    for sid in ("a", "b", "c"):
+        client.post("/api/clarify", json={"session_id": sid, "message": f"m{sid}"})
+    r = client.post("/api/sessions/order", json={"session_ids": ["c", "a", "b"]})
+    assert r.status_code == 200
+    sessions = client.get("/api/sessions").json()
+    assert [s["session_id"] for s in sessions[:3]] == ["c", "a", "b"]
+
+
+def test_session_delete_full_cleanup(client, monkeypatch):
+    """DELETE 全量清理：chat + evidence + edges + entries + conflicts + meta。"""
+    import sqlite3
+
+    from src.evidence.graph import EvidenceGraph
+    from src.evidence.store import EvidenceStore
+    from src.memory.memory_store import SharedMemoryStore
+
+    monkeypatch.setattr(server, "_get_clarifier_policy",
+                        lambda: _stub_policy('{"action":"ask","question":"q?"}'))
+    client.post("/api/clarify", json={"session_id": "del-s", "message": "研究问题"})
+    client.patch("/api/sessions/del-s", json={"title": "待删"})
+    # 先实例化各 store 建表，再直接构造证据/记忆/冲突数据
+    EvidenceStore(db_path=server.DB_PATH)
+    EvidenceGraph(db_path=server.DB_PATH)
+    SharedMemoryStore(db_path=server.DB_PATH)
+    conn = sqlite3.connect(server.DB_PATH)
+    conn.execute(
+        "INSERT INTO evidence (session_id, evidence_id, query, paper_id, paper_title, "
+        "source_url, claim, evidence_text, confidence, topic, embedding_json) "
+        "VALUES ('del-s','E-1','q','p','t','','c','e',0.9,'q','[]')"
+    )
+    conn.execute(
+        "INSERT INTO evidence_edges (session_id, source_id, target_id, relation, weight, "
+        "source_claim, target_claim, source_paper, target_paper, created_at) "
+        "VALUES ('del-s','E-1','p','SOURCED_FROM',1.0,'c','','t','',1.0)"
+    )
+    conn.execute(
+        "INSERT INTO entries (entry_id, claim, source, confidence, agent_id, timestamp, "
+        "evidence_type, embedding_json, topic, metadata_json, session_id) "
+        "VALUES ('en1','c','s',0.9,'a',1.0,'','[]','','{}','del-s')"
+    )
+    conn.execute(
+        "INSERT INTO conflicts (conflict_id, entry_id_1, entry_id_2, claim_1, claim_2, "
+        "similarity, status, resolution, detected_at) "
+        "VALUES ('cf1','en1','en2','a','b',0.8,'open','',1.0)"
+    )
+    conn.commit()
+    conn.close()
+
+    r = client.delete("/api/sessions/del-s")
+    assert r.status_code == 200
+    deleted = r.json()["deleted"]
+    assert deleted["chat"] >= 1
+    assert deleted["evidence"] == 1
+    assert deleted["edges"] == 1
+    assert deleted["entries"] == 1
+    assert deleted["conflicts"] == 1
+
+    conn = sqlite3.connect(server.DB_PATH)
+    for table in ("evidence", "evidence_edges", "entries", "chat_messages", "session_meta"):
+        n = conn.execute(f"SELECT COUNT(*) FROM {table} WHERE session_id='del-s'").fetchone()[0]
+        assert n == 0, f"{table} 未清空"
+    n = conn.execute("SELECT COUNT(*) FROM conflicts WHERE conflict_id='cf1'").fetchone()[0]
+    assert n == 0
+    conn.close()
