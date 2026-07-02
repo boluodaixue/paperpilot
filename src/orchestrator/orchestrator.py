@@ -88,6 +88,11 @@ class Orchestrator:
         self._replan_count: int = 0
         self._adversarial_count: int = 0
         self._seen_papers: set[str] = set()
+        # Research Loop 状态：已完成任务 / 轮次 / 累计证据数
+        self._done_task_ids: set[str] = set()
+        self._research_rounds: int = 0
+        self._evidence_count_prev: int = 0
+        self._evidence_count_cum: int = 0
 
         # 状态机处理器映射
         self._state_handlers: dict[OrchestratorState, Callable[[], asyncio.Future[OrchestratorState]]] = {
@@ -95,6 +100,7 @@ class Orchestrator:
             OrchestratorState.PLANNING: self._do_planning,
             OrchestratorState.DISPATCHING: self._do_dispatching,
             OrchestratorState.COLLECTING: self._do_collecting,
+            OrchestratorState.GAP_ANALYSIS: self._do_gap_analysis,
             OrchestratorState.SYNTHESIZING: self._do_synthesizing,
             OrchestratorState.ADVERSARIAL: self._do_adversarial,
             OrchestratorState.REPLANNING: self._do_replanning,
@@ -144,6 +150,10 @@ class Orchestrator:
         self._dag = None
         self._task_map.clear()
         self._seen_papers.clear()
+        self._done_task_ids.clear()
+        self._research_rounds = 0
+        self._evidence_count_prev = 0
+        self._evidence_count_cum = 0
         self._current_state = OrchestratorState.IDLE
 
         # 状态机主循环
@@ -268,10 +278,16 @@ class Orchestrator:
 
         semaphore = asyncio.Semaphore(self._config.max_concurrent)
         parallel_groups = self._dag.get_parallel_groups()
+        # Research Loop：跳过已完成任务，只跑本轮回合新增（动态补派）任务
+        pending_groups = [
+            [tid for tid in group if tid not in self._done_task_ids]
+            for group in parallel_groups
+        ]
+        pending_groups = [g for g in pending_groups if g]
         all_results: list[AgentResult] = []
 
-        for layer_idx, group in enumerate(parallel_groups):
-            print(f"[Dispatch] ▶ Layer {layer_idx + 1}/{len(parallel_groups)}: {group} (并行执行)")
+        for layer_idx, group in enumerate(pending_groups):
+            print(f"[Dispatch] ▶ Layer {layer_idx + 1}/{len(pending_groups)}: {group} (并行执行)")
 
             # 构建本层的 coroutine 列表
             async def _run_one(task_id: str) -> AgentResult:
@@ -334,7 +350,10 @@ class Orchestrator:
                 else:
                     all_results.append(lr)
 
-        self._results = all_results
+        # 累积结果并标记已完成任务（Research Loop 多轮共用 self._results）
+        for r in all_results:
+            self._done_task_ids.add(r.task_id)
+        self._results.extend(all_results)
         return OrchestratorState.COLLECTING
 
     async def _do_collecting(self) -> OrchestratorState:
@@ -378,7 +397,103 @@ class Orchestrator:
                 print("[Collect] Max replan rounds reached, proceeding with partial results")
                 # 超过最大重规划次数，继续合成（用已有结果）
 
+        # 记录本轮累计证据数（Research Loop 饱和度判定用）
+        if self.evidence_store is not None:
+            self._evidence_count_prev = self._evidence_count_cum
+            self._evidence_count_cum = self.evidence_store.count()
+
+        # PaperPilot: 图驱动的 Research Loop（动态补派子任务直到覆盖充分）
+        if self._config.enable_research_loop and self.evidence_store is not None:
+            return OrchestratorState.GAP_ANALYSIS
         return OrchestratorState.SYNTHESIZING
+
+    async def _do_gap_analysis(self) -> OrchestratorState:
+        """PaperPilot: 图驱动的 Research Loop —— 检查证据缺口，动态补派子任务。
+
+        停止条件（简版 RCS）：全局超时 / 达最大轮数 / 证据饱和（无增长）/ 任务数预算。
+        否则调 Gap Analyzer：有缺口 → 追加任务回 DISPATCHING；无 → SYNTHESIZING。
+        """
+        # 1) 预算 / 饱和预检
+        if self._is_global_timeout():
+            print("[GapAnalysis] 全局超时，停止循环")
+            return OrchestratorState.SYNTHESIZING
+        if self._research_rounds >= self._config.max_research_rounds:
+            print(f"[GapAnalysis] 已达最大轮数 {self._research_rounds}，停止循环")
+            return OrchestratorState.SYNTHESIZING
+        delta = self._evidence_count_cum - self._evidence_count_prev
+        if self._research_rounds > 0 and delta <= 0:
+            print("[GapAnalysis] 证据饱和（本轮无新增），停止循环")
+            return OrchestratorState.SYNTHESIZING
+
+        # 2) 收集证据覆盖数据（按子任务主题统计）
+        try:
+            plan_topics = [
+                t.description[:50] for t in self._task_map.values() if t.description
+            ]
+            evidence_by_topic: dict[str, int] = {}
+            for ev in self.evidence_store.get_all():
+                k = (ev.topic or "").strip()
+                if k:
+                    evidence_by_topic[k] = evidence_by_topic.get(k, 0) + 1
+        except Exception as e:
+            print(f"[GapAnalysis] 覆盖数据收集失败，停止循环: {e}")
+            return OrchestratorState.SYNTHESIZING
+
+        # 3) 调 Gap Analyzer（同步 LLM 调用走线程池）
+        from ..agents.gap_analyzer import GapPlan, run_gap_analysis
+
+        try:
+            plan = await asyncio.to_thread(
+                run_gap_analysis,
+                self.summarizer_policy,
+                self._query,
+                self._research_rounds + 1,
+                plan_topics,
+                evidence_by_topic,
+                self._config.min_evidence_per_topic,
+            )
+        except Exception as e:
+            print(f"[GapAnalysis] 分析失败，按 complete 处理: {e}")
+            plan = GapPlan(decision="complete", reason=f"Gap 分析异常: {e}")
+
+        # 4) 预算截断：每轮最多 max_gap_tasks_per_round，总量不超 max_total_tasks
+        quota = min(
+            self._config.max_gap_tasks_per_round,
+            max(0, self._config.max_total_tasks - len(self._dag)),
+        )
+        new_tasks = plan.new_tasks[:quota]
+
+        if plan.decision != "continue" or not new_tasks:
+            print(f"[GapAnalysis] 研究充分（{plan.reason or '无缺口'}），进入合成")
+            self._emit_progress({"type": "loop", "round": self._research_rounds + 1,
+                                 "gaps": len(plan.gaps), "new_tasks": 0, "decision": "complete"})
+            return OrchestratorState.SYNTHESIZING
+
+        # 5) 动态 fork：把补搜任务追加进 DAG + task_map（独立任务，无依赖）
+        added: list[str] = []
+        for i, gt in enumerate(new_tasks, 1):
+            tid = f"gap_{self._research_rounds}_{i}"
+            self._dag.add_node(tid)
+            self._task_map[tid] = SubTask(
+                task_id=tid,
+                task_type=TaskType.SEARCH,
+                description=gt.description,
+                search_hints=gt.search_hints,
+                timeout_seconds=120,
+                priority=2,
+                expected_type="factual",
+            )
+            added.append(tid)
+        self._research_rounds += 1
+        print(f"[GapAnalysis] 第 {self._research_rounds} 轮：发现 {len(plan.gaps)} 个缺口，补派 {len(added)} 个任务: {added}")
+        self._emit_progress({
+            "type": "loop",
+            "round": self._research_rounds,
+            "gaps": len(plan.gaps),
+            "new_tasks": added,
+            "decision": "continue",
+        })
+        return OrchestratorState.DISPATCHING
 
     def _sync_result_to_memory_store(self, result: AgentResult) -> None:
         """将 AgentResult 同步到 M4 SharedMemoryStore。
@@ -455,6 +570,12 @@ class Orchestrator:
                 if not papers:
                     query = self._task_fetch_query(self._task_map.get(r.task_id))
                     papers = fetched_by_query.get(query, [])
+                # Evidence 按子任务主题打标（Gap 检测按子主题统计证据覆盖；与 plan_topics 对齐用 description）
+                task = self._task_map.get(r.task_id)
+                if task and getattr(task, "description", None):
+                    ev_topic = task.description[:50]
+                else:
+                    ev_topic = self._task_fetch_query(task)[:50]
                 for paper in papers:
                     pid = paper.get("id", "")
                     if not pid or pid in self._seen_papers:
@@ -478,7 +599,7 @@ class Orchestrator:
                                 claim=c["claim"],
                                 evidence_text=c["evidence_text"],
                                 confidence=c.get("confidence", 0.5),
-                                topic=self._query[:50],
+                                topic=ev_topic,
                                 session_id=self.evidence_store.session_id,
                             )
                             final_id = self.evidence_store.put(ev)
@@ -644,8 +765,9 @@ class Orchestrator:
             self._task_map = self.planner.get_task_map_from_dag(self._dag, self.planner._last_raw_json)
             if not self._task_map:
                 self._task_map = self._rebuild_task_map_from_dag()
-            # 清空上一轮结果（保留在 memory 中，新任务可通过 context_keys 引用）
+            # 清空上一轮结果与完成标记（保留在 memory 中，新任务可通过 context_keys 引用）
             self._results = []
+            self._done_task_ids.clear()
         except PlanParseError as e:
             print(f"[Replan] Failed: {e}")
             # 重规划失败，如果已有部分成功结果，尝试直接合成

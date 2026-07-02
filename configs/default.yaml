@@ -128,6 +128,18 @@ orchestrator:
   max_replan_rounds: 3
   # 单次规划最多拆分的子问题数量
   max_sub_questions: 10
+  # Research Loop（Phase 3+4）：按证据缺口动态补派子任务，直到覆盖充分
+  enable_research_loop: true
+  # 最大 Research Loop 迭代轮数
+  max_research_rounds: 3
+  # 全 run 最大子任务总数（防无限 fork）
+  max_total_tasks: 12
+  # 每轮最多补派的任务数
+  max_gap_tasks_per_round: 2
+  # 子主题证据量低于此值视为缺口
+  min_evidence_per_topic: 2
+  # 连续 N 轮证据无增长则判饱和停止
+  saturation_no_growth_rounds: 1
   # 子 Agent 执行失败后的最大重试次数
   max_subagent_retries: 2
 

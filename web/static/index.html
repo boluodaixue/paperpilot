@@ -483,6 +483,11 @@ function appendProgress(ev) {
     case 'task_done': div.textContent = `[${t}] ✓ 子任务 ${ev.task_id}（${ev.status}，${ev.confidence}）`; break;
     case 'evidence': div.textContent = `[${t}] ◆ 证据 ${ev.evidence_id} 已入库（共 ${ev.total}）`; break;
     case 'synthesis': div.textContent = `[${t}] ★ 报告合成完成（置信度 ${ev.confidence}，证据 ${ev.evidence_count}）`; break;
+    case 'loop':
+      div.textContent = ev.decision === 'complete'
+        ? `[${t}] 🏁 研究覆盖充分，停止补研究（第 ${ev.round} 轮）`
+        : `[${t}] 🔄 第 ${ev.round} 轮：发现 ${ev.gaps} 个缺口，补派 ${ev.new_tasks.length || ev.new_tasks} 个任务`;
+      break;
     case 'done': div.textContent = `[${t}] ✅ 研究完成`; break;
     case 'error': div.textContent = `[${t}] ❌ ${ev.message}`; break;
     default: div.textContent = `[${t}] ${JSON.stringify(ev)}`;
