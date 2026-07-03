@@ -158,7 +158,7 @@ def test_session_evidence_endpoint_empty_ok(client):
 
 
 def test_research_persists_report_to_chat(tmp_path, monkeypatch):
-    """研究完成后报告以 kind='report' 落盘 chat_messages。"""
+    """研究完成后报告落盘，并在 done 之前完成 best-effort Vault 导出。"""
     import asyncio
 
     from web.server import ResearchTask
@@ -175,12 +175,52 @@ def test_research_persists_report_to_chat(tmp_path, monkeypatch):
     monkeypatch.setattr("src.core.runner.run_research", fake_run_research)
     monkeypatch.setattr("src.core.runner.initialize_modules", fake_initialize)
 
+    exported = []
+
+    def fake_export(session_id):
+        exported.append(session_id)
+        return str(tmp_path / "obsidian" / session_id)
+
+    monkeypatch.setattr(server, "_export_session_vault", fake_export)
+
     task = ResearchTask("tid", "sess-x", "q")
     asyncio.run(server._run_research_task(task))
     assert task.status == "done"
+    assert exported == ["sess-x"]
+    assert task.result["vault_path"].endswith("sess-x")
     msgs = server.get_chat_store().get_messages("sess-x")
     assert msgs[-1]["kind"] == "report"
     assert "报告正文" in msgs[-1]["content"]
+
+
+def test_research_succeeds_when_auto_export_fails(tmp_path, monkeypatch):
+    """自动导出是 best-effort，异常不得把成功研究改成 error。"""
+    import asyncio
+
+    from web.server import ResearchTask
+
+    monkeypatch.setattr(server, "DB_PATH", str(tmp_path / "t.db"))
+    server.get_chat_store._store = None
+
+    async def fake_run_research(query, config, modules, progress_callback=None):
+        return "# 报告正文\n\n" + "证据内容 " * 80
+
+    monkeypatch.setattr("src.core.runner.run_research", fake_run_research)
+    monkeypatch.setattr("src.core.runner.initialize_modules", lambda config, session_id="": {})
+
+    def broken_export(session_id):
+        raise OSError("disk unavailable")
+
+    monkeypatch.setattr(server, "_export_session_vault", broken_export)
+
+    task = ResearchTask("tid", "sess-export-fail", "q")
+    asyncio.run(server._run_research_task(task))
+
+    assert task.status == "done"
+    assert task.error is None
+    assert "vault_path" not in task.result
+    msgs = server.get_chat_store().get_messages("sess-export-fail")
+    assert msgs[-1]["kind"] == "report"
 
 
 # ---------------------------------------------------------------------------
@@ -286,3 +326,62 @@ def test_session_delete_full_cleanup(client, monkeypatch):
     n = conn.execute("SELECT COUNT(*) FROM conflicts WHERE conflict_id='cf1'").fetchone()[0]
     assert n == 0
     conn.close()
+
+
+# ---------------------------------------------------------------------------
+# Obsidian 导出 + 证据图富化
+# ---------------------------------------------------------------------------
+
+def test_export_obsidian_endpoint(client, monkeypatch, tmp_path):
+    """手动导出端点：返回 vault 路径且文件生成。"""
+    from pathlib import Path
+
+    from src.evidence.schemas import Evidence
+    from src.evidence.store import EvidenceStore
+
+    monkeypatch.setattr(server, "PROJECT_ROOT", tmp_path)  # 导出落到 tmp，不污染真实 outputs
+
+    # 种子：报告消息 + 证据
+    server.get_chat_store().add("sid1", "assistant", server.KIND_REPORT, "# 报告 [E-1]")
+    store = EvidenceStore(db_path=server.DB_PATH, session_id="sid1")
+    store.put(Evidence(
+        evidence_id="", query="q", paper_id="p1", paper_title="Paper", source_url="u",
+        claim="attention works", evidence_text="quote text", confidence=0.9, topic="t",
+        session_id="sid1", embedding=[0.1] * 384,
+    ))
+
+    r = client.post("/api/sessions/sid1/export-obsidian")
+    assert r.status_code == 200
+    data = r.json()
+    assert data["session_id"] == "sid1"
+    assert data["obsidian_uri"].startswith("obsidian://open?path=")
+    vault = Path(data["vault_path"])
+    assert vault.exists()
+    assert (vault / "00-研究报告.md").exists()
+    assert (vault / "E-1.md").exists()
+    assert "[[E-1|E-1]]" in (vault / "00-研究报告.md").read_text(encoding="utf-8")
+
+
+def test_export_obsidian_no_report_404(client):
+    r = client.post("/api/sessions/nonexistent/export-obsidian")
+    assert r.status_code == 404
+
+
+def test_session_graph_enriched(client):
+    """证据节点富化：claim / evidence_text / label=claim 前 10 字。"""
+    from src.evidence.schemas import Evidence
+    from src.evidence.store import EvidenceStore
+
+    store = EvidenceStore(db_path=server.DB_PATH, session_id="g1")
+    store.put(Evidence(
+        evidence_id="", query="q", paper_id="p1", paper_title="Paper", source_url="u",
+        claim="attention is key to transformers", evidence_text="verbatim quote",
+        confidence=0.9, topic="t", session_id="g1", embedding=[0.1] * 384,
+    ))
+    r = client.get("/api/sessions/g1/graph")
+    assert r.status_code == 200
+    ev_nodes = [n for n in r.json()["nodes"] if n.get("type") == "evidence"]
+    assert len(ev_nodes) == 1
+    assert ev_nodes[0]["claim"] == "attention is key to transformers"
+    assert ev_nodes[0]["evidence_text"] == "verbatim quote"
+    assert ev_nodes[0]["label"] == "attention "  # claim 前 10 个字符（含空格）

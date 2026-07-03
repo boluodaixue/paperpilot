@@ -214,5 +214,20 @@ htmlcov/
 .mypy_cache/
 # 忽略所有日志文件（包括 outputs 子目录中的）
 *.log
-# 保留 outputs 目录下的报告文件，只忽略日志
+# 研究报告与可视化均为运行产物；历史已跟踪样本不受本规则影响
 outputs/**/*.log
+outputs/reports/
+outputs/viz_smoke*
+# Obsidian 导出的 Vault（生成的证据库，不入库）
+outputs/obsidian/
+
+# 本地快速 E2E 配置（可能调用真实外部服务，不作为默认基线）
+configs/e2e_fast.yaml
+
+# Windows / pytest 在工作区根目录生成的临时运行目录
+.tmp_test_runtime/
+.stage*_tmp/
+.stage*_test_run/
+tmp*/
+pytest-of-*/
+torchinductor_*/
