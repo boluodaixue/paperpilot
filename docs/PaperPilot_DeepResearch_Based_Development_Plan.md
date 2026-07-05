@@ -1,332 +1,94 @@
-# PaperPilot 基于 DeepResearch-Agent 的开发路线调整方案
+# PaperPilot 基于现有 DeepResearch 代码的迁移策略
 
-## 1. 调整后的项目定位
+> 本文件说明“如何复用当前代码”，不再作为目标架构定义。目标架构见 [ARCHITECTURE.md](ARCHITECTURE.md)，完整任务见 [IMPLEMENTATION_PLAN.md](IMPLEMENTATION_PLAN.md)。
 
-PaperPilot 不从零构建完整 Deep Research Agent，而是基于现有 Deep
-Research Agent 框架进行增强。
+## 1. 当前基础
 
-核心定位：
+现有项目已经提供：
 
-> Evidence-Guided Autonomous Research Extension
+- Planner 生成子任务 DAG；
+- Orchestrator 状态机和分层并发；
+- Researcher 工具调用循环；
+- SharedMemoryStore；
+- EvidenceStore 与 EvidenceGraph；
+- Gap Analysis 和补研究循环；
+- Summarizer、Adversarial Loop；
+- Web、SSE、会话和 Obsidian 导出。
 
-即：
+这些模块构成迁移基础，但当前的 AgentPool 调度不能直接等同于目标中的动态 Agent fork。
 
-在已有 Deep Research Agent 的基础上，引入 Evidence Graph、Research Loop
-和 Research Completion Score，使 Agent
-能够进行可验证、可持续推进的论文研究。
+## 2. 核心迁移关系
 
-------------------------------------------------------------------------
+| 当前实现 | 目标实现 | 迁移方式 |
+|----------|----------|----------|
+| Orchestrator | Research Manager | 先抽取决策职责，再保留状态机作为运行驱动 |
+| Planner SubTask | PlanNode | 增加研究范围、证据要求和完成条件 |
+| AgentPool | AgentFactory + ForkController | 对象复用降为实现细节，fork 生命周期成为主语义 |
+| ResearcherAgent | 同质 ResearchAgent | 合并固定任务类型，通过 research_mode 调整策略 |
+| AgentResult | ResearchContribution | 从自然语言结果升级为来源、证据、Claim 和缺口协议 |
+| `_memory_store` 全局上下文 | ForkContext Snapshot | 按相关性和依赖显式继承，局部状态隔离 |
+| 动态追加 SubTask | 带血缘 AgentFork | 增加 parent、depth、attempt、预算、状态和持久化 |
+| 证据数量停止规则 | Completion Evaluator / RCS | 使用覆盖、质量、多样性、冲突、饱和和成本 |
+| 全量结果直接合成 | EvidencePackage | 只消费已验证、预算选择后的证据 |
+| 进程内任务状态 | ResearchRun Repository | 支持重连、恢复、取消和 Agent Tree |
 
-## 2. 基础框架策略
+## 3. 保留、改造与降级
 
-采用 qiqihezh/deepresearch-agent 作为基础系统。
+### 直接保留
 
-已有能力复用：
+- 工具接口；
+- SQLite 基础设施；
+- Evidence Graph 查询与 Web 可视化；
+- Obsidian 双链导出；
+- SSE 事件通道；
+- 现有单元测试中的数据构造和离线桩。
 
--   Agent orchestration
--   Research planning
--   Multi-agent execution
--   Search pipeline
--   Report generation
+### 渐进改造
 
-PaperPilot 聚焦新增能力：
+- Planner 和 SubTask；
+- Orchestrator 状态机；
+- Researcher 输出协议；
+- Memory Context 构建；
+- Evidence Schema 和关系判定；
+- Summarizer 输入协议；
+- Web 任务管理。
 
--   Evidence Extraction
--   Evidence Graph
--   Research Gap Detection
--   Research Completion Score
+### 可选增强
 
-------------------------------------------------------------------------
+- Adversarial Loop：保留为报告后处理，但不得破坏结构化引用；
+- Evolution：保持独立实验模块，直到 fork 轨迹和评测数据稳定后再决定接入；
+- Compressor：迁移为 Fork Context 和 EvidencePackage 的预算组件。
 
-## 3. 新架构设计
+## 4. 兼容迁移
 
-    User Question
+迁移期间使用：
 
-    ↓
+```yaml
+orchestrator:
+  execution_mode: legacy_pool  # legacy_pool | fork_v1
+```
 
-    Research Manager
+`fork_v1` 达到以下条件后才能成为默认值：
 
-    ↓
+1. 三个同质 Agent 并发时状态完全隔离；
+2. 每次执行都有持久化 fork 记录；
+3. 失败、取消和重试不会破坏父子树；
+4. 新旧路径在离线固定输入上输出兼容；
+5. Web 能显示最小 fork 生命周期；
+6. 完整测试通过。
 
-    Deep Research Engine
+随后逐步删除 legacy pool、固定角色路由和旧 Schema 适配层。
 
-    ↓
+## 5. 近期开发范围
 
-    Dynamic Research Agents
+第一批编码只完成：
 
-    ↓
+- 当前并发和生命周期 Bug 修复；
+- ForkSpec、AgentFork、ResearchContribution；
+- Fork Repository；
+- ForkController v1；
+- 初始 DAG 通过 fork_v1 执行；
+- fork started/completed SSE；
+- 并发隔离和持久化测试。
 
-    Evidence Extraction Layer
-
-    ↓
-
-    Evidence Graph
-
-    ↓
-
-    Research Gap Analyzer
-
-    ↓
-
-    Research Completion Score
-
-    ↓
-
-    Continue Research?
-
-    ↓
-
-    Final Verified Report
-
-------------------------------------------------------------------------
-
-## 4. 核心改造方向
-
-### 4.1 Report-centric → Evidence-centric
-
-传统流程：
-
-    Research Agent
-
-    ↓
-
-    Final Answer
-
-PaperPilot：
-
-    Research Agent
-
-    ↓
-
-    Claim Extraction
-
-    ↓
-
-    Evidence Extraction
-
-    ↓
-
-    Evidence Storage
-
-    ↓
-
-    Report Generation
-
-每个结论都需要对应：
-
--   Paper
--   Evidence
--   Claim
--   Relation
-
-------------------------------------------------------------------------
-
-### 4.2 增加 Evidence Graph
-
-数据结构：
-
-    Paper
-
-    ↓
-
-    Evidence
-
-    ↓
-
-    Claim
-
-关系：
-
--   SUPPORTS
--   CONTRADICTS
--   EXTENDS
--   ANSWERS
-
-用于：
-
--   证据追踪
--   冲突发现
--   知识缺口分析
-
-------------------------------------------------------------------------
-
-### 4.3 增加 Research Loop
-
-传统 Deep Research：
-
-    Research
-
-    ↓
-
-    Report
-
-    ↓
-
-    End
-
-PaperPilot：
-
-    Research
-
-    ↓
-
-    Evidence Graph Analysis
-
-    ↓
-
-    Gap Detection
-
-    ↓
-
-    Generate New Research Task
-
-    ↓
-
-    Continue Research
-
-    ↓
-
-    Final Report
-
-------------------------------------------------------------------------
-
-### 4.4 Research Completion Score
-
-RCS 不作为项目唯一核心，而作为自主停止机制。
-
-作用：
-
--   判断研究是否充分
--   避免无限搜索
--   指导下一轮研究
-
-示例：
-
-    RCS = 55%
-
-    缺少：
-    - Evaluation evidence
-    - Recent papers
-
-    Action:
-    继续研究
-
-    ↓
-
-    RCS = 85%
-
-    停止
-
-------------------------------------------------------------------------
-
-## 5. 开发路线
-
-### Phase 1：基于 DeepResearch Agent 跑通 MVP
-
-目标：
-
-快速获得可运行系统。
-
-实现：
-
--   Question input
--   Paper search
--   Abstract analysis
--   Evidence extraction
--   Report generation
-
-------------------------------------------------------------------------
-
-### Phase 2：Evidence Graph
-
-加入：
-
--   Paper database
--   Claim database
--   Evidence database
--   Graph relation
-
-技术：
-
--   SQLite
--   NetworkX
-
-------------------------------------------------------------------------
-
-### Phase 3：Research Manager + Dynamic Research
-
-加入：
-
--   Research planning
--   Task decomposition
--   Parallel research agents
--   Evidence merge
-
-------------------------------------------------------------------------
-
-### Phase 4：Research Loop
-
-加入：
-
--   Graph Analyst Agent
--   Gap Detection
--   New research task generation
-
-------------------------------------------------------------------------
-
-### Phase 5：RCS Evaluation
-
-加入：
-
--   Coverage
--   Evidence Quality
--   Saturation
-
-用于：
-
--   自动停止
--   实验评价
-
-------------------------------------------------------------------------
-
-## 6. 实验设计
-
-Baseline:
-
-原始 Deep Research Agent
-
-比较：
-
-1.  DeepResearch Agent
-2.  -   Evidence Graph
-3.  -   Research Loop
-4.  -   RCS
-
-评价：
-
--   Citation Accuracy
--   Evidence Coverage
--   Research Completeness
--   Token Cost
--   Runtime
-
-------------------------------------------------------------------------
-
-## 7. 项目最终描述
-
-PaperPilot:
-
-Built an evidence-guided autonomous literature research agent based on a
-Deep Research framework. Enhanced the system with Evidence Graph
-construction, research gap detection, and Research Completion Score
-driven iterative research.
-
-关键词：
-
--   Multi-Agent System
--   Deep Research Agent
--   Evidence Graph
--   Autonomous Research
--   LLM Agent
--   Knowledge Graph
--   Literature Research
+Evidence-first Merge、递归 fork、RCS 和 Agent Tree 在后续里程碑实现，避免一次重写整个系统。

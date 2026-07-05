@@ -1,734 +1,83 @@
-# PaperPilot：Evidence-Guided Autonomous AI Paper Research Agent
+# PaperPilot 产品方向与设计原则
 
-## 1. 项目定位
+> 本文件保留原始产品设计入口。详细系统设计已统一到 [ARCHITECTURE.md](ARCHITECTURE.md)，编码阶段和验收标准见 [IMPLEMENTATION_PLAN.md](IMPLEMENTATION_PLAN.md)。
 
-PaperPilot 是一个面向 AI 论文研究场景的 Multi-Agent Research System。
+## 核心方向
 
-核心目标：
+PaperPilot 是一个由 Research Manager 驱动的同质子 Agent 动态 fork 系统。
 
-> 让 Agent
-> 不只是搜索论文并生成总结，而是能够自主规划研究方向、并行探索论文、提取可验证
-> Evidence、构建 Evidence Graph，并根据知识缺口继续深入研究。
+它不是多个固定角色 Agent 的流水线，也不是简单并发多个搜索任务。Manager 根据研究计划和 Evidence Graph 的当前状态，持续 fork 能力相同、状态隔离的 Research Agent。每个 Agent 只负责一个清晰研究范围，并通过结构化 ResearchContribution 将证据合并回全局研究状态。
 
-项目定位：
+## 核心循环
 
--   不是 ChatGPT Paper Summary
--   不是简单 RAG
--   不是固定 Workflow
-
-而是：
-
-**Evidence-Centric Autonomous Research Agent**
-
-------------------------------------------------------------------------
-
-# 2. 总体设计理念
-
-## 2.1 核心问题
-
-传统 Research Agent：
-
-    Question
-     ↓
-    Search
-     ↓
-    Summarize
-     ↓
-    Answer
-
-存在问题：
-
--   搜索方向固定
--   缺少研究规划
--   结论缺少证据链
--   无法判断是否研究充分
--   无法发现知识缺口
-
-PaperPilot：
-
-    Research Question
-
-    ↓
-
-    Research Planning
-
-    ↓
-
-    Dynamic Agent Forking
-
-    ↓
-
-    Paper Discovery
-
-    ↓
-
-    Evidence Extraction
-
-    ↓
-
-    Evidence Graph
-
-    ↓
-
-    Gap Detection
-
-    ↓
-
-    Further Research
-
-    ↓
-
-    Verified Report
-
-------------------------------------------------------------------------
-
-# 3. 核心创新点
-
-## 3.1 Evidence Graph
-
-核心知识结构。
-
-不是：
-
-    Paper → Summary
-
-而是：
-
-    Paper
-
-     ↓
-
-    Evidence
-
-     ↓
-
-    Claim
-
-每个观点都有来源和证据。
-
-Graph 节点：
-
--   Research Question
--   Topic
--   Paper
--   Evidence
--   Claim
-
-Graph 边：
-
--   SUPPORTS
--   CONTRADICTS
--   EXTENDS
--   ANSWERS
-
-------------------------------------------------------------------------
-
-## 3.2 Dynamic Agent Forking
-
-不是固定角色 Agent。
-
-由 Research Manager 根据任务动态生成同质 Research Agent。
-
-例如：
-
-用户：
-
-"Analyze AI Agent Memory evolution"
-
-自动拆：
-
-    Agent 1:
-    Memory Architecture
-
-    Agent 2:
-    Retrieval Memory
-
-    Agent 3:
-    Memory Evaluation
-
-限制：
-
--   最大 Agent 数量
--   最大递归深度
--   Token / 时间预算
-
-------------------------------------------------------------------------
-
-## 3.3 Research Completion Score (RCS)
-
-用于判断研究是否完成。
-
-目标：
-
-避免：
-
--   搜太少
--   搜重复
--   无限搜索
-
-第一版：
-
-    RCS =
-    0.5 Coverage
-    +
-    0.3 Evidence Quality
-    +
-    0.2 Saturation
-
-指标：
-
-Coverage: 研究任务覆盖程度
-
-Evidence Quality: 论文来源质量
-
-Saturation: 新增信息是否减少
-
-------------------------------------------------------------------------
-
-# 4. 总 Agent 架构
-
-                        User Query
-
-                             |
-
-                             v
-
-                  Research Manager Agent
-
-                             |
-
-                      Research Plan
-
-                             |
-
-                  Dynamic Fork Controller
-
-                             |
-
-            +----------------+----------------+
-
-            |                |                |
-
-     Research Agent   Research Agent   Research Agent
-
-            |                |                |
-
-     Paper Search      Paper Search      Paper Search
-
-            |                |                |
-
-     Abstract Screening
-
-            |
-
-     Full Paper Reading
-
-            |
-
-     Evidence Extraction
-
-            |
-
-     Evidence Graph Update
-
-            |
-
-     Gap Detection
-
-            |
-
-     New Research Task
-
-            |
-
-     (Loop)
-
-            |
-
-     Synthesis Agent
-
-            |
-
-     Research Report
-
-            |
-
-     Graph Explorer
-
-------------------------------------------------------------------------
-
-# 5. Agent 设计
-
-## 5.1 Research Manager Agent
-
-职责：
-
--   理解用户问题
--   生成 Research Plan
--   创建 Research Task
--   分配 Agent
-
-输出：
-
-``` json
-{
-"task":
-"Analyze memory architecture",
-
-"priority":
-0.8
-}
+```text
+Research Question
+→ Research Manager 制定 Plan Graph
+→ Fork Controller 创建同质 Research Agent
+→ 子 Agent 并行发现来源、阅读、分析、提取证据
+→ Contribution Validator
+→ Evidence Merge / Evidence Graph
+→ Gap Analysis / Research Completion Score
+→ 继续：批准下一轮 fork
+→ 停止：生成并验证带引用报告
 ```
 
-------------------------------------------------------------------------
+## 多 Agent 定义
 
-## 5.2 Research Agent
+### Research Manager
 
-核心执行 Agent。
+唯一的 Run 级控制 Agent，负责全局研究方向、fork 审批、预算、合并和停止决策。
 
-流程：
+### Research Agent
 
-    Search Paper
+唯一的 Worker 蓝图。所有 Worker 都能执行搜索、阅读、分析、比较、验证和证据提取。不同 Agent 的差异来自 ForkSpec，而不是固定角色或人格。
 
-    ↓
+### Fork Controller
 
-    Abstract Screening
+把 Plan Node 转换为独立执行实例，记录 fork 的身份、父子血缘、深度、attempt、上下文快照、预算和状态。子 Agent 可以提议后续 fork，但不能自行绕过控制器创建 Agent。
 
-    ↓
+### Synthesizer
 
-    Select Relevant Papers
+在 Manager 宣布研究完成后消费 EvidencePackage 生成报告。它不属于同质研究 Worker，也不参与研究方向探索。
 
-    ↓
+## Evidence-first 定义
 
-    Read Sections
-
-    ↓
-
-    Extract Claims
-
-    ↓
-
-    Store Evidence
-
-输出：
-
-Claim + Evidence。
-
-------------------------------------------------------------------------
-
-## 5.3 Graph Analyst Agent
-
-职责：
-
--   分析 Evidence Graph
--   找知识缺口
--   发现冲突
-
-例如：
-
-发现：
-
-    Architecture:
-    Enough evidence
-
-    Evaluation:
-    Insufficient evidence
-
-生成新的 Research Task。
-
-------------------------------------------------------------------------
-
-## 5.4 Synthesis Agent
-
-职责：
-
--   读取 Evidence Graph
--   生成最终 Research Report
--   保证引用可追溯
-
-------------------------------------------------------------------------
-
-# 6. Paper Reading Pipeline
-
-## Step 1: Paper Discovery
-
-来源：
-
--   Arxiv API
--   Semantic Scholar API
--   用户上传 PDF
-
-------------------------------------------------------------------------
-
-## Step 2: Abstract Screening
-
-目的：
-
-减少无效论文阅读。
-
-输出：
-
-    KEEP / DROP
-
-------------------------------------------------------------------------
-
-## Step 3: Section-aware Reading
-
-优先阅读：
-
--   Method
--   Experiment
--   Ablation
--   Limitation
-
-避免全文无差别输入。
-
-------------------------------------------------------------------------
-
-## Step 4: Evidence Extraction
-
-输出：
-
-``` json
-{
-"claim":
-"Retrieval improves long horizon reasoning",
-
-"evidence":
-"Experiment section shows improvement",
-
-"source":
-"Paper X"
-}
+```text
+SourceDocument → EvidenceSpan → Claim → EvidenceRelation
 ```
 
-------------------------------------------------------------------------
+- 来源覆盖论文、网页和用户文件；
+- EvidenceSpan 必须可定位回原文；
+- Claim 必须是原子、可判真的主张；
+- EvidenceRelation 需要经过语义关系验证；
+- 最终引用必须能从报告句子追溯到 Claim、EvidenceSpan 和 SourceDocument。
 
-# 7. 技术栈
+## 自主停止
 
-## Backend
+Research Completion Score 不是单独的展示分数，而是 Manager 的停止协议。它至少考虑覆盖、证据质量、来源多样性、矛盾处理、信息饱和和继续研究成本。
 
-Python
+系统可以：
 
-## Agent Framework
+- `continue`：继续 fork；
+- `stop`：证据充分，进入合成；
+- `stop_with_uncertainty`：预算耗尽或关键缺口无法解决，生成带明确限制的报告。
 
-LangGraph
+## 产品体验
 
-负责：
+用户最终应能看到：
 
--   Agent state
--   Workflow
--   Loop
+- Research Manager 的研究计划；
+- 动态增长的 Agent fork 树；
+- 每个 Agent 的研究范围、状态、预算和证据贡献；
+- Evidence Graph 及支持、矛盾、扩展关系；
+- 为什么继续研究或停止；
+- 可追溯引用的最终报告；
+- 可导入 Obsidian 的报告、证据、论文与关系笔记。
 
-## LLM
+## 项目边界
 
-Claude SDK
-
-负责：
-
--   Reasoning
--   Tool Calling
--   Paper Understanding
-
-## Paper Source
-
-第一版：
-
--   Arxiv API
-
-后续：
-
--   Semantic Scholar
--   OpenAlex
-
-## PDF Processing
-
-PyMuPDF
-
-## Database
-
-SQLite
-
-存储：
-
--   Paper
--   Claim
--   Evidence
--   Graph Edge
-
-## Graph
-
-NetworkX
-
-## Frontend Demo
-
-Streamlit
-
-------------------------------------------------------------------------
-
-# 8. 开发迭代计划
-
-## Iteration 1：Single Research Agent MVP
-
-目标：
-
-跑通最小闭环。
-
-实现：
-
-    Question
-
-    ↓
-
-    Search Paper
-
-    ↓
-
-    Read Abstract
-
-    ↓
-
-    Extract Claim
-
-    ↓
-
-    Generate Report
-
-暂不做：
-
--   Multi Agent
--   Graph
--   RCS
-
-时间：
-
-1-2 周
-
-------------------------------------------------------------------------
-
-# Iteration 2：Evidence Graph
-
-目标：
-
-让研究结果可追溯。
-
-实现：
-
-数据库：
-
-    Paper
-
-    Evidence
-
-    Claim
-
-功能：
-
--   Graph 构建
--   Evidence 查询
--   Citation 展示
-
-时间：
-
-1 周
-
-------------------------------------------------------------------------
-
-# Iteration 3：Multi-Agent Research
-
-目标：
-
-实现动态并行研究。
-
-加入：
-
-Research Manager Agent
-
-流程：
-
-    Question
-
-    ↓
-
-    Research Plan
-
-    ↓
-
-    Fork Agents
-
-    ↓
-
-    Parallel Research
-
-    ↓
-
-    Merge Evidence
-
-时间：
-
-1-2 周
-
-------------------------------------------------------------------------
-
-# Iteration 4：Graph-driven Research Loop
-
-目标：
-
-让 Agent 自主继续研究。
-
-加入：
-
-Graph Analyst Agent
-
-流程：
-
-    Graph
-
-    ↓
-
-    Find Gap
-
-    ↓
-
-    Generate Task
-
-    ↓
-
-    Fork Agent
-
-时间：
-
-1-2 周
-
-------------------------------------------------------------------------
-
-# Iteration 5：Research Completion Score
-
-目标：
-
-实现自主停止。
-
-加入：
-
-RCS。
-
-停止条件：
-
-    RCS > threshold
-
-或者：
-
-Budget exhausted。
-
-时间：
-
-1 周
-
-------------------------------------------------------------------------
-
-# Iteration 6：Demo 与 Evaluation
-
-目标：
-
-形成简历级项目。
-
-实现：
-
--   Streamlit Graph Explorer
--   Research Trace
--   Benchmark
-
-评价指标：
-
-## Citation Accuracy
-
-引用是否支持观点
-
-## Evidence Coverage
-
-关键方向覆盖程度
-
-## Efficiency
-
--   Token
--   Time
--   Paper Count
-
-------------------------------------------------------------------------
-
-# 9. 第一版最终 Demo
-
-输入：
-
-    Analyze the evolution of AI Agent Memory.
-
-输出：
-
-## Research Plan
-
-    Memory Architecture
-    Retrieval Mechanism
-    Evaluation Benchmark
-
-------------------------------------------------------------------------
-
-## Agent Trace
-
-    Agent 1:
-    Architecture research
-
-    Agent 2:
-    Retrieval research
-
-    Agent 3:
-    Benchmark research
-
-------------------------------------------------------------------------
-
-## Evidence Graph
-
-    AI Agent Memory
-
-     ├── Architecture
-     │      |
-     │      Paper A
-     │
-     ├── Retrieval
-     │      |
-     │      Paper B
-     │
-     └── Evaluation
-            |
-            Paper C
-
-------------------------------------------------------------------------
-
-## Final Report
-
-带：
-
--   Claims
--   Citations
--   Evidence Links
-
-------------------------------------------------------------------------
-
-# 10. 项目最终简历描述
-
-PaperPilot:
-
-Built an evidence-guided autonomous literature research agent using
-multi-agent planning and dynamic task decomposition. Developed an
-Evidence Graph to connect papers, evidence, and claims, enabling
-iterative research expansion and citation-grounded report generation.
-
-技术关键词：
-
--   Multi-Agent System
--   LangGraph
--   Evidence Graph
--   LLM Agent
--   Literature Research
--   Retrieval
--   Knowledge Graph
--   Autonomous Research
+- 同质 Worker 不等于共享可变模型会话；
+- 向 DAG 增加 SubTask 不等于创建了完整 fork；
+- Agent 的自然语言总结不等于已验证证据；
+- 更多 Agent 不天然等于更好的研究，必须通过预算、去重、信息增量和评测控制；
+- Evolution 与 Adversarial 是可选增强能力，不改变 Manager/Fork/Evidence 的核心主干。
