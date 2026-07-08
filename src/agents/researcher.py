@@ -17,7 +17,7 @@ from typing import Any
 
 from .base_agent import BaseAgent
 from ..orchestrator.schemas import SubTask, AgentResult, AgentStatus
-from ..utils.tracing import trace_agent
+from ..utils.tracing import trace_agent, trace_block
 
 
 __all__ = ["ResearcherAgent"]
@@ -415,10 +415,20 @@ class ResearcherAgent(BaseAgent):
         tool = self.tool_map.get(tool_name)
         if tool is None:
             return {"error": f"Tool '{tool_name}' not found"}
-        try:
-            return await tool.execute(**args)
-        except Exception as e:
-            return {"error": f"{type(e).__name__}: {e}"}
+        with trace_block(
+            name=f"tool.{tool_name}",
+            run_type="tool",
+            inputs=args,
+            tags=["tool", tool_name],
+        ) as trace:
+            try:
+                result = await tool.execute(**args)
+                trace.add_metadata({"status": "success"})
+                return result
+            except Exception as e:
+                message = f"{type(e).__name__}: {e}"
+                trace.set_error(message)
+                return {"error": message}
 
     def _is_tool_failure_explanation(self, content: str) -> bool:
         """检测 LLM 回复是否是工具失败的解释说明而非真实研究结果。

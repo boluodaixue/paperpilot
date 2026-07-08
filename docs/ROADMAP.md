@@ -30,6 +30,7 @@
 | Web UI + SSE | ✅ | 已支持会话、进度、报告、证据表和证据图 |
 | Agent Tree UI | ⬜ | 尚无 fork 树与单 Agent 贡献展示 |
 | Obsidian 导出 | ✅ | 自动/手动导出报告、证据、关系和论文聚合笔记 |
+| Langfuse 可观测性 | ✅ | v4 SDK、OpenTelemetry 嵌套链路、OpenAI LLM generation、Agent/Tool/Chain/Retriever observation |
 | Adversarial Loop | ✅ | 可选报告优化模块 |
 | Evolution | 🟡 | 有实验代码和独立脚本，未接入在线研究主流程 |
 

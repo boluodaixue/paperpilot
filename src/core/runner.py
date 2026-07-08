@@ -34,6 +34,8 @@ PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
+from src.utils.tracing import trace_chain, trace_context
+
 
 # ---------------------------------------------------------------------------
 # 日志配置
@@ -335,6 +337,11 @@ def initialize_modules(config: dict, session_id: str = "") -> dict[str, Any]:
 # ---------------------------------------------------------------------------
 # 研究流程主函数
 # ---------------------------------------------------------------------------
+@trace_chain(
+    name="research.run",
+    tags=["paperpilot", "research-run"],
+    flush_on_exit=True,
+)
 async def run_research(
     query: str,
     config: dict,
@@ -394,7 +401,19 @@ async def run_research(
             orchestrator.set_progress_callback(progress_callback)
         except Exception:
             pass
-    report = await orchestrator.run(query, config=run_cfg)
+    memory_store = modules.get("memory_store")
+    session_id = getattr(memory_store, "session_id", "") or None
+    with trace_context(
+        session_id=session_id,
+        trace_name="paperpilot.research",
+        tags=["paperpilot", "research-run"],
+        metadata={
+            "backend": config.get("model", {}).get("backend", "unknown"),
+            "researchloop": run_cfg.enable_research_loop,
+            "adversarial": run_cfg.enable_adversarial,
+        },
+    ):
+        report = await orchestrator.run(query, config=run_cfg)
     logger.info(
         f"[Orchestrator] 报告生成完成 | 置信度={report.confidence:.2f} | "
         f"搜索轮数={report.num_searches} | 重规划={report.num_replan} | 对抗轮数={report.adversarial_rounds}"

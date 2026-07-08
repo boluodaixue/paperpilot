@@ -33,6 +33,7 @@ dependencies = [
     "aiohttp",
     "pyyaml",
     "python-dotenv>=1.0",  # 多后端 .env 配置支持
+    "langfuse>=4.0.0,<5.0.0",  # Agent/LLM 可观测性（OpenTelemetry）
     "sentence-transformers",
     "networkx",           # 用于 TextRank 等图算法
     "scikit-learn",

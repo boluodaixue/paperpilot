@@ -257,6 +257,22 @@ Synthesizer 不直接消费所有 Agent 对话，而是消费经过预算选择�
 
 Web 端应能展示 fork 树、每个 Agent 的研究范围、状态、成本、新增证据数和停止原因。
 
+项目使用 Langfuse v4 的 OpenTelemetry 上下文作为 tracing 基础。目标 trace 层级为：
+
+```text
+research.run                         chain
+├── planner.generate_plan           chain
+├── fork:<forkid>                   agent
+│   ├── llm-call                    generation
+│   ├── tool:<toolname>             tool
+│   └── contribution.validate       chain
+├── evidence.merge                  chain
+├── completion.evaluate             evaluator
+└── report.synthesize               agent
+```
+
+ResearchRun 使用 Langfuse `session_id` 进行会话关联；fork 相关字段通过 metadata 传播，统一使用 `runid`、`forkid`、`parentforkid`、`plannodeid` 和 `attempt`。Tracing 是旁路能力：SDK、网络或配置失败不得改变研究结果和状态机行为。
+
 ## 5. 核心数据契约
 
 ### 5.1 ForkSpec

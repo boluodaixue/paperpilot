@@ -41,8 +41,8 @@ pyyaml>=6.0
 # .env 环境变量管理（多后端 API Key 配置）
 python-dotenv>=1.0
 
-# LangSmith 追踪与可观测性（Agent 流程可视化，可选但强烈推荐）
-langsmith>=0.1.0
+# Langfuse v4 追踪与可观测性（OpenTelemetry + OpenAI drop-in client）
+langfuse>=4.0.0,<5.0.0
 
 # 文本向量化（M4 记忆嵌入 + M3 相关性过滤）
 sentence-transformers>=2.5
