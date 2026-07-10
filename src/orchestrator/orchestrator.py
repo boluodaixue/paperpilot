@@ -93,6 +93,7 @@ class Orchestrator:
         self._research_rounds: int = 0
         self._evidence_count_prev: int = 0
         self._evidence_count_cum: int = 0
+        self._global_timeout_degraded: bool = False
 
         # 状态机处理器映射
         self._state_handlers: dict[OrchestratorState, Callable[[], asyncio.Future[OrchestratorState]]] = {
@@ -154,22 +155,21 @@ class Orchestrator:
         self._research_rounds = 0
         self._evidence_count_prev = 0
         self._evidence_count_cum = 0
+        self._global_timeout_degraded = False
         self._current_state = OrchestratorState.IDLE
 
         # 状态机主循环
         while self._current_state not in (OrchestratorState.DONE, OrchestratorState.FAILED):
             # 全局超时检查
-            if self._is_global_timeout():
-                if self._current_state in (
-                    OrchestratorState.COLLECTING,
-                    OrchestratorState.SYNTHESIZING,
-                    OrchestratorState.ADVERSARIAL,
-                ):
-                    # 强制合成：用已有结果生成报告
+            if self._is_global_timeout() and not self._global_timeout_degraded:
+                if any(r.status == AgentStatus.SUCCESS for r in self._results):
+                    # 只切换一次，并继续执行 SYNTHESIZING handler；不能在此 break。
+                    self._global_timeout_degraded = True
                     self._current_state = OrchestratorState.SYNTHESIZING
+                    print("[Orchestrator] 全局超时，使用已有成功结果执行降级合成")
                 else:
                     self._current_state = OrchestratorState.FAILED
-                break
+                    break
 
             handler = self._state_handlers.get(self._current_state)
             if handler is None:
@@ -622,7 +622,7 @@ class Orchestrator:
         # 创建合成任务（超时走配置：慢速推理模型单次合成可能超过 5 分钟）
         synth_task = SubTask(
             task_id="synthesize_final",
-            task_type=TaskType.ANALYZE,  # 使用 ANALYZE 类型，实际由 SummarizerAgent 处理
+            task_type=TaskType.ANALYZE,  # schema 暂无 SYNTHESIZE；池使用内部类型键
             description="Synthesize all sub-task results into a final research report.",
             timeout_seconds=getattr(self._config, "synthesis_timeout_seconds", 600),
         )
@@ -642,14 +642,10 @@ class Orchestrator:
             ] if self.evidence_graph else [],
         }
 
-        agent = await self.agent_pool.get_agent(TaskType.ANALYZE)
-        # 需要 SummarizerAgent，但 agent_pool 可能返回 ResearcherAgent
-        # 这里我们通过类型检查或强制创建 SummarizerAgent
-        from ..agents.summarizer import SummarizerAgent
-        if not isinstance(agent, SummarizerAgent):
-            # 优先使用配置的 summarizer_policy（更大的 max_tokens），fallback 到 agent.policy
-            policy = self.summarizer_policy or agent.policy
-            agent = SummarizerAgent(name="summarizer", policy=policy, tools=agent.tools)
+        agent = await self.agent_pool.get_agent(
+            "synthesize",
+            policy=self.summarizer_policy,
+        )
 
         try:
             result = await asyncio.wait_for(
@@ -685,14 +681,25 @@ class Orchestrator:
                 ),
             )
 
+        if self._global_timeout_degraded:
+            report = self._memory_store["final_report"]
+            warning = "> **降级说明：因全局超时而降级，结果可能不完整。**"
+            if warning not in report.content:
+                report.content = f"{warning}\n\n{report.content}"
+
         report_obj = self._memory_store.get("final_report")
         self._emit_progress({
             "type": "synthesis",
             "confidence": round(report_obj.confidence, 2) if report_obj else 0.0,
             "evidence_count": len(self.evidence_store.get_all()) if self.evidence_store else 0,
-            "adversarial_next": bool(self._config.enable_adversarial),
+            "adversarial_next": bool(
+                self._config.enable_adversarial and not self._global_timeout_degraded
+            ),
         })
 
+        if self._global_timeout_degraded:
+            print("[Synthesize] ✓ 全局超时降级报告合成完成，跳过对抗优化")
+            return OrchestratorState.DONE
         if self._config.enable_adversarial:
             print("[Synthesize] ✓ 报告合成完成，进入对抗优化")
             return OrchestratorState.ADVERSARIAL

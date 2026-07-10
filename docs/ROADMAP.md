@@ -14,7 +14,8 @@
 | 能力 | 状态 | 当前边界 |
 |------|------|----------|
 | Planner DAG | ✅ | 能生成子任务并按依赖分层 |
-| 并发 Researcher | 🟡 | 同质 Worker 可并发，但来自对象池，尚无 fork 身份与上下文隔离 |
+| 执行正确性基线 | ✅ | Policy 单次调用状态、Agent 生命周期、超时降级、检索门槛、工具重试和短答案评测均有回归覆盖 |
+| 并发 Researcher | 🟡 | 三 Worker 调用状态已隔离，但仍来自对象池，尚无 fork 身份、血缘与上下文快照 |
 | 动态补研究 | 🟡 | Gap Analyzer 可以追加 SubTask，但不是持久化、带血缘的 Agent fork |
 | Research Manager | 🟡 | Orchestrator 承担部分 Manager 职责，尚未形成独立控制面 |
 | Fork Controller | ⬜ | 尚无 fork 审批、生命周期、递归深度和 attempt 模型 |
@@ -36,15 +37,15 @@
 
 ## 目标里程碑
 
-### M0：执行正确性基线 🔄
+### M0：执行正确性基线 ✅
 
-- 修复全局超时降级合成；
-- 隔离并发 Policy 和 tools 状态；
-- 修复 AgentPool 回收类型及合成对象泄漏；
-- 确保事实研究至少完成一次有效检索；
-- 修复 HotpotQA 短答案评测。
+- 修复全局超时降级合成，有成功结果时跳过对抗，无结果时明确失败；
+- 隔离并发 Policy 的 tools、messages 和截断状态，并由 ModelRouter 缓存 Policy 模板；
+- 修复 AgentPool 精确类型回收、重复释放和合成 Agent 生命周期；
+- 为 SEARCH 设置有效来源门槛，并支持可配置工具重试与固定 fallback；
+- 修复 HotpotQA 短答案提取。
 
-完成标志：当前执行路径在并发、超时、回收和评测上具有可靠回归测试。
+完成标志：专项联合测试 `24 passed`，全量测试 `173 passed`，三 Worker 并发隔离已有覆盖。详见 [阶段 1 执行正确性](STAGE_1_EXECUTION_CORRECTNESS.md)。
 
 ### M1：Fork 领域模型 ⬜
 

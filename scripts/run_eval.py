@@ -107,11 +107,13 @@ def evaluate_hotpotqa(
 
         try:
             report_text = asyncio.run(run_research(query, config, modules))
-            pred_answer = report_text.strip().split("\n")[0] if report_text.strip() else ""
+            pred_answer = bench.extract_short_answer(report_text, question=query)
+            extraction_method = bench.short_answer_extraction_method(report_text, question=query)
         except Exception as e:
             logger.warning(f"  → FAILED: {e}")
             pred_answer = ""
             report_text = ""
+            extraction_method = "research_failed"
 
         predictions.append({
             "query_id": idx,
@@ -126,6 +128,7 @@ def evaluate_hotpotqa(
             "query": query,
             "prediction": pred_answer,
             "gold": gold,
+            "extraction_method": extraction_method,
             "depth_metrics": depth,
         })
 

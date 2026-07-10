@@ -10,7 +10,7 @@
 4. 新旧路径短期通过 feature flag 并存；新路径达到验收标准后删除兼容层。
 5. 所有新增状态必须可持久化、可测试、可在 Web 进度中观察。
 
-在 Phase 0 正确性修复前，项目已经完成阶段 0.5 Langfuse 可观测性基线。后续新增的 ResearchRun、AgentFork、Evidence Merge 和 RCS 必须沿用现有 tracing 适配层，不再引入第二套 provider。
+项目已依次完成阶段 0.5 Langfuse 可观测性基线，以及阶段 1“执行正确性”（本计划 Phase 0）。后续新增的 ResearchRun、AgentFork、Evidence Merge 和 RCS 必须沿用现有 Langfuse 旁路 tracing 适配层，不再引入第二套 provider。
 
 ## 2. 目标目录调整
 
@@ -47,22 +47,24 @@ src/
 
 目录可以分阶段建立；首阶段不要求一次移动现有文件。
 
-## 3. Phase 0：修复执行基线
+## 3. 阶段 1：执行正确性（实施计划中的 Phase 0）✅
+
+完成日期：2026-08-27
 
 ### 目标
 
 在引入 fork 前消除会污染新架构的已知正确性问题。
 
-### 任务
+### 已完成
 
-- 修复全局超时进入 `SYNTHESIZING` 后立即退出状态机的问题；
-- 让模型 Policy 的 tools、消息和截断状态成为单次调用状态；
-- 修复 AgentPool 对 search/analyze/verify 的错误回收类型；
-- 修复合成阶段覆盖 Agent 变量导致的对象泄漏；
-- 保证需要事实检索的任务至少完成一次有效工具调用；
-- 工具错误采用可配置重试/替代工具，不立即判定整个任务失败；
-- 修复 HotpotQA 把报告标题当短答案的评测逻辑；
-- 为上述问题补回归测试。
+- `VLLMPolicy` 的 tools、messages 和 `was_truncated` 已改为单次调用状态，并支持调用级 `fork`，三个 Worker 的并发隔离已有覆盖；
+- `ModelRouter` 只缓存 Policy 模板，调用方从模板创建隔离实例；
+- `AgentPool` 按精确类型回收，重复释放安全，合成 Agent 的获取与释放纳入完整生命周期；
+- 全局超时且已有成功结果时执行真实降级合成并跳过对抗流程；没有成功结果时明确失败；
+- `Researcher` 的 SEARCH 模式要求达到有效来源门槛；
+- 工具失败支持可配置重试，并在重试耗尽后使用固定 fallback；
+- HotpotQA 评测改为提取短答案，不再把报告标题当作答案；
+- 为上述行为补充回归测试。
 
 ### 主要影响文件
 
@@ -81,6 +83,14 @@ src/
 - AgentPool 活跃数在一次 Run 后归零；
 - Search 模式不能在零有效来源时返回成功；
 - 原有测试与新增回归测试全部通过。
+
+### 验收结果
+
+- 阶段 1 专项联合测试：`24 passed`；
+- 全量测试：`173 passed`；
+- 三 Worker 并发场景覆盖 tools、messages 和截断状态隔离。
+
+完整记录见 [阶段 1 执行正确性](STAGE_1_EXECUTION_CORRECTNESS.md)。
 
 ## 4. Phase 1：建立 Fork 领域模型
 
@@ -425,16 +435,14 @@ Phase 0 正确性
 
 Phase 1～2 完成后，系统才具备真正的“同质子 Agent fork”；Phase 3～5 完成后，才具备“Evidence Graph 驱动的自主动态 fork”；Phase 6～8 完成后，才能将其称为可评测、可审计的完整 PaperPilot。
 
-## 13. 第一批建议开发任务
+## 13. 下一阶段开发范围
 
-下一轮编码建议只领取以下范围，避免一次改动过大：
+下一阶段是“阶段 2：Fork 领域模型（实施计划 Phase 1）”，编码范围限定为：
 
-1. 修复 Phase 0 的四个并发与生命周期 Bug；
-2. 新增 ForkSpec、AgentFork、ResearchContribution 数据类；
-3. 新增 ForkRepository 与迁移测试；
-4. 实现无持久递归的 `ForkController v1`；
-5. 用 feature flag 让初始 DAG 通过 ForkController 执行；
-6. 增加三 Agent 并发隔离集成测试；
-7. Web SSE 暂时只增加 fork started/completed 两类事件。
+1. 新增 `ResearchRun`、`PlanNode`、`ForkSpec`、`AgentFork`、`ForkBudget`、`ForkEvent`、`ResearchContribution` 和 `ForkProposal` 数据契约；
+2. 新增 Run/Fork/Contribution Repository、SQLite 迁移和幂等写入；
+3. 建立 fork 生命周期、parent/depth/attempt/budget/status 约束；
+4. 增加并发写、幂等、重启恢复和 fork 树重建测试；
+5. 为现有 `SubTask` 与 `AgentResult` 提供兼容适配。
 
-完成这批任务后，再进入 Evidence-first Contribution 重构。
+`ForkSpec`、`AgentFork`、`ForkRepository` 和 `ForkController` 在阶段 1 均未实现；其中前三者属于下一阶段，`ForkController` 按本计划在后续独立同质 Agent Fork 阶段实现。

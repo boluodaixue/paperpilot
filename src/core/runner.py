@@ -303,10 +303,17 @@ def initialize_modules(config: dict, session_id: str = "") -> dict[str, Any]:
     from src.orchestrator.orchestrator import Orchestrator
     from src.orchestrator.agent_pool import AgentPool
 
+    solver_policy_template = modules.get("solver_policy", default_policy)
+    tool_execution_cfg = config.get("tools", {}).get("execution", {})
     agent_pool = AgentPool(
-        policy_factory=lambda: modules.get("solver_policy", default_policy),
+        policy_factory=lambda: solver_policy_template.fork(),
         tools_factory=lambda: list(modules["tools"]),
         max_idle=3,
+        researcher_kwargs={
+            "tool_max_attempts": tool_execution_cfg.get("max_attempts", 2),
+            "tool_retry_delay_seconds": tool_execution_cfg.get("retry_delay_seconds", 0.25),
+            "tool_fallbacks": tool_execution_cfg.get("fallbacks", {}),
+        },
     )
     modules["agent_pool"] = agent_pool
 
