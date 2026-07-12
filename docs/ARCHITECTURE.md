@@ -1,370 +1,264 @@
 # PaperPilot 目标架构
 
-> 本文是 PaperPilot 的架构事实来源（Source of Truth）。项目的路线图、实现计划和代码重构均以本文为准。
+> 本文是 PaperPilot 当前唯一的架构事实来源。若其他文档、历史记录或现有代码与本文冲突，以本文为准。
 
-## 1. 项目定义
+## 1. 产品定义
 
-PaperPilot 是一个由 **Research Manager 驱动的同质子 Agent 动态 fork 系统**。
+PaperPilot 是一个基于 LangGraph 的递归式深度研究系统。
 
-Research Manager 根据研究问题制定计划，将不同研究方向 fork 给多个能力相同、状态隔离的 Research Agent。子 Agent 独立检索、阅读、分析和提取证据，并把结构化研究贡献合并回 Evidence Graph。Manager 再根据证据覆盖、质量、冲突和边际信息增量决定继续 fork，还是停止研究并合成报告。
+系统先由根 Research Agent 与用户对齐研究目标。用户可以修改研究范围和方向；只有用户确认后，根 Agent 才开始研究。研究期间，根 Agent 和所有子 Agent 运行同一套 Research AgentGraph。任何 Agent 都能思考、拆解、检索、阅读、分析、比较、提取证据、按条件 fork 同质子 Agent，并汇聚子结果。
 
-项目的核心不是“多个固定角色协作”，也不是“把若干任务放入对象池并发执行”，而是：
+研究结束后，根 Agent 生成最终报告，并把报告、采用的证据和来源以 Markdown 写入同一个持久化 Memory Store。报告通过 WikiLink 连接证据笔记，证据笔记再连接来源笔记；Obsidian 等工具可以直接根据这些链接展示关系。
 
-1. Manager 持有全局研究状态和停止权；
-2. Worker 是同一种 Research Agent 的独立 fork；
-3. fork 具有身份、父子关系、上下文快照、预算和生命周期；
-4. 子 Agent 通过 Evidence Merge 回流，而不是只提交自然语言小报告；
-5. Evidence Graph 驱动下一轮 fork；
-6. 研究达到完成条件后，报告从已验证证据生成。
+## 2. 核心原则
 
-## 2. 设计原则
+### 2.1 根 Agent 与子 Agent 同质
 
-### 2.1 Manager 与 Worker 分离
-
-Research Manager 属于控制面，负责规划、fork、预算、合并和停止判断。Research Agent 属于执行面，只负责一个受限研究范围。
-
-Manager 不亲自完成各领域检索；Worker 不直接修改全局计划，也不能绕过预算无限创建新 Agent。
-
-### 2.2 Worker 同质，任务异质
-
-所有 Research Agent 使用同一能力蓝图：
-
-- 搜索网页和论文；
-- 阅读来源；
-- 分析和比较；
-- 提取可定位证据；
-- 识别矛盾和未知项；
-- 提议后续研究方向。
-
-`discover`、`compare`、`verify`、`fill_gap`、`challenge` 是任务模式，不是不同 Agent 类型。同一个 Research Agent 可以执行所有模式。
-
-### 2.3 Fork 是执行实体，不是任务别名
-
-三个概念必须分开：
-
-| 概念 | 含义 |
-|------|------|
-| Plan Node | Manager 规划出的研究意图及依赖关系 |
-| Fork | 某个 Research Agent 对一个 Plan Node 的一次独立执行实例 |
-| Attempt | 同一 Plan Node 因重试、降级或替代策略产生的新一次执行 |
-
-向 DAG 添加任务不等于完成 Agent fork。真正的 fork 必须形成可追踪的执行记录。
-
-### 2.4 上下文按需继承，局部状态隔离
-
-子 Agent 不复制 Manager 的完整对话，也不共享可变 Policy 状态。fork 上下文只包含：
-
-- 原始研究问题；
-- 当前研究计划摘要；
-- 本次 fork 的研究范围和成功条件；
-- 必要的上游结果引用；
-- 与研究范围相关的 Evidence ID；
-- 独立的时间、token 和工具调用预算。
-
-子 Agent 的消息、scratchpad、工具状态和临时假设彼此隔离。共享数据通过不可变引用读取，通过 Merge 协议写入。
-
-### 2.5 Evidence-first Merge
-
-子 Agent 的主要产物不是一段总结，而是 `ResearchContribution`：
-
-- 新发现的来源；
-- 可在来源中定位的 Evidence Span；
-- 由证据支持的原子 Claim；
-- 对已有 Claim 的支持、矛盾或扩展候选；
-- 未解决问题；
-- 建议继续 fork 的研究方向；
-- 本次执行的成本、失败和质量信息。
-
-自然语言总结只是辅助字段。只有通过验证的 Evidence 才能进入全局证据图和最终报告。
-
-### 2.6 中央审批的受控递归
-
-子 Agent 可以提出 `ForkProposal`，但只有 Fork Controller 可以批准并创建新 fork。审批至少考虑：
-
-- 最大 fork 深度；
-- 全局和单轮 Agent 数量；
-- 剩余 token、时间和工具预算；
-- 与已执行研究范围的重复度；
-- 目标缺口的重要性；
-- 预期信息增量。
-
-这使系统具备递归探索能力，同时避免 Agent 爆炸。
-
-## 3. 总体架构
+根、子、孙 Agent 使用同一个 Research AgentGraph、工具协议和结果协议：
 
 ```text
-User / Web / CLI
-        │
-        ▼
-Research Manager ─────────────── Run State / Event Log
-        │
-        ├── Research Planner ─── Plan Graph
-        ├── Fork Controller ──── Fork Registry / Budget Manager
-        │        │
-        │        ├── fork Research Agent A ─┐
-        │        ├── fork Research Agent B ─┼── ResearchContribution
-        │        └── fork Research Agent C ─┘
-        │                                      │
-        ├── Contribution Validator ◄───────────┘
-        ├── Evidence Merge ────── Source / Evidence / Claim / Relation
-        ├── Evidence Graph
-        ├── Gap Analyzer
-        └── Completion Evaluator (RCS)
-                 │
-          continue research?
-             │          │
-            yes         no
-             │          ▼
-        next forks   Evidence-grounded Synthesizer
-                            │
-                            ▼
-                  Report / Web / Obsidian
+理解任务
+→ 思考与拆解
+→ 判断自己执行还是 fork
+→ 检索 / 阅读 / 分析 / 比较 / 证据提取
+→ 汇聚子 Agent 结果
+→ 总结本级结果
+→ 返回父级或生成最终报告
 ```
 
-## 4. 分层职责
+它们的差异只来自：
 
-### 4.1 交互层
+- 当前任务范围；
+- 独立的消息和工作上下文；
+- `thread_id`、父线程和根线程身份；
+- 当前递归深度；
+- 根 Agent 拥有用户交互和最终报告发布权限。
 
-负责研究澄清、会话管理、进度展示、Agent 树、报告、证据和图谱展示。交互层不得承担研究决策。
+系统不设置独立 Planner Agent、Summarizer Agent、Gap Agent 或固定专家角色。规划和总结都是每个 Research Agent 的内在步骤。
 
-主要入口：Web、CLI、REPL。
+### 2.2 Fork 是上下文与并行机制
 
-### 4.2 控制面
+任一 Research Agent 在满足以下任一条件时，可以建议 fork：
 
-#### Research Manager
+1. 存在两个或更多无依赖的研究任务，可以并行执行；
+2. 某个任务会产生大量中间材料，需要与当前上下文隔离；
+3. 某个任务预计需要至少三层连续工具调用，继续留在当前消息历史会明显膨胀上下文。
 
-每个研究 Run 唯一。负责：
+是否真正 fork 还必须通过硬约束：任务范围清晰、没有重复执行、仍有并发与资源预算、当前深度允许创建子线程。
 
-- 维护研究目标和全局状态；
-- 请求 Planner 生成或调整 Plan Graph；
-- 请求 Fork Controller 执行计划；
-- 接收并合并 ResearchContribution；
-- 触发 Gap Analysis 和 RCS；
-- 决定继续、降级、取消或合成。
-
-#### Research Planner
-
-输出研究意图，而不是角色分配。每个 Plan Node 包含：
-
-- 研究范围；
-- 任务模式；
-- 依赖；
-- 需要的证据类型；
-- 完成条件；
-- 优先级和预算建议。
-
-#### Fork Controller
-
-负责 fork 的创建、调度、取消、重试和血缘记录。它把 Plan Node 转换为独立 `ForkSpec`，通过 Agent Factory 创建 Research Agent。
-
-#### Budget Manager
-
-统一管理：
-
-- 最大并发；
-- 最大总 fork 数；
-- 最大 fork 深度；
-- 单 fork 与全局 token 预算；
-- 单 fork 与全局时间预算；
-- 工具调用预算。
-
-#### Completion Evaluator
-
-计算 Research Completion Score，并返回继续或停止的结构化理由。建议组成：
+递归深度固定为：
 
 ```text
-RCS = Coverage + EvidenceQuality + SourceDiversity
-    + ConflictResolution + Saturation - CostPenalty
+根 Agent：depth = 0
+子 Agent：depth = 1
+孙 Agent：depth = 2，禁止继续 fork
 ```
 
-权重应由评测校准，而不是永久硬编码。
+### 2.3 每个 Agent 都产生可汇聚结果
 
-### 4.3 同质执行面
+每个 Agent 返回结构化 Research Result，最少包括：
 
-Research Agent 是无固定领域角色的通用研究执行器。标准循环为：
+- 当前任务和完成状态；
+- 总结；
+- 关键发现；
+- 每项发现对应的证据；
+- 证据的来源与定位信息；
+- 冲突、不确定性和未完成项；
+- 子 Agent 结果的引用。
+
+子 Agent 不是只返回原始材料。它必须先总结自己的任务结果；父 Agent 再结合其他结果做更高一层汇总。最终报告只是根 Agent 的本级总结产物。
+
+### 2.4 运行状态与持久记忆分离
+
+LangGraph checkpointer 保存执行中的图状态、暂停点和恢复信息。Memory Store 保存研究完成后可长期使用的知识。
 
 ```text
-理解 ForkSpec
-→ 制定局部搜索策略
-→ 搜索和阅读来源
-→ 提取 Evidence Span
-→ 形成原子 Claim
-→ 自检来源相关性与证据充分性
-→ 提交 ResearchContribution / ForkProposal
+LangGraph checkpointer = 运行时恢复
+Markdown Memory Store  = 持久知识
 ```
 
-每个 fork 必须拥有独立 Policy 会话和工具状态。模型客户端可以共享连接池，但调用状态不可共享。
+不为运行线程另建 Run/Fork Repository，也不把完整消息历史当作长期知识保存。
 
-### 4.4 证据面
+### 2.5 一个 Memory Store，不设 Evidence Store
 
-统一处理论文、网页、用户文件和其他来源：
+系统只有一个持久化 Memory Store。第一版使用 Markdown Vault 实现，内部目录只是文件组织：
 
 ```text
-SourceDocument
-    └── EvidenceSpan
-            └── Claim
-                  └── EvidenceRelation
+memory/
+├── reports/
+├── evidence/
+└── sources/
 ```
 
-#### SourceDocument
+- 报告正文使用 `[[Evidence-...]]` 指向证据笔记；
+- 证据笔记记录摘录、分析和定位信息，并使用 `[[Source-...]]` 指向来源；
+- 来源笔记记录论文、网页或本地文件的元数据与访问位置；
+- WikiLink 是唯一显式关系表达，不维护独立 Evidence Graph、证据边分类器或图数据库。
 
-记录来源类型、URL、标题、作者、发布时间、抓取时间、内容哈希和原文定位信息。
+Evidence 是 Memory Store 中的一类 Markdown 内容，不是独立存储服务。
 
-#### EvidenceSpan
+### 2.6 完成判断保持简单
 
-必须能够回到来源中的具体位置，例如页码、章节、段落、字符区间或原始摘录。无法定位的内容不得标为已验证证据。
+现阶段不实现 RCS 或独立评分引擎。每个 Agent 根据任务完成情况做局部判断，根 Agent 对整项研究做最终判断。
 
-#### Claim
+停止或继续由可解释的硬规则约束：
 
-原子、可判真假的研究主张。Claim 与 EvidenceSpan 是多对多关系，不应把 LLM 生成的 claim 和原文摘录混成同一个对象。
+- 必需任务是否完成；
+- 关键结论是否有可定位来源；
+- 是否仍有阻断报告的证据缺口或冲突；
+- 本轮是否仍产生有效信息；
+- 是否达到深度、线程数、工具调用、时间或 token 上限。
 
-#### EvidenceRelation
+以后只有在积累了真实评测数据后，才考虑把 RCS 作为可插拔辅助评估器加入。
 
-Embedding 只用于召回候选关系；`SUPPORTS`、`CONTRADICTS`、`EXTENDS` 必须由关系分类器验证，并保存判定理由、模型版本和置信度。
+## 3. 两层 LangGraph
 
-### 4.5 合成面
+### 3.1 外层 Research Workflow
 
-Synthesizer 不直接消费所有 Agent 对话，而是消费经过预算选择的 `EvidencePackage`：
-
-- 研究问题；
-- 主题覆盖摘要；
-- 已验证 Claim；
-- 对应 Evidence Span 和来源；
-- 未解决冲突；
-- 重要限制和未知项。
-
-报告生成后再执行 Citation Validator，验证：
-
-- 引用 ID 存在；
-- 引用证据支持对应句子；
-- 关键结论具有引用；
-- 报告没有引用 fork 的临时内容。
-
-### 4.6 持久化与可观测性
-
-至少持久化以下实体：
-
-- ResearchRun；
-- PlanNode；
-- AgentFork；
-- ForkEvent；
-- ResearchContribution；
-- SourceDocument；
-- EvidenceSpan；
-- Claim；
-- EvidenceRelation；
-- Report 与 Citation。
-
-Web 端应能展示 fork 树、每个 Agent 的研究范围、状态、成本、新增证据数和停止原因。
-
-项目使用 Langfuse v4 的 OpenTelemetry 上下文作为 tracing 基础。目标 trace 层级为：
+外层只处理根任务生命周期：
 
 ```text
-research.run                         chain
-├── planner.generate_plan           chain
-├── fork:<forkid>                   agent
-│   ├── llm-call                    generation
-│   ├── tool:<toolname>             tool
-│   └── contribution.validate       chain
-├── evidence.merge                  chain
-├── completion.evaluate             evaluator
-└── report.synthesize               agent
+接收问题
+→ 根 Agent 理解并提出研究说明
+→ 等待用户确认
+   ├── 用户修改：更新说明并再次确认
+   └── 用户确认：启动根 Research AgentGraph
+→ 接收根 Research Result
+→ 生成最终报告
+→ 写入 Memory Store
+→ 可选 Red/Blue
+→ 完成
 ```
 
-ResearchRun 使用 Langfuse `session_id` 进行会话关联；fork 相关字段通过 metadata 传播，统一使用 `runid`、`forkid`、`parentforkid`、`plannodeid` 和 `attempt`。Tracing 是旁路能力：SDK、网络或配置失败不得改变研究结果和状态机行为。
+等待用户确认使用 LangGraph interrupt 与 checkpointer，恢复后继续同一 `thread_id`。
 
-## 5. 核心数据契约
+### 3.2 同质 Research AgentGraph
 
-### 5.1 ForkSpec
+根、子、孙 Agent 都调用同一个图定义：
 
 ```text
-fork_id
-run_id
-parent_fork_id
-plan_node_id
-fork_depth
-research_scope
-research_mode
-success_criteria
-inherited_evidence_ids
-dependency_contribution_ids
-token_budget
-time_budget_seconds
-tool_budget
+think_and_plan
+      ↓
+decide_next_action
+  ├── use_tool ───────────────┐
+  ├── fork_children ──并行──┐ │
+  ├── gather_children ◄─────┘ │
+  └── synthesize ◄────────────┘
+      ↓
+return_research_result
 ```
 
-### 5.2 AgentFork
+图可以循环调用工具，但必须受预算和停止条件限制。Fork 分支把明确任务和必要上下文传给同一个 AgentGraph；不得复制父 Agent 的全部消息历史。
+
+## 4. 执行身份
+
+每个执行线程只使用以下身份：
+
+- `thread_id`：当前 AgentGraph 执行；
+- `parent_thread_id`：创建当前执行的父线程，根线程为 `null`；
+- `root_thread_id`：整次研究的根线程；
+- `depth`：`0 | 1 | 2`。
+
+约束：
+
+- 根线程：`thread_id == root_thread_id`；
+- 子孙线程：`root_thread_id` 始终不变；
+- `parent_thread_id` 必须指向直接父线程；
+- `depth == 2` 时任何 fork 请求都转换为本地执行或带原因返回未完成项。
+
+## 5. Agent 输入输出边界
+
+父 Agent 给子 Agent 的输入只包含：
+
+- 明确的研究任务；
+- 必要背景和已知约束；
+- 期望输出；
+- 已知来源或需要核验的主张；
+- 执行身份和预算。
+
+不传递父 Agent 的完整对话、scratchpad 或无关工具输出。
+
+证据至少包含：
+
+- 支持的发现或主张；
+- 来源类型和标题；
+- URL、论文标识或本地文件位置；
+- 页码、章节、段落或网页定位信息（可取得时）；
+- 原文摘录或准确释义，并明确区分两者；
+- 局限与可信度说明。
+
+## 6. Memory Store 输出
+
+根 Agent 在研究汇聚完成后一次性提交本次持久化内容，避免多个子线程并发修改同一报告。
+
+建议的 Markdown frontmatter 仅保留稳定字段：
+
+```yaml
+---
+id: stable-id
+type: report | evidence | source
+created_at: ISO-8601
+root_thread_id: thread-id
+---
+```
+
+正文保持人类可读，不要求使用者理解内部运行模型。文件名和 WikiLink 必须稳定，重复执行持久化不得产生重复副本。
+
+## 7. 可选 Red/Blue
+
+Red/Blue 位于报告生成之后，默认关闭：
 
 ```text
-fork_id
-agent_id
-attempt
-status: REQUESTED | APPROVED | RUNNING | MERGING |
-        COMPLETED | FAILED | CANCELLED
-started_at / finished_at
-budget_used
-failure_reason
+Draft Report
+→ Red：从事实性、逻辑一致性、引用质量攻击
+→ Blue：执行 ADD / DELETE / MODIFY / VERIFY
+→ 根 Agent 校验链接与来源
+→ Final Report
 ```
 
-### 5.3 ResearchContribution
+Red/Blue 不参与 fork 决策，也不替代研究完成判断。任何修订不得创造不存在的来源或破坏 Markdown 链接。
 
-```text
-contribution_id
-fork_id
-findings
-source_documents
-evidence_spans
-claims
-relation_candidates
-unresolved_questions
-fork_proposals
-quality_summary
-execution_stats
-```
+## 8. 后续 LLM Wiki
 
-## 6. 主流程
+LLM Wiki 是 Memory Store 之上的未来能力，不进入当前研究执行核心。它可以：
 
-1. 用户确认研究问题，系统创建 ResearchRun。
-2. Research Manager 请求 Planner 生成初始 Plan Graph。
-3. Fork Controller 将可执行 Plan Node 转换为多个 ForkSpec。
-4. Agent Factory 创建独立的同质 Research Agent。
-5. 子 Agent 并行研究并提交 ResearchContribution。
-6. Validator 验证来源、摘录、Claim 和关系候选。
-7. Merge Service 以幂等事务写入 Evidence Store 和 Evidence Graph。
-8. Manager 更新 Plan Node 和 fork 状态。
-9. Gap Analyzer 与 Completion Evaluator 评估当前研究状态。
-10. 若未完成，Manager 批准新的 fork 或重试；若完成，构建 EvidencePackage。
-11. Synthesizer 生成报告，Citation Validator 做最终校验。
-12. 报告与完整研究轨迹持久化，并输出到 Web 和 Obsidian。
+- 基于既有报告、证据和来源回答问题；
+- 接收用户新增的论文或资料；
+- 整理、合并和建立新的 WikiLink；
+- 提示相互支持、冲突或值得继续研究的内容。
 
-## 7. 失败与降级原则
+它读取和维护同一 Markdown Memory Store，不引入第二套知识真相源。
 
-- 单 fork 失败不导致整个 Run 失败；Manager 可重试、换策略或接受缺口。
-- 重试必须生成新 attempt，不能覆盖历史 fork。
-- 全局超时时用已验证 EvidencePackage 合成降级报告。
-- Gap Analyzer 失败时不能默认“研究充分”，应使用确定性规则或标记不确定停止。
-- Evidence 验证失败只拒绝对应贡献，不应丢弃整个子 Agent 的其他有效证据。
-- 所有停止都必须记录机器可读的 stop reason。
+## 9. 现有代码的处理原则
 
-## 8. 当前代码与目标架构的关系
+现有仓库不是目标架构，不能因为已有模块就继续保留其角色。只逐项评估可复用性：
 
-当前代码可复用：
+优先考虑复用：
 
-- Planner 的 DAG 基础能力；
-- Orchestrator 状态机与分层并发；
-- Researcher 的工具循环；
-- EvidenceStore、EvidenceGraph 和 Obsidian 导出；
-- Gap Analyzer、Summarizer、Web SSE 和 ChatStore。
+- 搜索、论文、网页、文件读取等工具；
+- 模型调用和配置适配；
+- Langfuse tracing；
+- LangGraph checkpointer 与线程身份基础；
+- 符合新接口的 Markdown、Web 或会话能力。
 
-需要重构：
+默认不作为新架构骨架：
 
-- AgentPool 从对象复用升级为独立 fork 生命周期；
-- SEARCH/ANALYZE/VERIFY 固定类型改为同质 Research Agent + research mode；
-- 可变 Policy 和工具状态按 fork 隔离；
-- AgentResult 升级为 ResearchContribution；
-- Memory 全量复制改为上下文快照与引用；
-- 动态追加任务升级为带血缘、深度和预算的 fork；
-- Evidence 从“摘要生成 claim”升级为可定位、可验证的统一来源模型；
-- Research Loop 从简单计数停止升级为 RCS。
+- 旧 Orchestrator 状态循环；
+- Planner DAG；
+- AgentPool；
+- 独立 Summarizer、Gap Analyzer；
+- Evidence Store、Evidence Graph 和关系边；
+- RCS、Fork Tree 及围绕旧模型建立的控制服务。
 
-当前实现状态及迁移顺序见 [ROADMAP.md](ROADMAP.md) 和 [IMPLEMENTATION_PLAN.md](IMPLEMENTATION_PLAN.md)。
+旧代码在新路径达到对应能力且测试通过前可以暂时保留，但不得继续扩展。迁移完成后删除无调用者的旧模块、配置和测试。
+
+## 10. 非目标
+
+- 不创建多种固定人格或专家 Agent；
+- 不让根 Agent 成为与子 Agent 不同的专用 Manager 实现；
+- 不保留独立 Planner 或 Summarizer 角色；
+- 不建设 Evidence Graph 或图数据库；
+- 不在当前阶段实现 RCS；
+- 不无限递归 fork；
+- 不为了兼容旧代码复制领域模型、Repository 或服务；
+- 不在新路径验收前一次性删除仍被生产入口调用的旧代码。

@@ -2,118 +2,87 @@
 
 # PaperPilot
 
-### Research Manager 驱动的同质子 Agent 动态 Fork 研究系统
+### 基于 LangGraph 的同质 Research Agent 递归研究系统
 
 [![Python](https://img.shields.io/badge/Python-3.11-blue.svg)](https://python.org)
-[![Async](https://img.shields.io/badge/Async-asyncio-orange.svg)](https://docs.python.org/3/library/asyncio.html)
+[![LangGraph](https://img.shields.io/badge/Orchestration-LangGraph-green.svg)](https://www.langchain.com/langgraph)
 
 </div>
 
-## 项目定位
+## 项目目标
 
-PaperPilot 面向需要多方向探索、证据核验和持续补研究的复杂问题。
-
-系统由一个 Research Manager 维护全局研究状态。Manager 根据研究计划动态 fork 多个能力相同、上下文隔离的 Research Agent。子 Agent 分别研究不同范围，将来源、原文证据、原子 Claim、冲突和未解决问题合并回 Evidence Graph。Manager 再根据证据缺口和 Research Completion Score 决定继续 fork，还是停止并生成带引用的研究报告。
+PaperPilot 先由根 Research Agent 与用户对齐研究目标。用户确认后，根 Agent 开始研究，并在需要并行、隔离上下文或处理较深工具调用链时 fork 同质子 Agent。子 Agent 可以再 fork 一次，所有层级运行同一个 Research AgentGraph。
 
 ```text
-Research Question
-      ↓
-Research Manager
-      ↓
-Research Plan / Fork Controller
-      ↓
-同质 Research Agent A ─┐
-同质 Research Agent B ─┼→ Evidence Merge → Evidence Graph
-同质 Research Agent C ─┘                       ↓
-                              Gap Analysis / RCS
-                                  ↓         ↓
-                              next forks   report
+用户问题
+→ 根 Agent 对齐研究方向
+→ 用户修改 / 确认
+→ 同质 Research AgentGraph
+   ├── 思考与拆解
+   ├── 检索 / 阅读 / 分析 / 比较 / 证据提取
+   ├── 按条件 fork 同质 Agent
+   └── 汇聚并总结本级结果
+→ 根 Agent 生成最终报告
+→ 报告、证据、来源写入 Markdown Memory Store
+→ 可选 Red/Blue
 ```
 
-这里的 fork 不是普通的“把任务放进 AgentPool”：每个 fork 都应具有独立身份、父子血缘、上下文快照、执行预算、局部状态和生命周期。Worker 同质，研究任务和研究范围可以不同。
-
-完整定义见 [目标架构](docs/ARCHITECTURE.md)，迁移步骤见 [实施计划](docs/IMPLEMENTATION_PLAN.md)。
+完整定义见 [目标架构](docs/ARCHITECTURE.md)，具体步骤见 [实施计划](docs/IMPLEMENTATION_PLAN.md)，当前进度见 [路线图](docs/ROADMAP.md)。
 
 ## 核心设计
 
-### Research Manager 控制面
+### 同一个 Research AgentGraph
 
-- 生成和维护研究计划；
-- 决定哪些方向需要 fork；
-- 管理并发、递归深度、时间、token 和工具预算；
-- 合并子 Agent 的结构化研究贡献；
-- 根据 Evidence Graph 缺口和 RCS 决定继续或停止。
+根、子、孙 Agent 使用相同的图、工具协议和结果协议。每个 Agent 都能：
 
-### 同质 Research Agent 执行面
+- 思考和拆解当前任务；
+- 判断本地执行还是 fork；
+- 检索、阅读、分析、比较和提取证据；
+- 汇聚子 Agent 结果；
+- 总结并返回结构化 Research Result。
 
-所有 Worker 使用同一种 Research Agent 蓝图，都具备搜索、阅读、分析、比较、验证和证据提取能力。
+根 Agent 只额外负责用户交互和最终报告发布，不是另一种 Manager Agent。
 
-`discover`、`compare`、`verify`、`fill_gap`、`challenge` 是研究模式，不是固定角色。子 Agent 之间隔离消息、工具状态和 scratchpad，只通过明确的 Evidence/Contribution 契约共享成果。
+### 有界 Fork
 
-### Evidence-first 研究主干
+满足以下任一条件时可以 fork：
 
-```text
-SourceDocument → EvidenceSpan → Claim → EvidenceRelation
-```
+1. 多个任务没有依赖，可以并行；
+2. 中间材料较多，需要隔离上下文；
+3. 预计需要至少三层连续工具调用。
 
-- EvidenceSpan 必须能够定位回来源原文；
-- Claim 是原子、可判真的研究主张；
-- Embedding 只召回候选关系；
-- SUPPORTS、CONTRADICTS、EXTENDS 需要进一步验证；
-- 最终报告消费经过验证和预算筛选的 EvidencePackage，而不是所有 Agent 对话。
+递归限制为：根 `depth=0` → 子 `depth=1` → 孙 `depth=2`。孙 Agent 禁止继续 fork。
 
-### 图驱动 Research Loop
+### Markdown Memory Store
 
-每轮贡献合并后，系统检查：
-
-- 主题覆盖是否充分；
-- 是否缺少独立来源；
-- 是否存在未解决矛盾；
-- 最近一轮是否仍有有效信息增量；
-- 继续研究的预期收益是否高于成本。
-
-缺口可以由 Gap Analyzer 或子 Agent 以 ForkProposal 提出，但只能由中央 Fork Controller 审批和创建新 fork。
-
-## 当前实现状态
-
-当前仓库已经具备可运行的 Deep Research 主链路，并完成了部分 PaperPilot 能力：
-
-- Planner DAG 与分层并发执行；
-- 同质 Researcher Worker 池；
-- 网页、论文、文件、计算和代码工具；
-- SQLite 共享记忆与会话隔离；
-- Evidence 提取、存储和 Evidence Graph；
-- Gap Analysis 与动态追加研究任务；
-- 报告证据索引、关系展示和图谱；
-- FastAPI + SSE Web UI；
-- Obsidian Vault 自动/手动导出；
-- Langfuse v4 + OpenTelemetry 研究链路和 LLM 可观测性；
-- 阶段 1 执行正确性基线：并发调用状态隔离、Agent 生命周期、超时降级、检索门槛、工具重试与评测修复；
-- Red-Blue 对抗优化和评测工具。
-
-但当前“动态 fork”仍主要表现为向 DAG 追加 SubTask，再从 AgentPool 获取临时 Worker。独立 Agent 身份、上下文隔离、fork 血缘、持久生命周期、结构化 Contribution、受控递归和完整 RCS 尚待实现。因此当前状态应称为：
-
-> Evidence-centric Deep Research 原型 + 动态 Fork 迁移中的执行框架。
-
-准确进度见 [ROADMAP](docs/ROADMAP.md)。
-
-## 当前运行流程
+系统只使用一个持久化 Memory Store：
 
 ```text
-Web 澄清研究问题
-→ Planner 生成 DAG
-→ Orchestrator 分层调度 Researcher
-→ Researcher 调用搜索/论文/网页等工具
-→ Memory 写入中间结果
-→ Evidence Extractor 提取证据
-→ Evidence Graph 建立关系
-→ Gap Analyzer 追加补研究任务
-→ Summarizer 生成报告
-→ ChatStore 持久化
-→ Web 展示并导出 Obsidian Vault
+memory/
+├── reports/
+├── evidence/
+└── sources/
 ```
 
-该流程将在实施计划中逐步迁移为 `Research Manager → Fork Controller → ResearchContribution → Evidence Merge → RCS`。
+报告通过 `[[Evidence-...]]` 链接证据，证据通过 `[[Source-...]]` 链接论文、网页或文件来源。关系由 Markdown WikiLink 和 Obsidian backlinks 表达，不建设独立 Evidence Graph。
+
+### 简单完成判断
+
+当前不实现 RCS。Agent 根据任务完成情况、关键结论的来源、未解决问题、信息增量和硬预算判断继续或停止。RCS 只有在未来有真实评测数据时才可能作为可插拔辅助能力加入。
+
+## 当前仓库状态
+
+仓库仍包含原 Deep Research 架构的 Orchestrator、Planner DAG、AgentPool、Summarizer、Evidence Store 和 Evidence Graph 等代码。它们是迁移来源，不是目标架构。
+
+目前已经具备：
+
+- 搜索、论文、网页、文件、计算等研究工具；
+- 模型与配置适配；
+- Langfuse tracing；
+- LangGraph 最小单线程入口、checkpointer 和线程身份；
+- CLI、Web、评测以及旧研究链路。
+
+下一步是实现新的单个同质 Research AgentGraph。新路径通过对应验收后，再逐步删除无调用者的旧模块。
 
 ## 快速开始
 
@@ -130,7 +99,7 @@ pip install -r requirements.txt
 cp .env.template .env
 ```
 
-Windows PowerShell 激活环境：
+Windows PowerShell：
 
 ```powershell
 .venv\Scripts\Activate.ps1
@@ -160,51 +129,36 @@ python scripts/run_repl.py
 pytest -q
 ```
 
+以上入口目前仍可能运行旧研究链路；切换到新 Workflow 属于实施计划 N5。
+
 ## 仓库结构
 
 ```text
 deepresearch-agent/
-├── configs/               # 模型、Agent、工具和运行预算配置
-├── docs/
-│   ├── ARCHITECTURE.md     # 目标架构事实来源
-│   ├── IMPLEMENTATION_PLAN.md
-│   └── ROADMAP.md
-├── src/
-│   ├── core/              # 初始化和研究入口
-│   ├── orchestrator/      # 当前状态机、调度和 Research Loop
-│   ├── planner/           # 研究任务 DAG
-│   ├── agents/            # Researcher、Gap Analyzer、Summarizer
-│   ├── evidence/          # 证据、关系图和 Obsidian 导出
-│   ├── memory/            # 会话与长期记忆
-│   ├── compressor/        # 上下文压缩
-│   ├── adversarial/       # Red-Blue 报告优化
-│   ├── evolution/         # 实验性自进化模块，尚未接入主流程
-│   ├── models/            # 模型路由
-│   └── tools/             # 搜索、阅读、计算等工具
-├── web/                   # FastAPI、SSE 和单页前端
-├── evaluation/            # ResearchBench、HotpotQA 和评测指标
-├── scripts/               # CLI、评测、消融和维护脚本
-└── tests/
+├── configs/       # 当前模型、工具和运行配置
+├── docs/          # 现行设计、实施计划、路线图和历史记录
+├── src/           # 当前实现与后续新 Research AgentGraph
+├── web/           # 当前 Web 入口
+├── evaluation/    # 评测
+├── scripts/       # CLI 与维护脚本
+└── tests/         # 自动化测试
 ```
 
-## 文档导航
+## 文档
 
-- [目标架构](docs/ARCHITECTURE.md)：系统边界、组件、数据契约和主流程；
-- [实施计划](docs/IMPLEMENTATION_PLAN.md)：从当前代码迁移到目标架构的具体阶段；
-- [路线图](docs/ROADMAP.md)：当前完成度和下一阶段优先级；
-- [阶段 0 基线](docs/STAGE_0_BASELINE.md)：重构起点、提交和验证结果；
-- [阶段 0.5 Langfuse](docs/STAGE_0_5_LANGFUSE.md)：动态 fork 前的可观测性基线；
-- [阶段 1 执行正确性](docs/STAGE_1_EXECUTION_CORRECTNESS.md)：实施计划 Phase 0 的完成范围、验收结果和未实施边界；
-- [原始产品设计入口](docs/PaperPilot_Development_Plan.md)；
-- [基于现有 DeepResearch 的改造入口](docs/PaperPilot_DeepResearch_Based_Development_Plan.md)。
+- [文档索引](docs/README.md)
+- [目标架构](docs/ARCHITECTURE.md)
+- [实施计划](docs/IMPLEMENTATION_PLAN.md)
+- [路线图](docs/ROADMAP.md)
 
-## 非目标与边界
+## 明确不做
 
-- 项目不采用多个固定人格或固定专家角色作为核心机制；
-- 对象池复用不等同于 Agent fork；
-- 生成了报告不等于完成了可验证研究；
-- 自进化模块目前是实验性能力，不是在线主流程的一部分；
-- 本地 Web 默认按单用户工具设计，外网部署前需要补充鉴权、任务队列和安全边界。
+- 不设置不同类型的根 Agent、Manager Agent、Planner Agent 或 Summarizer Agent；
+- 不建设 Evidence Graph、证据边或图数据库；
+- 不把运行 checkpoint 和持久知识混为一套存储；
+- 不在当前路线实现 RCS；
+- 不允许超过两层的递归 fork；
+- 不为迁就旧实现而复制领域模型、服务或 Repository。
 
 ## License
 
