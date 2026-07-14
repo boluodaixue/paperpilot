@@ -4,7 +4,7 @@
 
 ## 当前判断
 
-仓库已有可运行的旧 Deep Research 链路、Langfuse 基础和 LangGraph 单线程入口，但这些代码多数建立在旧的 Manager / Planner / DAG / AgentPool / Evidence Graph 架构上，不能视为新 PaperPilot 架构已经完成。
+仓库已有可运行的旧 Deep Research 链路，也已完成新的单个同质 Research AgentGraph。旧 CLI/Web 主链路仍建立在 Manager / Planner / DAG / AgentPool / Evidence Graph 架构上，不能视为整体迁移已经完成。
 
 可选择迁移的基础能力包括工具、模型适配、tracing、checkpointer 和线程身份。是否复用由新接口决定。
 
@@ -13,8 +13,8 @@
 | 阶段 | 状态 | 完成标志 |
 |---|---|---|
 | N0 文档与架构收敛 | ✅ | 唯一架构、唯一计划、旧方案退出活跃文档 |
-| N1 单个同质 Research AgentGraph | 🔄 下一阶段 | 同一图以不同深度执行并返回带来源的结构化结果 |
-| N2 用户确认与单 Agent 纵向闭环 | ⬜ | 可修改、确认、恢复，并写出互链 Markdown |
+| N1 单个同质 Research AgentGraph | ✅ | 同一图以不同深度执行并返回带来源的结构化结果 |
+| N2 用户确认与单 Agent 纵向闭环 | 🔄 下一阶段 | 可修改、确认、恢复，并写出互链 Markdown |
 | N3 同质并行 Fork | ⬜ | 三种 fork 条件、上下文隔离、并行汇聚和部分失败可用 |
 | N4 一层递归与硬停止 | ⬜ | 根→子→孙可运行，孙不可再 fork，限制与恢复可靠 |
 | N5 入口迁移与旧实现清理 | ⬜ | CLI/Web 只走新路径，旧架构及证据图退出代码库 |
@@ -36,18 +36,30 @@
 - Red/Blue 是最终报告的可选后处理；
 - 旧模块按“复用、迁移能力、删除”逐项审查，不强行兼容。
 
-## 下一阶段：N1
+## N1 已完成
 
-只实现单个同质 AgentGraph：
+N1 已建立独立于旧 Orchestrator 的同质 AgentGraph：
 
 - 最小任务、执行上下文、结果和证据契约；
 - 思考、行动路由、工具调用、本级总结；
 - 根/子共用同一图定义；
 - 上下文与 checkpoint 隔离；
 - Langfuse 旁路追踪；
-- 固定离线输入、失败和预算停止测试。
+- 固定离线输入、失败和预算停止测试；
+- 现有 `MockWebSearchTool` 协议复用验证。
 
-N1 不实现用户确认、fork、Markdown 持久化、RCS 或 Red/Blue。
+N1 专项 `13 passed`，全量回归 `201 passed`。详见 [N1 实施记录](N1_HOMOGENEOUS_AGENT_GRAPH.md)。
+
+## 下一阶段：N2
+
+- 根 Agent 生成研究说明并通过 LangGraph interrupt 等待用户；
+- 用户可以反复修改，确认前不得调用研究工具；
+- 确认后调用 N1 的同质 AgentGraph；
+- 根 Agent 生成最终报告；
+- 报告、采用的证据和来源写入同一个 Markdown Memory Store；
+- WikiLink 可解析，重复提交幂等，确认点和研究节点可以恢复。
+
+N2 不实现 fork、Evidence Graph、RCS、Fork Tree 或 Red/Blue。
 
 ## 历史基础
 

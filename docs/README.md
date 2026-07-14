@@ -21,6 +21,10 @@
 
 历史记录中出现的 Manager、Planner DAG、AgentPool、Evidence Store、Evidence Graph、Gap Analysis 或 RCS，均不代表当前目标架构仍保留这些设计。
 
+## 当前架构实施记录
+
+- [N1_HOMOGENEOUS_AGENT_GRAPH.md](N1_HOMOGENEOUS_AGENT_GRAPH.md)：单个同质 Research AgentGraph 的实现与验收结果。
+
 ## 已清理文档
 
 以下重复方案已删除，其内容不再维护：
@@ -29,4 +33,3 @@
 - `PaperPilot_DeepResearch_Based_Development_Plan.md`
 
 产品目标已合并到 `ARCHITECTURE.md`，迁移步骤已合并到 `IMPLEMENTATION_PLAN.md`。
-

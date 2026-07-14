@@ -94,6 +94,10 @@ src/research/
 
 ## 5. N1：单个同质 Research AgentGraph
 
+### 状态
+
+已完成（2026-08-28）。实施记录见 [N1_HOMOGENEOUS_AGENT_GRAPH.md](N1_HOMOGENEOUS_AGENT_GRAPH.md)。
+
 ### 目标
 
 先证明同一个图能完成“思考—行动—总结”，不实现 fork，不接旧 Planner DAG。
@@ -326,4 +330,4 @@ N0 文档收敛
 → Future LLM Wiki
 ```
 
-下一次编码只进入 N1。遇到需要新增独立 Agent 角色、存储服务、图数据库、评分引擎或 fork 领域系统的设计，应停止扩展并先重新核对 [ARCHITECTURE.md](ARCHITECTURE.md)。
+下一次编码只进入 N2。遇到需要新增独立 Agent 角色、存储服务、图数据库、评分引擎或 fork 领域系统的设计，应停止扩展并先重新核对 [ARCHITECTURE.md](ARCHITECTURE.md)。
