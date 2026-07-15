@@ -14,8 +14,8 @@
 |---|---|---|
 | N0 文档与架构收敛 | ✅ | 唯一架构、唯一计划、旧方案退出活跃文档 |
 | N1 单个同质 Research AgentGraph | ✅ | 同一图以不同深度执行并返回带来源的结构化结果 |
-| N2 用户确认与单 Agent 纵向闭环 | 🔄 下一阶段 | 可修改、确认、恢复，并写出互链 Markdown |
-| N3 同质并行 Fork | ⬜ | 三种 fork 条件、上下文隔离、并行汇聚和部分失败可用 |
+| N2 用户确认与单 Agent 纵向闭环 | ✅ | 可修改、确认、恢复，并写出互链 Markdown |
+| N3 同质并行 Fork | 🔄 下一阶段 | 三种 fork 条件、上下文隔离、并行汇聚和部分失败可用 |
 | N4 一层递归与硬停止 | ⬜ | 根→子→孙可运行，孙不可再 fork，限制与恢复可靠 |
 | N5 入口迁移与旧实现清理 | ⬜ | CLI/Web 只走新路径，旧架构及证据图退出代码库 |
 | N6 可选 Red/Blue | ⬜ | 报告可选审查且不破坏证据链接 |
@@ -50,16 +50,28 @@ N1 已建立独立于旧 Orchestrator 的同质 AgentGraph：
 
 N1 专项 `13 passed`，全量回归 `201 passed`。详见 [N1 实施记录](N1_HOMOGENEOUS_AGENT_GRAPH.md)。
 
-## 下一阶段：N2
+## N2 已完成
 
 - 根 Agent 生成研究说明并通过 LangGraph interrupt 等待用户；
-- 用户可以反复修改，确认前不得调用研究工具；
+- 用户可以连续修改，确认前不会调用研究工具；
 - 确认后调用 N1 的同质 AgentGraph；
-- 根 Agent 生成最终报告；
+- 根 Agent 的结构化结果渲染为最终 Markdown 报告；
 - 报告、采用的证据和来源写入同一个 Markdown Memory Store；
-- WikiLink 可解析，重复提交幂等，确认点和研究节点可以恢复。
+- WikiLink 可解析，重复提交幂等，确认点和持久化失败可以恢复；
+- 持久化失败重试不会重复执行已经完成的研究工具。
 
-N2 不实现 fork、Evidence Graph、RCS、Fork Tree 或 Red/Blue。
+N2 专项 `8 passed`，N1+N2 联合专项 `21 passed`，全量回归 `209 passed`。详见 [N2 实施记录](N2_CONFIRMATION_AND_MEMORY.md)。
+
+## 下一阶段：N3
+
+- 实现可并行、需上下文隔离、预计工具链至少三层的轻量 fork policy；
+- 任务明确、不重复、预算允许且 `depth < 2` 时才实际 fork；
+- 父 Agent 只传明确任务和必要背景；
+- 子 Agent 调用与父级完全相同的 Research AgentGraph；
+- 并行汇聚成功、失败和部分结果；
+- 本阶段只实现根到子的一层，不实现孙 Agent。
+
+N3 不实现 RCS、Fork Tree、ForkController、AgentFactory、AgentPool 或 fork Repository。
 
 ## 历史基础
 

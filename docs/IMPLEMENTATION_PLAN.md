@@ -132,6 +132,10 @@ src/research/
 
 ## 6. N2：用户对齐、确认与单 Agent 纵向闭环
 
+### 状态
+
+已完成（2026-08-28）。实施记录见 [N2_CONFIRMATION_AND_MEMORY.md](N2_CONFIRMATION_AND_MEMORY.md)。
+
 ### 目标
 
 实现用户可以修改研究方向、确认后才执行研究，并得到持久化 Markdown 报告的完整单 Agent 产品流程。
@@ -330,4 +334,4 @@ N0 文档收敛
 → Future LLM Wiki
 ```
 
-下一次编码只进入 N2。遇到需要新增独立 Agent 角色、存储服务、图数据库、评分引擎或 fork 领域系统的设计，应停止扩展并先重新核对 [ARCHITECTURE.md](ARCHITECTURE.md)。
+下一次编码只进入 N3。遇到需要新增独立 Agent 角色、存储服务、图数据库、评分引擎或 fork 领域系统的设计，应停止扩展并先重新核对 [ARCHITECTURE.md](ARCHITECTURE.md)。

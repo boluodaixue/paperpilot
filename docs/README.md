@@ -24,6 +24,7 @@
 ## 当前架构实施记录
 
 - [N1_HOMOGENEOUS_AGENT_GRAPH.md](N1_HOMOGENEOUS_AGENT_GRAPH.md)：单个同质 Research AgentGraph 的实现与验收结果。
+- [N2_CONFIRMATION_AND_MEMORY.md](N2_CONFIRMATION_AND_MEMORY.md)：用户确认、单 Agent 闭环与 Markdown Memory Store 的实现与验收结果。
 
 ## 已清理文档
 
