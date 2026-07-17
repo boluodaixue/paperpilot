@@ -82,9 +82,11 @@ memory/
 - LangGraph 最小单线程入口、checkpointer 和线程身份；
 - 新的单个同质 Research AgentGraph：根/子共用同一图，支持工具循环、结构化结果、来源证据、硬停止和线程隔离；
 - N2 根工作流：研究说明、用户反复修改/确认、checkpoint 恢复、最终 Markdown 报告和单一 Memory Store；
+- N3 一级同质并行 fork：三种触发条件、依赖和预算门槛、父子上下文/实例/身份隔离、并行汇聚与部分失败保留；
+- N4 有界递归：根→子→孙、祖先去重、总线程/工具/时间/token/重试限制、共享 saver 下的取消与恢复；
 - CLI、Web、评测以及旧研究链路。
 
-N2 已通过 `8` 项专项测试，N1+N2 联合专项 `21 passed`，全量回归 `209 passed`。下一步 N3 将实现同质并行 fork；CLI 与 Web 默认入口仍要到 N5 才切换。
+N4 已通过 `17` 项专项测试，N1–N4 联合专项 `48 passed`，全量回归 `236 passed`。下一步 N5 会切换 CLI/Web/评测入口并删除 legacy，开始前必须先确认迁移与删除清单。
 
 ## 快速开始
 
@@ -154,6 +156,8 @@ deepresearch-agent/
 - [路线图](docs/ROADMAP.md)
 - [N1 实施记录](docs/N1_HOMOGENEOUS_AGENT_GRAPH.md)
 - [N2 实施记录](docs/N2_CONFIRMATION_AND_MEMORY.md)
+- [N3 实施记录](docs/N3_HOMOGENEOUS_PARALLEL_FORK.md)
+- [N4 实施记录](docs/N4_RECURSION_LIMITS_AND_RECOVERY.md)
 
 ## 明确不做
 

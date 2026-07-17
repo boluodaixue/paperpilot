@@ -14,6 +14,14 @@ class ResearchStatus(str, Enum):
     FAILED = "failed"
 
 
+class ForkReason(str, Enum):
+    """The three product-approved reasons for isolating work in a child Agent."""
+
+    PARALLEL = "parallel"
+    CONTEXT_ISOLATION = "context_isolation"
+    DEEP_TOOL_CHAIN = "deep_tool_chain"
+
+
 @dataclass(frozen=True)
 class ResearchTask:
     """A scoped research objective passed to any level of Research Agent."""
@@ -62,11 +70,19 @@ class ExecutionIdentity:
 
 @dataclass(frozen=True)
 class AgentLimits:
-    """N1 hard bounds that are actually consumed by the single AgentGraph."""
+    """Hard bounds consumed by every level of the single AgentGraph."""
 
     max_iterations: int = 8
     max_tool_calls: int = 12
     max_tool_output_chars: int = 12000
+    max_children: int = 4
+    max_fork_depth: int = 2
+    max_total_threads: int = 7
+    max_total_tool_calls: int = 36
+    max_elapsed_seconds: float = 300.0
+    max_total_tokens: int = 120000
+    max_retries_per_action: int = 1
+    max_total_retries: int = 6
 
     def validate(self) -> None:
         if self.max_iterations < 1:
@@ -75,6 +91,34 @@ class AgentLimits:
             raise ValueError("max_tool_calls cannot be negative")
         if self.max_tool_output_chars < 500:
             raise ValueError("max_tool_output_chars must be at least 500")
+        if self.max_children < 0:
+            raise ValueError("max_children cannot be negative")
+        if self.max_fork_depth not in (0, 1, 2):
+            raise ValueError("max_fork_depth must be 0, 1, or 2")
+        if self.max_total_threads < 1:
+            raise ValueError("max_total_threads must be at least 1")
+        if self.max_total_tool_calls < 0:
+            raise ValueError("max_total_tool_calls cannot be negative")
+        if self.max_elapsed_seconds <= 0:
+            raise ValueError("max_elapsed_seconds must be positive")
+        if self.max_total_tokens < 0:
+            raise ValueError("max_total_tokens cannot be negative")
+        if self.max_retries_per_action < 0:
+            raise ValueError("max_retries_per_action cannot be negative")
+        if self.max_total_retries < 0:
+            raise ValueError("max_total_retries cannot be negative")
+
+
+@dataclass(frozen=True)
+class ForkCandidate:
+    """A scoped child task proposal emitted by the same Research Agent loop."""
+
+    objective: str
+    expected_output: str
+    context: dict[str, Any] = field(default_factory=dict)
+    reasons: tuple[ForkReason, ...] = ()
+    estimated_tool_calls: int = 0
+    independent: bool = True
 
 
 @dataclass(frozen=True)
@@ -106,6 +150,9 @@ class ResearchResult:
     stop_reason: str | None = None
     iterations: int = 0
     tool_calls_used: int = 0
+    thread_count: int = 1
+    estimated_tokens_used: int = 0
+    retries_used: int = 0
 
 
 @dataclass(frozen=True)
@@ -132,7 +179,7 @@ class MemoryManifest:
 
 @dataclass(frozen=True)
 class ResearchWorkflowResult:
-    """Final output of the N2 root workflow."""
+    """Final output of the root research workflow."""
 
     brief: ResearchBrief
     research_result: ResearchResult

@@ -25,6 +25,8 @@
 
 - [N1_HOMOGENEOUS_AGENT_GRAPH.md](N1_HOMOGENEOUS_AGENT_GRAPH.md)：单个同质 Research AgentGraph 的实现与验收结果。
 - [N2_CONFIRMATION_AND_MEMORY.md](N2_CONFIRMATION_AND_MEMORY.md)：用户确认、单 Agent 闭环与 Markdown Memory Store 的实现与验收结果。
+- [N3_HOMOGENEOUS_PARALLEL_FORK.md](N3_HOMOGENEOUS_PARALLEL_FORK.md)：一级同质并行 fork、上下文隔离与部分失败汇聚的实现与验收结果。
+- [N4_RECURSION_LIMITS_AND_RECOVERY.md](N4_RECURSION_LIMITS_AND_RECOVERY.md)：一层递归、全局硬限制、取消与多线程 checkpoint 恢复的实现与验收结果。
 
 ## 已清理文档
 
