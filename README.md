@@ -72,7 +72,7 @@ memory/
 
 ## 当前仓库状态
 
-仓库仍包含原 Deep Research 架构的 Orchestrator、Planner DAG、AgentPool、Summarizer、Evidence Store 和 Evidence Graph 等代码。它们是迁移来源，不是目标架构。
+N0–N5 已完成。CLI、Web 和评测统一通过 `src/research/runtime.py` 进入同一个 Research Workflow；旧 Orchestrator、Planner DAG、AgentPool、独立 Summarizer、Evidence Store/Graph 和旧实验体系已经退出代码库。
 
 目前已经具备：
 
@@ -84,9 +84,9 @@ memory/
 - N2 根工作流：研究说明、用户反复修改/确认、checkpoint 恢复、最终 Markdown 报告和单一 Memory Store；
 - N3 一级同质并行 fork：三种触发条件、依赖和预算门槛、父子上下文/实例/身份隔离、并行汇聚与部分失败保留；
 - N4 有界递归：根→子→孙、祖先去重、总线程/工具/时间/token/重试限制、共享 saver 下的取消与恢复；
-- CLI、Web、评测以及旧研究链路。
+- N5 生产入口：CLI/Web 用户确认与恢复、SSE 事件回放、结构化评测结果和静态架构守卫。
 
-N4 已通过 `17` 项专项测试，N1–N4 联合专项 `48 passed`，全量回归 `236 passed`。下一步 N5 会切换 CLI/Web/评测入口并删除 legacy，开始前必须先确认迁移与删除清单。
+N5 完成后的全量回归为 `119 passed`。下一步仅进入可选 N6 Red/Blue，不提前恢复或扩展旧架构。
 
 ## 快速开始
 
@@ -121,6 +121,8 @@ python web/run.py
 python scripts/run_single.py --query "分析 AI Agent Memory 的演进、评测方法与关键证据"
 ```
 
+自动化场景可以显式增加 `--yes`；默认流程一定先展示研究说明并等待确认。
+
 ### 交互式研究
 
 ```bash
@@ -133,16 +135,14 @@ python scripts/run_repl.py
 pytest -q
 ```
 
-以上入口目前仍可能运行旧研究链路；切换到新 Workflow 属于实施计划 N5。
-
 ## 仓库结构
 
 ```text
 deepresearch-agent/
 ├── configs/       # 当前模型、工具和运行配置
 ├── docs/          # 现行设计、实施计划、路线图和历史记录
-├── src/           # 当前实现与后续新 Research AgentGraph
-├── web/           # 当前 Web 入口
+├── src/research/  # 唯一 Research Workflow、同质 AgentGraph 与 Markdown Memory
+├── web/           # 新 Workflow 的本地 Web 入口
 ├── evaluation/    # 评测
 ├── scripts/       # CLI 与维护脚本
 └── tests/         # 自动化测试
@@ -158,6 +158,7 @@ deepresearch-agent/
 - [N2 实施记录](docs/N2_CONFIRMATION_AND_MEMORY.md)
 - [N3 实施记录](docs/N3_HOMOGENEOUS_PARALLEL_FORK.md)
 - [N4 实施记录](docs/N4_RECURSION_LIMITS_AND_RECOVERY.md)
+- [N5 实施记录](docs/N5_ENTRY_MIGRATION_AND_LEGACY_CLEANUP.md)
 
 ## 明确不做
 

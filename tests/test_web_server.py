@@ -1,387 +1,209 @@
-"""Web 服务器 API 测试（TestClient，不真调 LLM）。"""
-
+"""Offline Web acceptance tests for the N5 Research Workflow migration."""
 from __future__ import annotations
 
-import sys
+import json
+import time
 from pathlib import Path
+from typing import Any
 
 import pytest
 from fastapi.testclient import TestClient
-
-PROJECT_ROOT = Path(__file__).resolve().parent.parent
-if str(PROJECT_ROOT) not in sys.path:
-    sys.path.insert(0, str(PROJECT_ROOT))
+from langgraph.checkpoint.memory import InMemorySaver
 
 import web.server as server
+from src.research.memory import MarkdownMemoryStore
+from src.research.runtime import build_research_runtime
+
+
+class FixedTool:
+    name = "web_search"
+
+    def __init__(self) -> None:
+        self.calls: list[dict[str, Any]] = []
+
+    def get_openai_tool_schema(self) -> dict[str, Any]:
+        return {"type": "function", "function": {
+            "name": self.name, "description": "fixed search",
+            "parameters": {"type": "object", "properties": {}},
+        }}
+
+    async def execute(self, **kwargs) -> dict[str, Any]:
+        self.calls.append(kwargs)
+        return {"results": [{
+            "title": "Fixed source", "url": "https://example.test/source",
+            "snippet": "A source-locatable fixed finding.",
+        }]}
+
+
+class FixedPolicy:
+    def __init__(self) -> None:
+        self.alignment_calls = 0
+        self.research_calls = 0
+
+    def __call__(self, messages, *, tools=None):
+        system = str(messages[0].get("content", ""))
+        if "before research begins" in system:
+            self.alignment_calls += 1
+            revision = max(0, self.alignment_calls - 1)
+            return {"content": json.dumps({
+                "objective": f"Fixed objective revision {revision}",
+                "scope": ["fixed scope"],
+                "directions": ["fixed direction"],
+                "constraints": ["cite locations"],
+                "expected_output": "Evidence-backed Markdown report",
+            }), "tool_calls": []}
+        self.research_calls += 1
+        if messages[-1]["role"] == "tool":
+            return {"content": json.dumps({
+                "status": "completed", "summary": "Fixed summary.",
+                "findings": ["A source-locatable fixed finding."],
+                "unresolved": [],
+            }), "tool_calls": []}
+        return {"content": "", "tool_calls": [{
+            "id": "call-search", "type": "function",
+            "function": {"name": "web_search", "arguments": "{}"},
+        }]}
 
 
 @pytest.fixture()
-def client(tmp_path, monkeypatch) -> TestClient:
-    # 指向临时数据库，避免触碰真实 data/memory.db
-    db = str(tmp_path / "test.db")
-    monkeypatch.setattr(server, "DB_PATH", db)
-    server.get_chat_store._store = None  # 重置 ChatStore 缓存，指向新 db
-    return TestClient(server.app)
+def web_client(tmp_path, monkeypatch):
+    policy, tool = FixedPolicy(), FixedTool()
+    runtime = build_research_runtime(
+        config={}, policy=policy, tools=[tool],
+        memory_store=MarkdownMemoryStore(tmp_path / "memory"),
+        checkpointer=InMemorySaver(),
+    )
+    monkeypatch.setattr(server, "CHAT_DB_PATH", str(tmp_path / "chat.db"))
+    server.get_chat_store._store = None
+    server.get_research_runtime._runtime = runtime
+    server._TASKS.clear()
+    with TestClient(server.app) as client:
+        yield client, runtime, policy, tool
+    server._TASKS.clear()
+    server.get_chat_store._store = None
+    server.get_research_runtime._runtime = None
 
 
-def test_index_serves_html(client):
-    r = client.get("/")
-    assert r.status_code == 200
-    assert "PaperPilot" in r.text
-    assert "证据" in r.text
+def _wait_result(client: TestClient, task_id: str) -> dict[str, Any]:
+    for _ in range(100):
+        response = client.get(f"/api/tasks/{task_id}/result")
+        if response.status_code == 200:
+            return response.json()
+        time.sleep(0.02)
+    raise AssertionError("research task did not finish")
 
 
-def test_list_sessions_returns_list(client):
-    r = client.get("/api/sessions")
-    assert r.status_code == 200
-    assert isinstance(r.json(), list)
+def test_first_request_pauses_without_research_tools(web_client):
+    client, runtime, policy, tool = web_client
+    response = client.post("/api/alignment", json={"message": "Research fixed topic"})
+    assert response.status_code == 200
+    data = response.json()
+    assert data["status"] == "waiting_confirmation"
+    assert data["task_id"] == data["thread_id"]
+    assert data["brief"]["revision"] == 0
+    assert policy.research_calls == 0
+    assert tool.calls == []
+    task = server._TASKS[data["task_id"]]
+    assert task.status == "waiting_confirmation"
 
 
-def test_start_research_returns_ids(client, monkeypatch):
-    # 不真跑研究：替换后台任务为 no-op
-    async def fake_run(task):
-        task.status = "done"
-        task.result = {"report_md": "# done"}
+def test_modify_and_confirm_resume_same_root_thread(web_client):
+    client, runtime, policy, tool = web_client
+    first = client.post("/api/alignment", json={"session_id": "s1", "message": "Question"}).json()
+    revised = client.post("/api/alignment", json={
+        "session_id": "s1", "task_id": first["task_id"],
+        "message": "Narrow the scope",
+    }).json()
+    assert revised["task_id"] == first["task_id"]
+    assert revised["thread_id"] == first["thread_id"]
+    assert revised["brief"]["revision"] == 1
+    assert tool.calls == []
 
-    monkeypatch.setattr(server, "_run_research_task", fake_run)
-
-    r = client.post("/api/research", json={"query": "test question"})
-    assert r.status_code == 200
-    data = r.json()
-    assert data["status"] == "running"
-    assert data["task_id"]
-    assert data["session_id"].startswith("web-")
-
-
-def test_start_research_empty_query_rejected(client):
-    r = client.post("/api/research", json={"query": "   "})
-    assert r.status_code == 400
-
-
-def test_start_research_reuses_session(client, monkeypatch):
-    async def fake_run(task):
-        task.status = "done"
-        task.result = {}
-
-    monkeypatch.setattr(server, "_run_research_task", fake_run)
-    r = client.post("/api/research", json={"query": "q", "session_id": "my-session"})
-    assert r.status_code == 200
-    assert r.json()["session_id"] == "my-session"
+    started = client.post("/api/research", json={
+        "task_id": first["task_id"], "session_id": "s1",
+    })
+    assert started.status_code == 200
+    result = _wait_result(client, first["task_id"])
+    assert result["transport_status"] == "done"
+    assert result["thread_id"] == first["thread_id"]
+    assert result["research_status"] == "completed"
+    assert len(tool.calls) == 1
 
 
-def test_task_result_done(client):
-    from web.server import ResearchTask
+@pytest.mark.asyncio
+async def test_event_buffer_deduplicates_cumulative_events_and_replays_by_cursor():
+    task = server.ResearchTask("root-events", "session-events", "q")
+    event = {
+        "kind": "agent_started", "thread_id": "root-events",
+        "parent_thread_id": None, "root_thread_id": "root-events", "depth": 0,
+    }
+    await task.publish_execution_events([event])
+    await task.publish_execution_events([event])
+    second = {**event, "kind": "agent_finished", "status": "completed"}
+    await task.publish_execution_events([event, second])
+    assert [item["type"] for item in task.events] == ["agent_started", "agent_finished"]
+    assert [item["sequence"] for item in task.events] == [1, 2]
+    assert (await task.wait_after(1)) == [task.events[1]]
+    assert all(item["root_thread_id"] == "root-events" for item in task.events)
 
-    task = ResearchTask("t123", "s1", "q")
+
+def test_sse_cursor_replays_only_unseen_events(web_client):
+    client, *_ = web_client
+    task = server.ResearchTask("root-replay", "s", "q")
     task.status = "done"
-    task.result = {"session_id": "s1", "report_md": "# report", "evidence": []}
-    server._TASKS["t123"] = task
-
-    r = client.get("/api/tasks/t123/result")
-    assert r.status_code == 200
-    data = r.json()
-    assert data["status"] == "done"
-    assert data["report_md"] == "# report"
-
-
-def test_task_result_not_found(client):
-    r = client.get("/api/tasks/nonexistent/result")
-    assert r.status_code == 404
-
-
-def test_session_graph_not_found(client):
-    r = client.get("/api/sessions/no-such-session/graph")
-    assert r.status_code == 404
-
-
-# ---------------------------------------------------------------------------
-# 澄清 / 会话消息 / 报告落盘
-# ---------------------------------------------------------------------------
-
-def _stub_policy(json_str: str):
-    class P:
-        def __call__(self, messages):
-            return {"content": json_str}
-    return P()
-
-
-def test_clarify_confirm_writes_proposal(client, monkeypatch):
-    monkeypatch.setattr(
-        server, "_get_clarifier_policy",
-        lambda: _stub_policy(
-            '{"action":"confirm","plan":{"topic":"T","scope":"S","angle":"A",'
-            '"depth":"D","focus_areas":["x","y"]},"research_query":"final query"}'
-        ),
-    )
-    r = client.post("/api/clarify", json={"message": "研究transformer"})
-    assert r.status_code == 200
-    data = r.json()
-    assert data["action"] == "confirm"
-    assert data["session_id"].startswith("web-")
-    assert data["research_query"] == "final query"
-    assert data["plan"]["focus_areas"] == ["x", "y"]
-
-    msgs = client.get(f"/api/sessions/{data['session_id']}/messages").json()
-    assert [m["kind"] for m in msgs] == ["chat", "proposal"]
-    assert msgs[0]["role"] == "user"
-    assert msgs[1]["role"] == "assistant"
-
-
-def test_clarify_ask_stores_question(client, monkeypatch):
-    monkeypatch.setattr(
-        server, "_get_clarifier_policy",
-        lambda: _stub_policy('{"action":"ask","question":"想侧重哪个阶段？"}'),
-    )
-    r = client.post("/api/clarify", json={"session_id": "s1", "message": "研究transformer"})
-    assert r.status_code == 200
-    assert r.json()["action"] == "ask"
-    msgs = client.get("/api/sessions/s1/messages").json()
-    assert msgs[-1]["role"] == "assistant"
-    assert "阶段" in msgs[-1]["content"]
-
-
-def test_sessions_list_uses_chat_title(client):
-    r = client.post("/api/clarify", json={"message": "这是第一条会话消息"})
-    sid = r.json()["session_id"]
-    sessions = client.get("/api/sessions").json()
-    titles = {s["session_id"]: s.get("title", "") for s in sessions}
-    assert sid in titles
-    assert titles[sid].startswith("这是第一条会话消息")
-
-
-def test_session_evidence_endpoint_empty_ok(client):
-    r = client.get("/api/sessions/nonexistent/evidence")
-    assert r.status_code == 200
-    data = r.json()
-    assert data["evidence"] == []
-    assert data["evidence_relations"] == []
-
-
-def test_research_persists_report_to_chat(tmp_path, monkeypatch):
-    """研究完成后报告落盘，并在 done 之前完成 best-effort Vault 导出。"""
-    import asyncio
-
-    from web.server import ResearchTask
-
-    monkeypatch.setattr(server, "DB_PATH", str(tmp_path / "t.db"))
-    server.get_chat_store._store = None
-
-    async def fake_run_research(query, config, modules, progress_callback=None):
-        return "# 报告正文\n\n" + "证据内容 " * 80  # 超过 300 字符阈值，视为正常报告
-
-    def fake_initialize(config, session_id=""):
-        return {}  # initialize_modules 是同步函数
-
-    monkeypatch.setattr("src.core.runner.run_research", fake_run_research)
-    monkeypatch.setattr("src.core.runner.initialize_modules", fake_initialize)
-
-    exported = []
-
-    def fake_export(session_id):
-        exported.append(session_id)
-        return str(tmp_path / "obsidian" / session_id)
-
-    monkeypatch.setattr(server, "_export_session_vault", fake_export)
-
-    task = ResearchTask("tid", "sess-x", "q")
-    asyncio.run(server._run_research_task(task))
-    assert task.status == "done"
-    assert exported == ["sess-x"]
-    assert task.result["vault_path"].endswith("sess-x")
-    msgs = server.get_chat_store().get_messages("sess-x")
-    assert msgs[-1]["kind"] == "report"
-    assert "报告正文" in msgs[-1]["content"]
-
-
-def test_research_succeeds_when_auto_export_fails(tmp_path, monkeypatch):
-    """自动导出是 best-effort，异常不得把成功研究改成 error。"""
-    import asyncio
-
-    from web.server import ResearchTask
-
-    monkeypatch.setattr(server, "DB_PATH", str(tmp_path / "t.db"))
-    server.get_chat_store._store = None
-
-    async def fake_run_research(query, config, modules, progress_callback=None):
-        return "# 报告正文\n\n" + "证据内容 " * 80
-
-    monkeypatch.setattr("src.core.runner.run_research", fake_run_research)
-    monkeypatch.setattr("src.core.runner.initialize_modules", lambda config, session_id="": {})
-
-    def broken_export(session_id):
-        raise OSError("disk unavailable")
-
-    monkeypatch.setattr(server, "_export_session_vault", broken_export)
-
-    task = ResearchTask("tid", "sess-export-fail", "q")
-    asyncio.run(server._run_research_task(task))
-
-    assert task.status == "done"
-    assert task.error is None
-    assert "vault_path" not in task.result
-    msgs = server.get_chat_store().get_messages("sess-export-fail")
-    assert msgs[-1]["kind"] == "report"
-
-
-# ---------------------------------------------------------------------------
-# 会话管理：重命名 / 置顶 / 排序 / 删除
-# ---------------------------------------------------------------------------
-
-def test_session_rename(client, monkeypatch):
-    monkeypatch.setattr(server, "_get_clarifier_policy",
-                        lambda: _stub_policy('{"action":"ask","question":"q?"}'))
-    client.post("/api/clarify", json={"session_id": "s1", "message": "hi"})
-    r = client.patch("/api/sessions/s1", json={"title": "新名字"})
-    assert r.status_code == 200
-    assert r.json()["title"] == "新名字"
-    sessions = client.get("/api/sessions").json()
-    titles = {s["session_id"]: s.get("title", "") for s in sessions}
-    assert titles["s1"] == "新名字"
-
-
-def test_session_rename_empty_rejected(client):
-    r = client.patch("/api/sessions/s1", json={"title": "   "})
-    assert r.status_code == 400
-
-
-def test_session_pin_toggle(client, monkeypatch):
-    monkeypatch.setattr(server, "_get_clarifier_policy",
-                        lambda: _stub_policy('{"action":"ask","question":"q?"}'))
-    client.post("/api/clarify", json={"session_id": "s1", "message": "hi"})
-    r = client.post("/api/sessions/s1/pin", json={"pinned": True})
-    assert r.json()["pinned"] is True
-    sessions = client.get("/api/sessions").json()
-    s1 = next(s for s in sessions if s["session_id"] == "s1")
-    assert s1["pinned"] is True
-    assert sessions[0]["session_id"] == "s1"  # 置顶排最前
-    client.post("/api/sessions/s1/pin", json={"pinned": False})
-    sessions = client.get("/api/sessions").json()
-    assert next(s for s in sessions if s["session_id"] == "s1")["pinned"] is False
-
-
-def test_session_order(client, monkeypatch):
-    monkeypatch.setattr(server, "_get_clarifier_policy",
-                        lambda: _stub_policy('{"action":"ask","question":"q?"}'))
-    for sid in ("a", "b", "c"):
-        client.post("/api/clarify", json={"session_id": sid, "message": f"m{sid}"})
-    r = client.post("/api/sessions/order", json={"session_ids": ["c", "a", "b"]})
-    assert r.status_code == 200
-    sessions = client.get("/api/sessions").json()
-    assert [s["session_id"] for s in sessions[:3]] == ["c", "a", "b"]
-
-
-def test_session_delete_full_cleanup(client, monkeypatch):
-    """DELETE 全量清理：chat + evidence + edges + entries + conflicts + meta。"""
-    import sqlite3
-
-    from src.evidence.graph import EvidenceGraph
-    from src.evidence.store import EvidenceStore
-    from src.memory.memory_store import SharedMemoryStore
-
-    monkeypatch.setattr(server, "_get_clarifier_policy",
-                        lambda: _stub_policy('{"action":"ask","question":"q?"}'))
-    client.post("/api/clarify", json={"session_id": "del-s", "message": "研究问题"})
-    client.patch("/api/sessions/del-s", json={"title": "待删"})
-    # 先实例化各 store 建表，再直接构造证据/记忆/冲突数据
-    EvidenceStore(db_path=server.DB_PATH)
-    EvidenceGraph(db_path=server.DB_PATH)
-    SharedMemoryStore(db_path=server.DB_PATH)
-    conn = sqlite3.connect(server.DB_PATH)
-    conn.execute(
-        "INSERT INTO evidence (session_id, evidence_id, query, paper_id, paper_title, "
-        "source_url, claim, evidence_text, confidence, topic, embedding_json) "
-        "VALUES ('del-s','E-1','q','p','t','','c','e',0.9,'q','[]')"
-    )
-    conn.execute(
-        "INSERT INTO evidence_edges (session_id, source_id, target_id, relation, weight, "
-        "source_claim, target_claim, source_paper, target_paper, created_at) "
-        "VALUES ('del-s','E-1','p','SOURCED_FROM',1.0,'c','','t','',1.0)"
-    )
-    conn.execute(
-        "INSERT INTO entries (entry_id, claim, source, confidence, agent_id, timestamp, "
-        "evidence_type, embedding_json, topic, metadata_json, session_id) "
-        "VALUES ('en1','c','s',0.9,'a',1.0,'','[]','','{}','del-s')"
-    )
-    conn.execute(
-        "INSERT INTO conflicts (conflict_id, entry_id_1, entry_id_2, claim_1, claim_2, "
-        "similarity, status, resolution, detected_at) "
-        "VALUES ('cf1','en1','en2','a','b',0.8,'open','',1.0)"
-    )
-    conn.commit()
-    conn.close()
-
-    r = client.delete("/api/sessions/del-s")
-    assert r.status_code == 200
-    deleted = r.json()["deleted"]
-    assert deleted["chat"] >= 1
-    assert deleted["evidence"] == 1
-    assert deleted["edges"] == 1
-    assert deleted["entries"] == 1
-    assert deleted["conflicts"] == 1
-
-    conn = sqlite3.connect(server.DB_PATH)
-    for table in ("evidence", "evidence_edges", "entries", "chat_messages", "session_meta"):
-        n = conn.execute(f"SELECT COUNT(*) FROM {table} WHERE session_id='del-s'").fetchone()[0]
-        assert n == 0, f"{table} 未清空"
-    n = conn.execute("SELECT COUNT(*) FROM conflicts WHERE conflict_id='cf1'").fetchone()[0]
-    assert n == 0
-    conn.close()
-
-
-# ---------------------------------------------------------------------------
-# Obsidian 导出 + 证据图富化
-# ---------------------------------------------------------------------------
-
-def test_export_obsidian_endpoint(client, monkeypatch, tmp_path):
-    """手动导出端点：返回 vault 路径且文件生成。"""
-    from pathlib import Path
-
-    from src.evidence.schemas import Evidence
-    from src.evidence.store import EvidenceStore
-
-    monkeypatch.setattr(server, "PROJECT_ROOT", tmp_path)  # 导出落到 tmp，不污染真实 outputs
-
-    # 种子：报告消息 + 证据
-    server.get_chat_store().add("sid1", "assistant", server.KIND_REPORT, "# 报告 [E-1]")
-    store = EvidenceStore(db_path=server.DB_PATH, session_id="sid1")
-    store.put(Evidence(
-        evidence_id="", query="q", paper_id="p1", paper_title="Paper", source_url="u",
-        claim="attention works", evidence_text="quote text", confidence=0.9, topic="t",
-        session_id="sid1", embedding=[0.1] * 384,
-    ))
-
-    r = client.post("/api/sessions/sid1/export-obsidian")
-    assert r.status_code == 200
-    data = r.json()
-    assert data["session_id"] == "sid1"
-    assert data["obsidian_uri"].startswith("obsidian://open?path=")
-    vault = Path(data["vault_path"])
-    assert vault.exists()
-    assert (vault / "00-研究报告.md").exists()
-    assert (vault / "E-1.md").exists()
-    assert "[[E-1|E-1]]" in (vault / "00-研究报告.md").read_text(encoding="utf-8")
-
-
-def test_export_obsidian_no_report_404(client):
-    r = client.post("/api/sessions/nonexistent/export-obsidian")
-    assert r.status_code == 404
-
-
-def test_session_graph_enriched(client):
-    """证据节点富化：claim / evidence_text / label=claim 前 10 字。"""
-    from src.evidence.schemas import Evidence
-    from src.evidence.store import EvidenceStore
-
-    store = EvidenceStore(db_path=server.DB_PATH, session_id="g1")
-    store.put(Evidence(
-        evidence_id="", query="q", paper_id="p1", paper_title="Paper", source_url="u",
-        claim="attention is key to transformers", evidence_text="verbatim quote",
-        confidence=0.9, topic="t", session_id="g1", embedding=[0.1] * 384,
-    ))
-    r = client.get("/api/sessions/g1/graph")
-    assert r.status_code == 200
-    ev_nodes = [n for n in r.json()["nodes"] if n.get("type") == "evidence"]
-    assert len(ev_nodes) == 1
-    assert ev_nodes[0]["claim"] == "attention is key to transformers"
-    assert ev_nodes[0]["evidence_text"] == "verbatim quote"
-    assert ev_nodes[0]["label"] == "attention "  # claim 前 10 个字符（含空格）
+    task.events = [
+        {"type": "agent_started", "sequence": 1},
+        {"type": "done", "sequence": 2},
+    ]
+    server._TASKS[task.task_id] = task
+    response = client.get(f"/api/tasks/{task.task_id}/events?cursor=1")
+    assert response.status_code == 200
+    assert '"sequence": 1' not in response.text
+    assert '"sequence": 2' in response.text
+
+
+def test_two_sessions_keep_threads_isolated(web_client):
+    client, runtime, *_ = web_client
+    alpha = client.post("/api/alignment", json={"session_id": "alpha", "message": "A"}).json()
+    beta = client.post("/api/alignment", json={"session_id": "beta", "message": "B"}).json()
+    assert alpha["thread_id"] != beta["thread_id"]
+    assert server._TASKS[alpha["task_id"]].session_id == "alpha"
+    assert server._TASKS[beta["task_id"]].session_id == "beta"
+
+
+def test_chat_stores_manifest_pointer_and_history_reads_markdown(web_client):
+    client, runtime, *_ = web_client
+    paused = client.post("/api/alignment", json={"session_id": "history", "message": "Q"}).json()
+    client.post("/api/research", json={"task_id": paused["task_id"], "session_id": "history"})
+    result = _wait_result(client, paused["task_id"])
+
+    raw = server.get_chat_store().get_messages("history")[-1]
+    pointer = json.loads(raw["content"])
+    assert raw["kind"] == "report"
+    assert pointer["manifest"]["report_path"] == result["manifest"]["report_path"]
+    assert "Fixed summary" not in raw["content"]
+
+    expanded = client.get("/api/sessions/history/messages").json()[-1]
+    assert "Fixed summary" in expanded["content"]
+    evidence = client.get("/api/sessions/history/evidence").json()["evidence"]
+    assert evidence and "Fixed source" in evidence[0]["markdown"]
+
+
+def test_session_delete_only_removes_chat_not_shared_memory(web_client):
+    client, runtime, *_ = web_client
+    server.get_chat_store().add("delete-me", "user", "chat", "hello")
+    response = client.delete("/api/sessions/delete-me")
+    assert response.status_code == 200
+    assert response.json()["deleted"] == {"chat": 1}
+
+
+def test_server_has_no_legacy_research_imports_or_graph_routes():
+    source = Path(server.__file__).read_text(encoding="utf-8")
+    for forbidden in (
+        "src.core.runner", "SharedMemoryStore", "EvidenceStore", "EvidenceGraph",
+        "web.clarifier", "export_session_vault",
+    ):
+        assert forbidden not in source
+    paths = {route.path for route in server.app.routes}
+    assert "/api/sessions/{sid}/graph" not in paths
+    assert "/api/sessions/{sid}/export-obsidian" not in paths

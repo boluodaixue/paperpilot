@@ -4,6 +4,35 @@ from unittest.mock import patch
 
 from evaluation.benchmarks.hotpotqa import HotpotQABenchmark
 from scripts.run_eval import evaluate_hotpotqa
+from src.research.models import (
+    MemoryManifest,
+    ResearchBrief,
+    ResearchResult,
+    ResearchStatus,
+    ResearchWorkflowResult,
+)
+
+
+class _Runtime:
+    def __init__(self, report: str) -> None:
+        self.report = report
+
+    @staticmethod
+    def new_thread_id() -> str:
+        return "eval-root"
+
+    async def run_auto_confirmed(self, query: str, *, thread_id: str) -> ResearchWorkflowResult:
+        brief = ResearchBrief(query, query, (), (), (), "report")
+        result = ResearchResult("task", ResearchStatus.COMPLETED, "done")
+        return ResearchWorkflowResult(
+            brief,
+            result,
+            self.report,
+            MemoryManifest("reports/eval-root.md"),
+        )
+
+    async def close(self) -> None:
+        return None
 
 
 def test_extracts_chinese_answer_field_after_title() -> None:
@@ -70,8 +99,7 @@ def test_evaluate_hotpotqa_uses_extractor_and_keeps_full_report() -> None:
 
     with (
         patch("scripts.run_eval.HotpotQABenchmark.get_samples", return_value=[sample]),
-        patch("scripts.run_eval.initialize_modules", return_value={}),
-        patch("scripts.run_eval.run_research", return_value=full_report),
+        patch("scripts.run_eval.build_research_runtime", return_value=_Runtime(full_report)),
         patch.object(HotpotQABenchmark, "extract_short_answer", wraps=HotpotQABenchmark.extract_short_answer) as extractor,
         patch.object(HotpotQABenchmark, "evaluate_report", return_value={"gold_entity_coverage": 1.0, "semantic_gold_coverage": 1.0, "report_length": len(full_report)}),
     ):

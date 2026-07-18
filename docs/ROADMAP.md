@@ -4,9 +4,7 @@
 
 ## 当前判断
 
-仓库已有可运行的旧 Deep Research 链路，也已完成新的单个同质 Research AgentGraph。旧 CLI/Web 主链路仍建立在 Manager / Planner / DAG / AgentPool / Evidence Graph 架构上，不能视为整体迁移已经完成。
-
-可选择迁移的基础能力包括工具、模型适配、tracing、checkpointer 和线程身份。是否复用由新接口决定。
+N0–N5 已完成。CLI、Web 和评测统一进入同一个 Research Workflow；旧 Manager / Planner / DAG / AgentPool / Evidence Graph 链路已经删除。当前主线只保留同质 Research AgentGraph、工具、模型适配、tracing、checkpointer、Markdown Memory 与 UI 会话投影。
 
 ## 进度
 
@@ -17,7 +15,7 @@
 | N2 用户确认与单 Agent 纵向闭环 | ✅ | 可修改、确认、恢复，并写出互链 Markdown |
 | N3 同质并行 Fork | ✅ | 三种 fork 条件、上下文隔离、并行汇聚和部分失败可用 |
 | N4 一层递归与硬停止 | ✅ | 根→子→孙可运行，孙不可再 fork，限制与恢复可靠 |
-| N5 入口迁移与旧实现清理 | 🔄 待对齐 | CLI/Web 只走新路径，旧架构及证据图退出代码库 |
+| N5 入口迁移与旧实现清理 | ✅ | CLI/Web/评测只走新路径，旧架构及证据图退出代码库 |
 | N6 可选 Red/Blue | ⬜ | 报告可选审查且不破坏证据链接 |
 | Future LLM Wiki | ⬜ | 基于同一 Memory Store 的问答、导入和整理 |
 
@@ -81,14 +79,19 @@ N2 专项 `8 passed`，N1+N2 联合专项 `21 passed`，全量回归 `209 passed
 
 详见 [N4 实施记录](N4_RECURSION_LIMITS_AND_RECOVERY.md)。
 
-## 下一阶段：N5（需先对齐清单）
+## N5 已完成
 
-- 切换 CLI、Web 和评测默认入口；
-- 把 N4 运行事件接入新入口的必要进度输出；
-- 比较新旧固定输入，确认能力覆盖；
-- 在确认的清单内删除旧 Orchestrator、Planner DAG、AgentPool、Summarizer、Evidence Store/Graph 及孤立配置。
+- CLI、Web 和评测默认入口已切换到共享 `ResearchRuntime`；
+- Web 使用同一 thread 完成说明修改、确认和研究，SSE 支持同进程游标回放；
+- 固定离线输入完成 N4 legacy 与 N5 Workflow 对照，新路径增加可定位 evidence 与 WikiLink；
+- 旧 Orchestrator、Planner DAG、AgentPool、独立 Summarizer、Evidence Store/Graph、Evolution、旧 Red/Blue 和孤立配置已删除；
+- N5 完成后全量回归 `119 passed`。
 
-N5 会实际修改和删除主线外 legacy 模块，开始前需先与用户确认迁移/删除清单。
+详见 [N5 实施记录](N5_ENTRY_MIGRATION_AND_LEGACY_CLEANUP.md)。
+
+## 下一阶段：N6（可选 Red/Blue）
+
+只在最终 Markdown 报告之上增加可关闭的审查与修订，不改变 Research AgentGraph、fork policy、Memory Store 或线程模型。N6 尚未开始。
 
 ## 历史基础
 

@@ -3,9 +3,8 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>PaperPilot — 证据中心深度研究</title>
+<title>PaperPilot — 递归深度研究</title>
 <script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
-<script src="https://unpkg.com/vis-network/standalone/umd/vis-network.min.js"></script>
 <style>
   * { box-sizing: border-box; margin: 0; padding: 0; }
   body { font-family: "Microsoft YaHei", "PingFang SC", sans-serif; background: #f5f6fa; color: #222; }
@@ -91,14 +90,7 @@
   table.data th { background: #f9fafb; font-weight: 600; }
   .cite-ok { color: #059669; font-weight: 600; }
   .cite-no { color: #b45309; }
-  .rel-card { border: 1px solid #e5e7eb; border-radius: 8px; padding: 9px 12px; margin: 6px 0; font-size: 12px; }
-  .rel-tag { display: inline-block; padding: 2px 8px; border-radius: 10px; font-size: 11px; font-weight: 700; margin-right: 8px; }
-  .rel-CONTRADICTS { background: #fde8e8; color: #c53030; }
-  .rel-SUPPORTS { background: #e6f7ec; color: #1a7f37; }
-  .rel-EXTENDS { background: #fef3e2; color: #b45309; }
-  #graphBox { width: 100%; height: 480px; border: 1px solid #e5e7eb; border-radius: 8px; }
-  .rc-graph { width: 100%; height: 480px; border: 1px solid #e5e7eb; border-radius: 8px; }
-  .vis-tooltip { max-width: 520px !important; white-space: pre-wrap !important; line-height: 1.5; }
+  .evidence-note { border: 1px solid #e5e7eb; border-radius: 8px; padding: 10px 12px; margin: 8px 0; }
   .empty { color: #9ca3af; text-align: center; padding: 34px 0; font-size: 13px; }
 
   /* ---------- 输入栏 ---------- */
@@ -112,7 +104,7 @@
 <div class="app">
   <!-- 侧边栏 -->
   <aside id="sidebar">
-    <div class="brand">PaperPilot<small>证据中心深度研究</small></div>
+    <div class="brand">PaperPilot<small>同质 Agent 递归深度研究</small></div>
     <button id="newSessionBtn">＋ 新建会话</button>
     <div id="sessionList"></div>
   </aside>
@@ -126,21 +118,20 @@
     <div id="proposalCard" style="display:none">
       <div class="head">📋 研究方案确认</div>
       <div class="body">
-        <label>研究课题</label><textarea id="p_topic" rows="1"></textarea>
-        <label>研究范围</label><textarea id="p_scope" rows="2"></textarea>
-        <label>切入角度</label><textarea id="p_angle" rows="1"></textarea>
-        <label>研究深度</label><textarea id="p_depth" rows="1"></textarea>
-        <label>关注点（逗号分隔）</label><textarea id="p_focus" rows="2"></textarea>
-        <label>最终研究查询（据此执行）</label><textarea id="p_query" rows="2"></textarea>
+        <label>研究目标</label><textarea id="p_objective" rows="2"></textarea>
+        <label>研究范围（每行一项）</label><textarea id="p_scope" rows="3"></textarea>
+        <label>研究方向（每行一项）</label><textarea id="p_directions" rows="3"></textarea>
+        <label>限制条件（每行一项）</label><textarea id="p_constraints" rows="2"></textarea>
+        <label>预期输出</label><textarea id="p_output" rows="2"></textarea>
       </div>
       <div class="actions">
-        <button class="btn btn-ghost" id="reClarifyBtn" onclick="reClarify()">重新澄清</button>
+        <button class="btn btn-ghost" id="reClarifyBtn" onclick="submitBriefChanges()">提交修改</button>
         <button class="btn btn-primary" id="startBtn" onclick="startResearch()">开始研究</button>
       </div>
     </div>
 
     <div id="inputBar">
-      <input type="text" id="msgInput" placeholder="输入研究问题，或回答澄清问题…" autocomplete="off">
+      <input type="text" id="msgInput" placeholder="输入研究问题，或说明如何修改研究方向…" autocomplete="off">
       <button class="btn btn-primary" id="sendBtn" onclick="sendMessage()">发送</button>
     </div>
   </main>
@@ -151,11 +142,11 @@
 // 全局状态
 // ------------------------------------------------------------------
 let currentSessionId = null;   // 当前会话
-let currentProposal = null;    // {plan, research_query} 待确认方案
+let currentProposal = null;    // {brief, task_id} 待确认说明
 let currentReportData = null;  // 当前报告数据
 let runningTask = null;        // {task_id, session_id} 正在运行的研究
 let eventSource = null;
-let network = null;
+const eventCursors = {};
 
 const $ = id => document.getElementById(id);
 
@@ -245,7 +236,7 @@ async function togglePin(sid, pinned) {
 }
 
 async function deleteSession(sid) {
-  if (!confirm('删除该会话将同时删除其证据/关系/记忆，不可恢复。确定删除？')) return;
+  if (!confirm('删除该会话的聊天记录？已写入 Memory Store 的共享研究笔记会保留。')) return;
   await fetch(`/api/sessions/${encodeURIComponent(sid)}`, { method: 'DELETE' });
   if (currentSessionId === sid) newSession();
   loadSessions();
@@ -302,13 +293,17 @@ async function selectSession(sid) {
     try {
       const tr = await fetch(`/api/sessions/${encodeURIComponent(sid)}/active-task`);
       const td = await tr.json();
-      if (td.task_id) { task = { task_id: td.task_id, session_id: sid }; runningTask = task; }
+      if (td.task_id) { task = { task_id: td.task_id, session_id: sid, status: td.status }; runningTask = task; }
     } catch (e) { /* 忽略 */ }
   }
-  if (task) {
-    // 研究中：重连 SSE 进度（服务器队列会回放已产生的事件）
+  if (task && task.status === 'running') {
     appendProgress({ type: 'state', state: '研究进行中（已恢复连接）' });
     openEventStream(task.task_id);
+    loadSessions();
+    return;
+  }
+  if (task && task.status === 'waiting_confirmation') {
+    showProposalFromHistory(msgs);
     loadSessions();
     return;
   }
@@ -343,14 +338,13 @@ function scrollToBottom() {
 }
 
 // ------------------------------------------------------------------
-// 发送消息 → 澄清
+// 发送消息 → 用户对齐
 // ------------------------------------------------------------------
 async function sendMessage() {
   const input = $('msgInput');
   const text = input.value.trim();
   if (!text || sendLock) return;
   input.value = '';
-  if (currentProposal) { currentProposal = null; $('proposalCard').style.display = 'none'; }
   appendBubble('user', text);
 
   const el = document.createElement('div');
@@ -359,21 +353,21 @@ async function sendMessage() {
 
   sendLock = true;
   try {
-    const r = await fetch('/api/clarify', {
+    const r = await fetch('/api/alignment', {
       method: 'POST', headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ session_id: currentSessionId, message: text }),
+      body: JSON.stringify({
+        session_id: currentSessionId,
+        task_id: currentProposal ? currentProposal.task_id : null,
+        message: text,
+      }),
     });
     const data = await r.json();
     el.remove();
-    if (!r.ok) { appendBubble('assistant', data.detail || '澄清失败'); return; }
+    if (!r.ok) { appendBubble('assistant', data.detail || '研究方向对齐失败'); return; }
 
     currentSessionId = data.session_id;
-    if (data.action === 'ask') {
-      appendBubble('assistant', data.question || '（请补充研究背景）');
-    } else {
-      currentProposal = { plan: data.plan || {}, research_query: data.research_query || '' };
-      showProposalCard(currentProposal);
-    }
+    currentProposal = { brief: data.brief || {}, task_id: data.task_id };
+    showProposalCard(currentProposal);
     $('chatHeaderSub').textContent = `会话 ${data.session_id}`;
     loadSessions();
   } catch (e) {
@@ -396,25 +390,23 @@ function showProposalCard(p) {
 }
 
 function setProposalFields(p) {
-  const plan = p.plan || {};
-  $('p_topic').value = plan.topic || '';
-  $('p_scope').value = plan.scope || '';
-  $('p_angle').value = plan.angle || '';
-  $('p_depth').value = plan.depth || '';
-  $('p_focus').value = (plan.focus_areas || []).join('，');
-  $('p_query').value = p.research_query || '';
+  const brief = p.brief || {};
+  $('p_objective').value = brief.objective || '';
+  $('p_scope').value = (brief.scope || []).join('\n');
+  $('p_directions').value = (brief.directions || []).join('\n');
+  $('p_constraints').value = (brief.constraints || []).join('\n');
+  $('p_output').value = brief.expected_output || '';
 }
 
-function readProposalFromForm() {
+function lines(id) { return $(id).value.split(/\n|，|,/).map(s=>s.trim()).filter(Boolean); }
+function readBriefFromForm() {
   return {
-    plan: {
-      topic: $('p_topic').value.trim(),
-      scope: $('p_scope').value.trim(),
-      angle: $('p_angle').value.trim(),
-      depth: $('p_depth').value.trim(),
-      focus_areas: $('p_focus').value.split(/[，,]/).map(s=>s.trim()).filter(Boolean),
-    },
-    research_query: $('p_query').value.trim(),
+    ...(currentProposal ? currentProposal.brief : {}),
+    objective: $('p_objective').value.trim(),
+    scope: lines('p_scope'),
+    directions: lines('p_directions'),
+    constraints: lines('p_constraints'),
+    expected_output: $('p_output').value.trim(),
   };
 }
 function showProposalFromHistory(msgs) {
@@ -422,25 +414,32 @@ function showProposalFromHistory(msgs) {
   if (!propMsg) return;
   try {
     const p = JSON.parse(propMsg.content);
-    currentProposal = p;
-    showProposalCard(p);
+    currentProposal = {brief: p.brief || {}, task_id: p.task_id};
+    showProposalCard(currentProposal);
   } catch (e) { /* 解析失败不弹卡 */ }
 }
-function reClarify() {
-  const p = readProposalFromForm();
-  $('msgInput').placeholder = '补充说明研究方向，或直接点开始研究…';
-  $('msgInput').focus();
-  // 简单处理：清掉确认卡，让用户继续对话澄清
-  currentProposal = null; $('proposalCard').style.display = 'none';
+async function submitBriefChanges() {
+  if (!currentProposal) return;
+  const feedback = '请按以下完整内容修改研究说明：' + JSON.stringify(readBriefFromForm());
+  const r = await fetch('/api/alignment', {
+    method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({session_id: currentSessionId, task_id: currentProposal.task_id, message: feedback}),
+  });
+  const data = await r.json();
+  if (!r.ok) { alert(data.detail || '修改失败'); return; }
+  currentProposal = {brief: data.brief || {}, task_id: data.task_id};
+  showProposalCard(currentProposal);
 }
 
 // ------------------------------------------------------------------
 // 开始研究
 // ------------------------------------------------------------------
 async function startResearch() {
-  const p = readProposalFromForm();
-  if (!p.research_query) { alert('请填写最终研究查询'); return; }
-  const query = p.research_query;
+  if (!currentProposal) return;
+  if (JSON.stringify(readBriefFromForm()) !== JSON.stringify(currentProposal.brief)) {
+    alert('研究说明已编辑，请先提交修改并等待更新后的说明。'); return;
+  }
+  const taskId = currentProposal.task_id;
 
   // 记录到会话：研究中
   $('proposalCard').style.display = 'none'; currentProposal = null;
@@ -448,11 +447,11 @@ async function startResearch() {
 
   const r = await fetch('/api/research', {
     method: 'POST', headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ query, session_id: currentSessionId }),
+    body: JSON.stringify({ task_id: taskId, session_id: currentSessionId }),
   });
   const data = await r.json();
   if (!r.ok) { appendProgress({ type: 'error', message: data.detail || '启动失败' }); return; }
-  runningTask = { task_id: data.task_id, session_id: currentSessionId };
+  runningTask = { task_id: data.task_id, session_id: currentSessionId, status: data.status };
   openEventStream(data.task_id);
 }
 
@@ -461,10 +460,12 @@ async function startResearch() {
 // ------------------------------------------------------------------
 function openEventStream(task_id) {
   if (eventSource) eventSource.close();
-  eventSource = new EventSource(`/api/tasks/${task_id}/events`);
+  const cursor = eventCursors[task_id] || 0;
+  eventSource = new EventSource(`/api/tasks/${task_id}/events?cursor=${cursor}`);
   eventSource.onmessage = (e) => {
     if (!e.data) return;
     const ev = JSON.parse(e.data);
+    if (ev.sequence) eventCursors[task_id] = ev.sequence;
     appendProgress(ev);
     if (ev.type === 'done') {
       eventSource.close(); eventSource = null;
@@ -475,7 +476,12 @@ function openEventStream(task_id) {
       runningTask = null;
     }
   };
-  eventSource.onerror = () => { eventSource.close(); eventSource = null; };
+  eventSource.onerror = () => {
+    eventSource.close(); eventSource = null;
+    if (runningTask && runningTask.task_id === task_id) {
+      setTimeout(() => openEventStream(task_id), 1000);
+    }
+  };
 }
 
 function appendProgress(ev) {
@@ -483,15 +489,13 @@ function appendProgress(ev) {
   div.className = 'progress-line ' + (ev.type || '');
   const t = new Date().toLocaleTimeString();
   switch (ev.type) {
-    case 'state': div.textContent = `[${t}] ▸ ${STATE_CN[ev.state] || ev.state}`; break;
-    case 'task_done': div.textContent = `[${t}] ✓ 子任务 ${ev.task_id}（${ev.status}，${ev.confidence}）`; break;
-    case 'evidence': div.textContent = `[${t}] ◆ 证据 ${ev.evidence_id} 已入库（共 ${ev.total}）`; break;
-    case 'synthesis': div.textContent = `[${t}] ★ 报告合成完成（置信度 ${ev.confidence}，证据 ${ev.evidence_count}）`; break;
-    case 'loop':
-      div.textContent = ev.decision === 'complete'
-        ? `[${t}] 🏁 研究覆盖充分，停止补研究（第 ${ev.round} 轮）`
-        : `[${t}] 🔄 第 ${ev.round} 轮：发现 ${ev.gaps} 个缺口，补派 ${ev.new_tasks.length || ev.new_tasks} 个任务`;
-      break;
+    case 'state': div.textContent = `[${t}] ▸ ${ev.state}`; break;
+    case 'confirmed': div.textContent = `[${t}] ✓ 研究说明已确认`; break;
+    case 'agent_started': div.textContent = `[${t}] ▸ Agent 开始（层级 ${ev.depth}，${ev.thread_id}）`; break;
+    case 'tool_finished': div.textContent = `[${t}] ${ev.ok?'✓':'✗'} 工具 ${ev.tool}（重试 ${ev.retries||0}）`; break;
+    case 'fork_finished': div.textContent = `[${t}] ⇄ 子研究汇聚：接受 ${ev.accepted}，拒绝 ${ev.rejected}`; break;
+    case 'agent_finished': div.textContent = `[${t}] ✓ Agent 完成（${ev.status}）`; break;
+    case 'agent_failed': div.textContent = `[${t}] ✗ Agent 失败：${ev.error||''}`; break;
     case 'done': div.textContent = `[${t}] ✅ 研究完成`; break;
     case 'error': div.textContent = `[${t}] ❌ ${ev.message}`; break;
     default: div.textContent = `[${t}] ${JSON.stringify(ev)}`;
@@ -499,15 +503,13 @@ function appendProgress(ev) {
   $('messages').appendChild(div);
   scrollToBottom();
 }
-const STATE_CN = { IDLE:'空闲', PLANNING:'规划', DISPATCHING:'调度', COLLECTING:'收集', SYNTHESIZING:'综合', ADVERSARIAL:'对抗优化', REPLANNING:'重规划', DONE:'完成', FAILED:'失败' };
-
 // ------------------------------------------------------------------
 // 结果获取与报告卡
 // ------------------------------------------------------------------
 async function fetchResult(task_id) {
   const r = await fetch(`/api/tasks/${task_id}/result`);
   const data = await r.json();
-  if (data.status !== 'done') {
+  if (data.transport_status !== 'done') {
     if (data.message) appendProgress({ type: 'error', message: data.message });
     return;
   }
@@ -523,7 +525,7 @@ async function loadReportData(sid, reportMsg) {
     const d = await r.json();
     ev = d;
   } catch (e) {}
-  return { report_md: reportMsg.content, evidence: ev.evidence || [], evidence_relations: ev.evidence_relations || [], session_id: sid };
+  return { report_md: reportMsg.content, evidence: ev.evidence || [], session_id: sid };
 }
 
 function renderReportCard(data) {
@@ -534,179 +536,38 @@ function renderReportCard(data) {
   const card = document.createElement('div');
   card.className = 'report-card';
   card.innerHTML = `
-    <div class="rc-head">
-      <button class="btn btn-ghost rc-obsidian" onclick="exportObsidian('${data.session_id}')">📓 在 Obsidian 打开</button>
-    </div>
     <div class="tabs">
       <div class="tab active" data-tab="report" onclick="switchTab(this,'report')">报告</div>
       <div class="tab" data-tab="evidence" onclick="switchTab(this,'evidence')">证据索引</div>
-      <div class="tab" data-tab="relations" onclick="switchTab(this,'relations')">证据关系</div>
-      <div class="tab" data-tab="graph" onclick="switchTab(this,'graph')">证据图</div>
     </div>
     <div class="tabbody active" data-name="report"><div class="rc-report"></div></div>
-    <div class="tabbody" data-name="evidence"><div class="rc-evidence"></div></div>
-    <div class="tabbody" data-name="relations"><div class="rc-relations"></div></div>
-    <div class="tabbody" data-name="graph">
-      <div style="margin-bottom:8px">
-        <select class="rc-filter" onchange="applyGraphFilter(this)">
-          <option value="all">全部关系</option>
-          <option value="SUPPORTS">仅支持 (SUPPORTS)</option>
-          <option value="CONTRADICTS">仅矛盾 (CONTRADICTS)</option>
-          <option value="EXTENDS">仅扩展 (EXTENDS)</option>
-        </select>
-      </div>
-      <div class="rc-graph"></div>
-      <div style="font-size:11px;color:#9ca3af;margin-top:6px">节点=claim 前 10 字 · 悬停看全文 · 可拖拽/缩放</div>
-    </div>`;
+    <div class="tabbody" data-name="evidence"><div class="rc-evidence"></div></div>`;
   $('messages').appendChild(card);
 
   card.querySelector('.rc-report').innerHTML = marked.parse(data.report_md || '（无报告内容）');
   renderEvidenceTable(card.querySelector('.rc-evidence'), data.evidence || [], data.report_md || '');
-  renderRelationsList(card.querySelector('.rc-relations'), data.evidence_relations || []);
-  renderGraph(card.querySelector('.rc-graph'), data.session_id);
   scrollToBottom();
-}
-
-async function exportObsidian(sid) {
-  try {
-    const r = await fetch(`/api/sessions/${encodeURIComponent(sid)}/export-obsidian`, { method: 'POST' });
-    const data = await r.json();
-    if (!r.ok) { alert(data.detail || '导出失败'); return; }
-    alert(`已导出到 Obsidian Vault：\n${data.vault_path}\n\n即将尝试用 Obsidian 打开。`);
-    window.location.href = data.obsidian_uri || ('obsidian://open?path=' + encodeURIComponent(data.vault_path));
-  } catch (e) { alert('导出失败: ' + e); }
 }
 
 function switchTab(tabEl, name) {
   const card = tabEl.closest('.report-card');
   card.querySelectorAll('.tab').forEach(t => t.classList.toggle('active', t.dataset.tab === name));
   card.querySelectorAll('.tabbody').forEach(t => t.classList.toggle('active', t.dataset.name === name));
-  // 图中继：容器从隐藏变可见后，重绘力导向图并适配视野
-  if (name === 'graph') {
-    const g = card.querySelector('.rc-graph');
-    if (g && g._net) {
-      setTimeout(() => { g._net.redraw(); g._net.fit(); }, 50);
-    }
-  }
 }
 
 function renderEvidenceTable(container, evidence, reportMd) {
   if (!evidence.length) { container.innerHTML = '<div class="empty">本会话暂无证据</div>'; return; }
-  const cited = new Set();
-  const re = /\[E-(\d+)\]/g; let m;
-  while ((m = re.exec(reportMd))) cited.add(`E-${m[1]}`);
-  let html = `<table class="data"><tr><th>ID</th><th>主张</th><th>来源论文</th><th>置信度</th><th>引用</th></tr>`;
-  for (const ev of evidence) {
-    const isCited = cited.has(ev.evidence_id);
-    html += `<tr><td><b>${escapeHtml(ev.evidence_id||'')}</b></td>` +
-      `<td>${escapeHtml(ev.claim||'')}</td>` +
-      `<td>${escapeHtml(ev.paper_title||'')}<br><span style="font-size:11px;color:#9ca3af">${escapeHtml(ev.source_url||'')}</span></td>` +
-      `<td>${ev.confidence != null ? ev.confidence.toFixed(2) : ''}</td>` +
-      `<td class="${isCited?'cite-ok':'cite-no'}">${isCited?'已引用':'未引用'}</td></tr>`;
-  }
-  container.innerHTML = html + '</table>';
-}
-
-function renderRelationsList(container, rels) {
-  if (!rels.length) { container.innerHTML = '<div class="empty">本会话暂无证据关系</div>'; return; }
-  const CN = { CONTRADICTS:'矛盾', SUPPORTS:'支持', EXTENDS:'扩展' };
   let html = '';
-  for (const [rel] of Object.entries(CN)) {
-    const list = rels.filter(r => r.relation === rel);
-    if (!list.length) continue;
-    html += `<h3 style="margin:12px 0 6px">${CN[rel]}（${list.length}）</h3>`;
-    for (const r of list) {
-      html += `<div class="rel-card"><span class="rel-tag rel-${r.relation}">${CN[r.relation]||r.relation}</span>` +
-        `<b>[${escapeHtml(r.source_id)}]</b> ${escapeHtml(r.source_claim||'')} → ` +
-        `<b>[${escapeHtml(r.target_id)}]</b> ${escapeHtml(r.target_claim||'')} ` +
-        `<span style="color:#9ca3af">（weight ${r.weight != null ? r.weight.toFixed(2) : ''}）</span></div>`;
+  for (const ev of evidence) {
+    if (ev.markdown) {
+      html += `<div class="evidence-note"><small>${escapeHtml(ev.path||'')}</small>${marked.parse(ev.markdown)}</div>`;
+    } else {
+      html += `<div class="evidence-note"><b>${escapeHtml(ev.finding||ev.evidence_id||'Evidence')}</b>` +
+        `<div>${escapeHtml(ev.title||'')} · ${escapeHtml(ev.source_ref||'')}</div>` +
+        `<small>${escapeHtml(ev.locator||'')}</small></div>`;
     }
   }
   container.innerHTML = html;
-}
-
-const NODE_COLORS = { evidence:{background:'#4a90d9',border:'#2c5f8a'}, paper:{background:'#7bc96f',border:'#4a9e3d'}, topic:{background:'#b07cd9',border:'#8557ab'} };
-const EDGE_COLORS = { SOURCED_FROM:'#a0a0a0', ANSWERS:'#a0a0a0', SUPPORTS:'#2ecc71', CONTRADICTS:'#e74c3c', EXTENDS:'#f39c12' };
-const SEMANTIC_REL = ['SUPPORTS','CONTRADICTS','EXTENDS'];
-
-async function renderGraph(container, sid) {
-  container.innerHTML = '<div class="empty">加载图中…</div>';
-  try {
-    const r = await fetch(`/api/sessions/${encodeURIComponent(sid)}/graph`);
-    if (!r.ok) { container.innerHTML = '<div class="empty">该会话暂无证据图</div>'; return; }
-    const data = await r.json();
-    if (!(data.nodes || []).length) { container.innerHTML = '<div class="empty">该会话暂无证据节点</div>'; return; }
-    container._graphData = data;
-    drawGraph(container, data, 'all');
-  } catch (e) { container.innerHTML = '<div class="empty">图加载失败</div>'; }
-}
-
-function drawGraph(container, data, filter) {
-  const allNodes = data.nodes || [];
-  const allEdges = data.edges || [];
-  const semanticEdges = allEdges.filter(e => SEMANTIC_REL.includes(e.relation));
-  let edges = semanticEdges;
-  let nodes = allNodes.filter(n => n.type === 'evidence');
-
-  if (filter !== 'all') {
-    // 单关系视图只保留该类语义边及其两端证据节点。
-    edges = semanticEdges.filter(e => e.relation === filter);
-    const keepIds = new Set();
-    for (const e of edges) {
-      keepIds.add(e.source);
-      keepIds.add(e.target);
-    }
-    nodes = nodes.filter(n => keepIds.has(n.id));
-  }
-
-  // 筛选会重建网络；先销毁旧实例，避免残留物理模拟和事件监听。
-  if (container._net) {
-    container._net.destroy();
-    container._net = null;
-  }
-
-  if (filter !== 'all' && !edges.length) {
-    const names = { SUPPORTS: '支持', CONTRADICTS: '矛盾', EXTENDS: '扩展' };
-    container.innerHTML = `<div class="empty">当前会话没有“${names[filter] || filter}”关系</div>`;
-    return;
-  }
-  if (!nodes.length) {
-    container.innerHTML = '<div class="empty">该会话暂无证据节点</div>';
-    return;
-  }
-
-  const nodeObjs = nodes.map(n => {
-    const label = String(n.claim || n.label || n.id).slice(0, 10);
-    // vis-network 会把 string title 当纯文本处理；使用换行而不是 HTML 标签，
-    // 配合 .vis-tooltip 的 pre-wrap 安全展示完整 claim、摘录和论文。
-    let title = `${n.id}\n类型：证据\n\n${n.claim || n.label || ''}`;
-    if (n.evidence_text) title += `\n\n原文摘录：${String(n.evidence_text).slice(0, 300)}`;
-    if (n.paper_title) title += `\n\n来源论文：${n.paper_title}`;
-    return { id: n.id, label, color: NODE_COLORS[n.type] || NODE_COLORS.evidence, title };
-  });
-
-  const edgeObjs = edges.map(e => ({
-    from: e.source, to: e.target,
-    label: `${String(e.relation).slice(0, 4)} ${e.weight != null ? e.weight.toFixed(2) : ''}`,
-    color: { color: EDGE_COLORS[e.relation] || '#999' },
-    width: 2,
-  }));
-
-  container.innerHTML = '';
-  // 容器在隐藏的 tab 里初始化时尺寸为 0，需在激活 tab 后 redraw/fit
-  container._net = new vis.Network(container, { nodes: nodeObjs, edges: edgeObjs }, {
-    nodes: { shape: 'dot', size: 14, font: { size: 11, face: 'Microsoft YaHei' } },
-    // EvidenceGraph 的语义边使用 canonical pair 存储，并无可靠方向性，因此不画箭头。
-    edges: { font: { size: 9, strokeWidth: 0 }, smooth: { enabled: true } },
-    physics: { barnesHut: { gravitationalConstant: -3000, springLength: 120 } },
-    interaction: { hover: true, tooltipDelay: 100 },
-  });
-}
-
-function applyGraphFilter(select) {
-  const card = select.closest('.report-card');
-  const g = card.querySelector('.rc-graph');
-  if (g && g._graphData) drawGraph(g, g._graphData, select.value);
 }
 
 // ------------------------------------------------------------------

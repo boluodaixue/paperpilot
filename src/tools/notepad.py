@@ -10,7 +10,7 @@
   3. 记录搜索策略（"已搜过 X 和 Y，接下来搜 Z"）
   4. 在后续轮次中读取笔记，避免重复工作
 
-与 Memory Store (M4) 的区别：
+与持久化 Markdown Memory Store 的区别：
   - Memory Store：结构化、去重、矛盾检测，用于跨 Agent 共享信息
   - Notepad：非结构化、个人化、临时性，用于单个 Agent 的"思维草稿"
 

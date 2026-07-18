@@ -1,108 +1,66 @@
 #!/usr/bin/env python3
-# -*- coding: utf-8 -*-
-"""
-scripts/run_single.py
-================================================================================
-DeepResearch Agent 单条查询运行脚本。
-
-Usage:
-    python scripts/run_single.py --query "你的研究问题" [--config path/to/config.yaml]
-================================================================================
-"""
-
+"""Run one PaperPilot research workflow with an explicit brief review."""
 from __future__ import annotations
 
 import argparse
 import asyncio
 import logging
-import os
 import sys
+from pathlib import Path
 
-from src.core.runner import initialize_modules, load_config, run_research, save_report, setup_logging
+PROJECT_ROOT = Path(__file__).resolve().parent.parent
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
+
+from scripts._workflow_cli import UserCancelled, report_path, run_reviewed_workflow
+from src.research.runtime import build_research_runtime, load_config, setup_logging
+
+
+async def _run(args: argparse.Namespace) -> Path:
+    config = load_config(args.config)
+    runtime = build_research_runtime(config=config)
+    thread_id = args.thread_id or runtime.new_thread_id()
+    try:
+        result = await run_reviewed_workflow(
+            runtime,
+            args.query,
+            thread_id=thread_id,
+            auto_confirm=args.yes,
+        )
+        return report_path(runtime, result)
+    finally:
+        await runtime.close(shutdown=True)
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(
-        description="DeepResearch Agent 单条查询运行脚本",
-        formatter_class=argparse.RawDescriptionHelpFormatter,
-        epilog="""
-示例:
-  python scripts/run_single.py --query "分析 2024 年 AI 芯片市场格局"
-  python scripts/run_single.py --query "量子计算在密码学中的应用" --config configs/custom.yaml
-        """,
+    parser = argparse.ArgumentParser(description="Run one PaperPilot research workflow")
+    parser.add_argument("--query", required=True, help="Research question")
+    parser.add_argument("--config", default=None, help="Configuration file")
+    parser.add_argument("--thread-id", default=None, help="Optional root thread identity")
+    parser.add_argument(
+        "--yes",
+        action="store_true",
+        help="Confirm the generated brief automatically (for automation)",
     )
-    parser.add_argument("--query", type=str, required=True, help="用户的研究问题（必填）")
-    parser.add_argument("--config", type=str, default=None, help="自定义配置文件路径")
-    parser.add_argument("--output_dir", type=str, default="outputs/reports", help="报告输出目录")
-    parser.add_argument("--session_id", type=str, default="", help="会话 ID（用于 memory store 隔离）")
-    parser.add_argument("--log_level", type=str, default="INFO", choices=["DEBUG", "INFO", "WARNING", "ERROR"])
+    parser.add_argument(
+        "--log-level",
+        default="INFO",
+        choices=["DEBUG", "INFO", "WARNING", "ERROR"],
+    )
     args = parser.parse_args()
-
-    # 将终端输出同时保存到报告目录下的日志文件
-    import datetime as _dt
-    # 中文 Windows 控制台默认 GBK，无法编码 ✓ 等字符；统一 UTF-8 避免 Tee 崩溃
-    for _stream in (sys.stdout, sys.stderr):
-        try:
-            _stream.reconfigure(encoding="utf-8", errors="replace")
-        except (AttributeError, ValueError):
-            pass
-    os.makedirs(args.output_dir, exist_ok=True)
-    log_filename = os.path.join(
-        args.output_dir,
-        f"run_{_dt.datetime.now().strftime('%Y%m%d_%H%M%S')}.log"
-    )
-
-    class Tee:
-        """同时输出到终端和文件的包装器。"""
-        def __init__(self, terminal, file):
-            self.terminal = terminal
-            self.file = file
-        def write(self, message):
-            self.terminal.write(message)
-            self.file.write(message)
-            self.file.flush()
-        def flush(self):
-            self.terminal.flush()
-            self.file.flush()
-        def isatty(self):
-            return self.terminal.isatty()
-
-    log_file = open(log_filename, "w", encoding="utf-8")
-    sys.stdout = Tee(sys.stdout, log_file)
-    sys.stderr = Tee(sys.stderr, log_file)
-    print(f"[日志] 终端输出已同时保存到: {log_filename}")
-
     setup_logging(args.log_level)
-    logger = logging.getLogger("main")
 
     try:
-        config = load_config(args.config)
-        logger.info(f"配置加载完成: {args.config or 'configs/default.yaml'}")
+        manifest_path = asyncio.run(_run(args))
+    except UserCancelled:
+        logging.getLogger("run_single").info("Research cancelled before confirmation")
+        raise SystemExit(2) from None
+    except Exception:
+        logging.getLogger("run_single").exception("Research workflow failed")
+        raise SystemExit(1) from None
 
-        modules = initialize_modules(config, session_id=args.session_id)
-        report = asyncio.run(run_research(args.query, config, modules))
-
-        filepath = save_report(report, args.query, args.output_dir)
-        logger.info(f"报告已保存: {filepath}")
-
-        # 报告持久化到会话消息（Web UI 侧边栏可回溯）
-        if args.session_id:
-            try:
-                from src.memory.chat_store import ChatStore
-                ChatStore().add(args.session_id, "assistant", "report", report)
-                logger.info(f"[Chat] 报告已写入会话消息: {args.session_id}")
-            except Exception as e:
-                logger.warning(f"[Chat] 报告写入会话消息失败: {e}")
-
-        print("\n" + "=" * 60)
-        print("最终研究报告")
-        print("=" * 60)
-        print(report)
-        print("=" * 60)
-
-    except Exception as e:
-        logger.exception("运行过程中发生错误")
-        sys.exit(1)
+    # The workflow already persisted the report; expose its canonical manifest path only.
+    print(manifest_path)
 
 
 if __name__ == "__main__":

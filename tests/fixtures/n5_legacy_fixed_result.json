@@ -1,0 +1,17 @@
+{
+  "baseline_commit": "82a4fa7",
+  "query": "Compare the fixed offline finding without using external tools.",
+  "report": {
+    "content": "# Fixed Offline Report\n\nThe fixed finding is reproducible and uses no external service.\n\nOverall Confidence: 0.82",
+    "sources": [],
+    "confidence": 0.82,
+    "num_searches": 1,
+    "num_replan": 0,
+    "adversarial_rounds": 0,
+    "evidence": [],
+    "evidence_relations": []
+  },
+  "failure_contract": {
+    "all_task_failures": "terminal_failed"
+  }
+}

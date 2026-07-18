@@ -6,7 +6,7 @@ evaluation/metrics/judge_based.py
 基于 LLM-as-Judge 的深度评测指标。
 
 适用于需要主观专家判断的场景（抽查、对比分析、最终质量验证）。
-底层调用 src.core.judge.LLMJudge，保持与核心层的单向依赖。
+底层调用 evaluation.judge.LLMJudge，不进入 Research AgentGraph。
 ================================================================================
 """
 
@@ -23,10 +23,10 @@ class JudgeBasedMetrics:
         report: str,
         query: str,
         ground_truth: dict[str, Any] | None = None,
-        backend: str = "mimo",
+        backend: str = "deepseek",
     ) -> dict[str, Any]:
         """
-        使用 MiMo 2.5 Pro 作为 Judge 对报告进行多维度评分。
+        使用指定 Judge 后端对报告进行多维度评分。
 
         当规则指标不足以精确评估时，调用此方法获取 LLM 的定性判断。
         返回结构包含事实准确性、逻辑一致性、引用质量、整体置信度。
@@ -40,7 +40,7 @@ class JudgeBasedMetrics:
         Returns:
             包含各维度得分和理由的字典。
         """
-        from src.core.judge import LLMJudge
+        from evaluation.judge import LLMJudge
 
         judge = LLMJudge(backend=backend)
         return judge.score_single(report, query, ground_truth)

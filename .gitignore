@@ -226,8 +226,16 @@ configs/e2e_fast.yaml
 
 # Windows / pytest 在工作区根目录生成的临时运行目录
 .tmp_test_runtime/
+.pytest-*/
+.test-temp*/
+.uv-cache/
 .stage*_tmp/
 .stage*_test_run/
+pip-build-tracker-*/
+pip-ephem-wheel-cache-*/
+pip-install-*/
+pip-target-*/
+pip-unpack-*/
 tmp*/
 pytest-of-*/
 torchinductor_*/
