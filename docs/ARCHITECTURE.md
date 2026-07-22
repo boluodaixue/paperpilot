@@ -126,7 +126,7 @@ Evidence 是 Memory Store 中的一类 Markdown 内容，不是独立存储服�
 → 接收根 Research Result
 → 生成最终报告
 → 写入 Memory Store
-→ 可选 Red/Blue
+→ 可选 Red/Blue 单次报告后处理
 → 完成
 ```
 
@@ -210,17 +210,32 @@ root_thread_id: thread-id
 
 ## 7. 可选 Red/Blue
 
-Red/Blue 位于报告生成之后，默认关闭：
+Red/Blue 是最终报告成功持久化后的单次可选后处理，默认关闭：
 
 ```text
-Draft Report
-→ Red：从事实性、逻辑一致性、引用质量攻击
-→ Blue：执行 ADD / DELETE / MODIFY / VERIFY
-→ 根 Agent 校验链接与来源
-→ Final Report
+Persisted Original Report + MemoryManifest
+→ Red：输出事实性 / 逻辑一致性 / 引用质量问题
+→ Blue：只执行 ADD / DELETE / MODIFY / VERIFY
+→ 确定性保护校验
+   ├── 通过：原路径原子写回修订报告
+   └── 失败：保留并返回原报告
 ```
 
-Red/Blue 不参与 fork 决策，也不替代研究完成判断。任何修订不得创造不存在的来源或破坏 Markdown 链接。
+Red 与 Blue 各调用一次本次运行已经装配的同一个 research policy，不获得工具，不进入 Research AgentGraph，不 fork，也不创建新的 `thread_id`、checkpoint 或执行身份。审查数据只在当前后处理调用内传递，不形成新的持久化领域模型。
+
+Red 只允许报告三类结构化问题：
+
+- `factual`：报告陈述与已有材料不一致、过度断言或无法由现有内容支持；
+- `logical_consistency`：前提、推理、结论或报告内部表述存在矛盾或跳跃；
+- `citation_quality`：引用位置、引用对象或引用对结论的支持关系存在问题。
+
+Blue 只能返回 `ADD`、`DELETE`、`MODIFY`、`VERIFY` 动作。`VERIFY` 只表达核验结论，不触发工具调用或新研究；任何需要新增来源的事项必须保留为未修订问题，不能伪造证据。根工作流按 Blue 声明的顺序确定性重放全部动作，重放结果必须与 Blue 同时返回的完整 Markdown 完全一致；不一致表示存在未声明修改，整次修订失败。
+
+在接受 Blue 结果前，系统以原始已持久化报告为基准进行确定性保护：YAML frontmatter 必须逐字保持，WikiLink 的 target 与出现次数必须保持，URL 的值与出现次数必须保持，`MemoryManifest` 及其报告、证据、来源路径不得改变。WikiLink alias 只是显示文本，允许随正文编辑而调整，但不得重定向链接。只有全部保护通过，才允许在 manifest 指向的同一报告路径原子写回。生成、解析、动作应用、保护校验或写回任一步失败时，原报告仍是最终交付。
+
+Red/Blue 不参与 fork 决策，不替代研究完成判断，不循环互攻，也不是 RCS 或评分引擎。N6 不增加 claim-evidence 新模型、Review Store、第二份报告仓库或其他持久化服务。
+
+当前 `ResearchResult` 不提供 claim 到 evidence 的逐条映射，因此确定性保护只能证明 frontmatter、WikiLink target、URL 和 manifest 等结构没有损坏，不能机械证明每条新增或修改后的表述都语义归因于正确证据。该语义审查由 Red/Blue 基于本次已有 evidence 完成。N6 不为此扩展数据模型；未来若要求可机械证明的强语义归因，必须另行对齐契约与验收边界。
 
 ## 8. 后续 LLM Wiki
 

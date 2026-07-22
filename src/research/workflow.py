@@ -22,12 +22,14 @@ from .models import (
     EvidenceItem,
     ExecutionIdentity,
     MemoryManifest,
+    ReportReviewOutcome,
     ResearchBrief,
     ResearchResult,
     ResearchTask,
     ResearchWorkflowResult,
 )
 from .policy import call_policy
+from .report_review import review_final_report
 
 
 __all__ = [
@@ -77,6 +79,7 @@ class ResearchWorkflowState(TypedDict, total=False):
     report_markdown: str | None
     memory_manifest: MemoryManifest | None
     workflow_result: ResearchWorkflowResult | None
+    report_review: ReportReviewOutcome | None
 
 
 _JSON_FENCE = re.compile(r"```(?:json)?\s*(.*?)\s*```", re.IGNORECASE | re.DOTALL)
@@ -241,6 +244,7 @@ def create_research_workflow_state(
         report_markdown=None,
         memory_manifest=None,
         workflow_result=None,
+        report_review=None,
         result=None,
     )
 
@@ -251,6 +255,7 @@ def build_research_workflow(
     memory_store: MarkdownMemoryStore,
     *,
     checkpointer: BaseCheckpointSaver | None = None,
+    report_review_enabled: bool = False,
 ) -> Any:
     """Build the root workflow around the same homogeneous Research AgentGraph."""
     tool_list = list(tools)
@@ -405,7 +410,90 @@ def build_research_workflow(
             "report_markdown": report_markdown,
             "memory_manifest": manifest,
             "workflow_result": workflow_result,
+            "report_review": None,
         }
+
+    async def postprocess_report(
+        state: ResearchWorkflowState,
+        config: RunnableConfig,
+    ) -> dict[str, Any]:
+        _validate_root_state(state, config)
+        if not report_review_enabled:
+            return {"report_review": None}
+
+        brief = state.get("brief")
+        result = state.get("result")
+        original_report = state.get("report_markdown")
+        manifest = state.get("memory_manifest")
+        if not isinstance(brief, ResearchBrief):
+            raise TypeError("report review requires a ResearchBrief")
+        if not isinstance(result, ResearchResult):
+            raise TypeError("report review requires a ResearchResult")
+        if not isinstance(original_report, str) or not original_report.strip():
+            raise TypeError("report review requires the persisted Markdown report")
+        if not isinstance(manifest, MemoryManifest):
+            raise TypeError("report review requires a MemoryManifest")
+
+        with _workflow_trace("postprocess_report", state) as observation:
+            try:
+                final_report, outcome = await review_final_report(
+                    policy,
+                    original_report,
+                    result,
+                    manifest,
+                )
+                workflow_result = ResearchWorkflowResult(
+                    brief=brief,
+                    research_result=result,
+                    report_markdown=final_report,
+                    memory_manifest=manifest,
+                    report_review=outcome,
+                )
+                if final_report != original_report:
+                    await asyncio.to_thread(
+                        memory_store.replace_report,
+                        manifest.report_path,
+                        final_report,
+                    )
+                observation.add_output(
+                    {
+                        "applied": outcome.applied,
+                        "issue_count": len(outcome.issues),
+                        "edit_count": len(outcome.edits),
+                        "fallback": False,
+                    }
+                )
+                return {
+                    "report_markdown": final_report,
+                    "workflow_result": workflow_result,
+                    "report_review": outcome,
+                }
+            except Exception as exc:
+                outcome = ReportReviewOutcome(
+                    applied=False,
+                    fallback_reason=f"{type(exc).__name__}: {exc}",
+                )
+                workflow_result = ResearchWorkflowResult(
+                    brief=brief,
+                    research_result=result,
+                    report_markdown=original_report,
+                    memory_manifest=manifest,
+                    report_review=outcome,
+                )
+                observation.add_output(
+                    {
+                        "applied": False,
+                        "issue_count": 0,
+                        "edit_count": 0,
+                        "fallback": True,
+                        "fallback_reason": outcome.fallback_reason,
+                    }
+                )
+                return {
+                    "report_markdown": original_report,
+                    "workflow_result": workflow_result,
+                    "report_review": outcome,
+                }
 
     def route_after_review(state: ResearchWorkflowState) -> str:
         return "prepare_research" if state.get("confirmed") else "revise_brief"
@@ -417,6 +505,7 @@ def build_research_workflow(
     builder.add_node("prepare_research", prepare_research)
     builder.add_node("research_agent", research_agent_graph)
     builder.add_node("persist_result", persist_result)
+    builder.add_node("postprocess_report", postprocess_report)
     builder.add_edge(START, "draft_brief")
     builder.add_edge("draft_brief", "review_brief")
     builder.add_conditional_edges(
@@ -430,7 +519,8 @@ def build_research_workflow(
     builder.add_edge("revise_brief", "review_brief")
     builder.add_edge("prepare_research", "research_agent")
     builder.add_edge("research_agent", "persist_result")
-    builder.add_edge("persist_result", END)
+    builder.add_edge("persist_result", "postprocess_report")
+    builder.add_edge("postprocess_report", END)
     return builder.compile(checkpointer=effective_checkpointer)
 
 

@@ -4,7 +4,7 @@
 
 ## 当前判断
 
-N0–N5 已完成。CLI、Web 和评测统一进入同一个 Research Workflow；旧 Manager / Planner / DAG / AgentPool / Evidence Graph 链路已经删除。当前主线只保留同质 Research AgentGraph、工具、模型适配、tracing、checkpointer、Markdown Memory 与 UI 会话投影。
+N0–N6 已完成。CLI、Web 和评测统一进入同一个 Research Workflow；旧 Manager / Planner / DAG / AgentPool / Evidence Graph 链路已经删除。当前主线只保留同质 Research AgentGraph、工具、模型适配、tracing、checkpointer、Markdown Memory、可选报告审查与 UI 会话投影。
 
 ## 进度
 
@@ -16,7 +16,7 @@ N0–N5 已完成。CLI、Web 和评测统一进入同一个 Research Workflow�
 | N3 同质并行 Fork | ✅ | 三种 fork 条件、上下文隔离、并行汇聚和部分失败可用 |
 | N4 一层递归与硬停止 | ✅ | 根→子→孙可运行，孙不可再 fork，限制与恢复可靠 |
 | N5 入口迁移与旧实现清理 | ✅ | CLI/Web/评测只走新路径，旧架构及证据图退出代码库 |
-| N6 可选 Red/Blue | ⬜ | 报告可选审查且不破坏证据链接 |
+| N6 可选 Red/Blue | ✅ | 默认关闭的单次报告后处理，且不破坏 frontmatter、WikiLink、URL 或 manifest |
 | Future LLM Wiki | ⬜ | 基于同一 Memory Store 的问答、导入和整理 |
 
 ## N0 已确定的架构决策
@@ -89,9 +89,23 @@ N2 专项 `8 passed`，N1+N2 联合专项 `21 passed`，全量回归 `209 passed
 
 详见 [N5 实施记录](N5_ENTRY_MIGRATION_AND_LEGACY_CLEANUP.md)。
 
-## 下一阶段：N6（可选 Red/Blue）
+## N6 已完成
 
-只在最终 Markdown 报告之上增加可关闭的审查与修订，不改变 Research AgentGraph、fork policy、Memory Store 或线程模型。N6 尚未开始。
+N6 只在最终 Markdown 报告成功持久化后增加默认关闭的单次审查与修订，不改变 Research AgentGraph、fork policy、Memory Store 或线程模型：
+
+- Red 与 Blue 复用同一 policy，各至多调用一次，均无工具、无 fork、无新线程；
+- Red 只报告 `factual / logical_consistency / citation_quality` 三类结构化问题；
+- Blue 只使用 `ADD / DELETE / MODIFY / VERIFY`；
+- 根工作流确定性顺序重放 Blue 动作，并拒绝与完整 Markdown 不一致的未声明修改；
+- frontmatter、WikiLink target 与次数、URL 的值与次数以及 manifest 由确定性规则保护；WikiLink alias 可调整；
+- 任一失败都保留原始已持久化报告；
+- 不实现 RCS、评分引擎、claim-evidence 新模型或新存储。
+
+N6 关键专项与回归为 `65 passed, 1 warning`；N1–N6 全量回归为 `160 passed, 1 warning`，其中 warning 为既有 `StarletteDeprecationWarning`。详见 [N6 实施记录](N6_OPTIONAL_REPORT_REVIEW.md)。
+
+## 下一阶段：Future LLM Wiki
+
+Future LLM Wiki 尚未开始。开始前需另行对齐产品范围、数据契约和验收标准，不从 N6 自动延伸实现。
 
 ## 历史基础
 

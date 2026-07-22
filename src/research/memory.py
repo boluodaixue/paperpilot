@@ -4,7 +4,7 @@ from __future__ import annotations
 import os
 import tempfile
 import threading
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 
 from .models import ExecutionIdentity, MemoryManifest, ResearchBrief, ResearchResult
 from .rendering import (
@@ -122,3 +122,22 @@ class MarkdownMemoryStore:
 
     def read_text(self, relative_path: str) -> str:
         return self._resolve(relative_path).read_text(encoding="utf-8")
+
+    def replace_report(self, report_path: str, markdown: str) -> None:
+        """Atomically replace one existing report without touching its bundle."""
+        relative = PurePosixPath(str(report_path))
+        if (
+            relative.is_absolute()
+            or len(relative.parts) != 2
+            or relative.parts[0] != "reports"
+            or relative.suffix.lower() != ".md"
+            or relative.name in {"", ".", ".."}
+        ):
+            raise ValueError("report_path must match reports/*.md")
+        if not markdown.strip():
+            raise ValueError("replacement report cannot be empty")
+        normalized = relative.as_posix()
+        with self._lock:
+            if not self._resolve(normalized).is_file():
+                raise FileNotFoundError(f"report does not exist: {normalized}")
+            self._write_atomic(normalized, markdown)

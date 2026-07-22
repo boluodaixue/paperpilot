@@ -289,28 +289,53 @@ src/research/
 
 ## 10. N6：可选 Red/Blue
 
+### 状态
+
+已完成（2026-08-28）。实施与验收结果见 [N6_OPTIONAL_REPORT_REVIEW.md](N6_OPTIONAL_REPORT_REVIEW.md)。
+
 ### 目标
 
-在稳定最终报告之上增加可关闭的报告审查，不改变研究执行核心。
+在成功持久化的最终报告之上增加默认关闭、最多执行一次的报告审查，不改变研究执行核心。
 
 ### 工作
 
-- Red 从事实性、逻辑一致性和引用质量提出结构化问题；
-- Blue 仅通过 `ADD / DELETE / MODIFY / VERIFY` 修改报告；
-- 修改后由根 Agent 检查证据和 WikiLink 是否仍有效；
-- 默认关闭，失败时保留未经优化但有效的原报告；
-- 对开启、关闭、攻击无效和修订破坏引用等路径增加测试。
+- 先按 N2 契约持久化原始最终报告和 `MemoryManifest`，N6 只在其后运行；
+- 使用 `research.report_review.enabled` 开关且默认关闭；关闭时不增加 policy 调用，也不改变返回结果、manifest 或文件；
+- Red 复用同一 research policy，且只调用一次；它不获得工具，只从事实性、逻辑一致性和引用质量提出结构化问题；
+- Blue 复用同一 policy，且只调用一次；它只允许返回 `ADD / DELETE / MODIFY / VERIFY`，其中 `VERIFY` 不触发外部核验；
+- 根工作流按返回顺序确定性重放 Blue 动作，并要求重放结果与 Blue 返回的完整 Markdown 完全一致，拒绝任何未声明修改；
+- 两次调用均不进入 AgentGraph、不 fork、不创建新线程或 checkpoint；
+- 以原报告快照和原 manifest 做确定性保护：frontmatter 逐字不变，WikiLink target 与次数不变（alias 可调整），URL 的值与次数不变，manifest 与全部路径不变；
+- 保护通过后，只原子替换 manifest 已指向的同一报告文件；不修改 evidence/source，不保存 Red/Blue 中间结果；
+- 任一 policy、解析、动作、校验或写入异常都降级到原报告；写入异常不得损坏已经持久化的原文件；
+- 对关闭、有效修订、三类 Red 问题、四类 Blue 动作、无效动作、动作与完整 Markdown 不一致、链接/URL/frontmatter/manifest 篡改、policy 异常和写回异常增加固定离线测试。
+
+### 不做
+
+- RCS、质量分数、奖励模型或独立 CompletionEvaluator；
+- 新的 Red Agent / Blue Agent 图节点、角色、线程、工具循环或 fork；
+- claim-evidence 新领域模型、Review Repository、Review Store 或第二套持久化；
+- 为完成修订而重新检索、修改原始来源或生成新的 evidence/source；
+- Red/Blue 多轮互攻、自动研究回流或修改 AgentGraph/fork policy。
 
 ### 验收
 
 - Red/Blue 不创建研究线程、不修改原始来源、不伪造证据；
 - 开关不改变 AgentGraph、fork policy 和 Memory Store 契约；
-- 修订后的每个关键结论仍可链接到有效证据；
-- 关闭或失败时仍能正常交付报告。
+- 关闭时 policy 零额外调用，开启时 Red 和 Blue 各至多一次且无工具；
+- Red 只产生 `factual / logical_consistency / citation_quality` 三类结构化问题，Blue 只接受四种动作；
+- Blue 动作按顺序重放后与其完整 Markdown 完全一致；
+- 修订后 frontmatter、WikiLink target 与次数、URL 的值与次数以及 manifest 与原报告保护快照一致；
+- 关闭、无有效问题或任一失败时仍正常交付原始已持久化报告；
+- 关键专项与回归 `65 passed, 1 warning`，全量回归 `160 passed, 1 warning`；全量中的 warning 为既有 `StarletteDeprecationWarning`。
 
 ## 11. Future：LLM Wiki
 
-在 N1—N5 稳定后再规划：
+### 状态
+
+尚未开始。
+
+N0–N6 稳定后再单独规划：
 
 - 对 Memory Store 提问；
 - 导入用户论文、网页和笔记；
@@ -347,4 +372,4 @@ N0 文档收敛
 → Future LLM Wiki
 ```
 
-下一次编码只进入 N6 的可选 Red/Blue。不得把 N6 扩展为新的研究 Agent 角色、存储服务、图数据库、评分引擎或 fork 领域系统；遇到此类设计应停止扩展并先重新核对 [ARCHITECTURE.md](ARCHITECTURE.md)。
+N6 已完成。下一阶段仅为 Future LLM Wiki，当前尚未开始；开始前必须另行对齐范围，不得从 N6 隐式扩展新的 Agent 角色、线程、存储、评分引擎或 claim-evidence 领域系统。
