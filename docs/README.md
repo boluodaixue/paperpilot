@@ -2,11 +2,13 @@
 
 ## 现行文档
 
-只有以下三份文档定义当前项目：
+以下文档共同定义当前项目和已确认的下一主线：
 
 1. [ARCHITECTURE.md](ARCHITECTURE.md)：唯一架构事实来源；
 2. [IMPLEMENTATION_PLAN.md](IMPLEMENTATION_PLAN.md)：唯一开发顺序和验收边界；
-3. [ROADMAP.md](ROADMAP.md)：当前完成度和下一阶段。
+3. [ROADMAP.md](ROADMAP.md)：当前完成度和下一阶段；
+4. [LLM_WIKI_OBSIDIAN_ARCHITECTURE.md](LLM_WIKI_OBSIDIAN_ARCHITECTURE.md)：LLM Wiki + Obsidian 主线的目标架构附录；
+5. [LLM_WIKI_OBSIDIAN_IMPLEMENTATION_PLAN.md](LLM_WIKI_OBSIDIAN_IMPLEMENTATION_PLAN.md)：W0–W6 的具体实施与验收附录。
 
 若现有代码、注释、历史记录或提交说明与现行文档冲突，以 `ARCHITECTURE.md` 为准。
 

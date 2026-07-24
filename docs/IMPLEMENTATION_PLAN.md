@@ -329,21 +329,23 @@ src/research/
 - 关闭、无有效问题或任一失败时仍正常交付原始已持久化报告；
 - 关键专项与回归 `65 passed, 1 warning`，全量回归 `160 passed, 1 warning`；全量中的 warning 为既有 `StarletteDeprecationWarning`。
 
-## 11. Future：LLM Wiki
+## 11. LLM Wiki + Obsidian
 
 ### 状态
 
-尚未开始。
+方案与实施计划已确认，尚未开始编码。
 
-N0–N6 稳定后再单独规划：
+具体执行以 [LLM Wiki + Obsidian 实施计划](LLM_WIKI_OBSIDIAN_IMPLEMENTATION_PLAN.md) 为唯一阶段顺序和验收边界：
 
-- 对 Memory Store 提问；
-- 导入用户论文、网页和笔记；
-- 自动整理 Markdown 与 WikiLink；
-- 发现已有知识之间的关联、冲突和空白；
-- 从 Wiki 中发起新的研究任务。
+- W0 Memory/Vault 契约与安全基础；
+- W1 多 Memory 持久化；
+- W2 Obsidian 最小接入；
+- W3 基于旧 Memory 继续研究；
+- W4 Memory 问答与受控新建笔记；
+- W5 资料导入与整理；
+- W6 稳定化、迁移与入口收口。
 
-本阶段不改变 Research AgentGraph，不新增第二套存储。
+该主线不改变 Research AgentGraph，不新增第二套存储，不开发复杂 Markdown 阅读器。
 
 ## 12. 测试顺序
 
@@ -369,7 +371,7 @@ N0 文档收敛
 → N4 一层递归 + 硬停止 + 恢复
 → N5 切换入口 + 清理 legacy
 → N6 可选 Red/Blue
-→ Future LLM Wiki
+→ W0–W6 LLM Wiki + Obsidian
 ```
 
-N6 已完成。下一阶段仅为 Future LLM Wiki，当前尚未开始；开始前必须另行对齐范围，不得从 N6 隐式扩展新的 Agent 角色、线程、存储、评分引擎或 claim-evidence 领域系统。
+N6 已完成。下一次编码从 LLM Wiki + Obsidian 的 W0 开始。不得从该主线隐式扩展新的 Agent 角色、图/向量数据库、复杂阅读器、第二套存储或未经确认的自动写入行为。
