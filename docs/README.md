@@ -31,6 +31,7 @@
 - [N4_RECURSION_LIMITS_AND_RECOVERY.md](N4_RECURSION_LIMITS_AND_RECOVERY.md)：一层递归、全局硬限制、取消与多线程 checkpoint 恢复的实现与验收结果。
 - [N5_ENTRY_MIGRATION_AND_LEGACY_CLEANUP.md](N5_ENTRY_MIGRATION_AND_LEGACY_CLEANUP.md)：生产入口迁移、固定输入对照与 legacy 清理结果。
 - [N6_OPTIONAL_REPORT_REVIEW.md](N6_OPTIONAL_REPORT_REVIEW.md)：默认关闭的单次 Red/Blue 报告后处理实现与验收结果。
+- [W0_MEMORY_VAULT_CONTRACT.md](W0_MEMORY_VAULT_CONTRACT.md)：长期 Memory/Vault、frontmatter、WikiLink 与路径安全契约的实现与验收结果。
 
 ## 已清理文档
 

@@ -116,7 +116,8 @@ def test_default_config_contains_only_active_runtime_sections() -> None:
     assert set(config["model"]["backend_mapping"]) == {"research", "judge"}
     assert set(config["model"]["backend_sampling"]["modules"]) == {"research", "judge"}
     assert set(config["research"]["limits"]) == AGENT_LIMIT_FIELDS
-    assert config["research"]["memory_root"]
+    assert config["research"]["vault_root"]
+    assert "memory_root" not in config["research"]
     assert config["chat"]["db_path"]
     assert "execution" not in config["tools"]
 

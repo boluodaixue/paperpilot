@@ -25,7 +25,7 @@ model:
     judge: "deepseek"
 
 research:
-  memory_root: "memory"
+  vault_root: "memory"
   report_review:
     enabled: false
   limits:

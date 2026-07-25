@@ -178,6 +178,17 @@ class MemoryManifest:
 
 
 @dataclass(frozen=True)
+class MemoryDescriptor:
+    """Minimal identity and location contract for one long-lived Memory."""
+
+    memory_id: str
+    title: str
+    relative_path: str
+    created_at: str
+    updated_at: str
+
+
+@dataclass(frozen=True)
 class ReportIssue:
     """One structured Red review finding about the final report."""
 

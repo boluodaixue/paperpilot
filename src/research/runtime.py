@@ -55,6 +55,7 @@ __all__ = [
     "limits_from_config",
     "load_config",
     "setup_logging",
+    "vault_root_from_config",
 ]
 
 
@@ -119,24 +120,49 @@ def build_research_tools(config: dict[str, Any]) -> list[Any]:
     return [available[name] for name in enabled]
 
 
+def _research_config(config: dict[str, Any]) -> Mapping[str, Any]:
+    research = config.get("research", {})
+    if not isinstance(research, Mapping):
+        raise ValueError("research configuration must be a mapping")
+    return research
+
+
 def limits_from_config(config: dict[str, Any]) -> AgentLimits:
-    values = config.get("research", {}).get("limits", {})
+    values = _research_config(config).get("limits", {})
     allowed = AgentLimits.__dataclass_fields__.keys()
     limits = AgentLimits(**{key: values[key] for key in allowed if key in values})
     limits.validate()
     return limits
 
 
-def _memory_root(config: dict[str, Any]) -> Path:
-    configured = config.get("research", {}).get("memory_root", "memory")
-    path = Path(str(configured))
+def vault_root_from_config(config: dict[str, Any]) -> Path:
+    """Resolve the configured Vault root, with legacy ``memory_root`` fallback."""
+    research = _research_config(config)
+    if "vault_root" in research:
+        key = "vault_root"
+        configured = research[key]
+    elif "memory_root" in research:
+        key = "memory_root"
+        configured = research[key]
+    else:
+        key = "vault_root"
+        configured = "memory"
+
+    try:
+        raw_path = os.fspath(configured)
+    except TypeError as exc:
+        raise ValueError(
+            f"research.{key} must be a non-empty path-like string"
+        ) from exc
+    if not isinstance(raw_path, str) or not raw_path.strip():
+        raise ValueError(f"research.{key} must be a non-empty path-like string")
+
+    path = Path(raw_path)
     return path if path.is_absolute() else PROJECT_ROOT / path
 
 
 def _report_review_enabled(config: dict[str, Any]) -> bool:
-    research = config.get("research", {})
-    if not isinstance(research, Mapping):
-        raise ValueError("research configuration must be a mapping")
+    research = _research_config(config)
     report_review = research.get("report_review", {})
     if not isinstance(report_review, Mapping):
         raise ValueError("research.report_review must be a mapping")
@@ -258,7 +284,7 @@ def build_research_runtime(
         memory_store=(
             memory_store
             if memory_store is not None
-            else MarkdownMemoryStore(_memory_root(effective_config))
+            else MarkdownMemoryStore(vault_root_from_config(effective_config))
         ),
         checkpointer=checkpointer if checkpointer is not None else InMemorySaver(),
         limits=limits_from_config(effective_config),

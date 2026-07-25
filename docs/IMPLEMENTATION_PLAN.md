@@ -333,7 +333,7 @@ src/research/
 
 ### 状态
 
-方案与实施计划已确认，尚未开始编码。
+W0 已完成，W1–W6 尚未开始。W0 实施与验收结果见 [W0_MEMORY_VAULT_CONTRACT.md](W0_MEMORY_VAULT_CONTRACT.md)。
 
 具体执行以 [LLM Wiki + Obsidian 实施计划](LLM_WIKI_OBSIDIAN_IMPLEMENTATION_PLAN.md) 为唯一阶段顺序和验收边界：
 
@@ -374,4 +374,4 @@ N0 文档收敛
 → W0–W6 LLM Wiki + Obsidian
 ```
 
-N6 已完成。下一次编码从 LLM Wiki + Obsidian 的 W0 开始。不得从该主线隐式扩展新的 Agent 角色、图/向量数据库、复杂阅读器、第二套存储或未经确认的自动写入行为。
+N6 与 W0 已完成，W1 尚未开始。不得从该主线隐式扩展新的 Agent 角色、图/向量数据库、复杂阅读器、第二套存储或未经确认的自动写入行为。
