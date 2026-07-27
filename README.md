@@ -101,11 +101,12 @@ N6 只处理已经成功持久化的最终 Markdown 报告，由 `research.repor
 
 该能力不是新的 Research Agent 角色、RCS 或评分引擎，也不引入 claim-evidence 新模型或第二套存储。详细边界见 [N6 实施记录](docs/N6_OPTIONAL_REPORT_REVIEW.md)。
 
-下一主线已确认为 LLM Wiki + Obsidian：Obsidian 负责 Markdown 阅读、编辑和双链，PaperPilot 负责多 Memory、检索对话、受控写入和继续研究。默认使用一个 Vault 和多个长期 Memory，不自建复杂阅读器。W0 Memory/Vault 契约与安全基础已完成；W1 多 Memory 持久化尚未开始。
+下一主线已确认为 LLM Wiki + Obsidian：Obsidian 负责 Markdown 阅读、编辑和双链，PaperPilot 负责多 Memory、检索对话、受控写入和继续研究。默认使用一个 Vault 和多个长期 Memory，不自建复杂阅读器。W0 Memory/Vault 契约与 W1 多 Memory 持久化已完成；W2 Obsidian 最小接入尚未开始。
 
 - [LLM Wiki + Obsidian 目标架构](docs/LLM_WIKI_OBSIDIAN_ARCHITECTURE.md)
 - [LLM Wiki + Obsidian 实施计划](docs/LLM_WIKI_OBSIDIAN_IMPLEMENTATION_PLAN.md)
 - [W0 实施记录](docs/W0_MEMORY_VAULT_CONTRACT.md)
+- [W1 实施记录](docs/W1_MULTI_MEMORY_PERSISTENCE.md)
 
 ## 快速开始
 

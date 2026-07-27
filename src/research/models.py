@@ -229,3 +229,4 @@ class ResearchWorkflowResult:
     report_markdown: str
     memory_manifest: MemoryManifest
     report_review: ReportReviewOutcome | None = None
+    memory_id: str | None = None

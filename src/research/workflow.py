@@ -30,6 +30,7 @@ from .models import (
 )
 from .policy import call_policy
 from .report_review import review_final_report
+from .vault import validate_memory_id
 
 
 __all__ = [
@@ -44,6 +45,7 @@ class ResearchWorkflowState(TypedDict, total=False):
     """Fields used by the outer workflow and embedded Research AgentGraph."""
 
     question: str
+    memory_id: str | None
     brief: ResearchBrief | None
     alignment_messages: list[dict[str, Any]]
     revision_feedback: str | None
@@ -231,10 +233,15 @@ def create_research_workflow_state(
     question: str,
     identity: ExecutionIdentity,
     limits: AgentLimits | None = None,
+    *,
+    memory_id: str | None = None,
 ) -> ResearchWorkflowState:
     """Create the root workflow input used for the first ``ainvoke`` call."""
+    if memory_id is not None:
+        validate_memory_id(memory_id)
     return ResearchWorkflowState(
         question=question,
+        memory_id=memory_id,
         brief=None,
         alignment_messages=[],
         revision_feedback=None,
@@ -269,11 +276,20 @@ def build_research_workflow(
         child_checkpointer=effective_checkpointer,
     )
 
+    def validate_workflow_state(
+        state: ResearchWorkflowState,
+        config: RunnableConfig,
+    ) -> None:
+        _validate_root_state(state, config)
+        memory_id = state.get("memory_id")
+        if memory_id is not None:
+            memory_store.get_memory(validate_memory_id(memory_id))
+
     async def draft_brief(
         state: ResearchWorkflowState,
         config: RunnableConfig,
     ) -> dict[str, Any]:
-        _validate_root_state(state, config)
+        validate_workflow_state(state, config)
         messages = [
             {"role": "system", "content": _alignment_system_prompt()},
             {"role": "user", "content": state["question"]},
@@ -297,7 +313,7 @@ def build_research_workflow(
         state: ResearchWorkflowState,
         config: RunnableConfig,
     ) -> dict[str, Any]:
-        _validate_root_state(state, config)
+        validate_workflow_state(state, config)
         brief = state.get("brief")
         if not isinstance(brief, ResearchBrief):
             raise TypeError("draft_brief must produce a ResearchBrief")
@@ -312,7 +328,7 @@ def build_research_workflow(
         state: ResearchWorkflowState,
         config: RunnableConfig,
     ) -> dict[str, Any]:
-        _validate_root_state(state, config)
+        validate_workflow_state(state, config)
         current = state.get("brief")
         feedback = str(state.get("revision_feedback") or "").strip()
         if not isinstance(current, ResearchBrief):
@@ -349,7 +365,7 @@ def build_research_workflow(
         state: ResearchWorkflowState,
         config: RunnableConfig,
     ) -> dict[str, Any]:
-        _validate_root_state(state, config)
+        validate_workflow_state(state, config)
         brief = state.get("brief")
         if not state.get("confirmed"):
             raise ValueError("research cannot start before user confirmation")
@@ -379,7 +395,7 @@ def build_research_workflow(
         state: ResearchWorkflowState,
         config: RunnableConfig,
     ) -> dict[str, Any]:
-        _validate_root_state(state, config)
+        validate_workflow_state(state, config)
         brief = state.get("brief")
         result = state.get("result")
         if not isinstance(brief, ResearchBrief):
@@ -387,17 +403,28 @@ def build_research_workflow(
         if not isinstance(result, ResearchResult):
             raise TypeError("Research AgentGraph completed without a ResearchResult")
         with _workflow_trace("persist", state) as observation:
-            report_markdown, manifest = await asyncio.to_thread(
-                memory_store.persist_research,
-                brief,
-                result,
-                state["identity"],
-            )
+            memory_id = state.get("memory_id")
+            if memory_id is None:
+                report_markdown, manifest = await asyncio.to_thread(
+                    memory_store.persist_research,
+                    brief,
+                    result,
+                    state["identity"],
+                )
+            else:
+                report_markdown, manifest = await asyncio.to_thread(
+                    memory_store.persist_research,
+                    brief,
+                    result,
+                    state["identity"],
+                    memory_id=memory_id,
+                )
             workflow_result = ResearchWorkflowResult(
                 brief=brief,
                 research_result=result,
                 report_markdown=report_markdown,
                 memory_manifest=manifest,
+                memory_id=memory_id,
             )
             observation.add_output(
                 {
@@ -417,7 +444,7 @@ def build_research_workflow(
         state: ResearchWorkflowState,
         config: RunnableConfig,
     ) -> dict[str, Any]:
-        _validate_root_state(state, config)
+        validate_workflow_state(state, config)
         if not report_review_enabled:
             return {"report_review": None}
 
@@ -448,6 +475,7 @@ def build_research_workflow(
                     report_markdown=final_report,
                     memory_manifest=manifest,
                     report_review=outcome,
+                    memory_id=state.get("memory_id"),
                 )
                 if final_report != original_report:
                     await asyncio.to_thread(
@@ -479,6 +507,7 @@ def build_research_workflow(
                     report_markdown=original_report,
                     memory_manifest=manifest,
                     report_review=outcome,
+                    memory_id=state.get("memory_id"),
                 )
                 observation.add_output(
                     {

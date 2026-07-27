@@ -35,6 +35,7 @@ from .memory import MarkdownMemoryStore
 from .models import (
     AgentLimits,
     ExecutionIdentity,
+    MemoryDescriptor,
     ResearchBrief,
     ResearchWorkflowResult,
 )
@@ -210,6 +211,7 @@ class ResearchRuntime:
         question: str,
         *,
         thread_id: str | None = None,
+        memory_id: str | None = None,
     ) -> dict[str, Any]:
         root_thread_id = thread_id or self.new_thread_id()
         identity = ExecutionIdentity(
@@ -219,7 +221,12 @@ class ResearchRuntime:
             depth=0,
         )
         return await self.graph.ainvoke(
-            create_research_workflow_state(question, identity, self.limits),
+            create_research_workflow_state(
+                question,
+                identity,
+                self.limits,
+                memory_id=memory_id,
+            ),
             config={"configurable": {"thread_id": root_thread_id}},
         )
 
@@ -241,9 +248,14 @@ class ResearchRuntime:
         question: str,
         *,
         thread_id: str | None = None,
+        memory_id: str | None = None,
     ) -> ResearchWorkflowResult:
         root_thread_id = thread_id or self.new_thread_id()
-        await self.start(question, thread_id=root_thread_id)
+        await self.start(
+            question,
+            thread_id=root_thread_id,
+            memory_id=memory_id,
+        )
         final = await self.review(root_thread_id, "confirm")
         result = final.get("workflow_result")
         if not isinstance(result, ResearchWorkflowResult):
@@ -258,6 +270,19 @@ class ResearchRuntime:
 
     def read_memory(self, relative_path: str) -> str:
         return self.memory_store.read_text(relative_path)
+
+    def create_memory(
+        self,
+        title: str,
+        memory_id: str | None = None,
+    ) -> MemoryDescriptor:
+        return self.memory_store.create_memory(title, memory_id=memory_id)
+
+    def list_memories(self) -> tuple[MemoryDescriptor, ...]:
+        return self.memory_store.list_memories()
+
+    def get_memory(self, memory_id: str) -> MemoryDescriptor:
+        return self.memory_store.get_memory(memory_id)
 
     async def close(self, *, shutdown: bool = False) -> None:
         await WebSearchTool.close_session()
