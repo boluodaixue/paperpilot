@@ -14,7 +14,13 @@ PROJECT_ROOT = Path(__file__).resolve().parent.parent
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-from scripts._workflow_cli import UserCancelled, report_path, run_reviewed_workflow
+from scripts._workflow_cli import (
+    UserCancelled,
+    format_result_locations,
+    report_path,
+    run_reviewed_workflow,
+    vault_name_from_config,
+)
 from src.research.runtime import build_research_runtime, load_config, setup_logging
 
 
@@ -40,6 +46,7 @@ def print_help() -> None:
 
 async def _repl(args: argparse.Namespace) -> None:
     config = load_config(args.config)
+    vault_name = vault_name_from_config(config)
     runtime = build_research_runtime(config=config)
     session_id = args.session_id or f"session-{datetime.now():%Y%m%d-%H%M%S}"
     completed: list[Path] = []
@@ -74,6 +81,7 @@ async def _repl(args: argparse.Namespace) -> None:
                     runtime,
                     query,
                     thread_id=thread_id,
+                    memory_id=getattr(args, "memory_id", None),
                 )
             except UserCancelled:
                 print("Research cancelled.")
@@ -84,7 +92,7 @@ async def _repl(args: argparse.Namespace) -> None:
 
             path = report_path(runtime, result)
             completed.append(path)
-            print(path)
+            print(format_result_locations(runtime, result, vault_name=vault_name))
     finally:
         await runtime.close(shutdown=True)
 
@@ -93,6 +101,11 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="PaperPilot interactive research shell")
     parser.add_argument("--config", default=None, help="Configuration file")
     parser.add_argument("--session-id", default=None, help="Operator grouping label")
+    parser.add_argument(
+        "--memory-id",
+        default=None,
+        help="Optional existing Memory ID for research in this session",
+    )
     parser.add_argument(
         "--log-level",
         default="INFO",

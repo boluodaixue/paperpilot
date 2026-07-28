@@ -26,6 +26,8 @@ model:
 
 research:
   vault_root: "memory"
+  # Optional exact Obsidian Vault name. Omit it to open notes by absolute path.
+  # vault_name: "PaperPilotVault"
   report_review:
     enabled: false
   limits:

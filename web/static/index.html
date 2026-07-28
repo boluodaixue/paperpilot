@@ -35,8 +35,15 @@
 
   /* ---------- 主区 ---------- */
   #main { flex: 1; display: flex; flex-direction: column; min-width: 0; }
-  #chatHeader { padding: 12px 20px; background: #fff; border-bottom: 1px solid #e5e7eb; font-size: 14px; font-weight: 600; }
+  #chatHeader { padding: 10px 20px; background: #fff; border-bottom: 1px solid #e5e7eb; font-size: 14px;
+                font-weight: 600; display: flex; align-items: center; justify-content: space-between; gap: 16px; }
   #chatHeader .sub { font-size: 11px; color: #9ca3af; font-weight: 400; margin-left: 8px; }
+  #memoryControls { display: flex; align-items: center; gap: 7px; min-width: 0; }
+  #memorySelect { max-width: 240px; padding: 7px 9px; border: 1px solid #d1d5db; border-radius: 7px; background: #fff; }
+  .memory-action { padding: 7px 10px; border: 1px solid #d1d5db; border-radius: 7px; background: #fff;
+                   color: #374151; cursor: pointer; font-size: 12px; text-decoration: none; white-space: nowrap; }
+  .memory-action:hover { border-color: #2563eb; color: #2563eb; }
+  .memory-action:disabled, .memory-action.disabled { color: #9ca3af; cursor: not-allowed; border-color: #e5e7eb; }
 
   #messages { flex: 1; overflow-y: auto; padding: 18px 22px; }
   .msg { max-width: 72%; margin-bottom: 12px; border-radius: 10px; padding: 10px 14px; font-size: 14px; line-height: 1.65; }
@@ -111,7 +118,14 @@
 
   <!-- 主区 -->
   <main id="main">
-    <div id="chatHeader">会话<span class="sub" id="chatHeaderSub">输入问题开始</span></div>
+    <div id="chatHeader">
+      <div>会话<span class="sub" id="chatHeaderSub">输入问题开始</span></div>
+      <div id="memoryControls">
+        <select id="memorySelect" aria-label="选择 Memory"></select>
+        <button class="memory-action" id="createMemoryBtn" type="button">＋ 新建 Memory</button>
+        <a class="memory-action disabled" id="openObsidianBtn" aria-disabled="true">在 Obsidian 中打开</a>
+      </div>
+    </div>
     <div id="messages"></div>
 
     <!-- 研究方案确认卡（位于输入框上方） -->
@@ -147,8 +161,83 @@ let currentReportData = null;  // 当前报告数据
 let runningTask = null;        // {task_id, session_id} 正在运行的研究
 let eventSource = null;
 const eventCursors = {};
+let memories = [];
+let selectedMemoryId = null;
+let memorySelectionLocked = false;
 
 const $ = id => document.getElementById(id);
+
+// ------------------------------------------------------------------
+// Memory 选择与 Obsidian 打开
+// ------------------------------------------------------------------
+function renderMemoryControls() {
+  const select = $('memorySelect');
+  select.innerHTML = '';
+  const empty = document.createElement('option');
+  empty.value = ''; empty.textContent = '选择 Memory（可选）';
+  select.appendChild(empty);
+  for (const memory of memories) {
+    const option = document.createElement('option');
+    option.value = memory.memory_id;
+    option.textContent = memory.title;
+    select.appendChild(option);
+  }
+  if (memories.some(memory => memory.memory_id === selectedMemoryId)) {
+    select.value = selectedMemoryId;
+  } else {
+    selectedMemoryId = null;
+    select.value = '';
+  }
+  select.disabled = memorySelectionLocked;
+  $('createMemoryBtn').disabled = memorySelectionLocked;
+
+  const selected = memories.find(memory => memory.memory_id === selectedMemoryId);
+  const open = $('openObsidianBtn');
+  if (selected) {
+    open.href = selected.obsidian_uri;
+    open.classList.remove('disabled');
+    open.setAttribute('aria-disabled', 'false');
+  } else {
+    open.removeAttribute('href');
+    open.classList.add('disabled');
+    open.setAttribute('aria-disabled', 'true');
+  }
+}
+
+function setMemorySelection(memoryId, locked = false) {
+  selectedMemoryId = memoryId || null;
+  memorySelectionLocked = locked;
+  renderMemoryControls();
+}
+
+async function loadMemories(preferredMemoryId = selectedMemoryId) {
+  try {
+    const r = await fetch('/api/memories');
+    if (!r.ok) return;
+    memories = await r.json();
+    selectedMemoryId = preferredMemoryId;
+    renderMemoryControls();
+  } catch (e) { /* 研究入口不依赖 Obsidian 可用性 */ }
+}
+
+async function createMemory() {
+  if (memorySelectionLocked) return;
+  const title = prompt('新 Memory 标题');
+  if (title === null || !title.trim()) return;
+  const r = await fetch('/api/memories', {
+    method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ title: title.trim() }),
+  });
+  const data = await r.json();
+  if (!r.ok) { alert(data.detail || 'Memory 新建失败'); return; }
+  await loadMemories(data.memory_id);
+}
+
+$('memorySelect').addEventListener('change', (event) => {
+  if (memorySelectionLocked) { renderMemoryControls(); return; }
+  setMemorySelection(event.target.value || null, false);
+});
+$('createMemoryBtn').addEventListener('click', createMemory);
 
 // ------------------------------------------------------------------
 // 侧边栏
@@ -263,6 +352,7 @@ function fmtTime(ts) {
 function newSession() {
   currentSessionId = null; currentProposal = null; currentReportData = null; runningTask = null;
   if (eventSource) { eventSource.close(); eventSource = null; }
+  setMemorySelection(selectedMemoryId, false);
   $('messages').innerHTML = '';
   $('proposalCard').style.display = 'none';
   $('chatHeaderSub').textContent = '输入问题开始';
@@ -277,13 +367,15 @@ function newSession() {
 async function selectSession(sid) {
   currentSessionId = sid; currentProposal = null; currentReportData = null;
   if (eventSource) { eventSource.close(); eventSource = null; }
+  memorySelectionLocked = true;
+  renderMemoryControls();
   $('messages').innerHTML = '';
   $('proposalCard').style.display = 'none';
   $('chatHeaderSub').textContent = `会话 ${sid}`;
   const r = await fetch(`/api/sessions/${encodeURIComponent(sid)}/messages`);
   const msgs = await r.json();
   $('messages').innerHTML = '';
-  if (!msgs.length) { loadSessions(); return; }
+  if (!msgs.length) { setMemorySelection(selectedMemoryId, false); loadSessions(); return; }
   // 跳过 proposal/report（单独卡片渲染），其余当气泡显示
   for (const m of msgs) renderStoredMessage(m);
 
@@ -293,16 +385,24 @@ async function selectSession(sid) {
     try {
       const tr = await fetch(`/api/sessions/${encodeURIComponent(sid)}/active-task`);
       const td = await tr.json();
-      if (td.task_id) { task = { task_id: td.task_id, session_id: sid, status: td.status }; runningTask = task; }
+      if (td.task_id) {
+        task = {
+          task_id: td.task_id, session_id: sid, status: td.status,
+          memory_id: td.memory_id || null,
+        };
+        runningTask = task;
+      }
     } catch (e) { /* 忽略 */ }
   }
   if (task && task.status === 'running') {
+    setMemorySelection(task.memory_id, true);
     appendProgress({ type: 'state', state: '研究进行中（已恢复连接）' });
     openEventStream(task.task_id);
     loadSessions();
     return;
   }
   if (task && task.status === 'waiting_confirmation') {
+    setMemorySelection(task.memory_id, true);
     showProposalFromHistory(msgs);
     loadSessions();
     return;
@@ -310,6 +410,8 @@ async function selectSession(sid) {
 
   // 按最后一条消息决定尾部状态：proposal → 恢复确认卡；report → 恢复报告卡
   const last = msgs[msgs.length - 1];
+  const lastReport = msgs.filter(message => message.kind === 'report').slice(-1)[0];
+  setMemorySelection(lastReport ? lastReport.memory_id : null, false);
   if (last.kind === 'proposal') {
     showProposalFromHistory(msgs);
   } else if (last.kind === 'report') {
@@ -358,6 +460,7 @@ async function sendMessage() {
       body: JSON.stringify({
         session_id: currentSessionId,
         task_id: currentProposal ? currentProposal.task_id : null,
+        memory_id: selectedMemoryId,
         message: text,
       }),
     });
@@ -367,6 +470,7 @@ async function sendMessage() {
 
     currentSessionId = data.session_id;
     currentProposal = { brief: data.brief || {}, task_id: data.task_id };
+    setMemorySelection(data.memory_id, true);
     showProposalCard(currentProposal);
     $('chatHeaderSub').textContent = `会话 ${data.session_id}`;
     loadSessions();
@@ -423,7 +527,12 @@ async function submitBriefChanges() {
   const feedback = '请按以下完整内容修改研究说明：' + JSON.stringify(readBriefFromForm());
   const r = await fetch('/api/alignment', {
     method: 'POST', headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({session_id: currentSessionId, task_id: currentProposal.task_id, message: feedback}),
+    body: JSON.stringify({
+      session_id: currentSessionId,
+      task_id: currentProposal.task_id,
+      memory_id: selectedMemoryId,
+      message: feedback,
+    }),
   });
   const data = await r.json();
   if (!r.ok) { alert(data.detail || '修改失败'); return; }
@@ -451,7 +560,11 @@ async function startResearch() {
   });
   const data = await r.json();
   if (!r.ok) { appendProgress({ type: 'error', message: data.detail || '启动失败' }); return; }
-  runningTask = { task_id: data.task_id, session_id: currentSessionId, status: data.status };
+  runningTask = {
+    task_id: data.task_id, session_id: currentSessionId,
+    memory_id: data.memory_id || null, status: data.status,
+  };
+  setMemorySelection(runningTask.memory_id, true);
   openEventStream(data.task_id);
 }
 
@@ -474,6 +587,7 @@ function openEventStream(task_id) {
     } else if (ev.type === 'error') {
       eventSource.close(); eventSource = null;
       runningTask = null;
+      setMemorySelection(selectedMemoryId, false);
     }
   };
   eventSource.onerror = () => {
@@ -514,6 +628,7 @@ async function fetchResult(task_id) {
     return;
   }
   currentReportData = data;
+  setMemorySelection(data.memory_id, false);
   renderReportCard(data);
   loadSessions();
 }
@@ -525,7 +640,12 @@ async function loadReportData(sid, reportMsg) {
     const d = await r.json();
     ev = d;
   } catch (e) {}
-  return { report_md: reportMsg.content, evidence: ev.evidence || [], session_id: sid };
+  return {
+    report_md: reportMsg.content,
+    evidence: ev.evidence || [],
+    session_id: sid,
+    memory_id: reportMsg.memory_id || null,
+  };
 }
 
 function renderReportCard(data) {
@@ -582,6 +702,7 @@ let sendLock = false;
 $('newSessionBtn').onclick = newSession;
 $('msgInput').addEventListener('keydown', e => { if (e.key === 'Enter') sendMessage(); });
 loadSessions();
+loadMemories();
 newSession();
 </script>
 </body>

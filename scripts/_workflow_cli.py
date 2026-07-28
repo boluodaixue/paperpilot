@@ -1,12 +1,13 @@
 """Shared command-line interaction for the PaperPilot research workflow."""
 from __future__ import annotations
 
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from dataclasses import asdict
 from pathlib import Path
 from typing import Any
 
 from src.research.models import ResearchBrief, ResearchWorkflowResult
+from src.research.obsidian import build_obsidian_open_uri
 from src.research.runtime import ResearchRuntime
 
 
@@ -53,12 +54,20 @@ async def run_reviewed_workflow(
     question: str,
     *,
     thread_id: str,
+    memory_id: str | None = None,
     auto_confirm: bool = False,
     input_fn: Callable[[str], str] = input,
     output_fn: Callable[[str], Any] = print,
 ) -> ResearchWorkflowResult:
     """Start one root workflow and keep it paused until the brief is accepted."""
-    state = await runtime.start(question, thread_id=thread_id)
+    if memory_id is None:
+        state = await runtime.start(question, thread_id=thread_id)
+    else:
+        state = await runtime.start(
+            question,
+            thread_id=thread_id,
+            memory_id=memory_id,
+        )
     while True:
         output_fn(format_brief(_brief_from_state(state)))
         if auto_confirm:
@@ -87,3 +96,49 @@ async def run_reviewed_workflow(
 def report_path(runtime: ResearchRuntime, result: ResearchWorkflowResult) -> Path:
     """Resolve the persisted report manifest entry to its Markdown file."""
     return (runtime.memory_store.root / result.memory_manifest.report_path).resolve()
+
+
+def vault_name_from_config(config: Mapping[str, Any]) -> str | None:
+    """Read the optional explicit Obsidian Vault name without deriving one."""
+    research = config.get("research", {})
+    if not isinstance(research, Mapping):
+        raise ValueError("research configuration must be a mapping")
+    value = research.get("vault_name")
+    if value is None:
+        return None
+    if not isinstance(value, str) or not value.strip():
+        raise ValueError("research.vault_name must be a non-empty string")
+    return value.strip()
+
+
+def format_result_locations(
+    runtime: ResearchRuntime,
+    result: ResearchWorkflowResult,
+    *,
+    vault_name: str | None = None,
+) -> str:
+    """Format durable output locations for one completed workflow."""
+    vault_root = Path(runtime.memory_store.root).resolve()
+    lines = [f"Vault: {vault_root}"]
+    if result.memory_id is None:
+        lines.extend(
+            (
+                "Memory Home: unavailable (legacy Memory)",
+                "Obsidian URI: unavailable (legacy Memory)",
+            )
+        )
+    else:
+        home_relative_path = f"Memories/{result.memory_id}/Home.md"
+        uri = build_obsidian_open_uri(
+            vault_root,
+            home_relative_path,
+            vault_name=vault_name,
+        )
+        lines.extend(
+            (
+                f"Memory Home: {(vault_root / home_relative_path).resolve()}",
+                f"Obsidian URI: {uri}",
+            )
+        )
+    lines.append(f"Report: {report_path(runtime, result)}")
+    return "\n".join(lines)

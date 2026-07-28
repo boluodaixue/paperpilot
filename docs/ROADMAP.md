@@ -4,7 +4,7 @@
 
 ## 当前判断
 
-N0–N6 与 LLM Wiki + Obsidian 的 W0–W1 已完成。CLI、Web 和评测继续进入同一个 Research Workflow；旧 Manager / Planner / DAG / AgentPool / Evidence Graph 链路已经删除。W1 在同一个 MarkdownMemoryStore 内实现多 Memory 持久化，没有改变 Research AgentGraph 或开始 Obsidian 前端接入。
+N0–N6 与 LLM Wiki + Obsidian 的 W0–W2 已完成。CLI、Web 和评测继续进入同一个 Research Workflow；旧 Manager / Planner / DAG / AgentPool / Evidence Graph 链路已经删除。W2 只增加安全 Obsidian 打开 URI、最小 Memory 控件和 CLI 位置输出，没有改变 Research AgentGraph 或引入阅读器。
 
 ## 进度
 
@@ -19,7 +19,8 @@ N0–N6 与 LLM Wiki + Obsidian 的 W0–W1 已完成。CLI、Web 和评测继�
 | N6 可选 Red/Blue | ✅ | 默认关闭的单次报告后处理，且不破坏 frontmatter、WikiLink、URL 或 manifest |
 | W0 Memory/Vault 契约 | ✅ | 稳定 `memory_id`、Vault 路径、frontmatter/WikiLink 安全与 legacy 只读识别 |
 | W1 多 Memory 持久化 | ✅ | 原子创建/列出/选择 Memory，研究隔离写入并保留历史 |
-| W2–W6 LLM Wiki + Obsidian | 📝 | 尚未开始；按已确认计划逐阶段实施 |
+| W2 Obsidian 最小接入 | ✅ | Web/CLI 可定位并打开指定 Memory `Home.md`，不自建阅读器 |
+| W3–W6 LLM Wiki + Obsidian | 📝 | 尚未开始；按已确认计划逐阶段实施 |
 
 ## N0 已确定的架构决策
 
@@ -129,7 +130,20 @@ W0 在不改变 N1–N6 主链的前提下完成了长期 Memory/Vault 基础：
 - 并发创建、并发写入和 symlink/junction 逃逸均有确定性测试；
 - W1 专项 `19 passed, 1 warning`，原 W0 + N1–N6 回归 `240 passed, 1 warning`，仓库全量 `259 passed, 1 warning`。
 
-详见 [W1 实施记录](W1_MULTI_MEMORY_PERSISTENCE.md)。W2 Obsidian 最小接入尚未开始。
+详见 [W1 实施记录](W1_MULTI_MEMORY_PERSISTENCE.md)。
+
+## W2 已完成
+
+- 使用标准 `obsidian://open` URI，可按显式 Vault 名称和文件路径打开，也可按绝对路径打开；
+- 中文、空格、嵌套路径和 URI 保留字符均按 UTF-8 percent-encoding；
+- URI 目标复用 W0 Vault 路径安全检查，不接受路径逃逸、非 Markdown 或 symlink/junction 逃逸；
+- Web 增加 Memory 选择器、新建 Memory 和“在 Obsidian 中打开”，新研究携带明确选择的 `memory_id`；
+- CLI 可用 `--memory-id` 选择已有 Memory，并在完成后输出 Vault、Home、URI 和报告路径；
+- 每次列出 Memory 都重新读取 `Home.md`，因此 Obsidian 外部标题编辑会在下一次请求中生效；
+- 不检测或启动 Obsidian，不写 `.obsidian/`，不实现插件、阅读器或笔记写入；
+- W2 专项 `34 passed, 1 warning`，原 N1–N6 + W0–W1 回归 `259 passed, 1 warning`，仓库全量 `293 passed, 1 warning`。
+
+详见 [W2 实施记录](W2_OBSIDIAN_MINIMAL_INTEGRATION.md)。W3 基于旧 Memory 继续研究尚未开始。
 
 ## 历史基础
 

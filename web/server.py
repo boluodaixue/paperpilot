@@ -30,7 +30,8 @@ for _stream in (sys.stdout, sys.stderr):
         pass
 
 from src.memory.chat_store import KIND_PROPOSAL, KIND_REPORT, ChatStore  # noqa: E402
-from src.research.models import ResearchWorkflowResult  # noqa: E402
+from src.research.models import MemoryDescriptor, ResearchWorkflowResult  # noqa: E402
+from src.research.obsidian import build_obsidian_open_uri  # noqa: E402
 from src.research.runtime import ResearchRuntime, build_research_runtime, load_config  # noqa: E402
 
 STATIC_DIR = Path(__file__).resolve().parent / "static"
@@ -135,6 +136,10 @@ class ResearchRequest(BaseModel):
     session_id: str | None = None
 
 
+class MemoryCreateRequest(BaseModel):
+    title: str
+
+
 class SessionRename(BaseModel):
     title: str
 
@@ -203,6 +208,38 @@ def _latest_report_pointer(session_id: str) -> dict[str, Any] | None:
             if isinstance(value, dict) and isinstance(value.get("manifest"), dict):
                 return value
     return None
+
+
+def _configured_vault_name() -> str | None:
+    research = _config.get("research", {})
+    value = research.get("vault_name") if isinstance(research, dict) else None
+    if value is None:
+        return None
+    if not isinstance(value, str) or not value.strip():
+        raise HTTPException(
+            status_code=500,
+            detail="research.vault_name 必须是非空字符串",
+        )
+    return value.strip()
+
+
+def _memory_response(
+    runtime: ResearchRuntime,
+    descriptor: MemoryDescriptor,
+) -> dict[str, Any]:
+    home_relative_path = f"{descriptor.relative_path}Home.md"
+    vault_root = runtime.memory_store.root
+    home_absolute_path = (vault_root / home_relative_path).resolve(strict=False)
+    return {
+        **asdict(descriptor),
+        "home_relative_path": home_relative_path,
+        "home_absolute_path": str(home_absolute_path),
+        "obsidian_uri": build_obsidian_open_uri(
+            vault_root,
+            home_relative_path,
+            vault_name=_configured_vault_name(),
+        ),
+    }
 
 
 def _expanded_messages(session_id: str) -> list[dict[str, Any]]:
@@ -421,6 +458,28 @@ async def session_active_task(sid: str) -> dict[str, Any]:
 @app.get("/api/sessions")
 async def list_sessions() -> list[dict[str, Any]]:
     return get_chat_store().list_sessions()
+
+
+@app.get("/api/memories")
+async def list_memories() -> list[dict[str, Any]]:
+    runtime = get_research_runtime()
+    return [_memory_response(runtime, item) for item in runtime.list_memories()]
+
+
+@app.post("/api/memories")
+async def create_memory(req: MemoryCreateRequest) -> dict[str, Any]:
+    title = (req.title or "").strip()
+    if not title:
+        raise HTTPException(status_code=400, detail="Memory 标题不能为空")
+    _configured_vault_name()
+    runtime = get_research_runtime()
+    try:
+        descriptor = runtime.create_memory(title)
+    except FileExistsError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return _memory_response(runtime, descriptor)
 
 
 @app.get("/api/sessions/{sid}/messages")
