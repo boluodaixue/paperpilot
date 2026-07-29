@@ -30,6 +30,7 @@ from .models import (
 )
 from .policy import call_policy
 from .report_review import review_final_report
+from .retrieval import MarkdownMemoryIndex, MemorySearchHit
 from .vault import validate_memory_id
 
 
@@ -46,6 +47,7 @@ class ResearchWorkflowState(TypedDict, total=False):
 
     question: str
     memory_id: str | None
+    retrieved_memory: list[dict[str, Any]]
     brief: ResearchBrief | None
     alignment_messages: list[dict[str, Any]]
     revision_feedback: str | None
@@ -153,11 +155,57 @@ def _as_string_tuple(value: Any) -> tuple[str, ...]:
     return tuple(str(item).strip() for item in value if str(item).strip())
 
 
+def _bounded_memory_hits(
+    hits: Iterable[MemorySearchHit],
+) -> list[dict[str, Any]]:
+    return [
+        {
+            "path": hit.relative_path,
+            "title": hit.title[:300],
+            "summary": hit.summary[:1200],
+            "wikilinks": [link[:300] for link in hit.wikilinks[:8]],
+        }
+        for hit in tuple(hits)[:5]
+    ]
+
+
+def _memory_alignment_message(
+    memory_id: str,
+    retrieved_memory: list[dict[str, Any]],
+) -> dict[str, str]:
+    if retrieved_memory:
+        introduction = (
+            "Use the following deterministic matches from the selected Memory to "
+            "separate known information from remaining research gaps."
+        )
+    else:
+        introduction = (
+            "No relevant notes were found in the selected Memory. Do not claim that "
+            "prior Memory information was used."
+        )
+    payload = {
+        "memory_id": memory_id,
+        "hits": retrieved_memory,
+    }
+    return {
+        "role": "system",
+        "content": (
+            f"{introduction}\n"
+            "The Memory ID and note paths below are fixed by PaperPilot; do not "
+            "replace or invent them. Return known_information and research_gaps as "
+            "arrays in the research brief JSON.\n"
+            f"MEMORY_CONTEXT_JSON:\n{json.dumps(payload, ensure_ascii=False)}"
+        ),
+    }
+
+
 def _parse_brief(
     content: str,
     *,
     question: str,
     revision: int,
+    memory_id: str | None = None,
+    retrieved_memory: Iterable[dict[str, Any]] = (),
 ) -> ResearchBrief:
     candidate = (content or "").strip()
     fenced = _JSON_FENCE.search(candidate)
@@ -179,6 +227,31 @@ def _parse_brief(
         raise ValueError("research brief must contain at least one direction")
     if not expected_output:
         raise ValueError("research brief expected_output cannot be empty")
+    fixed_memory = tuple(retrieved_memory) if memory_id is not None else ()
+    memory_paths = tuple(
+        str(item["path"])
+        for item in fixed_memory
+        if str(item.get("path") or "").strip()
+    )
+    if memory_id is None:
+        known_information: tuple[str, ...] = ()
+        research_gaps: tuple[str, ...] = ()
+    else:
+        if not fixed_memory:
+            known_information = ()
+        elif "known_information" in payload:
+            known_information = _as_string_tuple(payload.get("known_information"))
+        else:
+            known_information = tuple(
+                str(item["summary"]).strip()
+                for item in fixed_memory
+                if str(item.get("summary") or "").strip()
+            )
+        research_gaps = (
+            _as_string_tuple(payload.get("research_gaps"))
+            if "research_gaps" in payload
+            else directions
+        )
     return ResearchBrief(
         question=question,
         objective=objective,
@@ -187,6 +260,10 @@ def _parse_brief(
         constraints=_as_string_tuple(payload.get("constraints")),
         expected_output=expected_output,
         revision=revision,
+        memory_id=memory_id,
+        memory_paths=memory_paths,
+        known_information=known_information,
+        research_gaps=research_gaps,
     )
 
 
@@ -242,6 +319,7 @@ def create_research_workflow_state(
     return ResearchWorkflowState(
         question=question,
         memory_id=memory_id,
+        retrieved_memory=[],
         brief=None,
         alignment_messages=[],
         revision_feedback=None,
@@ -275,6 +353,7 @@ def build_research_workflow(
         inherit_checkpointer=True,
         child_checkpointer=effective_checkpointer,
     )
+    memory_index = MarkdownMemoryIndex(memory_store)
 
     def validate_workflow_state(
         state: ResearchWorkflowState,
@@ -290,8 +369,28 @@ def build_research_workflow(
         config: RunnableConfig,
     ) -> dict[str, Any]:
         validate_workflow_state(state, config)
+        memory_id = state.get("memory_id")
+        retrieved_memory: list[dict[str, Any]] = []
+        if memory_id is not None:
+            try:
+                hits = memory_index.search(
+                    memory_id,
+                    state["question"],
+                    limit=5,
+                )
+            except FileNotFoundError:
+                # Compatible Stores may expose a descriptor without local Markdown.
+                # A deleted selected Memory still fails this second existence check.
+                memory_store.get_memory(memory_id)
+                hits = ()
+            retrieved_memory = _bounded_memory_hits(hits)
         messages = [
             {"role": "system", "content": _alignment_system_prompt()},
+            *(
+                [_memory_alignment_message(memory_id, retrieved_memory)]
+                if memory_id is not None
+                else []
+            ),
             {"role": "user", "content": state["question"]},
         ]
         with _workflow_trace("draft_brief", state) as observation:
@@ -300,10 +399,13 @@ def build_research_workflow(
                 str(response.get("content") or ""),
                 question=state["question"],
                 revision=0,
+                memory_id=memory_id,
+                retrieved_memory=retrieved_memory,
             )
             observation.add_output({"revision": brief.revision})
         return {
             "brief": brief,
+            "retrieved_memory": retrieved_memory,
             "alignment_messages": [*messages, _assistant_message(response)],
             "revision_feedback": None,
             "confirmed": False,
@@ -352,6 +454,8 @@ def build_research_workflow(
                 str(response.get("content") or ""),
                 question=state["question"],
                 revision=current.revision + 1,
+                memory_id=state.get("memory_id"),
+                retrieved_memory=state.get("retrieved_memory", []),
             )
             observation.add_output({"revision": brief.revision})
         return {
@@ -371,14 +475,23 @@ def build_research_workflow(
             raise ValueError("research cannot start before user confirmation")
         if not isinstance(brief, ResearchBrief):
             raise TypeError("confirmed workflow requires a ResearchBrief")
+        task_context: dict[str, Any] = {
+            "original_question": state["question"],
+            "scope": list(brief.scope),
+            "directions": list(brief.directions),
+        }
+        if brief.memory_id is not None:
+            task_context.update(
+                {
+                    "retrieved_memory": state.get("retrieved_memory", []),
+                    "known_information": list(brief.known_information),
+                    "research_gaps": list(brief.research_gaps),
+                }
+            )
         task = ResearchTask(
             task_id=f"root-task-{state['identity'].root_thread_id}",
             objective=brief.objective,
-            context={
-                "original_question": state["question"],
-                "scope": list(brief.scope),
-                "directions": list(brief.directions),
-            },
+            context=task_context,
             expected_output=brief.expected_output,
             constraints=brief.constraints,
             require_evidence=True,

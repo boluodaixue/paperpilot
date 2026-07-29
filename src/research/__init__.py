@@ -7,6 +7,7 @@ from .agent_graph import (
 )
 from .memory import MarkdownMemoryStore
 from .obsidian import build_obsidian_open_uri
+from .retrieval import MarkdownMemoryIndex, MemorySearchHit
 from .runtime import (
     ResearchRuntime,
     build_research_runtime,
@@ -62,6 +63,8 @@ __all__ = [
     "LEGACY_ROOT_DIRECTORIES",
     "MemoryDescriptor",
     "MemoryManifest",
+    "MemorySearchHit",
+    "MarkdownMemoryIndex",
     "MarkdownMemoryStore",
     "ReportEdit",
     "ReportIssue",

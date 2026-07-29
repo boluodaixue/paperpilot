@@ -101,13 +101,14 @@ N6 只处理已经成功持久化的最终 Markdown 报告，由 `research.repor
 
 该能力不是新的 Research Agent 角色、RCS 或评分引擎，也不引入 claim-evidence 新模型或第二套存储。详细边界见 [N6 实施记录](docs/N6_OPTIONAL_REPORT_REVIEW.md)。
 
-下一主线已确认为 LLM Wiki + Obsidian：Obsidian 负责 Markdown 阅读、编辑和双链，PaperPilot 负责多 Memory、检索对话、受控写入和继续研究。默认使用一个 Vault 和多个长期 Memory，不自建复杂阅读器。W0 Memory/Vault 契约、W1 多 Memory 持久化和 W2 Obsidian 最小接入已完成；W3 尚未开始。
+下一主线已确认为 LLM Wiki + Obsidian：Obsidian 负责 Markdown 阅读、编辑和双链，PaperPilot 负责多 Memory、检索对话、受控写入和继续研究。默认使用一个 Vault 和多个长期 Memory，不自建复杂阅读器。W0–W3 已完成；W4 Memory 问答与受控新建笔记尚未开始。
 
 - [LLM Wiki + Obsidian 目标架构](docs/LLM_WIKI_OBSIDIAN_ARCHITECTURE.md)
 - [LLM Wiki + Obsidian 实施计划](docs/LLM_WIKI_OBSIDIAN_IMPLEMENTATION_PLAN.md)
 - [W0 实施记录](docs/W0_MEMORY_VAULT_CONTRACT.md)
 - [W1 实施记录](docs/W1_MULTI_MEMORY_PERSISTENCE.md)
 - [W2 实施记录](docs/W2_OBSIDIAN_MINIMAL_INTEGRATION.md)
+- [W3 实施记录](docs/W3_CONTINUE_RESEARCH_FROM_MEMORY.md)
 
 ## 快速开始
 
@@ -148,7 +149,7 @@ python web/run.py
 python scripts/run_single.py --query "分析 AI Agent Memory 的演进、评测方法与关键证据"
 ```
 
-选择已有长期 Memory 时增加 `--memory-id M-...`。研究完成后 CLI 会输出 Vault、Memory `Home.md`、Obsidian URI 和报告路径。自动化场景可以显式增加 `--yes`；默认流程一定先展示研究说明并等待确认。
+选择已有长期 Memory 时增加 `--memory-id M-...`。PaperPilot 会从该 Memory 的最新 Markdown 中确定性筛选相关旧笔记，并在 Research Brief 中列出命中文件、已知信息和新研究空白；确认后新报告仍写回同一 Memory。研究完成后 CLI 会输出 Vault、Memory `Home.md`、Obsidian URI 和报告路径。自动化场景可以显式增加 `--yes`；默认流程一定先展示研究说明并等待确认。
 
 ### 交互式研究
 
@@ -190,6 +191,7 @@ deepresearch-agent/
 - [W0 实施记录](docs/W0_MEMORY_VAULT_CONTRACT.md)
 - [W1 实施记录](docs/W1_MULTI_MEMORY_PERSISTENCE.md)
 - [W2 实施记录](docs/W2_OBSIDIAN_MINIMAL_INTEGRATION.md)
+- [W3 实施记录](docs/W3_CONTINUE_RESEARCH_FROM_MEMORY.md)
 
 ## 明确不做
 

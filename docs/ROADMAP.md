@@ -4,7 +4,7 @@
 
 ## 当前判断
 
-N0–N6 与 LLM Wiki + Obsidian 的 W0–W2 已完成。CLI、Web 和评测继续进入同一个 Research Workflow；旧 Manager / Planner / DAG / AgentPool / Evidence Graph 链路已经删除。W2 只增加安全 Obsidian 打开 URI、最小 Memory 控件和 CLI 位置输出，没有改变 Research AgentGraph 或引入阅读器。
+N0–N6 与 LLM Wiki + Obsidian 的 W0–W3 已完成。CLI、Web 和评测继续进入同一个 Research Workflow；旧 Manager / Planner / DAG / AgentPool / Evidence Graph 链路已经删除。W3 只在根 Research Brief 前增加当前 Memory 的确定性 Markdown 检索，没有改变 Research AgentGraph、fork、递归或持久化主链。
 
 ## 进度
 
@@ -20,7 +20,8 @@ N0–N6 与 LLM Wiki + Obsidian 的 W0–W2 已完成。CLI、Web 和评测继�
 | W0 Memory/Vault 契约 | ✅ | 稳定 `memory_id`、Vault 路径、frontmatter/WikiLink 安全与 legacy 只读识别 |
 | W1 多 Memory 持久化 | ✅ | 原子创建/列出/选择 Memory，研究隔离写入并保留历史 |
 | W2 Obsidian 最小接入 | ✅ | Web/CLI 可定位并打开指定 Memory `Home.md`，不自建阅读器 |
-| W3–W6 LLM Wiki + Obsidian | 📝 | 尚未开始；按已确认计划逐阶段实施 |
+| W3 基于旧 Memory 继续研究 | ✅ | 旧笔记进入 Research Brief，新报告回写同一 Memory且保留历史 |
+| W4–W6 LLM Wiki + Obsidian | 📝 | 尚未开始；按已确认计划逐阶段实施 |
 
 ## N0 已确定的架构决策
 
@@ -143,7 +144,21 @@ W0 在不改变 N1–N6 主链的前提下完成了长期 Memory/Vault 基础：
 - 不检测或启动 Obsidian，不写 `.obsidian/`，不实现插件、阅读器或笔记写入；
 - W2 专项 `34 passed, 1 warning`，原 N1–N6 + W0–W1 回归 `259 passed, 1 warning`，仓库全量 `293 passed, 1 warning`。
 
-详见 [W2 实施记录](W2_OBSIDIAN_MINIMAL_INTEGRATION.md)。W3 基于旧 Memory 继续研究尚未开始。
+详见 [W2 实施记录](W2_OBSIDIAN_MINIMAL_INTEGRATION.md)。
+
+## W3 已完成
+
+- 当前 Memory 的 Markdown 在每次搜索时重建进程内索引，不写缓存或第二套知识库；
+- 索引读取 frontmatter、文件名/H1、全文、WikiLink 出边/反向引用、mtime 和内容哈希；
+- 中英文关键词按标题、路径、frontmatter、正文和一跳链接确定性排序，结果最多 5 项且摘要有硬上限；
+- 其他 Memory、无关文件与 symlink/junction 逃逸不会进入上下文；
+- Research Brief 固定展示目标 `memory_id`、命中文件、已知信息和新研究空白，模型不能改写检索确定的路径；
+- 同一检索快照贯穿 Brief 修改与确认，确认前仍不调用研究工具；
+- 根 Research Agent 只收到有界摘要、已知信息和空白，不接收 `memory_id`，AgentGraph、fork、identity 与 tracing 保持不变；
+- 新报告继续通过 W1 路由写回同一 Memory，不覆盖旧报告；
+- W3 专项 `22 passed`，原 N1–N6 + W0–W2 回归 `293 passed, 1 warning`，仓库全量 `315 passed, 1 warning`。
+
+详见 [W3 实施记录](W3_CONTINUE_RESEARCH_FROM_MEMORY.md)。W4 Memory 问答与受控新建笔记尚未开始。
 
 ## 历史基础
 

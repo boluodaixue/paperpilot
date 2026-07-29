@@ -221,6 +221,27 @@ def render_report(
     scope = "\n".join(f"- {item}" for item in brief.scope) or "- Not specified"
     directions = "\n".join(f"- {item}" for item in brief.directions) or "- Not specified"
     constraints = "\n".join(f"- {item}" for item in brief.constraints) or "- None"
+    memory_context = ""
+    if brief.memory_id is not None:
+        memory_paths = (
+            "\n".join(f"- `{path}`" for path in brief.memory_paths)
+            or "- No relevant Memory notes were used."
+        )
+        known_information = (
+            "\n".join(f"- {item}" for item in brief.known_information)
+            or "- None identified."
+        )
+        research_gaps = (
+            "\n".join(f"- {item}" for item in brief.research_gaps)
+            or "- None identified."
+        )
+        memory_context = (
+            "## Memory Context\n\n"
+            f"**Memory ID:** {brief.memory_id}\n\n"
+            f"**Used notes**\n\n{memory_paths}\n\n"
+            f"**Known information**\n\n{known_information}\n\n"
+            f"**Research gaps**\n\n{research_gaps}\n\n"
+        )
 
     finding_lines = [f"- {finding}" for finding in result.findings]
     if not finding_lines:
@@ -266,6 +287,7 @@ def render_report(
         f"**Directions**\n\n{directions}\n\n"
         f"**Constraints**\n\n{constraints}\n\n"
         f"**Expected output:** {brief.expected_output}\n\n"
+        f"{memory_context}"
         f"## Summary\n\n{result.summary or 'No summary was produced.'}{summary_suffix}\n\n"
         f"## Findings\n\n{findings_text}\n\n"
         f"## Evidence-backed Details\n\n{evidence_text}\n\n"

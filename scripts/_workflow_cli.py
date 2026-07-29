@@ -36,16 +36,41 @@ def format_brief(brief: ResearchBrief) -> str:
     lines = [
         "\nResearch Brief",
         f"  Question: {values['question']}",
-        f"  Objective: {values['objective']}",
-        "  Scope:",
-        *(f"    - {item}" for item in values["scope"]),
-        "  Directions:",
-        *(f"    - {item}" for item in values["directions"]),
-        "  Constraints:",
-        *(f"    - {item}" for item in values["constraints"]),
-        f"  Expected output: {values['expected_output']}",
-        f"  Revision: {values['revision']}",
     ]
+    if values.get("memory_id") is not None:
+        lines.extend(
+            (
+                f"  Target Memory: {values['memory_id']}",
+                "  Matched Memory files:",
+                *(
+                    f"    - {item}"
+                    for item in values.get("memory_paths", ()) or ("(none)",)
+                ),
+                "  Known information:",
+                *(
+                    f"    - {item}"
+                    for item in values.get("known_information", ()) or ("(none)",)
+                ),
+                "  New research gaps:",
+                *(
+                    f"    - {item}"
+                    for item in values.get("research_gaps", ()) or ("(none)",)
+                ),
+            )
+        )
+    lines.extend(
+        [
+            f"  Objective: {values['objective']}",
+            "  Scope:",
+            *(f"    - {item}" for item in values["scope"]),
+            "  Directions:",
+            *(f"    - {item}" for item in values["directions"]),
+            "  Constraints:",
+            *(f"    - {item}" for item in values["constraints"]),
+            f"  Expected output: {values['expected_output']}",
+            f"  Revision: {values['revision']}",
+        ]
+    )
     return "\n".join(lines)
 
 

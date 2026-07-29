@@ -65,6 +65,13 @@
   #proposalCard label { display: block; font-size: 12px; color: #6b7280; margin: 8px 0 3px; }
   #proposalCard textarea { width: 100%; border: 1px solid #d1d5db; border-radius: 6px; padding: 7px 9px; font-size: 13px; resize: vertical; font-family: inherit; }
   #proposalCard textarea.focus { height: auto; }
+  #briefMemoryContext { margin-bottom: 12px; padding: 10px 12px; border: 1px solid #c7d2fe; border-radius: 8px;
+                        background: #f8faff; color: #374151; }
+  #briefMemoryContext .context-title { font-size: 12px; font-weight: 700; color: #3730a3; margin-bottom: 6px; }
+  #briefMemoryContext .context-row { margin-top: 6px; font-size: 12px; }
+  #briefMemoryContext .context-label { color: #6b7280; font-weight: 600; }
+  #briefMemoryContext ul { margin: 3px 0 0 20px; }
+  #p_memory_id { font-family: Consolas, monospace; }
   #proposalCard .actions { padding: 10px 14px; border-top: 1px solid #f3f4f6; display: flex; gap: 10px; align-items: center; justify-content: flex-end; }
   .btn { padding: 9px 20px; border: none; border-radius: 8px; cursor: pointer; font-size: 14px; font-weight: 600; }
   .btn-primary { background: #2563eb; color: #fff; }
@@ -132,6 +139,13 @@
     <div id="proposalCard" style="display:none">
       <div class="head">📋 研究方案确认</div>
       <div class="body">
+        <div id="briefMemoryContext" hidden>
+          <div class="context-title">Memory 研究上下文（只读）</div>
+          <div class="context-row"><span class="context-label">目标 Memory：</span><span id="p_memory_id"></span></div>
+          <div class="context-row"><span class="context-label">命中文件：</span><ul id="p_memory_paths"></ul></div>
+          <div class="context-row"><span class="context-label">已知信息：</span><ul id="p_known_information"></ul></div>
+          <div class="context-row"><span class="context-label">新研究空白：</span><ul id="p_research_gaps"></ul></div>
+        </div>
         <label>研究目标</label><textarea id="p_objective" rows="2"></textarea>
         <label>研究范围（每行一项）</label><textarea id="p_scope" rows="3"></textarea>
         <label>研究方向（每行一项）</label><textarea id="p_directions" rows="3"></textarea>
@@ -495,11 +509,34 @@ function showProposalCard(p) {
 
 function setProposalFields(p) {
   const brief = p.brief || {};
+  renderBriefMemoryContext(brief);
   $('p_objective').value = brief.objective || '';
   $('p_scope').value = (brief.scope || []).join('\n');
   $('p_directions').value = (brief.directions || []).join('\n');
   $('p_constraints').value = (brief.constraints || []).join('\n');
   $('p_output').value = brief.expected_output || '';
+}
+
+function renderBriefContextList(id, values) {
+  const list = $(id);
+  list.innerHTML = '';
+  const items = (values && values.length) ? values : ['（无）'];
+  for (const value of items) {
+    const item = document.createElement('li');
+    item.textContent = value;
+    list.appendChild(item);
+  }
+}
+
+function renderBriefMemoryContext(brief) {
+  const context = $('briefMemoryContext');
+  const managed = Boolean(brief.memory_id);
+  context.hidden = !managed;
+  if (!managed) return;
+  $('p_memory_id').textContent = brief.memory_id;
+  renderBriefContextList('p_memory_paths', brief.memory_paths || []);
+  renderBriefContextList('p_known_information', brief.known_information || []);
+  renderBriefContextList('p_research_gaps', brief.research_gaps || []);
 }
 
 function lines(id) { return $(id).value.split(/\n|，|,/).map(s=>s.trim()).filter(Boolean); }
