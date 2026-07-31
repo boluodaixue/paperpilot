@@ -32,10 +32,16 @@ from ..tools import (
 )
 from ..utils.tracing import flush_tracing, shutdown_tracing
 from .memory import MarkdownMemoryStore
+from .memory_dialogue import (
+    answer_memory as answer_from_memory,
+    propose_memory_note as propose_note_from_memory,
+)
 from .models import (
     AgentLimits,
     ExecutionIdentity,
+    MemoryAnswer,
     MemoryDescriptor,
+    MemoryNoteProposal,
     ResearchBrief,
     ResearchWorkflowResult,
 )
@@ -283,6 +289,31 @@ class ResearchRuntime:
 
     def get_memory(self, memory_id: str) -> MemoryDescriptor:
         return self.memory_store.get_memory(memory_id)
+
+    async def answer_memory(
+        self,
+        memory_id: str,
+        question: str,
+    ) -> MemoryAnswer:
+        return await answer_from_memory(
+            self.memory_store,
+            self.policy,
+            memory_id,
+            question,
+        )
+
+    async def propose_memory_note(
+        self,
+        answer: MemoryAnswer,
+    ) -> MemoryNoteProposal:
+        return await propose_note_from_memory(
+            self.memory_store,
+            self.policy,
+            answer,
+        )
+
+    def commit_memory_note(self, proposal: MemoryNoteProposal) -> dict[str, str]:
+        return self.memory_store.commit_memory_note(proposal)
 
     async def close(self, *, shutdown: bool = False) -> None:
         await WebSearchTool.close_session()

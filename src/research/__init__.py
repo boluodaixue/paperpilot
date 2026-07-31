@@ -5,7 +5,12 @@ from .agent_graph import (
     create_research_agent_state,
     run_research_agent,
 )
-from .memory import MarkdownMemoryStore
+from .memory import (
+    MarkdownMemoryStore,
+    MemoryWriteConflictError,
+    update_memory_home_with_note,
+)
+from .memory_dialogue import answer_memory, propose_memory_note
 from .obsidian import build_obsidian_open_uri
 from .retrieval import MarkdownMemoryIndex, MemorySearchHit
 from .runtime import (
@@ -28,8 +33,11 @@ from .models import (
     ExecutionIdentity,
     ForkCandidate,
     ForkReason,
+    MemoryAnswer,
+    MemoryCitation,
     MemoryDescriptor,
     MemoryManifest,
+    MemoryNoteProposal,
     ReportEdit,
     ReportIssue,
     ReportReviewOutcome,
@@ -62,8 +70,12 @@ __all__ = [
     "LEGACY_MEMORY_ID",
     "LEGACY_ROOT_DIRECTORIES",
     "MemoryDescriptor",
+    "MemoryAnswer",
+    "MemoryCitation",
     "MemoryManifest",
+    "MemoryNoteProposal",
     "MemorySearchHit",
+    "MemoryWriteConflictError",
     "MarkdownMemoryIndex",
     "MarkdownMemoryStore",
     "ReportEdit",
@@ -76,6 +88,7 @@ __all__ = [
     "ResearchTask",
     "ResearchWorkflowResult",
     "build_obsidian_open_uri",
+    "answer_memory",
     "build_research_agent_graph",
     "build_research_runtime",
     "build_research_tools",
@@ -88,10 +101,12 @@ __all__ = [
     "limits_from_config",
     "load_config",
     "memory_relative_path",
+    "propose_memory_note",
     "resolve_vault_markdown_path",
     "resume_research_workflow",
     "run_research_agent",
     "setup_logging",
+    "update_memory_home_with_note",
     "validate_frontmatter",
     "validate_memory_descriptor",
     "validate_memory_id",

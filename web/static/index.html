@@ -39,7 +39,7 @@
                 font-weight: 600; display: flex; align-items: center; justify-content: space-between; gap: 16px; }
   #chatHeader .sub { font-size: 11px; color: #9ca3af; font-weight: 400; margin-left: 8px; }
   #memoryControls { display: flex; align-items: center; gap: 7px; min-width: 0; }
-  #memorySelect { max-width: 240px; padding: 7px 9px; border: 1px solid #d1d5db; border-radius: 7px; background: #fff; }
+  #memorySelect, #interactionMode { max-width: 240px; padding: 7px 9px; border: 1px solid #d1d5db; border-radius: 7px; background: #fff; }
   .memory-action { padding: 7px 10px; border: 1px solid #d1d5db; border-radius: 7px; background: #fff;
                    color: #374151; cursor: pointer; font-size: 12px; text-decoration: none; white-space: nowrap; }
   .memory-action:hover { border-color: #2563eb; color: #2563eb; }
@@ -107,6 +107,19 @@
   .evidence-note { border: 1px solid #e5e7eb; border-radius: 8px; padding: 10px 12px; margin: 8px 0; }
   .empty { color: #9ca3af; text-align: center; padding: 34px 0; font-size: 13px; }
 
+  /* ---------- Memory 问答与受控保存 ---------- */
+  .memory-answer-card { max-width: 78%; margin: 0 0 12px; padding: 14px; background: #fff;
+                        border: 1px solid #c7d2fe; border-radius: 10px; line-height: 1.7; }
+  .memory-answer-card .answer-head { color: #3730a3; font-size: 12px; font-weight: 700; margin-bottom: 7px; }
+  .memory-answer-card .answer-citations { margin: 10px 0; padding-left: 20px; font-size: 12px; }
+  .memory-answer-card .answer-citations a { color: #2563eb; }
+  #noteProposalCard { margin: 0 22px 10px; padding: 14px; background: #fff; border: 1px solid #f59e0b;
+                      border-radius: 10px; box-shadow: 0 2px 8px rgba(0,0,0,.08); }
+  #noteProposalCard .proposal-target { font-size: 12px; color: #6b7280; margin: 6px 0; }
+  #noteProposalMarkdown { max-height: 300px; overflow: auto; padding: 10px; background: #f8fafc;
+                          border: 1px solid #e5e7eb; border-radius: 7px; white-space: pre-wrap; font-size: 12px; }
+  #noteProposalCard .actions { display: flex; justify-content: flex-end; gap: 8px; margin-top: 10px; }
+
   /* ---------- 输入栏 ---------- */
   #inputBar { display: flex; gap: 10px; padding: 12px 22px 16px; }
   #msgInput { flex: 1; padding: 11px 14px; border: 1px solid #d1d5db; border-radius: 10px; font-size: 14px; }
@@ -128,6 +141,10 @@
     <div id="chatHeader">
       <div>会话<span class="sub" id="chatHeaderSub">输入问题开始</span></div>
       <div id="memoryControls">
+        <select id="interactionMode" aria-label="选择工作模式">
+          <option value="research">基于此 Memory 研究</option>
+          <option value="memory-answer">Memory 问答</option>
+        </select>
         <select id="memorySelect" aria-label="选择 Memory"></select>
         <button class="memory-action" id="createMemoryBtn" type="button">＋ 新建 Memory</button>
         <a class="memory-action disabled" id="openObsidianBtn" aria-disabled="true">在 Obsidian 中打开</a>
@@ -158,6 +175,16 @@
       </div>
     </div>
 
+    <div id="noteProposalCard" hidden>
+      <strong>保存回答为笔记：Markdown 完整预览</strong>
+      <div class="proposal-target" id="noteProposalTarget"></div>
+      <pre id="noteProposalMarkdown"></pre>
+      <div class="actions">
+        <button class="btn btn-ghost" type="button" id="cancelNoteProposalBtn">取消</button>
+        <button class="btn btn-primary" type="button" id="confirmNoteProposalBtn">确认写入 Memory</button>
+      </div>
+    </div>
+
     <div id="inputBar">
       <input type="text" id="msgInput" placeholder="输入研究问题，或说明如何修改研究方向…" autocomplete="off">
       <button class="btn btn-primary" id="sendBtn" onclick="sendMessage()">发送</button>
@@ -178,6 +205,7 @@ const eventCursors = {};
 let memories = [];
 let selectedMemoryId = null;
 let memorySelectionLocked = false;
+let currentMemoryNoteProposal = null;
 
 const $ = id => document.getElementById(id);
 
@@ -203,6 +231,7 @@ function renderMemoryControls() {
     select.value = '';
   }
   select.disabled = memorySelectionLocked;
+  $('interactionMode').disabled = memorySelectionLocked;
   $('createMemoryBtn').disabled = memorySelectionLocked;
 
   const selected = memories.find(memory => memory.memory_id === selectedMemoryId);
@@ -216,6 +245,7 @@ function renderMemoryControls() {
     open.classList.add('disabled');
     open.setAttribute('aria-disabled', 'true');
   }
+  updateInputMode();
 }
 
 function setMemorySelection(memoryId, locked = false) {
@@ -252,6 +282,19 @@ $('memorySelect').addEventListener('change', (event) => {
   setMemorySelection(event.target.value || null, false);
 });
 $('createMemoryBtn').addEventListener('click', createMemory);
+$('interactionMode').addEventListener('change', updateInputMode);
+
+function updateInputMode() {
+  const input = $('msgInput');
+  if (!input) return;
+  if ($('interactionMode').value === 'memory-answer') {
+    input.placeholder = selectedMemoryId
+      ? '询问当前 Memory 中已有的内容…'
+      : '请先选择一个 Memory';
+  } else {
+    input.placeholder = '输入研究问题，例如：transformer 的来历与发展';
+  }
+}
 
 // ------------------------------------------------------------------
 // 侧边栏
@@ -369,8 +412,10 @@ function newSession() {
   setMemorySelection(selectedMemoryId, false);
   $('messages').innerHTML = '';
   $('proposalCard').style.display = 'none';
+  currentMemoryNoteProposal = null;
+  $('noteProposalCard').hidden = true;
   $('chatHeaderSub').textContent = '输入问题开始';
-  $('msgInput').placeholder = '输入研究问题，例如：transformer 的来历与发展';
+  updateInputMode();
   $('msgInput').focus();
   loadSessions();
 }
@@ -409,6 +454,7 @@ async function selectSession(sid) {
     } catch (e) { /* 忽略 */ }
   }
   if (task && task.status === 'running') {
+    $('interactionMode').value = 'research';
     setMemorySelection(task.memory_id, true);
     appendProgress({ type: 'state', state: '研究进行中（已恢复连接）' });
     openEventStream(task.task_id);
@@ -416,6 +462,7 @@ async function selectSession(sid) {
     return;
   }
   if (task && task.status === 'waiting_confirmation') {
+    $('interactionMode').value = 'research';
     setMemorySelection(task.memory_id, true);
     showProposalFromHistory(msgs);
     loadSessions();
@@ -454,9 +501,138 @@ function scrollToBottom() {
 }
 
 // ------------------------------------------------------------------
+// Memory 问答与受控保存
+// ------------------------------------------------------------------
+async function sendMemoryQuestion() {
+  const input = $('msgInput');
+  const question = input.value.trim();
+  if (!question || sendLock) return;
+  if (!selectedMemoryId) {
+    appendBubble('assistant', '请先选择一个 Memory。');
+    return;
+  }
+  const memoryId = selectedMemoryId;
+  input.value = '';
+  appendBubble('user', question);
+  const thinking = document.createElement('div');
+  thinking.className = 'msg thinking';
+  thinking.textContent = '正在查找当前 Memory…';
+  $('messages').appendChild(thinking);
+  scrollToBottom();
+
+  sendLock = true;
+  setMemorySelection(memoryId, true);
+  try {
+    const r = await fetch(`/api/memories/${encodeURIComponent(memoryId)}/answers`, {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ question }),
+    });
+    const answer = await r.json();
+    thinking.remove();
+    if (!r.ok) { appendBubble('assistant', answer.detail || 'Memory 问答失败'); return; }
+    renderMemoryAnswer(answer);
+  } catch (e) {
+    thinking.remove();
+    appendBubble('assistant', 'Memory 问答请求失败，请重试');
+  } finally {
+    sendLock = false;
+    setMemorySelection(memoryId, false);
+  }
+}
+
+function renderMemoryAnswer(answer) {
+  const card = document.createElement('div');
+  card.className = 'memory-answer-card';
+  const head = document.createElement('div');
+  head.className = 'answer-head';
+  const hasInsufficientEvidence = Array.isArray(answer.insufficient_evidence)
+    && answer.insufficient_evidence.length > 0;
+  head.textContent = hasInsufficientEvidence ? 'Memory 回答（证据不足）' : 'Memory 回答';
+  card.appendChild(head);
+
+  const body = document.createElement('div');
+  body.className = 'answer-markdown';
+  body.innerHTML = renderSafeMarkdown(answer.markdown || '（无回答）');
+  card.appendChild(body);
+
+  const citations = document.createElement('ul');
+  citations.className = 'answer-citations';
+  for (const citation of answer.citations || []) {
+    const item = document.createElement('li');
+    const link = document.createElement('a');
+    link.href = citation.obsidian_uri;
+    link.textContent = citation.wikilink || citation.title || citation.relative_path;
+    item.appendChild(link);
+    citations.appendChild(item);
+  }
+  if (citations.children.length) card.appendChild(citations);
+
+  const save = document.createElement('button');
+  save.type = 'button';
+  save.className = 'btn btn-ghost save-memory-answer';
+  save.textContent = '保存回答为笔记';
+  save.addEventListener('click', () => requestMemoryNoteProposal(answer));
+  card.appendChild(save);
+  $('messages').appendChild(card);
+  scrollToBottom();
+}
+
+async function requestMemoryNoteProposal(answer) {
+  try {
+    const r = await fetch(
+      `/api/memories/${encodeURIComponent(answer.memory_id)}/note-proposals`,
+      {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ answer_id: answer.answer_id }),
+      },
+    );
+    const proposal = await r.json();
+    if (!r.ok) { alert(proposal.detail || '笔记提案生成失败'); return; }
+    currentMemoryNoteProposal = proposal;
+    $('noteProposalTarget').textContent = `目标：${proposal.target_path}`;
+    $('noteProposalMarkdown').textContent = proposal.markdown;
+    $('noteProposalCard').hidden = false;
+    $('noteProposalCard').scrollIntoView({ behavior: 'smooth', block: 'nearest' });
+  } catch (e) {
+    alert('笔记提案请求失败，请重试');
+  }
+}
+
+function cancelMemoryNoteProposal() {
+  currentMemoryNoteProposal = null;
+  $('noteProposalCard').hidden = true;
+  $('noteProposalMarkdown').textContent = '';
+}
+
+async function confirmMemoryNoteProposal() {
+  if (!currentMemoryNoteProposal) return;
+  const proposal = currentMemoryNoteProposal;
+  const button = $('confirmNoteProposalBtn');
+  button.disabled = true;
+  try {
+    const r = await fetch(
+      `/api/memory-note-proposals/${encodeURIComponent(proposal.proposal_id)}/confirm`,
+      { method: 'POST' },
+    );
+    const result = await r.json();
+    if (!r.ok) { alert(result.detail || '笔记写入失败'); return; }
+    cancelMemoryNoteProposal();
+    appendBubble('assistant', `已写入 ${result.wikilink}（${result.target_path}）`);
+  } catch (e) {
+    alert('笔记写入请求失败，请重试');
+  } finally {
+    button.disabled = false;
+  }
+}
+
+// ------------------------------------------------------------------
 // 发送消息 → 用户对齐
 // ------------------------------------------------------------------
 async function sendMessage() {
+  if ($('interactionMode').value === 'memory-answer') {
+    await sendMemoryQuestion();
+    return;
+  }
   const input = $('msgInput');
   const text = input.value.trim();
   if (!text || sendLock) return;
@@ -733,10 +909,54 @@ function renderEvidenceTable(container, evidence, reportMd) {
 function escapeHtml(s) {
   return String(s).replace(/[&<>"']/g, c => ({ '&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;' }[c]));
 }
+
+function renderSafeMarkdown(markdown) {
+  const template = document.createElement('template');
+  template.innerHTML = marked.parse(String(markdown || ''));
+  const allowedTags = new Set([
+    'P', 'BR', 'HR', 'H1', 'H2', 'H3', 'H4', 'H5', 'H6',
+    'BLOCKQUOTE', 'PRE', 'CODE', 'UL', 'OL', 'LI', 'STRONG',
+    'EM', 'DEL', 'A', 'TABLE', 'THEAD', 'TBODY', 'TR', 'TH', 'TD',
+  ]);
+  for (const element of [...template.content.querySelectorAll('*')]) {
+    if (!allowedTags.has(element.tagName)) {
+      element.replaceWith(document.createTextNode(element.textContent || ''));
+      continue;
+    }
+    for (const attribute of [...element.attributes]) {
+      const name = attribute.name.toLowerCase();
+      const keepHref = element.tagName === 'A' && name === 'href'
+        && isSafeMarkdownLink(attribute.value);
+      const keepTitle = element.tagName === 'A' && name === 'title';
+      const keepStart = element.tagName === 'OL' && name === 'start'
+        && /^\d+$/.test(attribute.value);
+      const keepCodeClass = element.tagName === 'CODE' && name === 'class'
+        && /^language-[a-z0-9_-]+$/i.test(attribute.value);
+      if (!keepHref && !keepTitle && !keepStart && !keepCodeClass) {
+        element.removeAttribute(attribute.name);
+      }
+    }
+    if (element.tagName === 'A' && element.hasAttribute('href')) {
+      element.setAttribute('rel', 'noopener noreferrer');
+    }
+  }
+  return template.innerHTML;
+}
+
+function isSafeMarkdownLink(href) {
+  try {
+    const protocol = new URL(String(href), window.location.href).protocol;
+    return protocol === 'http:' || protocol === 'https:' || protocol === 'mailto:';
+  } catch (e) {
+    return false;
+  }
+}
 let sendLock = false;
 
 // 初始化
 $('newSessionBtn').onclick = newSession;
+$('cancelNoteProposalBtn').addEventListener('click', cancelMemoryNoteProposal);
+$('confirmNoteProposalBtn').addEventListener('click', confirmMemoryNoteProposal);
 $('msgInput').addEventListener('keydown', e => { if (e.key === 'Enter') sendMessage(); });
 loadSessions();
 loadMemories();

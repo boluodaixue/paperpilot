@@ -4,7 +4,7 @@
 
 ## 当前判断
 
-N0–N6 与 LLM Wiki + Obsidian 的 W0–W3 已完成。CLI、Web 和评测继续进入同一个 Research Workflow；旧 Manager / Planner / DAG / AgentPool / Evidence Graph 链路已经删除。W3 只在根 Research Brief 前增加当前 Memory 的确定性 Markdown 检索，没有改变 Research AgentGraph、fork、递归或持久化主链。
+N0–N6 与 LLM Wiki + Obsidian 的 W0–W4 已完成。CLI、Web 和评测继续进入同一个 Research Workflow；旧 Manager / Planner / DAG / AgentPool / Evidence Graph 链路已经删除。W4 只在当前 Memory 上增加只读问答和用户确认后的受控笔记写入，没有改变 Research AgentGraph、fork、递归或报告持久化主链。
 
 ## 进度
 
@@ -21,7 +21,8 @@ N0–N6 与 LLM Wiki + Obsidian 的 W0–W3 已完成。CLI、Web 和评测继�
 | W1 多 Memory 持久化 | ✅ | 原子创建/列出/选择 Memory，研究隔离写入并保留历史 |
 | W2 Obsidian 最小接入 | ✅ | Web/CLI 可定位并打开指定 Memory `Home.md`，不自建阅读器 |
 | W3 基于旧 Memory 继续研究 | ✅ | 旧笔记进入 Research Brief，新报告回写同一 Memory且保留历史 |
-| W4–W6 LLM Wiki + Obsidian | 📝 | 尚未开始；按已确认计划逐阶段实施 |
+| W4 Memory 问答与受控新建笔记 | ✅ | 带可打开引用的当前 Memory 回答，确认后才新建笔记并更新 Home |
+| W5–W6 LLM Wiki + Obsidian | 📝 | 尚未开始；按已确认计划逐阶段实施 |
 
 ## N0 已确定的架构决策
 
@@ -158,7 +159,22 @@ W0 在不改变 N1–N6 主链的前提下完成了长期 Memory/Vault 基础：
 - 新报告继续通过 W1 路由写回同一 Memory，不覆盖旧报告；
 - W3 专项 `22 passed`，原 N1–N6 + W0–W2 回归 `293 passed, 1 warning`，仓库全量 `315 passed, 1 warning`。
 
-详见 [W3 实施记录](W3_CONTINUE_RESEARCH_FROM_MEMORY.md)。W4 Memory 问答与受控新建笔记尚未开始。
+详见 [W3 实施记录](W3_CONTINUE_RESEARCH_FROM_MEMORY.md)。
+
+## W4 已完成
+
+- 问答只检索用户明确选择的当前 Memory，其他 Memory 不进入上下文；
+- 无命中时明确返回证据不足且不调用 policy，有命中时回答只采用实际命中路径并由 PaperPilot 附加完整 WikiLink；
+- 普通问答不发起 Research Workflow、不使用工具、不写文件或 Chat Store；
+- 保存回答先生成带稳定 note ID、固定路径、完整 frontmatter 和受限来源的 Markdown 提案，未确认时 Vault 不变；
+- 用户确认后只新建对应 `notes/` 笔记并受控更新同一 Memory 的 `Home.md` Notes 链接；
+- Home 内容哈希、目标不存在约束以及在原子替换点保留并复核旧 Home，阻止 Obsidian 外部编辑、重复确认与并发提交被静默覆盖；
+- 写回失败会回滚本次笔记和受控临时文件；恢复期间持续外部写入时返回冲突并保留最新捕获版本，不删除未知内容；非法路径、frontmatter、跨 Memory WikiLink 与 symlink/junction 逃逸不会写入；
+- Web 明确区分“基于此 Memory 研究”和“Memory 问答”，回答使用白名单 Markdown 安全渲染，引用可在 Obsidian 中打开，保存前展示完整 Markdown 并要求确认；
+- W4 专项 `35 passed, 1 warning`，warning 为既有 `StarletteDeprecationWarning`；
+- 原 N1–N6 + W0–W3 前序回归 `315 passed, 1 warning`，包含 W4 的仓库全量回归 `350 passed, 1 warning`。
+
+详见 [W4 实施记录](W4_MEMORY_QA_CONTROLLED_NOTES.md)。W5 资料导入与整理尚未开始。
 
 ## 历史基础
 

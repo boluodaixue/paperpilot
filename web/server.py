@@ -9,8 +9,9 @@ import sys
 import time
 import uuid
 from collections import Counter
+from collections.abc import Mapping
 from contextlib import asynccontextmanager
-from dataclasses import asdict
+from dataclasses import asdict, is_dataclass
 from pathlib import Path
 from typing import Any, Iterable
 
@@ -30,7 +31,13 @@ for _stream in (sys.stdout, sys.stderr):
         pass
 
 from src.memory.chat_store import KIND_PROPOSAL, KIND_REPORT, ChatStore  # noqa: E402
-from src.research.models import MemoryDescriptor, ResearchWorkflowResult  # noqa: E402
+from src.research.memory import MemoryWriteConflictError  # noqa: E402
+from src.research.models import (  # noqa: E402
+    MemoryAnswer,
+    MemoryDescriptor,
+    MemoryNoteProposal,
+    ResearchWorkflowResult,
+)
 from src.research.obsidian import build_obsidian_open_uri  # noqa: E402
 from src.research.runtime import ResearchRuntime, build_research_runtime, load_config  # noqa: E402
 
@@ -122,6 +129,8 @@ class ResearchTask:
 
 _TASKS: dict[str, ResearchTask] = {}
 _RUN_SEMAPHORE = asyncio.Semaphore(1)
+_MEMORY_ANSWERS: dict[str, MemoryAnswer] = {}
+_MEMORY_NOTE_PROPOSALS: dict[str, MemoryNoteProposal] = {}
 
 
 class AlignmentRequest(BaseModel):
@@ -138,6 +147,14 @@ class ResearchRequest(BaseModel):
 
 class MemoryCreateRequest(BaseModel):
     title: str
+
+
+class MemoryAnswerRequest(BaseModel):
+    question: str
+
+
+class MemoryNoteProposalRequest(BaseModel):
+    answer_id: str
 
 
 class SessionRename(BaseModel):
@@ -240,6 +257,42 @@ def _memory_response(
             vault_name=_configured_vault_name(),
         ),
     }
+
+
+def _answer_response(
+    runtime: ResearchRuntime,
+    answer: MemoryAnswer,
+) -> dict[str, Any]:
+    payload = asdict(answer)
+    payload["citations"] = [
+        {
+            **asdict(citation),
+            "obsidian_uri": build_obsidian_open_uri(
+                runtime.memory_store.root,
+                citation.relative_path,
+                vault_name=_configured_vault_name(),
+            ),
+        }
+        for citation in answer.citations
+    ]
+    return payload
+
+
+def _commit_response(value: Any) -> dict[str, Any]:
+    if isinstance(value, Mapping):
+        payload = dict(value)
+    elif is_dataclass(value):
+        payload = asdict(value)
+    else:
+        fields = ("memory_id", "target_path", "home_path", "wikilink")
+        try:
+            payload = {field: getattr(value, field) for field in fields}
+        except AttributeError as exc:
+            raise RuntimeError("Memory note commit returned an invalid result") from exc
+    required = {"memory_id", "target_path", "home_path", "wikilink"}
+    if not required.issubset(payload):
+        raise RuntimeError("Memory note commit returned an invalid result")
+    return payload
 
 
 def _expanded_messages(session_id: str) -> list[dict[str, Any]]:
@@ -480,6 +533,84 @@ async def create_memory(req: MemoryCreateRequest) -> dict[str, Any]:
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     return _memory_response(runtime, descriptor)
+
+
+@app.post("/api/memories/{memory_id}/answers")
+async def answer_memory(
+    memory_id: str,
+    req: MemoryAnswerRequest,
+) -> dict[str, Any]:
+    question = (req.question or "").strip()
+    if not question:
+        raise HTTPException(status_code=400, detail="Memory 问题不能为空")
+    runtime = get_research_runtime()
+    try:
+        runtime.get_memory(memory_id)
+    except (FileNotFoundError, ValueError) as exc:
+        raise HTTPException(status_code=404, detail=f"Memory 不存在: {memory_id}") from exc
+    answer = await runtime.answer_memory(memory_id, question)
+    if (
+        not isinstance(answer, MemoryAnswer)
+        or answer.memory_id != memory_id
+        or answer.question != question
+    ):
+        raise RuntimeError("Memory answer does not match the request")
+    payload = _answer_response(runtime, answer)
+    _MEMORY_ANSWERS[answer.answer_id] = answer
+    return payload
+
+
+@app.post("/api/memories/{memory_id}/note-proposals")
+async def propose_memory_note(
+    memory_id: str,
+    req: MemoryNoteProposalRequest,
+) -> dict[str, Any]:
+    answer_id = (req.answer_id or "").strip()
+    if not answer_id:
+        raise HTTPException(status_code=400, detail="answer_id 不能为空")
+    answer = _MEMORY_ANSWERS.get(answer_id)
+    if answer is None:
+        raise HTTPException(status_code=404, detail=f"Memory answer 不存在: {answer_id}")
+    if answer.memory_id != memory_id:
+        raise HTTPException(status_code=409, detail="answer 与 memory 不匹配")
+    proposal = await get_research_runtime().propose_memory_note(answer)
+    if (
+        not isinstance(proposal, MemoryNoteProposal)
+        or proposal.answer_id != answer.answer_id
+        or proposal.memory_id != memory_id
+    ):
+        raise RuntimeError("Memory note proposal does not match the answer")
+    _MEMORY_NOTE_PROPOSALS[proposal.proposal_id] = proposal
+    return asdict(proposal)
+
+
+@app.post("/api/memory-note-proposals/{proposal_id}/confirm")
+async def confirm_memory_note(proposal_id: str) -> dict[str, Any]:
+    proposal = _MEMORY_NOTE_PROPOSALS.get(proposal_id)
+    if proposal is None:
+        raise HTTPException(
+            status_code=404,
+            detail=f"Memory note proposal 不存在: {proposal_id}",
+        )
+    answer = _MEMORY_ANSWERS.get(proposal.answer_id)
+    if answer is None:
+        raise HTTPException(status_code=409, detail="proposal 的原始 answer 已不可用")
+    if answer.answer_id != proposal.answer_id or answer.memory_id != proposal.memory_id:
+        raise HTTPException(status_code=409, detail="proposal 与 answer 不匹配")
+    try:
+        result = get_research_runtime().commit_memory_note(proposal)
+    except MemoryWriteConflictError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    payload = _commit_response(result)
+    if (
+        payload["memory_id"] != proposal.memory_id
+        or payload["target_path"] != proposal.target_path
+        or payload["home_path"] != proposal.home_path
+        or payload["wikilink"] != proposal.wikilink
+    ):
+        raise RuntimeError("Memory note commit does not match the proposal")
+    _MEMORY_NOTE_PROPOSALS.pop(proposal_id, None)
+    return payload
 
 
 @app.get("/api/sessions/{sid}/messages")
