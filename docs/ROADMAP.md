@@ -4,7 +4,7 @@
 
 ## 当前判断
 
-N0–N6 与 LLM Wiki + Obsidian 的 W0–W4 已完成。CLI、Web 和评测继续进入同一个 Research Workflow；旧 Manager / Planner / DAG / AgentPool / Evidence Graph 链路已经删除。W4 只在当前 Memory 上增加只读问答和用户确认后的受控笔记写入，没有改变 Research AgentGraph、fork、递归或报告持久化主链。
+N0–N6 与 LLM Wiki + Obsidian 的 W0–W5 已完成。CLI、Web 和评测继续进入同一个 Research Workflow；旧 Manager / Planner / DAG / AgentPool / Evidence Graph 链路已经删除。W5 只在 Web 中增加当前 Memory 的 PDF/文本/显式 URL 导入、受控整理提案和确认后成组写入，没有改变 Research AgentGraph、Research Workflow、fork、递归、checkpointer、Chat Store 或 N6 Red/Blue。W6 尚未开始。
 
 ## 进度
 
@@ -22,7 +22,8 @@ N0–N6 与 LLM Wiki + Obsidian 的 W0–W4 已完成。CLI、Web 和评测继�
 | W2 Obsidian 最小接入 | ✅ | Web/CLI 可定位并打开指定 Memory `Home.md`，不自建阅读器 |
 | W3 基于旧 Memory 继续研究 | ✅ | 旧笔记进入 Research Brief，新报告回写同一 Memory且保留历史 |
 | W4 Memory 问答与受控新建笔记 | ✅ | 带可打开引用的当前 Memory 回答，确认后才新建笔记并更新 Home |
-| W5–W6 LLM Wiki + Obsidian | 📝 | 尚未开始；按已确认计划逐阶段实施 |
+| W5 资料导入与整理 | ✅ | file/PDF/text/显式 URL 生成受控提案，确认后写入 attachment/import/note 并线性化 Home |
+| W6 稳定化、迁移与入口收口 | 📝 | 尚未开始；按已确认计划单独实施和验收 |
 
 ## N0 已确定的架构决策
 
@@ -174,7 +175,21 @@ W0 在不改变 N1–N6 主链的前提下完成了长期 Memory/Vault 基础：
 - W4 专项 `35 passed, 1 warning`，warning 为既有 `StarletteDeprecationWarning`；
 - 原 N1–N6 + W0–W3 前序回归 `315 passed, 1 warning`，包含 W4 的仓库全量回归 `350 passed, 1 warning`。
 
-详见 [W4 实施记录](W4_MEMORY_QA_CONTROLLED_NOTES.md)。W5 资料导入与整理尚未开始。
+详见 [W4 实施记录](W4_MEMORY_QA_CONTROLLED_NOTES.md)。
+
+## W5 已完成
+
+- Web 支持明确选择的 PDF/UTF-8 文本文件、直接粘贴文本和显式 HTTP/HTTPS URL，未点击生成预览时不读取 URL；
+- 原始内容按 SHA-256 写入 `attachments/`，带页/行/网页段 locator 的结构化提取写入 `imports/`，受控 policy 只提议一篇支持/冲突/空白整理笔记；
+- `source_ref + locator + content_hash` 精确三元组在准备与提交内双重去重，同内容不同来源可安全共享 content-addressed attachment；
+- 未确认提案不写 Vault，确认后在单 PaperPilot 进程的共享 Vault `RLock` 内成组发布 attachment/import/note，以内容哈希复核后的 `Home.md` 原子替换为线性化点；
+- 失败会按文件身份回滚本次未线性化文件，已被其他完成 Import 引用的共享 attachment 不会被失败事务回滚删除；
+- attachment 规范路径和保留扩展名的 WikiLink、frontmatter、跨 Memory/路径逃逸、symlink/junction、恶意 Markdown/HTML 以及 URL SSRF/DNS/重定向/大小/超时均有确定性保护；
+- W5 专项 `61 passed, 1 warning`，原 N1–N6 + W0–W4 前序回归 `350 passed, 1 warning`，包含 W5 的仓库全量回归 `411 passed, 1 warning`，warning 为既有 `StarletteDeprecationWarning`。
+
+W5 没有实现 CLI 导入收口、legacy 迁移、文件树、内置阅读器、文件系统监控、Repository、持久化索引或新 Agent。W5 不引入 journal、bundle 或 cross-process lock，不保证多 PaperPilot 进程同时写同一 Vault；W6 也不因此自动承诺扩展该范围。
+
+详见 [W5 实施记录](W5_CONTROLLED_IMPORTS.md)。W6 尚未开始。
 
 ## 历史基础
 

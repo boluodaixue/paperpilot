@@ -120,6 +120,25 @@
                           border: 1px solid #e5e7eb; border-radius: 7px; white-space: pre-wrap; font-size: 12px; }
   #noteProposalCard .actions { display: flex; justify-content: flex-end; gap: 8px; margin-top: 10px; }
 
+  /* ---------- Memory 资料导入 ---------- */
+  #memoryImportCard { margin: 0 22px 10px; padding: 14px; background: #fff; border: 1px solid #0ea5e9;
+                      border-radius: 10px; box-shadow: 0 2px 8px rgba(0,0,0,.08); }
+  #memoryImportCard label { display: block; margin: 8px 0 4px; color: #475569; font-size: 12px; }
+  #memoryImportCard input, #memoryImportCard select, #memoryImportCard textarea {
+    width: 100%; padding: 8px 10px; border: 1px solid #d1d5db; border-radius: 7px; font: inherit;
+  }
+  #memoryImportCard textarea { min-height: 110px; resize: vertical; }
+  #memoryImportCard .import-source-pane[hidden], #memoryImportPreview[hidden] { display: none; }
+  #memoryImportPreview { margin-top: 12px; padding-top: 12px; border-top: 1px solid #e5e7eb; }
+  #memoryImportStatus { margin-bottom: 8px; font-weight: 700; color: #0369a1; }
+  #memoryImportStatus.duplicate { color: #047857; }
+  #memoryImportMeta, #memoryImportTargets { font-size: 12px; line-height: 1.65; white-space: pre-wrap; }
+  #memoryImportTargets a { color: #2563eb; }
+  .import-markdown-preview { max-height: 260px; overflow: auto; padding: 10px; margin-top: 5px;
+                             background: #f8fafc; border: 1px solid #e5e7eb; border-radius: 7px;
+                             white-space: pre-wrap; font-size: 12px; }
+  #memoryImportCard .actions { display: flex; justify-content: flex-end; gap: 8px; margin-top: 10px; }
+
   /* ---------- 输入栏 ---------- */
   #inputBar { display: flex; gap: 10px; padding: 12px 22px 16px; }
   #msgInput { flex: 1; padding: 11px 14px; border: 1px solid #d1d5db; border-radius: 10px; font-size: 14px; }
@@ -147,6 +166,7 @@
         </select>
         <select id="memorySelect" aria-label="选择 Memory"></select>
         <button class="memory-action" id="createMemoryBtn" type="button">＋ 新建 Memory</button>
+        <button class="memory-action" id="importMemoryBtn" type="button">导入资料</button>
         <a class="memory-action disabled" id="openObsidianBtn" aria-disabled="true">在 Obsidian 中打开</a>
       </div>
     </div>
@@ -185,6 +205,44 @@
       </div>
     </div>
 
+    <div id="memoryImportCard" hidden>
+      <strong>导入资料到当前 Memory</strong>
+      <label for="importSourceKind">资料来源</label>
+      <select id="importSourceKind">
+        <option value="file">本地 PDF / 文本文件</option>
+        <option value="text">粘贴文本</option>
+        <option value="url">显式 URL</option>
+      </select>
+      <div class="import-source-pane" id="importFilePane">
+        <label for="importFileInput">文件（最大 10 MiB）</label>
+        <input id="importFileInput" type="file" accept=".pdf,.txt,.md,.markdown">
+      </div>
+      <div class="import-source-pane" id="importTextPane" hidden>
+        <label for="importTextTitle">标题</label>
+        <input id="importTextTitle" type="text" maxlength="200">
+        <label for="importTextContent">文本（最大 10 MiB）</label>
+        <textarea id="importTextContent"></textarea>
+      </div>
+      <div class="import-source-pane" id="importUrlPane" hidden>
+        <label for="importUrlInput">URL（仅点击生成预览后读取）</label>
+        <input id="importUrlInput" type="url" placeholder="https://example.com/article">
+      </div>
+      <div id="memoryImportPreview" hidden>
+        <div id="memoryImportStatus"></div>
+        <div id="memoryImportMeta"></div>
+        <div id="memoryImportTargets"></div>
+        <label id="importMarkdownLabel" for="importMarkdownPreview">Import Markdown 完整预览</label>
+        <pre class="import-markdown-preview" id="importMarkdownPreview"></pre>
+        <label id="noteMarkdownLabel" for="importNoteMarkdownPreview">Note Markdown 完整预览</label>
+        <pre class="import-markdown-preview" id="importNoteMarkdownPreview"></pre>
+      </div>
+      <div class="actions">
+        <button class="btn btn-ghost" type="button" id="cancelMemoryImportBtn">取消</button>
+        <button class="btn btn-ghost" type="button" id="previewMemoryImportBtn">生成导入预览</button>
+        <button class="btn btn-primary" type="button" id="confirmMemoryImportBtn" hidden>确认导入</button>
+      </div>
+    </div>
+
     <div id="inputBar">
       <input type="text" id="msgInput" placeholder="输入研究问题，或说明如何修改研究方向…" autocomplete="off">
       <button class="btn btn-primary" id="sendBtn" onclick="sendMessage()">发送</button>
@@ -206,6 +264,10 @@ let memories = [];
 let selectedMemoryId = null;
 let memorySelectionLocked = false;
 let currentMemoryNoteProposal = null;
+let currentMemoryImportProposal = null;
+let currentMemoryImportMemoryId = null;
+const MAX_IMPORT_FILE_BYTES = 10 * 1024 * 1024;
+const MAX_IMPORT_TEXT_BYTES = 10 * 1024 * 1024;
 
 const $ = id => document.getElementById(id);
 
@@ -233,6 +295,7 @@ function renderMemoryControls() {
   select.disabled = memorySelectionLocked;
   $('interactionMode').disabled = memorySelectionLocked;
   $('createMemoryBtn').disabled = memorySelectionLocked;
+  $('importMemoryBtn').disabled = memorySelectionLocked || !selectedMemoryId;
 
   const selected = memories.find(memory => memory.memory_id === selectedMemoryId);
   const open = $('openObsidianBtn');
@@ -407,6 +470,7 @@ function fmtTime(ts) {
   return `${String(d.getMonth()+1).padStart(2,'0')}-${String(d.getDate()).padStart(2,'0')} ${String(d.getHours()).padStart(2,'0')}:${String(d.getMinutes()).padStart(2,'0')}`;
 }
 function newSession() {
+  void cancelMemoryImport();
   currentSessionId = null; currentProposal = null; currentReportData = null; runningTask = null;
   if (eventSource) { eventSource.close(); eventSource = null; }
   setMemorySelection(selectedMemoryId, false);
@@ -424,6 +488,7 @@ function newSession() {
 // 会话选择（历史）
 // ------------------------------------------------------------------
 async function selectSession(sid) {
+  void cancelMemoryImport();
   currentSessionId = sid; currentProposal = null; currentReportData = null;
   if (eventSource) { eventSource.close(); eventSource = null; }
   memorySelectionLocked = true;
@@ -620,6 +685,213 @@ async function confirmMemoryNoteProposal() {
     appendBubble('assistant', `已写入 ${result.wikilink}（${result.target_path}）`);
   } catch (e) {
     alert('笔记写入请求失败，请重试');
+  } finally {
+    button.disabled = false;
+  }
+}
+
+// ------------------------------------------------------------------
+// Memory 资料导入：显式预览后确认
+// ------------------------------------------------------------------
+function setImportSourcePane() {
+  const kind = $('importSourceKind').value;
+  $('importFilePane').hidden = kind !== 'file';
+  $('importTextPane').hidden = kind !== 'text';
+  $('importUrlPane').hidden = kind !== 'url';
+}
+
+function resetMemoryImportPreview() {
+  currentMemoryImportProposal = null;
+  $('memoryImportPreview').hidden = true;
+  $('memoryImportStatus').textContent = '';
+  $('memoryImportStatus').className = '';
+  $('memoryImportMeta').textContent = '';
+  $('memoryImportTargets').replaceChildren();
+  $('importMarkdownPreview').textContent = '';
+  $('importNoteMarkdownPreview').textContent = '';
+  $('importMarkdownLabel').hidden = false;
+  $('importMarkdownPreview').hidden = false;
+  $('noteMarkdownLabel').hidden = false;
+  $('importNoteMarkdownPreview').hidden = false;
+  $('confirmMemoryImportBtn').hidden = true;
+  $('previewMemoryImportBtn').hidden = false;
+  for (const id of (
+    ['importSourceKind', 'importFileInput', 'importTextTitle', 'importTextContent', 'importUrlInput']
+  )) {
+    $(id).disabled = false;
+  }
+}
+
+function openMemoryImport() {
+  if (memorySelectionLocked || !selectedMemoryId) return;
+  currentMemoryImportMemoryId = selectedMemoryId;
+  resetMemoryImportPreview();
+  setImportSourcePane();
+  $('memoryImportCard').hidden = false;
+  $('msgInput').disabled = true;
+  $('sendBtn').disabled = true;
+  setMemorySelection(currentMemoryImportMemoryId, true);
+  $('memoryImportCard').scrollIntoView({ behavior: 'smooth', block: 'nearest' });
+}
+
+function closeMemoryImport() {
+  const memoryId = currentMemoryImportMemoryId;
+  currentMemoryImportMemoryId = null;
+  resetMemoryImportPreview();
+  $('memoryImportCard').hidden = true;
+  $('msgInput').disabled = false;
+  $('sendBtn').disabled = false;
+  setMemorySelection(memoryId, false);
+}
+
+async function cancelMemoryImport() {
+  if (!currentMemoryImportMemoryId && $('memoryImportCard').hidden) return;
+  const proposal = currentMemoryImportProposal;
+  const memoryId = currentMemoryImportMemoryId;
+  closeMemoryImport();
+  if (!proposal || !proposal.proposal_id || !memoryId) return;
+  try {
+    await fetch(
+      `/api/memories/${encodeURIComponent(memoryId)}/import-proposals/${encodeURIComponent(proposal.proposal_id)}`,
+      { method: 'DELETE' },
+    );
+  } catch (e) { /* 进程内 proposal 也会在服务重启时释放 */ }
+}
+
+function readFileAsBase64(file) {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onerror = () => reject(reader.error || new Error('文件读取失败'));
+    reader.onload = () => {
+      const dataUrl = String(reader.result || '');
+      const comma = dataUrl.indexOf(',');
+      if (comma < 0) { reject(new Error('文件编码失败')); return; }
+      resolve(dataUrl.slice(comma + 1));
+    };
+    reader.readAsDataURL(file);
+  });
+}
+
+async function buildMemoryImportRequest() {
+  const kind = $('importSourceKind').value;
+  if (kind === 'file') {
+    const file = $('importFileInput').files[0];
+    if (!file) throw new Error('请选择要导入的文件');
+    if (file.size > MAX_IMPORT_FILE_BYTES) throw new Error('文件不能超过 10 MiB');
+    return {
+      kind: 'file', file_name: file.name, media_type: file.type || null,
+      size_bytes: file.size, content_base64: await readFileAsBase64(file),
+    };
+  }
+  if (kind === 'text') {
+    const title = $('importTextTitle').value.trim();
+    const text = $('importTextContent').value;
+    if (!title) throw new Error('请填写文本标题');
+    if (!text.trim()) throw new Error('请粘贴要导入的文本');
+    if (new TextEncoder().encode(text).byteLength > MAX_IMPORT_TEXT_BYTES) {
+      throw new Error('粘贴文本不能超过 10 MiB');
+    }
+    return { kind: 'text', title, text };
+  }
+  const url = $('importUrlInput').value;
+  if (!url.trim()) throw new Error('请输入显式 URL');
+  return { kind: 'url', url };
+}
+
+function appendImportTarget(container, label, path, wikilink, uri) {
+  if (!path) return;
+  const row = document.createElement('div');
+  row.appendChild(document.createTextNode(`${label}：`));
+  if (uri) {
+    const link = document.createElement('a');
+    link.href = uri;
+    link.textContent = wikilink || path;
+    row.appendChild(link);
+  } else {
+    row.appendChild(document.createTextNode(wikilink || path));
+  }
+  container.appendChild(row);
+}
+
+function renderMemoryImportPreview(payload) {
+  const duplicate = payload.status === 'duplicate';
+  $('memoryImportPreview').hidden = false;
+  $('memoryImportStatus').className = duplicate ? 'duplicate' : '';
+  $('memoryImportStatus').textContent = duplicate
+    ? '该资料已存在，不会重复写入附件或笔记。'
+    : '导入提案已生成；确认前 Memory 未发生变化。';
+  const sizeLine = Number.isInteger(payload.byte_size) ? `\n大小：${payload.byte_size} bytes` : '';
+  $('memoryImportMeta').textContent =
+    `来源：${payload.source_kind || ''} · ${payload.source_ref || ''}` +
+    `\nLocator：${payload.locator || ''}` +
+    `\nSHA-256：${payload.content_hash || ''}${sizeLine}`;
+  const targets = $('memoryImportTargets');
+  targets.replaceChildren();
+  appendImportTarget(targets, '原始附件', payload.attachment_path, null, payload.attachment_obsidian_uri);
+  appendImportTarget(targets, '结构化导入', payload.import_path, payload.import_wikilink, payload.import_obsidian_uri);
+  appendImportTarget(targets, '整理笔记', payload.note_path, payload.note_wikilink, payload.note_obsidian_uri);
+  appendImportTarget(targets, 'Memory Home', payload.home_path, null, payload.home_obsidian_uri);
+
+  const hasImportMarkdown = typeof payload.import_markdown === 'string';
+  const hasNoteMarkdown = typeof payload.note_markdown === 'string';
+  $('importMarkdownLabel').hidden = !hasImportMarkdown;
+  $('importMarkdownPreview').hidden = !hasImportMarkdown;
+  $('importMarkdownPreview').textContent = hasImportMarkdown ? payload.import_markdown : '';
+  $('noteMarkdownLabel').hidden = !hasNoteMarkdown;
+  $('importNoteMarkdownPreview').hidden = !hasNoteMarkdown;
+  $('importNoteMarkdownPreview').textContent = hasNoteMarkdown ? payload.note_markdown : '';
+  currentMemoryImportProposal = duplicate ? null : payload;
+  $('confirmMemoryImportBtn').hidden = duplicate || payload.can_confirm !== true;
+  $('previewMemoryImportBtn').hidden = true;
+  for (const id of (
+    ['importSourceKind', 'importFileInput', 'importTextTitle', 'importTextContent', 'importUrlInput']
+  )) {
+    $(id).disabled = true;
+  }
+}
+
+async function previewMemoryImport() {
+  if (!currentMemoryImportMemoryId || currentMemoryImportProposal) return;
+  const button = $('previewMemoryImportBtn');
+  button.disabled = true;
+  try {
+    const body = await buildMemoryImportRequest();
+    const r = await fetch(
+      `/api/memories/${encodeURIComponent(currentMemoryImportMemoryId)}/import-proposals`,
+      {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(body),
+      },
+    );
+    const payload = await r.json();
+    if (!r.ok) { alert(payload.detail || '导入预览生成失败'); return; }
+    renderMemoryImportPreview(payload);
+  } catch (e) {
+    alert(e.message || '导入预览生成失败');
+  } finally {
+    button.disabled = false;
+  }
+}
+
+async function confirmMemoryImport() {
+  const proposal = currentMemoryImportProposal;
+  const memoryId = currentMemoryImportMemoryId;
+  if (!proposal || !memoryId) return;
+  const button = $('confirmMemoryImportBtn');
+  button.disabled = true;
+  try {
+    const r = await fetch(
+      `/api/memories/${encodeURIComponent(memoryId)}/import-proposals/${encodeURIComponent(proposal.proposal_id)}/confirm`,
+      { method: 'POST' },
+    );
+    const payload = await r.json();
+    if (!r.ok) { alert(payload.detail || '导入确认失败，请重新生成预览'); return; }
+    closeMemoryImport();
+    appendBubble('assistant', payload.status === 'duplicate'
+      ? '该资料已由另一项确认导入，本次未重复写入。'
+      : `资料已导入当前 Memory：${payload.import_path || proposal.import_path}`);
+  } catch (e) {
+    alert('导入确认请求失败，请重试');
   } finally {
     button.disabled = false;
   }
@@ -957,6 +1229,11 @@ let sendLock = false;
 $('newSessionBtn').onclick = newSession;
 $('cancelNoteProposalBtn').addEventListener('click', cancelMemoryNoteProposal);
 $('confirmNoteProposalBtn').addEventListener('click', confirmMemoryNoteProposal);
+$('importMemoryBtn').addEventListener('click', openMemoryImport);
+$('importSourceKind').addEventListener('change', setImportSourcePane);
+$('previewMemoryImportBtn').addEventListener('click', previewMemoryImport);
+$('cancelMemoryImportBtn').addEventListener('click', cancelMemoryImport);
+$('confirmMemoryImportBtn').addEventListener('click', confirmMemoryImport);
 $('msgInput').addEventListener('keydown', e => { if (e.key === 'Enter') sendMessage(); });
 loadSessions();
 loadMemories();

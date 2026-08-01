@@ -15,6 +15,7 @@ LEGACY_ROOT_DIRECTORIES = ("reports", "evidence", "sources")
 
 _MEMORY_ID = re.compile(r"^M-[A-Za-z0-9]+(?:-[A-Za-z0-9]+)*$")
 _NOTE_ID = re.compile(r"^[A-Za-z][A-Za-z0-9]*-[A-Za-z0-9]+(?:-[A-Za-z0-9]+)*$")
+_ATTACHMENT_NAME = re.compile(r"^Asset-[0-9a-f]{64}\.(?:pdf|txt|html)$")
 _FRONTMATTER_REQUIRED = frozenset(
     {
         "id",
@@ -209,6 +210,81 @@ def resolve_vault_markdown_path(
     return target
 
 
+def validate_memory_attachment_path(
+    relative_path: str | os.PathLike[str],
+    *,
+    memory_id: str | None = None,
+) -> str:
+    """Validate one canonical content-addressed W5 attachment path."""
+    raw = _coerce_relative_path(relative_path)
+    relative = PurePosixPath(raw)
+    _validate_path_components(raw.split("/"), field_name="attachment path")
+    if (
+        len(relative.parts) != 4
+        or relative.parts[0] != "Memories"
+        or relative.parts[2] != "attachments"
+        or not _ATTACHMENT_NAME.fullmatch(relative.parts[3])
+    ):
+        raise ValueError(
+            "attachment path must match "
+            "Memories/M-id/attachments/Asset-<64hex>.(pdf|txt|html)"
+        )
+    path_memory_id = validate_memory_id(relative.parts[1])
+    if memory_id is not None and path_memory_id != validate_memory_id(memory_id):
+        raise ValueError("attachment path must remain inside the selected Memory")
+    return relative.as_posix()
+
+
+def resolve_memory_attachment_path(
+    vault_root: str | os.PathLike[str],
+    relative_path: str | os.PathLike[str],
+    *,
+    memory_id: str | None = None,
+) -> Path:
+    """Resolve one W5 attachment while rejecting Vault and Memory escape."""
+    raw = validate_memory_attachment_path(relative_path, memory_id=memory_id)
+    relative = PurePosixPath(raw)
+    root = Path(vault_root).resolve(strict=False)
+    lexical_target = root / Path(*relative.parts)
+    current = root
+    is_junction = getattr(os.path, "isjunction", lambda _path: False)
+    for component in relative.parts:
+        current = current / component
+        try:
+            file_attributes = getattr(os.lstat(current), "st_file_attributes", 0)
+        except OSError:
+            file_attributes = 0
+        if (
+            current.is_symlink()
+            or is_junction(current)
+            or bool(file_attributes & 0x400)
+        ):
+            raise ValueError("attachment path cannot traverse a symlink or junction")
+    memory_root = (root / "Memories" / relative.parts[1]).resolve(strict=False)
+    target = lexical_target.resolve(strict=False)
+    if not memory_root.is_relative_to(root) or not target.is_relative_to(memory_root):
+        raise ValueError("attachment path escapes the selected Memory")
+    return target
+
+
+def build_attachment_wikilink(
+    attachment_relative_path: str | os.PathLike[str],
+    alias: str | None = None,
+) -> str:
+    """Build an Obsidian WikiLink whose attachment extension is preserved."""
+    target = validate_memory_attachment_path(attachment_relative_path)
+    if alias is None:
+        return f"[[{target}]]"
+    if (
+        not isinstance(alias, str)
+        or not alias.strip()
+        or alias != alias.strip()
+        or any(character in alias for character in _INVALID_WIKILINK_CHARACTERS)
+    ):
+        raise ValueError("attachment WikiLink alias is unsafe")
+    return f"[[{target}|{alias}]]"
+
+
 def validate_wikilink_target(target: str) -> str:
     """Validate one canonical, extension-free Memory note WikiLink target."""
     raw = _coerce_relative_path(target)
@@ -266,13 +342,16 @@ def detect_legacy_memory_layout(
 __all__ = [
     "LEGACY_MEMORY_ID",
     "LEGACY_ROOT_DIRECTORIES",
+    "build_attachment_wikilink",
     "build_wikilink",
     "detect_legacy_memory_layout",
     "ensure_unique_memory_ids",
     "memory_relative_path",
+    "resolve_memory_attachment_path",
     "resolve_vault_markdown_path",
     "validate_frontmatter",
     "validate_memory_descriptor",
+    "validate_memory_attachment_path",
     "validate_memory_id",
     "validate_wikilink_target",
 ]

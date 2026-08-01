@@ -36,8 +36,9 @@
 - [W2_OBSIDIAN_MINIMAL_INTEGRATION.md](W2_OBSIDIAN_MINIMAL_INTEGRATION.md)：安全 Obsidian URI、Web Memory 控件与 CLI 位置输出的实现与验收结果。
 - [W3_CONTINUE_RESEARCH_FROM_MEMORY.md](W3_CONTINUE_RESEARCH_FROM_MEMORY.md)：可重建 Markdown 检索、Research Brief 记忆上下文与同 Memory 继续研究的实现和验收结果。
 - [W4_MEMORY_QA_CONTROLLED_NOTES.md](W4_MEMORY_QA_CONTROLLED_NOTES.md)：当前 Memory 问答、带 WikiLink 引用、受控笔记提案与并发冲突保护的实现和验收结果。
+- [W5_CONTROLLED_IMPORTS.md](W5_CONTROLLED_IMPORTS.md)：PDF/文本/显式 URL 导入、可定位提取、受控整理提案与确认后成组写入的实现和验收结果。
 
-LLM Wiki + Obsidian 主线当前已完成 W0–W4；W5 资料导入与整理尚未开始。
+LLM Wiki + Obsidian 主线当前已完成 W0–W5；W6 稳定化、迁移与入口收口尚未开始。
 
 ## 已清理文档
 

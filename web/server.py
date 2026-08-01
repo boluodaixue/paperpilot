@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import asyncio
+import base64
+import binascii
 import json
 import os
 import sys
@@ -13,12 +15,12 @@ from collections.abc import Mapping
 from contextlib import asynccontextmanager
 from dataclasses import asdict, is_dataclass
 from pathlib import Path
-from typing import Any, Iterable
+from typing import Any, Iterable, Literal
 
 from fastapi import FastAPI, Header, HTTPException
 from fastapi.responses import HTMLResponse, StreamingResponse
 from langgraph.types import Command
-from pydantic import BaseModel
+from pydantic import BaseModel, ConfigDict
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 if str(PROJECT_ROOT) not in sys.path:
@@ -32,9 +34,12 @@ for _stream in (sys.stdout, sys.stderr):
 
 from src.memory.chat_store import KIND_PROPOSAL, KIND_REPORT, ChatStore  # noqa: E402
 from src.research.memory import MemoryWriteConflictError  # noqa: E402
+from src.research.memory_import import MemoryImportLimitError  # noqa: E402
 from src.research.models import (  # noqa: E402
     MemoryAnswer,
     MemoryDescriptor,
+    MemoryImportDuplicate,
+    MemoryImportProposal,
     MemoryNoteProposal,
     ResearchWorkflowResult,
 )
@@ -131,6 +136,10 @@ _TASKS: dict[str, ResearchTask] = {}
 _RUN_SEMAPHORE = asyncio.Semaphore(1)
 _MEMORY_ANSWERS: dict[str, MemoryAnswer] = {}
 _MEMORY_NOTE_PROPOSALS: dict[str, MemoryNoteProposal] = {}
+_MEMORY_IMPORT_PROPOSALS: dict[str, MemoryImportProposal] = {}
+
+_MAX_MEMORY_IMPORT_BYTES = 10 * 1024 * 1024
+_MAX_MEMORY_IMPORT_BASE64_CHARS = ((_MAX_MEMORY_IMPORT_BYTES + 2) // 3) * 4
 
 
 class AlignmentRequest(BaseModel):
@@ -155,6 +164,19 @@ class MemoryAnswerRequest(BaseModel):
 
 class MemoryNoteProposalRequest(BaseModel):
     answer_id: str
+
+
+class MemoryImportProposalRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    kind: Literal["file", "text", "url"]
+    file_name: str | None = None
+    media_type: str | None = None
+    size_bytes: int | None = None
+    content_base64: str | None = None
+    title: str | None = None
+    text: str | None = None
+    url: str | None = None
 
 
 class SessionRename(BaseModel):
@@ -292,6 +314,85 @@ def _commit_response(value: Any) -> dict[str, Any]:
     required = {"memory_id", "target_path", "home_path", "wikilink"}
     if not required.issubset(payload):
         raise RuntimeError("Memory note commit returned an invalid result")
+    return payload
+
+
+def _import_wikilink_for_path(wikilinks: Iterable[str], path: str | None) -> str | None:
+    if not path:
+        return None
+    target = path[:-3] if path.endswith(".md") else path
+    for wikilink in wikilinks:
+        if not isinstance(wikilink, str) or not wikilink.startswith("[["):
+            continue
+        link_target = wikilink[2:-2].split("|", 1)[0]
+        if link_target == target:
+            return wikilink
+    return None
+
+
+def _add_import_obsidian_uris(
+    runtime: ResearchRuntime,
+    payload: dict[str, Any],
+) -> None:
+    vault_name = _configured_vault_name()
+    for field in ("attachment_path", "import_path", "note_path", "home_path"):
+        path = payload.get(field)
+        if not path:
+            continue
+        payload[field.replace("_path", "_obsidian_uri")] = build_obsidian_open_uri(
+            runtime.memory_store.root,
+            path,
+            vault_name=vault_name,
+        )
+
+
+def _import_preview_response(
+    runtime: ResearchRuntime,
+    value: MemoryImportProposal | MemoryImportDuplicate,
+) -> dict[str, Any]:
+    payload = asdict(value)
+    payload.pop("attachment_bytes", None)
+    if isinstance(value, MemoryImportProposal):
+        payload.update({"status": "proposed", "can_confirm": True})
+    else:
+        payload.update({"status": "duplicate", "can_confirm": False})
+        payload["import_wikilink"] = _import_wikilink_for_path(
+            value.wikilinks,
+            value.import_path,
+        )
+        payload["note_wikilink"] = _import_wikilink_for_path(
+            value.wikilinks,
+            value.note_path,
+        )
+    _add_import_obsidian_uris(runtime, payload)
+    return payload
+
+
+def _memory_import_commit_response(
+    runtime: ResearchRuntime,
+    value: Any,
+) -> dict[str, Any]:
+    if isinstance(value, MemoryImportDuplicate):
+        return _import_preview_response(runtime, value)
+    if isinstance(value, Mapping):
+        payload = dict(value)
+    elif is_dataclass(value):
+        payload = asdict(value)
+    else:
+        raise RuntimeError("Memory import commit returned an invalid result")
+    payload.pop("attachment_bytes", None)
+    required = {
+        "status", "memory_id", "attachment_path", "import_path",
+        "note_path", "home_path", "wikilinks",
+    }
+    if (
+        not required.issubset(payload)
+        or payload.get("status") not in {"committed", "duplicate"}
+        or not isinstance(payload.get("memory_id"), str)
+    ):
+        raise RuntimeError("Memory import commit returned an invalid result")
+    payload["can_confirm"] = False
+    _add_import_obsidian_uris(runtime, payload)
     return payload
 
 
@@ -533,6 +634,133 @@ async def create_memory(req: MemoryCreateRequest) -> dict[str, Any]:
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     return _memory_response(runtime, descriptor)
+
+
+@app.post("/api/memories/{memory_id}/import-proposals")
+async def prepare_memory_import(
+    memory_id: str,
+    req: MemoryImportProposalRequest,
+) -> dict[str, Any]:
+    runtime = get_research_runtime()
+    try:
+        runtime.get_memory(memory_id)
+    except (FileNotFoundError, ValueError) as exc:
+        raise HTTPException(status_code=404, detail=f"Memory 不存在: {memory_id}") from exc
+
+    provided = set(req.model_fields_set)
+    allowed = {
+        "file": {"kind", "file_name", "media_type", "size_bytes", "content_base64"},
+        "text": {"kind", "title", "text"},
+        "url": {"kind", "url"},
+    }[req.kind]
+    required = {
+        "file": {"kind", "file_name", "size_bytes", "content_base64"},
+        "text": {"kind", "title", "text"},
+        "url": {"kind", "url"},
+    }[req.kind]
+    if not required.issubset(provided) or not provided.issubset(allowed):
+        raise HTTPException(status_code=400, detail="导入来源字段不匹配")
+
+    try:
+        if req.kind == "file":
+            file_name = (req.file_name or "").strip()
+            encoded = req.content_base64 or ""
+            declared_size = req.size_bytes
+            if not file_name or declared_size is None or declared_size < 0 or not encoded:
+                raise HTTPException(status_code=400, detail="文件名、大小和内容不能为空")
+            if (
+                declared_size > _MAX_MEMORY_IMPORT_BYTES
+                or len(encoded) > _MAX_MEMORY_IMPORT_BASE64_CHARS
+            ):
+                raise HTTPException(status_code=413, detail="导入文件不能超过 10 MiB")
+            try:
+                content = base64.b64decode(encoded, validate=True)
+            except (binascii.Error, ValueError) as exc:
+                raise HTTPException(status_code=400, detail="content_base64 不是有效的 base64") from exc
+            if len(content) != declared_size:
+                raise HTTPException(status_code=400, detail="声明的文件大小与解码内容不匹配")
+            if len(content) > _MAX_MEMORY_IMPORT_BYTES:
+                raise HTTPException(status_code=413, detail="导入文件不能超过 10 MiB")
+            result = await runtime.prepare_memory_file_import(
+                memory_id,
+                file_name,
+                content,
+            )
+        elif req.kind == "text":
+            title = (req.title or "").strip()
+            text = req.text or ""
+            if not title or not text.strip():
+                raise HTTPException(status_code=400, detail="文本标题和内容不能为空")
+            if len(text.encode("utf-8")) > _MAX_MEMORY_IMPORT_BYTES:
+                raise HTTPException(status_code=413, detail="导入文本不能超过 10 MiB")
+            result = await runtime.prepare_memory_text_import(memory_id, title, text)
+        else:
+            url = req.url or ""
+            if not url.strip():
+                raise HTTPException(status_code=400, detail="URL 不能为空")
+            result = await runtime.prepare_memory_url_import(memory_id, url)
+    except MemoryImportLimitError as exc:
+        raise HTTPException(status_code=413, detail=str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    if isinstance(result, MemoryImportDuplicate):
+        if result.memory_id != memory_id:
+            raise RuntimeError("Memory import duplicate does not match the request")
+        return _import_preview_response(runtime, result)
+    if not isinstance(result, MemoryImportProposal) or result.memory_id != memory_id:
+        raise RuntimeError("Memory import proposal does not match the request")
+    existing = _MEMORY_IMPORT_PROPOSALS.get(result.proposal_id)
+    if existing is not None and existing != result:
+        raise RuntimeError("Memory import proposal id collision")
+    _MEMORY_IMPORT_PROPOSALS[result.proposal_id] = result
+    return _import_preview_response(runtime, result)
+
+
+@app.post("/api/memories/{memory_id}/import-proposals/{proposal_id}/confirm")
+async def confirm_memory_import(
+    memory_id: str,
+    proposal_id: str,
+) -> dict[str, Any]:
+    proposal = _MEMORY_IMPORT_PROPOSALS.get(proposal_id)
+    if proposal is None:
+        raise HTTPException(
+            status_code=404,
+            detail=f"Memory import proposal 不存在: {proposal_id}",
+        )
+    if proposal.memory_id != memory_id:
+        raise HTTPException(status_code=409, detail="proposal 与 memory 不匹配")
+    runtime = get_research_runtime()
+    try:
+        result = runtime.commit_memory_import(proposal)
+    except MemoryWriteConflictError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    payload = _memory_import_commit_response(runtime, result)
+    if payload["memory_id"] != memory_id:
+        raise RuntimeError("Memory import commit does not match the proposal")
+    _MEMORY_IMPORT_PROPOSALS.pop(proposal_id, None)
+    return payload
+
+
+@app.delete("/api/memories/{memory_id}/import-proposals/{proposal_id}")
+async def cancel_memory_import(
+    memory_id: str,
+    proposal_id: str,
+) -> dict[str, Any]:
+    proposal = _MEMORY_IMPORT_PROPOSALS.get(proposal_id)
+    if proposal is None:
+        raise HTTPException(
+            status_code=404,
+            detail=f"Memory import proposal 不存在: {proposal_id}",
+        )
+    if proposal.memory_id != memory_id:
+        raise HTTPException(status_code=409, detail="proposal 与 memory 不匹配")
+    _MEMORY_IMPORT_PROPOSALS.pop(proposal_id, None)
+    return {
+        "status": "cancelled",
+        "proposal_id": proposal_id,
+        "memory_id": memory_id,
+    }
 
 
 @app.post("/api/memories/{memory_id}/answers")
