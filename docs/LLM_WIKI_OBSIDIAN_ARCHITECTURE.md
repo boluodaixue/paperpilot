@@ -202,6 +202,7 @@ Obsidian URI 只用于打开，不用于绕过 PaperPilot 的校验直接追加�
 - “继续此 Memory 对话”；
 - “保存回答为笔记”；
 - “基于此 Memory 发起研究”；
+- “迁移既有 Memory”；
 - “在 Obsidian 中打开”。
 
 前端不实现文件树、Markdown 编辑器、Backlink 面板、图谱或 PDF 阅读器。
@@ -210,7 +211,11 @@ Obsidian URI 只用于打开，不用于绕过 PaperPilot 的校验直接追加�
 
 当前 Vault 根目录下的 `reports/`、`evidence/` 和 `sources/` 不自动搬移，避免破坏已存在的 `MemoryManifest` 和 Chat Store 引用。
 
-首版将其作为一个可读的“既有 Memory”暴露。新建 Memory 使用 `Memories/M-<id>/` 契约。后续如果实施迁移，必须是显式、可预览、可回退的一次性操作，不在常规启动时暗中改路径。
+W6 将其作为虚拟只读 `M-legacy` 暴露：可以在当前根目录范围内检索和问答，不能研究、保存笔记、导入或接受任何 managed 写入。新建 Memory 使用 `Memories/M-<id>/` 契约，CLI/Web 写入入口必须显式选择一个 managed Memory。
+
+W6 的迁移是显式 copy-on-publish：先生成包含目标 Home 和每篇转换后 Markdown 的完整零写预览；确认时复核源快照、在同卷隐藏 staging 中完整生成和校验，再以一次目录 rename 发布新的 `Memories/M-<id>/`。任一失败都清理 staging 且不产生可见目标。legacy 根文件永远不移动、不删除、不改写，因此旧 `MemoryManifest` 和 Chat Store 指针仍可读取；迁移成功后当前会话也不会自动切换到新 Memory。
+
+这不是跨 SQLite 与 Vault 的全局事务，不引入旧指针批量重写、cross-process lock、journal 或 bundle。多个 PaperPilot 进程同时写同一 Vault 不在本主线保证范围。
 
 ## 10. 完整闭环
 

@@ -40,6 +40,8 @@
   #chatHeader .sub { font-size: 11px; color: #9ca3af; font-weight: 400; margin-left: 8px; }
   #memoryControls { display: flex; align-items: center; gap: 7px; min-width: 0; }
   #memorySelect, #interactionMode { max-width: 240px; padding: 7px 9px; border: 1px solid #d1d5db; border-radius: 7px; background: #fff; }
+  #memoryIdBadge { max-width: 230px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+                   font: 11px Consolas, monospace; color: #475569; }
   .memory-action { padding: 7px 10px; border: 1px solid #d1d5db; border-radius: 7px; background: #fff;
                    color: #374151; cursor: pointer; font-size: 12px; text-decoration: none; white-space: nowrap; }
   .memory-action:hover { border-color: #2563eb; color: #2563eb; }
@@ -139,6 +141,15 @@
                              white-space: pre-wrap; font-size: 12px; }
   #memoryImportCard .actions { display: flex; justify-content: flex-end; gap: 8px; margin-top: 10px; }
 
+  /* ---------- legacy Memory 显式迁移 ---------- */
+  #legacyMigrationCard { margin: 0 22px 10px; padding: 14px; background: #fff;
+                         border: 1px solid #8b5cf6; border-radius: 10px;
+                         box-shadow: 0 2px 8px rgba(0,0,0,.08); }
+  #legacyMigrationPreview { max-height: 340px; overflow: auto; padding: 10px;
+                            background: #f8fafc; border: 1px solid #e5e7eb;
+                            border-radius: 7px; white-space: pre-wrap; font-size: 12px; }
+  #legacyMigrationCard .actions { display: flex; justify-content: flex-end; gap: 8px; margin-top: 10px; }
+
   /* ---------- 输入栏 ---------- */
   #inputBar { display: flex; gap: 10px; padding: 12px 22px 16px; }
   #msgInput { flex: 1; padding: 11px 14px; border: 1px solid #d1d5db; border-radius: 10px; font-size: 14px; }
@@ -165,8 +176,10 @@
           <option value="memory-answer">Memory 问答</option>
         </select>
         <select id="memorySelect" aria-label="选择 Memory"></select>
+        <span id="memoryIdBadge">memory_id：未绑定</span>
         <button class="memory-action" id="createMemoryBtn" type="button">＋ 新建 Memory</button>
         <button class="memory-action" id="importMemoryBtn" type="button">导入资料</button>
+        <button class="memory-action" id="migrateLegacyBtn" type="button" hidden>迁移既有 Memory</button>
         <a class="memory-action disabled" id="openObsidianBtn" aria-disabled="true">在 Obsidian 中打开</a>
       </div>
     </div>
@@ -243,6 +256,16 @@
       </div>
     </div>
 
+    <div id="legacyMigrationCard" hidden>
+      <strong>既有 Memory 迁移：完整预览</strong>
+      <p>根目录旧文件将永久保留为只读兼容；确认后只原子发布新的 managed Memory，不会切换当前会话。</p>
+      <pre id="legacyMigrationPreview"></pre>
+      <div class="actions">
+        <button class="btn btn-ghost" type="button" id="cancelLegacyMigrationBtn">取消</button>
+        <button class="btn btn-primary" type="button" id="confirmLegacyMigrationBtn">确认发布副本</button>
+      </div>
+    </div>
+
     <div id="inputBar">
       <input type="text" id="msgInput" placeholder="输入研究问题，或说明如何修改研究方向…" autocomplete="off">
       <button class="btn btn-primary" id="sendBtn" onclick="sendMessage()">发送</button>
@@ -263,9 +286,12 @@ const eventCursors = {};
 let memories = [];
 let selectedMemoryId = null;
 let memorySelectionLocked = false;
+let sessionMemoryBound = false;
+let sessionMemoryId = null;
 let currentMemoryNoteProposal = null;
 let currentMemoryImportProposal = null;
 let currentMemoryImportMemoryId = null;
+let currentLegacyMigrationProposal = null;
 const MAX_IMPORT_FILE_BYTES = 10 * 1024 * 1024;
 const MAX_IMPORT_TEXT_BYTES = 10 * 1024 * 1024;
 
@@ -278,7 +304,7 @@ function renderMemoryControls() {
   const select = $('memorySelect');
   select.innerHTML = '';
   const empty = document.createElement('option');
-  empty.value = ''; empty.textContent = '选择 Memory（可选）';
+  empty.value = ''; empty.textContent = '选择 Memory';
   select.appendChild(empty);
   for (const memory of memories) {
     const option = document.createElement('option');
@@ -288,18 +314,37 @@ function renderMemoryControls() {
   }
   if (memories.some(memory => memory.memory_id === selectedMemoryId)) {
     select.value = selectedMemoryId;
+  } else if (sessionMemoryBound && sessionMemoryId) {
+    const unavailable = document.createElement('option');
+    unavailable.value = sessionMemoryId;
+    unavailable.textContent = `${sessionMemoryId}（当前不可读取）`;
+    select.appendChild(unavailable);
+    selectedMemoryId = sessionMemoryId;
+    select.value = sessionMemoryId;
   } else {
     selectedMemoryId = null;
     select.value = '';
   }
-  select.disabled = memorySelectionLocked;
-  $('interactionMode').disabled = memorySelectionLocked;
-  $('createMemoryBtn').disabled = memorySelectionLocked;
-  $('importMemoryBtn').disabled = memorySelectionLocked || !selectedMemoryId;
-
+  const sessionLocked = memorySelectionLocked || sessionMemoryBound;
   const selected = memories.find(memory => memory.memory_id === selectedMemoryId);
+  const readOnly = Boolean(selected && selected.read_only);
+  select.disabled = sessionLocked;
+  $('interactionMode').disabled = memorySelectionLocked;
+  const researchOption = $('interactionMode').querySelector('option[value="research"]');
+  researchOption.disabled = readOnly;
+  if (readOnly && $('interactionMode').value === 'research') {
+    $('interactionMode').value = 'memory-answer';
+  }
+  $('createMemoryBtn').disabled = sessionLocked;
+  $('importMemoryBtn').disabled = memorySelectionLocked || !selectedMemoryId || readOnly;
+  $('migrateLegacyBtn').hidden = !(selected && selected.can_migrate);
+  $('migrateLegacyBtn').disabled = memorySelectionLocked;
+  $('memoryIdBadge').textContent = sessionMemoryBound
+    ? `memory_id：${sessionMemoryId || 'legacy'}`
+    : 'memory_id：未绑定';
+
   const open = $('openObsidianBtn');
-  if (selected) {
+  if (selected && selected.obsidian_uri) {
     open.href = selected.obsidian_uri;
     open.classList.remove('disabled');
     open.setAttribute('aria-disabled', 'false');
@@ -312,8 +357,16 @@ function renderMemoryControls() {
 }
 
 function setMemorySelection(memoryId, locked = false) {
-  selectedMemoryId = memoryId || null;
+  selectedMemoryId = sessionMemoryBound ? sessionMemoryId : (memoryId || null);
   memorySelectionLocked = locked;
+  renderMemoryControls();
+}
+
+function bindCurrentSession(sessionId, memoryId) {
+  currentSessionId = sessionId;
+  sessionMemoryBound = Boolean(memoryId);
+  sessionMemoryId = memoryId || null;
+  selectedMemoryId = sessionMemoryId;
   renderMemoryControls();
 }
 
@@ -322,7 +375,7 @@ async function loadMemories(preferredMemoryId = selectedMemoryId) {
     const r = await fetch('/api/memories');
     if (!r.ok) return;
     memories = await r.json();
-    selectedMemoryId = preferredMemoryId;
+    selectedMemoryId = sessionMemoryBound ? sessionMemoryId : preferredMemoryId;
     renderMemoryControls();
   } catch (e) { /* 研究入口不依赖 Obsidian 可用性 */ }
 }
@@ -340,11 +393,78 @@ async function createMemory() {
   await loadMemories(data.memory_id);
 }
 
+async function openLegacyMigration() {
+  const selected = memories.find(memory => memory.memory_id === selectedMemoryId);
+  if (!selected || !selected.can_migrate || memorySelectionLocked) return;
+  const targetMemoryId = prompt('目标 memory_id（格式 M-...）', 'M-migrated-legacy');
+  if (targetMemoryId === null || !targetMemoryId.trim()) return;
+  const title = prompt('迁移后的 Memory 标题', 'Migrated existing research');
+  if (title === null || !title.trim()) return;
+  const response = await fetch('/api/legacy-memory/migration-proposals', {
+    method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      title: title.trim(), target_memory_id: targetMemoryId.trim(),
+    }),
+  });
+  const proposal = await response.json();
+  if (!response.ok) { alert(proposal.detail || '迁移预览生成失败'); return; }
+  currentLegacyMigrationProposal = proposal;
+  const sections = [
+    `Source: ${proposal.source_memory_id}（保留只读）`,
+    `Target: ${proposal.target_memory_id}`,
+    `Home: ${proposal.home_path}`,
+    '', proposal.home_markdown || '',
+  ];
+  for (const file of proposal.files || []) {
+    sections.push('', `${file.source_path} → ${file.target_path}`, file.markdown || '');
+  }
+  $('legacyMigrationPreview').textContent = sections.join('\n');
+  $('legacyMigrationCard').hidden = false;
+  $('legacyMigrationCard').scrollIntoView({ behavior: 'smooth', block: 'nearest' });
+}
+
+async function cancelLegacyMigration() {
+  const proposal = currentLegacyMigrationProposal;
+  currentLegacyMigrationProposal = null;
+  $('legacyMigrationCard').hidden = true;
+  $('legacyMigrationPreview').textContent = '';
+  if (!proposal) return;
+  await fetch(
+    `/api/legacy-memory/migration-proposals/${encodeURIComponent(proposal.proposal_id)}`,
+    { method: 'DELETE' },
+  );
+}
+
+async function confirmLegacyMigration() {
+  const proposal = currentLegacyMigrationProposal;
+  if (!proposal) return;
+  const button = $('confirmLegacyMigrationBtn');
+  button.disabled = true;
+  try {
+    const response = await fetch(
+      `/api/legacy-memory/migration-proposals/${encodeURIComponent(proposal.proposal_id)}/confirm`,
+      { method: 'POST' },
+    );
+    const result = await response.json();
+    if (!response.ok) { alert(result.detail || '迁移失败，请重新生成预览'); return; }
+    currentLegacyMigrationProposal = null;
+    $('legacyMigrationCard').hidden = true;
+    $('legacyMigrationPreview').textContent = '';
+    await loadMemories(sessionMemoryId);
+    alert(`迁移已发布到 ${result.memory_id}；当前会话仍绑定 ${sessionMemoryId}。`);
+  } finally {
+    button.disabled = false;
+  }
+}
+
 $('memorySelect').addEventListener('change', (event) => {
-  if (memorySelectionLocked) { renderMemoryControls(); return; }
+  if (memorySelectionLocked || sessionMemoryBound) { renderMemoryControls(); return; }
   setMemorySelection(event.target.value || null, false);
 });
 $('createMemoryBtn').addEventListener('click', createMemory);
+$('migrateLegacyBtn').addEventListener('click', openLegacyMigration);
+$('cancelLegacyMigrationBtn').addEventListener('click', cancelLegacyMigration);
+$('confirmLegacyMigrationBtn').addEventListener('click', confirmLegacyMigration);
 $('interactionMode').addEventListener('change', updateInputMode);
 
 function updateInputMode() {
@@ -395,7 +515,7 @@ async function loadSessions() {
     });
     div.addEventListener('click', (e) => {
       if (e.target.closest('.actions')) return;
-      selectSession(s.session_id);
+      selectSession(s.session_id, Boolean(s.memory_id), s.memory_id || null);
     });
     div.addEventListener('dragstart', (e) => { dragSid = s.session_id; div.classList.add('dragging'); });
     div.addEventListener('dragend', () => div.classList.remove('dragging'));
@@ -471,9 +591,11 @@ function fmtTime(ts) {
 }
 function newSession() {
   void cancelMemoryImport();
+  void cancelLegacyMigration();
   currentSessionId = null; currentProposal = null; currentReportData = null; runningTask = null;
   if (eventSource) { eventSource.close(); eventSource = null; }
-  setMemorySelection(selectedMemoryId, false);
+  sessionMemoryBound = false; sessionMemoryId = null;
+  setMemorySelection(null, false);
   $('messages').innerHTML = '';
   $('proposalCard').style.display = 'none';
   currentMemoryNoteProposal = null;
@@ -487,9 +609,12 @@ function newSession() {
 // ------------------------------------------------------------------
 // 会话选择（历史）
 // ------------------------------------------------------------------
-async function selectSession(sid) {
+async function selectSession(sid, memoryBound = false, memoryId = null) {
   void cancelMemoryImport();
+  void cancelLegacyMigration();
   currentSessionId = sid; currentProposal = null; currentReportData = null;
+  sessionMemoryBound = memoryBound; sessionMemoryId = memoryId;
+  selectedMemoryId = memoryBound ? memoryId : null;
   if (eventSource) { eventSource.close(); eventSource = null; }
   memorySelectionLocked = true;
   renderMemoryControls();
@@ -536,8 +661,8 @@ async function selectSession(sid) {
 
   // 按最后一条消息决定尾部状态：proposal → 恢复确认卡；report → 恢复报告卡
   const last = msgs[msgs.length - 1];
-  const lastReport = msgs.filter(message => message.kind === 'report').slice(-1)[0];
-  setMemorySelection(lastReport ? lastReport.memory_id : null, false);
+  // W6 deliberately ignores lastReport.memory_id: session metadata is authoritative.
+  setMemorySelection(sessionMemoryId, false);
   if (last.kind === 'proposal') {
     showProposalFromHistory(msgs);
   } else if (last.kind === 'report') {
@@ -590,11 +715,13 @@ async function sendMemoryQuestion() {
   try {
     const r = await fetch(`/api/memories/${encodeURIComponent(memoryId)}/answers`, {
       method: 'POST', headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ question }),
+      body: JSON.stringify({ question, session_id: currentSessionId }),
     });
     const answer = await r.json();
     thinking.remove();
     if (!r.ok) { appendBubble('assistant', answer.detail || 'Memory 问答失败'); return; }
+    bindCurrentSession(answer.session_id, answer.memory_id);
+    loadSessions();
     renderMemoryAnswer(answer);
   } catch (e) {
     thinking.remove();
@@ -635,8 +762,13 @@ function renderMemoryAnswer(answer) {
   const save = document.createElement('button');
   save.type = 'button';
   save.className = 'btn btn-ghost save-memory-answer';
-  save.textContent = '保存回答为笔记';
-  save.addEventListener('click', () => requestMemoryNoteProposal(answer));
+  const answerMemory = memories.find(memory => memory.memory_id === answer.memory_id);
+  const readOnly = Boolean(answerMemory && answerMemory.read_only);
+  save.textContent = readOnly ? '只读 Memory：请先迁移' : '保存回答为笔记';
+  save.disabled = readOnly;
+  if (!readOnly) {
+    save.addEventListener('click', () => requestMemoryNoteProposal(answer));
+  }
   card.appendChild(save);
   $('messages').appendChild(card);
   scrollToBottom();
@@ -648,7 +780,7 @@ async function requestMemoryNoteProposal(answer) {
       `/api/memories/${encodeURIComponent(answer.memory_id)}/note-proposals`,
       {
         method: 'POST', headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ answer_id: answer.answer_id }),
+        body: JSON.stringify({ answer_id: answer.answer_id, session_id: currentSessionId }),
       },
     );
     const proposal = await r.json();
@@ -724,6 +856,8 @@ function resetMemoryImportPreview() {
 
 function openMemoryImport() {
   if (memorySelectionLocked || !selectedMemoryId) return;
+  const selected = memories.find(memory => memory.memory_id === selectedMemoryId);
+  if (selected && selected.read_only) return;
   currentMemoryImportMemoryId = selectedMemoryId;
   resetMemoryImportPreview();
   setImportSourcePane();
@@ -779,7 +913,8 @@ async function buildMemoryImportRequest() {
     if (!file) throw new Error('请选择要导入的文件');
     if (file.size > MAX_IMPORT_FILE_BYTES) throw new Error('文件不能超过 10 MiB');
     return {
-      kind: 'file', file_name: file.name, media_type: file.type || null,
+      kind: 'file', session_id: currentSessionId,
+      file_name: file.name, media_type: file.type || null,
       size_bytes: file.size, content_base64: await readFileAsBase64(file),
     };
   }
@@ -791,11 +926,11 @@ async function buildMemoryImportRequest() {
     if (new TextEncoder().encode(text).byteLength > MAX_IMPORT_TEXT_BYTES) {
       throw new Error('粘贴文本不能超过 10 MiB');
     }
-    return { kind: 'text', title, text };
+    return { kind: 'text', session_id: currentSessionId, title, text };
   }
   const url = $('importUrlInput').value;
   if (!url.trim()) throw new Error('请输入显式 URL');
-  return { kind: 'url', url };
+  return { kind: 'url', session_id: currentSessionId, url };
 }
 
 function appendImportTarget(container, label, path, wikilink, uri) {
@@ -865,6 +1000,9 @@ async function previewMemoryImport() {
     );
     const payload = await r.json();
     if (!r.ok) { alert(payload.detail || '导入预览生成失败'); return; }
+    bindCurrentSession(payload.session_id, payload.memory_id);
+    currentMemoryImportMemoryId = payload.memory_id;
+    loadSessions();
     renderMemoryImportPreview(payload);
   } catch (e) {
     alert(e.message || '导入预览生成失败');
@@ -905,6 +1043,15 @@ async function sendMessage() {
     await sendMemoryQuestion();
     return;
   }
+  if (!selectedMemoryId) {
+    appendBubble('assistant', '请先明确选择一个 managed Memory。');
+    return;
+  }
+  const selected = memories.find(memory => memory.memory_id === selectedMemoryId);
+  if (selected && selected.read_only) {
+    appendBubble('assistant', '既有 Memory 为只读；请先显式迁移再发起研究。');
+    return;
+  }
   const input = $('msgInput');
   const text = input.value.trim();
   if (!text || sendLock) return;
@@ -930,7 +1077,7 @@ async function sendMessage() {
     el.remove();
     if (!r.ok) { appendBubble('assistant', data.detail || '研究方向对齐失败'); return; }
 
-    currentSessionId = data.session_id;
+    bindCurrentSession(data.session_id, data.memory_id);
     currentProposal = { brief: data.brief || {}, task_id: data.task_id };
     setMemorySelection(data.memory_id, true);
     showProposalCard(currentProposal);

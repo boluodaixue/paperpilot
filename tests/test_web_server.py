@@ -15,6 +15,9 @@ from src.research.memory import MarkdownMemoryStore
 from src.research.runtime import build_research_runtime
 
 
+_MEMORY_ID = "M-web"
+
+
 class FixedTool:
     name = "web_search"
 
@@ -68,9 +71,11 @@ class FixedPolicy:
 @pytest.fixture()
 def web_client(tmp_path, monkeypatch):
     policy, tool = FixedPolicy(), FixedTool()
+    memory_store = MarkdownMemoryStore(tmp_path / "memory")
+    memory_store.create_memory("Web regression", _MEMORY_ID)
     runtime = build_research_runtime(
         config={}, policy=policy, tools=[tool],
-        memory_store=MarkdownMemoryStore(tmp_path / "memory"),
+        memory_store=memory_store,
         checkpointer=InMemorySaver(),
     )
     monkeypatch.setattr(server, "CHAT_DB_PATH", str(tmp_path / "chat.db"))
@@ -95,12 +100,16 @@ def _wait_result(client: TestClient, task_id: str) -> dict[str, Any]:
 
 def test_first_request_pauses_without_research_tools(web_client):
     client, runtime, policy, tool = web_client
-    response = client.post("/api/alignment", json={"message": "Research fixed topic"})
+    response = client.post(
+        "/api/alignment",
+        json={"memory_id": _MEMORY_ID, "message": "Research fixed topic"},
+    )
     assert response.status_code == 200
     data = response.json()
     assert data["status"] == "waiting_confirmation"
     assert data["task_id"] == data["thread_id"]
     assert data["brief"]["revision"] == 0
+    assert data["memory_id"] == _MEMORY_ID
     assert policy.research_calls == 0
     assert tool.calls == []
     task = server._TASKS[data["task_id"]]
@@ -109,7 +118,9 @@ def test_first_request_pauses_without_research_tools(web_client):
 
 def test_modify_and_confirm_resume_same_root_thread(web_client):
     client, runtime, policy, tool = web_client
-    first = client.post("/api/alignment", json={"session_id": "s1", "message": "Question"}).json()
+    first = client.post("/api/alignment", json={
+        "session_id": "s1", "memory_id": _MEMORY_ID, "message": "Question",
+    }).json()
     revised = client.post("/api/alignment", json={
         "session_id": "s1", "task_id": first["task_id"],
         "message": "Narrow the scope",
@@ -164,8 +175,12 @@ def test_sse_cursor_replays_only_unseen_events(web_client):
 
 def test_two_sessions_keep_threads_isolated(web_client):
     client, runtime, *_ = web_client
-    alpha = client.post("/api/alignment", json={"session_id": "alpha", "message": "A"}).json()
-    beta = client.post("/api/alignment", json={"session_id": "beta", "message": "B"}).json()
+    alpha = client.post("/api/alignment", json={
+        "session_id": "alpha", "memory_id": _MEMORY_ID, "message": "A",
+    }).json()
+    beta = client.post("/api/alignment", json={
+        "session_id": "beta", "memory_id": _MEMORY_ID, "message": "B",
+    }).json()
     assert alpha["thread_id"] != beta["thread_id"]
     assert server._TASKS[alpha["task_id"]].session_id == "alpha"
     assert server._TASKS[beta["task_id"]].session_id == "beta"
@@ -173,7 +188,9 @@ def test_two_sessions_keep_threads_isolated(web_client):
 
 def test_chat_stores_manifest_pointer_and_history_reads_markdown(web_client):
     client, runtime, *_ = web_client
-    paused = client.post("/api/alignment", json={"session_id": "history", "message": "Q"}).json()
+    paused = client.post("/api/alignment", json={
+        "session_id": "history", "memory_id": _MEMORY_ID, "message": "Q",
+    }).json()
     client.post("/api/research", json={"task_id": paused["task_id"], "session_id": "history"})
     result = _wait_result(client, paused["task_id"])
 

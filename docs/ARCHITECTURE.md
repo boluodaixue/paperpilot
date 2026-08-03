@@ -274,7 +274,21 @@ LLM Wiki 的目标架构已确认，详见 [LLM Wiki + Obsidian 目标架构](LL
 
 N5 已完成生产入口切换。上述旧角色、领域模型、图谱存储、孤立配置和专属测试均已删除；历史提交与历史文档只用于追溯。CLI、Web 和评测共用 `src/research/runtime.py` 装配同一个 Workflow。
 
-## 10. 非目标
+## 10. LLM Wiki + Obsidian 收口
+
+W0–W6 已完成。LLM Wiki 继续复用唯一 `ResearchRuntime`、`MarkdownMemoryStore`、Research Workflow 和同质 AgentGraph：
+
+- 一个 Vault 包含多个长期 `Memories/M-.../`，Markdown 是唯一知识真相源；
+- CLI/Web 的真实写入入口必须显式选择 managed Memory；Web session 将第一次选择持久化为 nullable `session_meta.memory_id`，之后不可隐式切换；
+- 当前 Memory 问答只读取每次从 Markdown 重建的命中，保存、导入和继续研究沿用已有用户确认与受控写入；
+- 根目录 `reports/evidence/sources` 作为虚拟只读 `M-legacy` 被检索和问答，不作为 W6 默认写入目标；
+- legacy 迁移是完整预览后的 copy-on-publish：校验隐藏 staging 后以一次同卷目录 rename 发布新 managed Memory；根文件和旧 Chat manifest 永远不移动、不改写，迁移后也不自动换绑会话；
+- Langfuse 记录 `memory_id`、检索路径/分数和写入路径/状态，不记录问题、Markdown 正文或附件字节；
+- 固定离线 `memory_wiki` 评测覆盖检索、引用、拒答、受控写入和继续研究。
+
+该收口不增加领域模型、Service、Repository、持久化索引、Agent 角色、第二套存储、内置阅读器、文件监控、cross-process lock、journal 或 bundle。历史低层 `memory_id=None` 仍用于兼容既有 Workflow/manifest，但不由 W6 CLI/Web 暴露为可写选择。详见 [W6 实施记录](W6_STABILIZATION_MIGRATION_AND_ENTRY.md)。
+
+## 11. 非目标
 
 - 不创建多种固定人格或专家 Agent；
 - 不让根 Agent 成为与子 Agent 不同的专用 Manager 实现；

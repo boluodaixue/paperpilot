@@ -116,6 +116,7 @@ def _workflow_trace(name: str, state: ResearchWorkflowState):
         "parent_thread_id": identity.parent_thread_id,
         "root_thread_id": identity.root_thread_id,
         "depth": identity.depth,
+        "memory_id": state.get("memory_id"),
     }
     with trace_context(
         session_id=identity.root_thread_id,
@@ -541,7 +542,10 @@ def build_research_workflow(
             )
             observation.add_output(
                 {
+                    "memory_id": memory_id,
                     "report_path": manifest.report_path,
+                    "evidence_paths": list(manifest.evidence_paths),
+                    "source_paths": list(manifest.source_paths),
                     "evidence_count": len(manifest.evidence_paths),
                     "source_count": len(manifest.source_paths),
                 }

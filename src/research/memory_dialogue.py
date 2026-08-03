@@ -17,7 +17,13 @@ from .models import (
 )
 from .policy import call_policy
 from .retrieval import MarkdownMemoryIndex, MemorySearchHit
-from .vault import build_wikilink, validate_memory_id
+from .vault import (
+    LEGACY_MEMORY_ID,
+    build_legacy_wikilink,
+    build_wikilink,
+    scan_legacy_memory_markdown,
+    validate_memory_id,
+)
 
 
 _JSON_FENCE = re.compile(r"```(?:json)?\s*(.*?)\s*```", re.IGNORECASE | re.DOTALL)
@@ -96,7 +102,11 @@ async def answer_memory(
 ) -> MemoryAnswer:
     """Answer from one Memory without writing files or falling back to research."""
     validate_memory_id(memory_id)
-    memory_store.get_memory(memory_id)
+    if memory_id == LEGACY_MEMORY_ID:
+        if not scan_legacy_memory_markdown(memory_store.root):
+            raise FileNotFoundError("legacy Memory contains no Markdown files")
+    else:
+        memory_store.get_memory(memory_id)
     if not isinstance(question, str) or not question.strip():
         raise ValueError("question must be a non-empty string")
     clean_question = question.strip()
@@ -169,7 +179,11 @@ async def answer_memory(
         links: list[str] = []
         for path in valid_paths:
             hit = hit_by_path[path]
-            wikilink = build_wikilink(path)
+            wikilink = (
+                build_legacy_wikilink(path)
+                if memory_id == LEGACY_MEMORY_ID
+                else build_wikilink(path)
+            )
             citation_by_path.setdefault(
                 path,
                 MemoryCitation(
@@ -280,6 +294,8 @@ async def propose_memory_note(
     if not isinstance(answer, MemoryAnswer):
         raise TypeError("answer must be a MemoryAnswer")
     validate_memory_id(answer.memory_id)
+    if answer.memory_id == LEGACY_MEMORY_ID:
+        raise ValueError("M-legacy is read-only and cannot accept note proposals")
     memory_store.get_memory(answer.memory_id)
     suffix = uuid.uuid4().hex
     proposal_id = f"Proposal-{suffix}"

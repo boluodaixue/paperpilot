@@ -63,10 +63,17 @@ class ChatStore:
                         title TEXT NOT NULL DEFAULT '',
                         pinned INTEGER NOT NULL DEFAULT 0,
                         sort_order REAL NOT NULL DEFAULT 0,
+                        memory_id TEXT,
                         updated_at REAL NOT NULL
                     )
                     """
                 )
+                columns = {
+                    str(row[1])
+                    for row in conn.execute("PRAGMA table_info(session_meta)").fetchall()
+                }
+                if "memory_id" not in columns:
+                    conn.execute("ALTER TABLE session_meta ADD COLUMN memory_id TEXT")
                 conn.commit()
             finally:
                 conn.close()
@@ -113,6 +120,70 @@ class ChatStore:
                         (sid, float(i), time.time()),
                     )
                 conn.commit()
+            finally:
+                conn.close()
+
+    def bind_memory(self, session_id: str, memory_id: str) -> str:
+        """Bind one session to exactly one explicit Memory ID.
+
+        Repeating the same binding is idempotent.  A different later binding is
+        rejected so UI state cannot silently move an existing conversation.
+        """
+        if not isinstance(session_id, str) or not session_id.strip():
+            raise ValueError("session_id must be a non-empty string")
+        if not isinstance(memory_id, str) or not memory_id.strip():
+            raise ValueError("memory_id must be a non-empty string")
+        normalized_session_id = session_id.strip()
+        normalized_memory_id = memory_id.strip()
+        with self._lock:
+            conn = self._connect()
+            try:
+                conn.execute("BEGIN IMMEDIATE")
+                row = conn.execute(
+                    "SELECT memory_id FROM session_meta "
+                    "WHERE session_id = ?",
+                    (normalized_session_id,),
+                ).fetchone()
+                if row is not None and row["memory_id"] is not None:
+                    existing = row["memory_id"]
+                    if existing != normalized_memory_id:
+                        raise ValueError(
+                            "session is already bound to a different Memory"
+                        )
+                    conn.commit()
+                    return existing
+                conn.execute(
+                    """
+                    INSERT INTO session_meta (
+                        session_id, title, pinned, sort_order,
+                        memory_id, updated_at
+                    )
+                    VALUES (?, '', 0, 0, ?, ?)
+                    ON CONFLICT(session_id) DO UPDATE SET
+                        memory_id = excluded.memory_id,
+                        updated_at = excluded.updated_at
+                    """,
+                    (normalized_session_id, normalized_memory_id, time.time()),
+                )
+                conn.commit()
+                return normalized_memory_id
+            except Exception:
+                conn.rollback()
+                raise
+            finally:
+                conn.close()
+
+    def get_memory_binding(self, session_id: str) -> str | None:
+        """Return the explicit binding; legacy NULL rows remain unbound."""
+        with self._lock:
+            conn = self._connect()
+            try:
+                row = conn.execute(
+                    "SELECT memory_id FROM session_meta "
+                    "WHERE session_id = ?",
+                    (session_id,),
+                ).fetchone()
+                return None if row is None else row["memory_id"]
             finally:
                 conn.close()
 
@@ -197,13 +268,18 @@ class ChatStore:
             try:
                 cur = conn.execute(
                     "SELECT cm.session_id, cm.role, cm.content, cm.timestamp, "
-                    "sm.title AS meta_title, sm.pinned, sm.sort_order "
+                    "sm.title AS meta_title, sm.pinned, sm.sort_order, "
+                    "sm.memory_id "
                     "FROM chat_messages cm "
                     "LEFT JOIN session_meta sm ON sm.session_id = cm.session_id "
                     "ORDER BY cm.session_id, "
                     "CAST(SUBSTR(cm.message_id, 3) AS INTEGER), cm.timestamp"
                 )
                 rows = cur.fetchall()
+                meta_rows = conn.execute(
+                    "SELECT session_id, title, pinned, sort_order, updated_at, "
+                    "memory_id FROM session_meta"
+                ).fetchall()
             finally:
                 conn.close()
 
@@ -217,12 +293,35 @@ class ChatStore:
                     "count": 0, "_first_user": None,
                     "pinned": bool(r["pinned"]), "sort_order": r["sort_order"] or 0.0,
                     "_meta_title": r["meta_title"] or "",
+                    "memory_id": r["memory_id"],
                 },
             )
             group["count"] += 1
             group["last_update"] = max(group["last_update"], r["timestamp"])
             if r["role"] == "user" and group["_first_user"] is None:
                 group["_first_user"] = (r["content"] or "").strip()
+
+        for r in meta_rows:
+            group = by_session.setdefault(
+                r["session_id"],
+                {
+                    "session_id": r["session_id"],
+                    "title": r["session_id"],
+                    "last_update": float(r["updated_at"]),
+                    "count": 0,
+                    "_first_user": None,
+                    "pinned": bool(r["pinned"]),
+                    "sort_order": r["sort_order"] or 0.0,
+                    "_meta_title": r["title"] or "",
+                    "memory_id": r["memory_id"],
+                },
+            )
+            if group["count"] == 0:
+                group["last_update"] = float(r["updated_at"])
+            group["pinned"] = bool(r["pinned"])
+            group["sort_order"] = r["sort_order"] or 0.0
+            group["_meta_title"] = r["title"] or ""
+            group["memory_id"] = r["memory_id"]
 
         result = []
         for g in by_session.values():
@@ -235,6 +334,7 @@ class ChatStore:
                 "sort_order": g["sort_order"],
                 "last_update": g["last_update"],
                 "count": g["count"],
+                "memory_id": g["memory_id"],
             })
         result.sort(key=lambda s: (not s["pinned"], s["sort_order"], -s["last_update"]))
         return result

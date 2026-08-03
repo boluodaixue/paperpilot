@@ -11,6 +11,7 @@ import logging
 import os
 import uuid
 from collections.abc import Mapping
+from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, Iterable
 
@@ -30,7 +31,12 @@ from ..tools import (
     NotepadTool,
     WebSearchTool,
 )
-from ..utils.tracing import flush_tracing, shutdown_tracing
+from ..utils.tracing import (
+    flush_tracing,
+    shutdown_tracing,
+    trace_block,
+    trace_context,
+)
 from .memory import MarkdownMemoryStore
 from .memory_dialogue import (
     answer_memory as answer_from_memory,
@@ -57,9 +63,43 @@ from .workflow import (
     create_research_workflow_state,
     resume_research_workflow,
 )
+from .vault import LEGACY_MEMORY_ID, scan_legacy_memory_markdown
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
+
+
+@contextmanager
+def _memory_trace(name: str, memory_id: str | None, *, run_type: str = "chain"):
+    """Attach bounded Memory identity to one existing runtime operation."""
+    metadata = {"memory_id": memory_id} if memory_id is not None else None
+    with trace_context(metadata=metadata, tags=["memory"]):
+        with trace_block(name, run_type=run_type, tags=["memory"]) as observation:
+            if memory_id is not None:
+                observation.add_metadata({"memory_id": memory_id})
+            yield observation
+
+
+def _memory_import_preview_trace(
+    value: Any,
+    *,
+    memory_id: str | None = None,
+) -> dict[str, Any]:
+    """Return path-only import trace output without constraining delegated results."""
+    if isinstance(value, MemoryImportDuplicate):
+        status = "duplicate"
+    elif isinstance(value, MemoryImportProposal):
+        status = "proposal"
+    else:
+        status = "result"
+    return {
+        "status": status,
+        "memory_id": getattr(value, "memory_id", memory_id),
+        "proposal_id": getattr(value, "proposal_id", None),
+        "attachment_path": getattr(value, "attachment_path", None),
+        "import_path": getattr(value, "import_path", None),
+        "note_path": getattr(value, "note_path", None),
+    }
 
 __all__ = [
     "PROJECT_ROOT",
@@ -226,6 +266,11 @@ class ResearchRuntime:
         thread_id: str | None = None,
         memory_id: str | None = None,
     ) -> dict[str, Any]:
+        if memory_id == LEGACY_MEMORY_ID:
+            raise ValueError(
+                "M-legacy is read-only; migrate it or select a managed Memory "
+                "before starting research"
+            )
         root_thread_id = thread_id or self.new_thread_id()
         identity = ExecutionIdentity(
             thread_id=root_thread_id,
@@ -233,15 +278,25 @@ class ResearchRuntime:
             root_thread_id=root_thread_id,
             depth=0,
         )
-        return await self.graph.ainvoke(
-            create_research_workflow_state(
-                question,
-                identity,
-                self.limits,
-                memory_id=memory_id,
-            ),
-            config={"configurable": {"thread_id": root_thread_id}},
-        )
+        with _memory_trace("paperpilot.research.start", memory_id) as observation:
+            result = await self.graph.ainvoke(
+                create_research_workflow_state(
+                    question,
+                    identity,
+                    self.limits,
+                    memory_id=memory_id,
+                ),
+                config={"configurable": {"thread_id": root_thread_id}},
+            )
+            brief = result.get("brief")
+            observation.add_output(
+                {
+                    "memory_id": memory_id,
+                    "thread_id": root_thread_id,
+                    "memory_paths": list(getattr(brief, "memory_paths", ())),
+                }
+            )
+            return result
 
     async def review(
         self,
@@ -249,12 +304,34 @@ class ResearchRuntime:
         action: str,
         feedback: str | None = None,
     ) -> dict[str, Any]:
-        return await resume_research_workflow(
-            self.graph,
-            thread_id=thread_id,
-            action=action,
-            feedback=feedback,
-        )
+        state = await self.get_state(thread_id)
+        memory_id = state.get("memory_id")
+        with _memory_trace("paperpilot.research.review", memory_id) as observation:
+            result = await resume_research_workflow(
+                self.graph,
+                thread_id=thread_id,
+                action=action,
+                feedback=feedback,
+            )
+            workflow_result = result.get("workflow_result")
+            manifest = getattr(workflow_result, "memory_manifest", None)
+            observation.add_output(
+                {
+                    "memory_id": memory_id,
+                    "thread_id": thread_id,
+                    "action": action,
+                    "write_paths": (
+                        [
+                            manifest.report_path,
+                            *manifest.evidence_paths,
+                            *manifest.source_paths,
+                        ]
+                        if manifest is not None
+                        else []
+                    ),
+                }
+            )
+            return result
 
     async def run_auto_confirmed(
         self,
@@ -297,30 +374,139 @@ class ResearchRuntime:
     def get_memory(self, memory_id: str) -> MemoryDescriptor:
         return self.memory_store.get_memory(memory_id)
 
+    def get_memory_option(self, memory_id: str) -> dict[str, Any]:
+        """Resolve one CLI/Web selection without weakening MemoryDescriptor."""
+        if memory_id == LEGACY_MEMORY_ID:
+            files = scan_legacy_memory_markdown(self.memory_store.root)
+            if not files:
+                raise FileNotFoundError("legacy Memory contains no Markdown files")
+            return {
+                "memory_id": LEGACY_MEMORY_ID,
+                "title": "Existing Memory (read-only)",
+                "relative_path": None,
+                "created_at": None,
+                "updated_at": None,
+                "read_only": True,
+                "can_migrate": True,
+                "file_count": len(files),
+            }
+        descriptor = self.get_memory(memory_id)
+        return {
+            "memory_id": descriptor.memory_id,
+            "title": descriptor.title,
+            "relative_path": descriptor.relative_path,
+            "created_at": descriptor.created_at,
+            "updated_at": descriptor.updated_at,
+            "read_only": False,
+            "can_migrate": False,
+            "file_count": None,
+        }
+
+    def list_memory_options(self) -> tuple[dict[str, Any], ...]:
+        """List managed selections plus the virtual read-only legacy option."""
+        options = [self.get_memory_option(item.memory_id) for item in self.list_memories()]
+        if scan_legacy_memory_markdown(self.memory_store.root):
+            options.append(self.get_memory_option(LEGACY_MEMORY_ID))
+        return tuple(options)
+
+    def prepare_legacy_memory_migration(
+        self,
+        title: str,
+        memory_id: str | None = None,
+    ) -> dict[str, object]:
+        with _memory_trace(
+            "paperpilot.memory.legacy_migration.prepare", LEGACY_MEMORY_ID
+        ) as observation:
+            proposal = self.memory_store.prepare_legacy_memory_migration(
+                title,
+                memory_id,
+            )
+            files = proposal["files"]
+            observation.add_output(
+                {
+                    "status": "proposal",
+                    "source_memory_id": LEGACY_MEMORY_ID,
+                    "target_memory_id": proposal["target_memory_id"],
+                    "proposal_id": proposal["proposal_id"],
+                    "source_files": [item["source_path"] for item in files],
+                    "target_files": [item["target_path"] for item in files],
+                }
+            )
+            return proposal
+
+    def commit_legacy_memory_migration(
+        self,
+        proposal: Mapping[str, object],
+    ) -> MemoryDescriptor:
+        target_memory_id = str(proposal.get("target_memory_id") or "")
+        with _memory_trace(
+            "paperpilot.memory.legacy_migration.commit", target_memory_id or None
+        ) as observation:
+            descriptor = self.memory_store.commit_legacy_memory_migration(proposal)
+            observation.add_output(
+                {
+                    "status": "committed",
+                    "source_memory_id": LEGACY_MEMORY_ID,
+                    "memory_id": descriptor.memory_id,
+                    "home_path": f"{descriptor.relative_path}Home.md",
+                }
+            )
+            return descriptor
+
     async def answer_memory(
         self,
         memory_id: str,
         question: str,
     ) -> MemoryAnswer:
-        return await answer_from_memory(
-            self.memory_store,
-            self.policy,
-            memory_id,
-            question,
-        )
+        with _memory_trace("paperpilot.memory.answer", memory_id) as observation:
+            answer = await answer_from_memory(
+                self.memory_store,
+                self.policy,
+                memory_id,
+                question,
+            )
+            observation.add_output(
+                {
+                    "memory_id": memory_id,
+                    "answer_id": answer.answer_id,
+                    "retrieved_files": [
+                        citation.relative_path for citation in answer.citations
+                    ],
+                    "insufficient_evidence_count": len(answer.insufficient_evidence),
+                }
+            )
+            return answer
 
     async def propose_memory_note(
         self,
         answer: MemoryAnswer,
     ) -> MemoryNoteProposal:
-        return await propose_note_from_memory(
-            self.memory_store,
-            self.policy,
-            answer,
-        )
+        with _memory_trace(
+            "paperpilot.memory.note.prepare", answer.memory_id
+        ) as observation:
+            proposal = await propose_note_from_memory(
+                self.memory_store,
+                self.policy,
+                answer,
+            )
+            observation.add_output(
+                {
+                    "memory_id": proposal.memory_id,
+                    "proposal_id": proposal.proposal_id,
+                    "target_path": proposal.target_path,
+                    "home_path": proposal.home_path,
+                    "source_paths": list(proposal.source_paths),
+                }
+            )
+            return proposal
 
     def commit_memory_note(self, proposal: MemoryNoteProposal) -> dict[str, str]:
-        return self.memory_store.commit_memory_note(proposal)
+        with _memory_trace(
+            "paperpilot.memory.note.commit", proposal.memory_id
+        ) as observation:
+            result = self.memory_store.commit_memory_note(proposal)
+            observation.add_output(dict(result))
+            return result
 
     async def prepare_memory_file_import(
         self,
@@ -328,13 +514,20 @@ class ResearchRuntime:
         file_name: str,
         content: bytes,
     ) -> MemoryImportProposal | MemoryImportDuplicate:
-        return await prepare_file_import(
-            self.memory_store,
-            self.policy,
-            memory_id,
-            file_name,
-            content,
-        )
+        with _memory_trace(
+            "paperpilot.memory.import.prepare", memory_id
+        ) as observation:
+            result = await prepare_file_import(
+                self.memory_store,
+                self.policy,
+                memory_id,
+                file_name,
+                content,
+            )
+            observation.add_output(
+                _memory_import_preview_trace(result, memory_id=memory_id)
+            )
+            return result
 
     async def prepare_memory_text_import(
         self,
@@ -342,28 +535,64 @@ class ResearchRuntime:
         title: str,
         text: str,
     ) -> MemoryImportProposal | MemoryImportDuplicate:
-        return await prepare_text_import(
-            self.memory_store,
-            self.policy,
-            memory_id,
-            title,
-            text,
-        )
+        with _memory_trace(
+            "paperpilot.memory.import.prepare", memory_id
+        ) as observation:
+            result = await prepare_text_import(
+                self.memory_store,
+                self.policy,
+                memory_id,
+                title,
+                text,
+            )
+            observation.add_output(
+                _memory_import_preview_trace(result, memory_id=memory_id)
+            )
+            return result
 
     async def prepare_memory_url_import(
         self,
         memory_id: str,
         url: str,
     ) -> MemoryImportProposal | MemoryImportDuplicate:
-        return await prepare_url_import(
-            self.memory_store,
-            self.policy,
-            memory_id,
-            url,
-        )
+        with _memory_trace(
+            "paperpilot.memory.import.prepare", memory_id
+        ) as observation:
+            result = await prepare_url_import(
+                self.memory_store,
+                self.policy,
+                memory_id,
+                url,
+            )
+            observation.add_output(
+                _memory_import_preview_trace(result, memory_id=memory_id)
+            )
+            return result
 
     def commit_memory_import(self, proposal: MemoryImportProposal) -> dict[str, Any]:
-        return self.memory_store.commit_memory_import(proposal)
+        with _memory_trace(
+            "paperpilot.memory.import.commit", getattr(proposal, "memory_id", None)
+        ) as observation:
+            result = self.memory_store.commit_memory_import(proposal)
+            observation.add_output(
+                {
+                    key: value
+                    for key, value in result.items()
+                    if key
+                    in {
+                        "status",
+                        "memory_id",
+                        "attachment_path",
+                        "import_path",
+                        "note_path",
+                        "home_path",
+                        "wikilinks",
+                    }
+                }
+                if isinstance(result, Mapping)
+                else {"status": "result"}
+            )
+            return result
 
     async def close(self, *, shutdown: bool = False) -> None:
         await WebSearchTool.close_session()

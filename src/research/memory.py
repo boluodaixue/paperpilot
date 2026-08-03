@@ -12,7 +12,8 @@ import sys
 import tempfile
 import threading
 import uuid
-from datetime import datetime
+from collections.abc import Mapping
+from datetime import datetime, timezone
 from pathlib import Path, PurePosixPath
 
 import yaml
@@ -38,11 +39,13 @@ from .rendering import (
     source_note_id,
 )
 from .vault import (
+    LEGACY_MEMORY_ID,
     build_attachment_wikilink,
     build_wikilink,
     memory_relative_path,
     resolve_memory_attachment_path,
     resolve_vault_markdown_path,
+    scan_legacy_memory_markdown,
     validate_frontmatter,
     validate_memory_attachment_path,
     validate_memory_descriptor,
@@ -105,6 +108,20 @@ _IMPORT_NOTE_FRONTMATTER_FIELDS = frozenset(
     }
 )
 _MAX_HOME_RESTORE_EXCHANGES = 16
+_LEGACY_MIGRATION_PROPOSAL_KEYS = frozenset(
+    {
+        "proposal_id",
+        "source_memory_id",
+        "source_content_hash",
+        "target_memory_id",
+        "title",
+        "created_at",
+        "target_relative_path",
+        "home_path",
+        "home_markdown",
+        "files",
+    }
+)
 _VAULT_LOCKS: dict[str, threading.RLock] = {}
 _VAULT_LOCKS_GUARD = threading.Lock()
 
@@ -437,6 +454,316 @@ def update_memory_home_with_import(
         newline=newline,
     )
     return "".join(lines)
+
+
+def _legacy_markdown_parts(
+    markdown: str,
+    *,
+    source_path: str,
+) -> tuple[dict[str, object], str]:
+    """Split permissive legacy frontmatter without treating it as managed data."""
+    lines = markdown.splitlines(keepends=True)
+    if not lines or lines[0].rstrip("\r\n") != "---":
+        return {}, markdown
+    closing = next(
+        (
+            index
+            for index, line in enumerate(lines[1:], start=1)
+            if line.rstrip("\r\n") == "---"
+        ),
+        None,
+    )
+    if closing is None:
+        raise ValueError(f"legacy Markdown frontmatter is not closed: {source_path}")
+    try:
+        loaded = yaml.safe_load("".join(lines[1:closing]))
+    except yaml.YAMLError as exc:
+        raise ValueError(
+            f"legacy Markdown frontmatter is invalid YAML: {source_path}"
+        ) from exc
+    if loaded is None:
+        frontmatter: dict[str, object] = {}
+    elif isinstance(loaded, dict):
+        frontmatter = dict(loaded)
+    else:
+        raise ValueError(
+            f"legacy Markdown frontmatter must be a mapping: {source_path}"
+        )
+    return frontmatter, "".join(lines[closing + 1 :])
+
+
+def _legacy_snapshot(
+    vault_root: Path,
+) -> tuple[tuple[dict[str, object], ...], str]:
+    """Capture the exact safe Markdown source set without writing the Vault."""
+    records: list[dict[str, object]] = []
+    digest = hashlib.sha256()
+    for relative_path, path in scan_legacy_memory_markdown(vault_root):
+        try:
+            with path.open("rb") as handle:
+                content = handle.read()
+                modified_ns = os.fstat(handle.fileno()).st_mtime_ns
+        except OSError as exc:
+            raise ValueError(
+                f"legacy Markdown cannot be read: {relative_path}"
+            ) from exc
+        try:
+            markdown = content.decode("utf-8")
+        except UnicodeDecodeError as exc:
+            raise ValueError(
+                f"legacy Markdown must be UTF-8: {relative_path}"
+            ) from exc
+        content_hash = hashlib.sha256(content).hexdigest()
+        encoded_path = relative_path.encode("utf-8")
+        digest.update(len(encoded_path).to_bytes(8, "big"))
+        digest.update(encoded_path)
+        digest.update(bytes.fromhex(content_hash))
+        records.append(
+            {
+                "source_path": relative_path,
+                "source_content_hash": content_hash,
+                "modified_ns": modified_ns,
+                "markdown": markdown,
+            }
+        )
+    if not records:
+        raise FileNotFoundError("legacy Memory contains no Markdown files")
+    return tuple(records), digest.hexdigest()
+
+
+def _migration_timestamp(modified_ns: object) -> str:
+    if not isinstance(modified_ns, int) or isinstance(modified_ns, bool):
+        raise TypeError("legacy Markdown modified_ns must be an integer")
+    return datetime.fromtimestamp(
+        modified_ns / 1_000_000_000,
+        tz=timezone.utc,
+    ).isoformat(timespec="seconds")
+
+
+def _legacy_note_title(
+    frontmatter: Mapping[str, object],
+    body: str,
+    *,
+    fallback: str,
+) -> str:
+    title = frontmatter.get("title")
+    if isinstance(title, str) and title.strip():
+        return title.strip()
+    heading = re.search(r"^#\s+(.+?)\s*$", body, re.MULTILINE)
+    return heading.group(1).strip() if heading else fallback
+
+
+def _render_migrated_frontmatter(
+    *,
+    note_id: str,
+    note_type: str,
+    memory_id: str,
+    title: str,
+    timestamp: str,
+    root_thread_id: object = None,
+) -> str:
+    fields: list[tuple[str, object]] = [
+        ("id", note_id),
+        ("type", note_type),
+        ("memory_id", memory_id),
+        ("title", title),
+        ("created_at", timestamp),
+        ("updated_at", timestamp),
+        ("origin", "research"),
+        ("status", "confirmed"),
+    ]
+    if root_thread_id is not None:
+        if not isinstance(root_thread_id, (str, int, float, bool)):
+            raise ValueError("legacy root_thread_id must be a flat YAML scalar")
+        fields.append(("root_thread_id", root_thread_id))
+    lines = ["---"]
+    lines.extend(
+        f"{key}: {json.dumps(value, ensure_ascii=False)}" for key, value in fields
+    )
+    lines.extend(("tags:", "  - paperpilot", "---"))
+    return "\n".join(lines)
+
+
+def _migration_target_map(
+    records: tuple[dict[str, object], ...],
+    memory_id: str,
+) -> dict[str, str]:
+    prefixes = {"reports": "Report", "evidence": "Evidence", "sources": "Source"}
+    targets: dict[str, str] = {}
+    used_targets: dict[str, str] = {}
+    for record in records:
+        source_path = str(record["source_path"])
+        directory = PurePosixPath(source_path).parts[0]
+        frontmatter, _ = _legacy_markdown_parts(
+            str(record["markdown"]),
+            source_path=source_path,
+        )
+        declared_type = frontmatter.get("type")
+        expected_type = directory.removesuffix("s")
+        if declared_type is not None and declared_type != expected_type:
+            raise ValueError(
+                f"legacy Markdown type does not match its directory: {source_path}"
+            )
+        raw_id = frontmatter.get("id")
+        identity = (
+            raw_id.strip()
+            if isinstance(raw_id, str) and raw_id.strip()
+            else PurePosixPath(source_path).stem
+        )
+        note_id = managed_note_id(prefixes[directory], identity)
+        target_path = f"Memories/{memory_id}/{directory}/{note_id}.md"
+        portable_target_key = target_path.casefold()
+        previous = used_targets.get(portable_target_key)
+        if previous is not None:
+            raise ValueError(
+                "legacy migration target collision: "
+                f"{previous} and {source_path} both map to {target_path}"
+            )
+        used_targets[portable_target_key] = source_path
+        targets[source_path] = target_path
+    return targets
+
+
+def _rewrite_legacy_wikilinks(
+    body: str,
+    *,
+    source_path: str,
+    target_map: Mapping[str, str],
+) -> str:
+    def replace(match: re.Match[str]) -> str:
+        raw = match.group(1)
+        parts = raw.split("|", 1)
+        target = parts[0].strip()
+        alias = parts[1] if len(parts) == 2 else None
+        if not target or "#" in target or "\\" in target:
+            raise ValueError(f"legacy WikiLink is not migratable in {source_path}")
+        if target.startswith("Memories/"):
+            canonical = validate_wikilink_target(target.removesuffix(".md"))
+            return build_wikilink(f"{canonical}.md", alias)
+        candidate = target if target.endswith(".md") else f"{target}.md"
+        try:
+            legacy_target = PurePosixPath(candidate).as_posix()
+            # The target map itself is the authoritative set of safe source paths.
+            migrated_target = target_map[legacy_target]
+        except (KeyError, ValueError) as exc:
+            raise ValueError(
+                f"legacy WikiLink target is missing or ambiguous in {source_path}: {target}"
+            ) from exc
+        return build_wikilink(migrated_target, alias)
+
+    rewritten = _WIKILINK.sub(replace, body)
+    unmatched = _WIKILINK.sub("", body)
+    if "[[" in unmatched or "]]" in unmatched:
+        raise ValueError(f"legacy Markdown contains malformed WikiLink syntax: {source_path}")
+    return rewritten
+
+
+def _render_migration_home(
+    *,
+    memory_id: str,
+    title: str,
+    timestamp: str,
+    report_paths: tuple[str, ...],
+) -> str:
+    home = render_memory_home(
+        memory_id=memory_id,
+        title=title,
+        created_at=timestamp,
+        updated_at=timestamp,
+    )
+    marker = "## Reports\n\n- None yet.\n"
+    if home.count(marker) != 1:
+        raise RuntimeError("Memory Home renderer no longer has one Reports placeholder")
+    if not report_paths:
+        return home
+    links = "\n".join(f"- {build_wikilink(path)}" for path in report_paths)
+    return home.replace(marker, f"## Reports\n\n{links}\n", 1)
+
+
+def _build_legacy_migration_proposal(
+    records: tuple[dict[str, object], ...],
+    source_hash: str,
+    *,
+    proposal_id: str,
+    memory_id: str,
+    title: str,
+    created_at: str,
+) -> dict[str, object]:
+    target_map = _migration_target_map(records, memory_id)
+    files: list[dict[str, str]] = []
+    for record in records:
+        source_path = str(record["source_path"])
+        target_path = target_map[source_path]
+        directory = PurePosixPath(source_path).parts[0]
+        note_type = directory.removesuffix("s")
+        frontmatter, body = _legacy_markdown_parts(
+            str(record["markdown"]),
+            source_path=source_path,
+        )
+        note_id = PurePosixPath(target_path).stem
+        note_title = _legacy_note_title(
+            frontmatter,
+            body,
+            fallback=PurePosixPath(source_path).stem,
+        )
+        timestamp = _migration_timestamp(record["modified_ns"])
+        rewritten_body = _rewrite_legacy_wikilinks(
+            body,
+            source_path=source_path,
+            target_map=target_map,
+        )
+        migrated = (
+            _render_migrated_frontmatter(
+                note_id=note_id,
+                note_type=note_type,
+                memory_id=memory_id,
+                title=note_title,
+                timestamp=timestamp,
+                root_thread_id=(
+                    frontmatter.get("root_thread_id")
+                    if note_type == "report"
+                    else None
+                ),
+            )
+            + "\n"
+            + rewritten_body.lstrip("\r\n")
+        )
+        if not migrated.endswith("\n"):
+            migrated += "\n"
+        files.append(
+            {
+                "source_path": source_path,
+                "source_content_hash": str(record["source_content_hash"]),
+                "target_path": target_path,
+                "markdown": migrated,
+                "wikilink": build_wikilink(target_path),
+            }
+        )
+    files.sort(key=lambda item: item["source_path"])
+    report_paths = tuple(
+        item["target_path"]
+        for item in files
+        if PurePosixPath(item["target_path"]).parts[2] == "reports"
+    )
+    home_path = f"Memories/{memory_id}/Home.md"
+    home = _render_migration_home(
+        memory_id=memory_id,
+        title=title,
+        timestamp=created_at,
+        report_paths=report_paths,
+    )
+    return {
+        "proposal_id": proposal_id,
+        "source_memory_id": LEGACY_MEMORY_ID,
+        "source_content_hash": source_hash,
+        "target_memory_id": memory_id,
+        "title": title,
+        "created_at": created_at,
+        "target_relative_path": memory_relative_path(memory_id),
+        "home_path": home_path,
+        "home_markdown": home,
+        "files": tuple(files),
+    }
 
 
 class MarkdownMemoryStore:
@@ -847,6 +1174,8 @@ class MarkdownMemoryStore:
             raise TypeError("proposal must be a MemoryNoteProposal")
         self._proposal_strings(proposal)
         validate_memory_id(proposal.memory_id)
+        if proposal.memory_id == LEGACY_MEMORY_ID:
+            raise ValueError("M-legacy is read-only and cannot accept note proposals")
         self.get_memory(proposal.memory_id)
 
         expected_home = f"{memory_relative_path(proposal.memory_id)}Home.md"
@@ -997,6 +1326,8 @@ class MarkdownMemoryStore:
             raise TypeError("proposal must be a MemoryImportProposal")
         self._import_proposal_strings(proposal)
         validate_memory_id(proposal.memory_id)
+        if proposal.memory_id == LEGACY_MEMORY_ID:
+            raise ValueError("M-legacy is read-only and cannot accept imports")
         self.get_memory(proposal.memory_id)
         if proposal.source_kind not in {"file", "text", "url"}:
             raise ValueError("proposal source_kind must be file, text, or url")
@@ -1679,6 +2010,322 @@ class MarkdownMemoryStore:
             )
         )
 
+    def prepare_legacy_memory_migration(
+        self,
+        title: str,
+        memory_id: str | None = None,
+    ) -> dict[str, object]:
+        """Build a complete copy-on-publish migration preview without writes."""
+        if not isinstance(title, str) or not title.strip():
+            raise ValueError("legacy migration title must be a non-empty string")
+        target_memory_id = memory_id or f"M-legacy-{uuid.uuid4().hex}"
+        validate_memory_id(target_memory_id)
+        if target_memory_id == LEGACY_MEMORY_ID:
+            raise ValueError("M-legacy is reserved for the read-only legacy Memory")
+
+        with self._lock:
+            self._reject_linked_vault_path("Memories")
+            target = self._resolve(memory_relative_path(target_memory_id).rstrip("/"))
+            if target.exists():
+                raise FileExistsError(
+                    f"Memory already exists: {target_memory_id}"
+                )
+            records, source_hash = _legacy_snapshot(self.root)
+            proposal = _build_legacy_migration_proposal(
+                records,
+                source_hash,
+                proposal_id=f"LegacyMigration-{uuid.uuid4().hex}",
+                memory_id=target_memory_id,
+                title=title.strip(),
+                created_at=self._timestamp(),
+            )
+            self._validate_legacy_migration_documents(proposal)
+            return proposal
+
+    def _validate_legacy_migration_documents(
+        self,
+        proposal: Mapping[str, object],
+        *,
+        staging: Path | None = None,
+    ) -> MemoryDescriptor:
+        if not isinstance(proposal, Mapping):
+            raise TypeError("legacy migration proposal must be a mapping")
+        if set(proposal) != _LEGACY_MIGRATION_PROPOSAL_KEYS:
+            raise ValueError("legacy migration proposal fields do not match the contract")
+        for field_name in (
+            "proposal_id",
+            "source_memory_id",
+            "source_content_hash",
+            "target_memory_id",
+            "title",
+            "created_at",
+            "target_relative_path",
+            "home_path",
+            "home_markdown",
+        ):
+            value = proposal[field_name]
+            if not isinstance(value, str) or not value.strip():
+                raise ValueError(
+                    f"legacy migration proposal {field_name} must be non-empty"
+                )
+        if proposal["source_memory_id"] != LEGACY_MEMORY_ID:
+            raise ValueError("legacy migration source identity must remain M-legacy")
+        if not re.fullmatch(r"LegacyMigration-[0-9a-f]{32}", str(proposal["proposal_id"])):
+            raise ValueError("legacy migration proposal_id is not canonical")
+        if not _SHA256.fullmatch(str(proposal["source_content_hash"])):
+            raise ValueError("legacy migration source hash must be a lowercase SHA-256")
+        memory_id = validate_memory_id(str(proposal["target_memory_id"]))
+        if memory_id == LEGACY_MEMORY_ID:
+            raise ValueError("M-legacy is reserved for the read-only legacy Memory")
+        expected_relative = memory_relative_path(memory_id)
+        expected_home = f"{expected_relative}Home.md"
+        if proposal["target_relative_path"] != expected_relative:
+            raise ValueError("legacy migration target_relative_path is not canonical")
+        if proposal["home_path"] != expected_home:
+            raise ValueError("legacy migration home_path is not canonical")
+
+        home_markdown = str(proposal["home_markdown"])
+        _, _, home_frontmatter = _frontmatter_parts(
+            home_markdown,
+            label="migrated Memory Home.md",
+        )
+        if (
+            home_frontmatter["type"] != "home"
+            or home_frontmatter["memory_id"] != memory_id
+            or home_frontmatter["title"] != proposal["title"]
+            or home_frontmatter["created_at"] != proposal["created_at"]
+            or home_frontmatter["updated_at"] != proposal["created_at"]
+        ):
+            raise ValueError("migrated Memory Home.md does not match its proposal")
+
+        files = proposal["files"]
+        if not isinstance(files, tuple) or not files:
+            raise ValueError("legacy migration proposal files must be a non-empty tuple")
+        source_paths: set[str] = set()
+        target_paths: set[str] = {expected_home}
+        file_by_target: dict[str, Mapping[str, str]] = {}
+        for item in files:
+            if not isinstance(item, Mapping) or set(item) != {
+                "source_path",
+                "source_content_hash",
+                "target_path",
+                "markdown",
+                "wikilink",
+            }:
+                raise ValueError("legacy migration file entry is invalid")
+            if any(not isinstance(value, str) for value in item.values()):
+                raise ValueError("legacy migration file fields must be strings")
+            source_path = str(item["source_path"])
+            target_path = str(item["target_path"])
+            if source_path in source_paths or target_path in target_paths:
+                raise ValueError("legacy migration paths must be unique")
+            source_paths.add(source_path)
+            target_paths.add(target_path)
+            if not _SHA256.fullmatch(str(item["source_content_hash"])):
+                raise ValueError("legacy migration file hash must be a SHA-256")
+            relative = PurePosixPath(target_path)
+            if (
+                len(relative.parts) != 4
+                or relative.parts[0] != "Memories"
+                or relative.parts[1] != memory_id
+                or relative.parts[2] not in {"reports", "evidence", "sources"}
+            ):
+                raise ValueError("legacy migration target leaves the selected Memory")
+            resolve_vault_markdown_path(self.root, target_path)
+            if build_wikilink(target_path) != item["wikilink"]:
+                raise ValueError("legacy migration file WikiLink is not canonical")
+            markdown = str(item["markdown"])
+            _, _, frontmatter = _frontmatter_parts(
+                markdown,
+                label=f"migrated Markdown {target_path}",
+            )
+            if (
+                frontmatter["id"] != relative.stem
+                or frontmatter["type"] != relative.parts[2].removesuffix("s")
+                or frontmatter["memory_id"] != memory_id
+                or frontmatter["origin"] != "research"
+                or frontmatter["status"] != "confirmed"
+                or frontmatter["tags"] != ["paperpilot"]
+            ):
+                raise ValueError(
+                    f"migrated Markdown frontmatter does not match its path: {target_path}"
+                )
+            file_by_target[target_path] = item  # type: ignore[assignment]
+
+        for relative_path, markdown in (
+            (expected_home, home_markdown),
+            *(
+                (target_path, str(item["markdown"]))
+                for target_path, item in file_by_target.items()
+            ),
+        ):
+            for match in _WIKILINK.finditer(markdown):
+                target, _ = _parse_wikilink(match.group(0))
+                target_path = f"{target}.md"
+                if target_path in target_paths:
+                    continue
+                external = resolve_vault_markdown_path(self.root, target_path)
+                if not external.is_file():
+                    raise ValueError(
+                        f"migrated WikiLink target does not exist: {target_path}"
+                    )
+            unmatched = _WIKILINK.sub("", markdown)
+            if "[[" in unmatched or "]]" in unmatched:
+                raise ValueError(
+                    f"migrated Markdown has malformed WikiLink syntax: {relative_path}"
+                )
+
+        report_links = {
+            f"{match.group(1).split('|', 1)[0]}.md"
+            for match in _WIKILINK.finditer(home_markdown)
+        }
+        expected_reports = {
+            path
+            for path in target_paths
+            if PurePosixPath(path).parts[2:3] == ("reports",)
+        }
+        if not expected_reports.issubset(report_links):
+            raise ValueError("migrated Memory Home.md does not link every report")
+
+        descriptor = validate_memory_descriptor(
+            MemoryDescriptor(
+                memory_id=memory_id,
+                title=str(proposal["title"]),
+                relative_path=expected_relative,
+                created_at=str(proposal["created_at"]),
+                updated_at=str(proposal["created_at"]),
+            )
+        )
+
+        if staging is not None:
+            expected_files = {
+                "Home.md",
+                *(
+                    PurePosixPath(path).relative_to(
+                        "Memories", memory_id
+                    ).as_posix()
+                    for path in file_by_target
+                ),
+            }
+            actual_files = {
+                path.relative_to(staging).as_posix()
+                for path in staging.rglob("*")
+                if path.is_file()
+            }
+            if actual_files != expected_files:
+                raise ValueError("legacy migration staging contains unexpected files")
+            with (staging / "Home.md").open(
+                "r", encoding="utf-8", newline=""
+            ) as handle:
+                staged_home = handle.read()
+            if staged_home != home_markdown:
+                raise ValueError("legacy migration staging Home.md changed")
+            for target_path, item in file_by_target.items():
+                relative = PurePosixPath(target_path).relative_to(
+                    "Memories", memory_id
+                )
+                with staging.joinpath(*relative.parts).open(
+                    "r", encoding="utf-8", newline=""
+                ) as handle:
+                    staged_markdown = handle.read()
+                if staged_markdown != item["markdown"]:
+                    raise ValueError(
+                        f"legacy migration staging file changed: {target_path}"
+                    )
+        return descriptor
+
+    def commit_legacy_memory_migration(
+        self,
+        proposal: Mapping[str, object],
+    ) -> MemoryDescriptor:
+        """Publish a verified legacy copy with one same-volume directory rename."""
+        with self._lock:
+            descriptor = self._validate_legacy_migration_documents(proposal)
+            records, source_hash = _legacy_snapshot(self.root)
+            if source_hash != proposal["source_content_hash"]:
+                raise MemoryWriteConflictError(
+                    "legacy Memory changed after the migration preview"
+                )
+            expected = _build_legacy_migration_proposal(
+                records,
+                source_hash,
+                proposal_id=str(proposal["proposal_id"]),
+                memory_id=descriptor.memory_id,
+                title=descriptor.title,
+                created_at=descriptor.created_at,
+            )
+            if expected != dict(proposal):
+                raise ValueError("legacy migration proposal content was modified")
+
+            self._reject_linked_vault_path("Memories")
+            memories_root = self._resolve("Memories")
+            target = self._resolve(descriptor.relative_path.rstrip("/"))
+            if target.exists():
+                raise FileExistsError(
+                    f"Memory already exists: {descriptor.memory_id}"
+                )
+            created_memories_root = not memories_root.exists()
+            memories_root.mkdir(parents=True, exist_ok=True)
+            staging = Path(
+                tempfile.mkdtemp(
+                    prefix=f".{descriptor.memory_id}.migration.",
+                    dir=memories_root,
+                )
+            )
+            try:
+                for directory in _MEMORY_DIRECTORIES:
+                    (staging / directory).mkdir()
+                (staging / "Home.md").write_text(
+                    str(proposal["home_markdown"]),
+                    encoding="utf-8",
+                    newline="\n",
+                )
+                files = proposal["files"]
+                assert isinstance(files, tuple)
+                for item in files:
+                    assert isinstance(item, Mapping)
+                    target_path = PurePosixPath(str(item["target_path"]))
+                    relative = target_path.relative_to(
+                        "Memories", descriptor.memory_id
+                    )
+                    destination = staging.joinpath(*relative.parts)
+                    destination.write_text(
+                        str(item["markdown"]),
+                        encoding="utf-8",
+                        newline="\n",
+                    )
+
+                self._validate_legacy_migration_documents(
+                    proposal,
+                    staging=staging,
+                )
+                _, final_source_hash = _legacy_snapshot(self.root)
+                if final_source_hash != source_hash:
+                    raise MemoryWriteConflictError(
+                        "legacy Memory changed during migration commit"
+                    )
+                try:
+                    staging.rename(target)
+                except FileExistsError:
+                    raise FileExistsError(
+                        f"Memory already exists: {descriptor.memory_id}"
+                    ) from None
+                except OSError as exc:
+                    if target.exists():
+                        raise FileExistsError(
+                            f"Memory already exists: {descriptor.memory_id}"
+                        ) from None
+                    raise exc
+            finally:
+                if staging.exists():
+                    shutil.rmtree(staging)
+                if created_memories_root:
+                    try:
+                        memories_root.rmdir()
+                    except OSError:
+                        pass
+            return descriptor
+
     def create_memory(
         self,
         title: str,
@@ -1690,6 +2337,8 @@ class MarkdownMemoryStore:
         if memory_id is None:
             memory_id = f"M-{uuid.uuid4().hex}"
         validate_memory_id(memory_id)
+        if memory_id == LEGACY_MEMORY_ID:
+            raise ValueError("M-legacy is reserved for the read-only legacy Memory")
         descriptor_path = memory_relative_path(memory_id)
         target = self._resolve(descriptor_path.rstrip("/"))
         memories_root = self._resolve("Memories")
@@ -1764,6 +2413,8 @@ class MarkdownMemoryStore:
             raise ValueError("only the root Research Agent can persist a final report")
 
         if memory_id is not None:
+            if memory_id == LEGACY_MEMORY_ID:
+                raise ValueError("M-legacy is read-only and cannot accept research output")
             self.get_memory(memory_id)
 
         report_note = report_note_id(identity.root_thread_id)

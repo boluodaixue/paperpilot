@@ -321,6 +321,148 @@ def build_wikilink(
     return f"[[{target}|{alias}]]"
 
 
+def validate_legacy_memory_markdown_path(
+    relative_path: str | os.PathLike[str],
+) -> str:
+    """Validate one Markdown path in the read-only legacy root layout.
+
+    Legacy paths deliberately remain separate from the managed-Memory WikiLink
+    contract.  This helper exists only for reading and explicit copy-on-publish
+    migration; it does not make the legacy root a writable ``MemoryDescriptor``.
+    """
+    raw = _coerce_relative_path(relative_path)
+    relative = PurePosixPath(raw)
+    _validate_path_components(raw.split("/"), field_name="legacy Memory path")
+    if (
+        len(relative.parts) < 2
+        or relative.parts[0] not in LEGACY_ROOT_DIRECTORIES
+        or relative.suffix != ".md"
+    ):
+        raise ValueError(
+            "legacy Memory path must be Markdown below reports/, evidence/, or sources/"
+        )
+    return relative.as_posix()
+
+
+def resolve_legacy_memory_markdown_path(
+    vault_root: str | os.PathLike[str],
+    relative_path: str | os.PathLike[str],
+) -> Path:
+    """Resolve one legacy Markdown file without following links or junctions."""
+    raw = validate_legacy_memory_markdown_path(relative_path)
+    root = Path(vault_root).resolve(strict=False)
+    current = root
+    is_junction = getattr(os.path, "isjunction", lambda _path: False)
+    for component in PurePosixPath(raw).parts:
+        current = current / component
+        try:
+            file_attributes = getattr(os.lstat(current), "st_file_attributes", 0)
+        except OSError:
+            file_attributes = 0
+        if (
+            current.is_symlink()
+            or is_junction(current)
+            or bool(file_attributes & 0x400)
+        ):
+            raise ValueError("legacy Memory path cannot traverse a symlink or junction")
+    target = current.resolve(strict=False)
+    if not target.is_relative_to(root):
+        raise ValueError("legacy Memory path escapes the configured Vault")
+    return target
+
+
+def scan_legacy_memory_markdown(
+    vault_root: str | os.PathLike[str],
+) -> tuple[tuple[str, Path], ...]:
+    """Return every safe legacy Markdown path in deterministic order.
+
+    The scan is read-only and rejects linked directory entries instead of
+    silently following or partially migrating them.  Non-Markdown regular files
+    are outside the legacy Markdown Memory contract and are ignored.
+    """
+    root = Path(vault_root).resolve(strict=False)
+    is_junction = getattr(os.path, "isjunction", lambda _path: False)
+    results: list[tuple[str, Path]] = []
+    for directory_name in LEGACY_ROOT_DIRECTORIES:
+        directory = root / directory_name
+        if not directory.exists():
+            continue
+        try:
+            file_attributes = getattr(os.lstat(directory), "st_file_attributes", 0)
+        except OSError as exc:
+            raise ValueError(
+                f"legacy Memory directory cannot be inspected: {directory_name}"
+            ) from exc
+        if (
+            directory.is_symlink()
+            or is_junction(directory)
+            or bool(file_attributes & 0x400)
+        ):
+            raise ValueError(
+                f"legacy Memory directory cannot be a symlink or junction: {directory_name}"
+            )
+        if not directory.is_dir():
+            continue
+
+        pending = [directory]
+        while pending:
+            current = pending.pop()
+            try:
+                entries = sorted(current.iterdir(), key=lambda item: item.name)
+            except OSError as exc:
+                relative = current.relative_to(root).as_posix()
+                raise ValueError(
+                    f"legacy Memory directory cannot be read: {relative}"
+                ) from exc
+            for candidate in entries:
+                try:
+                    file_attributes = getattr(
+                        os.lstat(candidate), "st_file_attributes", 0
+                    )
+                except OSError as exc:
+                    relative = candidate.relative_to(root).as_posix()
+                    raise ValueError(
+                        f"legacy Memory entry cannot be inspected: {relative}"
+                    ) from exc
+                if (
+                    candidate.is_symlink()
+                    or is_junction(candidate)
+                    or bool(file_attributes & 0x400)
+                ):
+                    relative = candidate.relative_to(root).as_posix()
+                    raise ValueError(
+                        f"legacy Memory entry cannot be a symlink or junction: {relative}"
+                    )
+                if candidate.is_dir():
+                    pending.append(candidate)
+                    continue
+                if not candidate.is_file() or candidate.suffix != ".md":
+                    continue
+                relative = candidate.relative_to(root).as_posix()
+                resolved = resolve_legacy_memory_markdown_path(root, relative)
+                results.append((relative, resolved))
+    return tuple(sorted(results, key=lambda item: item[0]))
+
+
+def build_legacy_wikilink(
+    markdown_relative_path: str | os.PathLike[str],
+    alias: str | None = None,
+) -> str:
+    """Build a safe WikiLink to an existing-root legacy Markdown note."""
+    raw = validate_legacy_memory_markdown_path(markdown_relative_path)
+    target = raw[:-3]
+    if alias is None:
+        return f"[[{target}]]"
+    if (
+        not isinstance(alias, str)
+        or not alias.strip()
+        or alias != alias.strip()
+        or any(character in alias for character in _INVALID_WIKILINK_CHARACTERS)
+    ):
+        raise ValueError("legacy WikiLink alias is unsafe")
+    return f"[[{target}|{alias}]]"
+
+
 def detect_legacy_memory_layout(
     vault_root: str | os.PathLike[str],
 ) -> tuple[str, ...]:
@@ -343,15 +485,19 @@ __all__ = [
     "LEGACY_MEMORY_ID",
     "LEGACY_ROOT_DIRECTORIES",
     "build_attachment_wikilink",
+    "build_legacy_wikilink",
     "build_wikilink",
     "detect_legacy_memory_layout",
     "ensure_unique_memory_ids",
     "memory_relative_path",
     "resolve_memory_attachment_path",
+    "resolve_legacy_memory_markdown_path",
     "resolve_vault_markdown_path",
+    "scan_legacy_memory_markdown",
     "validate_frontmatter",
     "validate_memory_descriptor",
     "validate_memory_attachment_path",
     "validate_memory_id",
+    "validate_legacy_memory_markdown_path",
     "validate_wikilink_target",
 ]

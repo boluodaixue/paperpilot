@@ -224,7 +224,7 @@ W5 没有实现 CLI 导入收口、legacy 迁移、文件树、内置阅读器�
 
 ### 状态
 
-尚未开始。W5 的单进程导入契约不自动为 W6 增加 cross-process lock、journal 或 bundle 任务；如需扩展必须另行对齐。
+已完成（2026-08-28）。实施与验收结果见 [W6_STABILIZATION_MIGRATION_AND_ENTRY.md](W6_STABILIZATION_MIGRATION_AND_ENTRY.md)。W6 没有增加 cross-process lock、journal 或 bundle。
 
 ### 目标
 
@@ -247,6 +247,15 @@ W5 没有实现 CLI 导入收口、legacy 迁移、文件树、内置阅读器�
 - Markdown Vault 是唯一知识真相源；
 - Obsidian 未安装、未打开或外部编辑冲突时，PaperPilot 不丢数据也不静默覆盖；
 - N1–N6 研究、递归、恢复、报告和可选 Red/Blue 全量回归通过。
+
+### 实施结果
+
+- CLI/Web 真实写入入口统一通过 `ResearchRuntime` 要求显式 managed Memory；Web session 持久化 nullable `memory_id` 并拒绝后续切换；
+- 虚拟 `M-legacy` 只读检索/问答，研究、笔记、导入和 managed 写入均拒绝；CLI/Web 提供完整预览后的显式迁移；
+- 迁移用二次源快照、完整 staging 校验和单次同卷目录 rename 发布新 managed 副本；legacy 根文件、旧 Chat manifest 与当前 session 绑定不移动、不改写、不自动切换；
+- Langfuse 补齐 `memory_id`、检索路径/分数和写入路径/状态，不上传问题、Markdown 正文或附件字节；
+- 固定离线 `memory_wiki` 五项评测 `5/5 passed`；W6 专项 `39 passed, 1 warning`，原 N1–N6 回归 `160 passed, 1 warning`，前序集合 `411 passed, 1 warning`，仓库全量 `450 passed, 1 warning`；pytest warning 为既有 `StarletteDeprecationWarning`；
+- 未新增领域模型、Service、Repository、持久化索引、Agent 角色、自动写入、第二套存储或内置阅读器。
 
 ## 10. 每阶段测试顺序
 
@@ -273,4 +282,4 @@ W0 Memory/Vault 契约与安全基础
 → W6 稳定化、迁移与入口收口
 ```
 
-W0–W5 已完成，W6 尚未开始。后续进入 W6 前仍须以其既定范围单独实施和验收；当实现需要增加本计划未定义的数据模型、服务、索引、Agent 角色或自动写入行为时，必须停止扩展并先与用户对齐。
+W0–W6 已按顺序全部完成。该主线没有隐含的下一阶段；任何新增数据模型、服务、索引、Agent 角色、自动写入、跨进程事务或阅读器能力都必须另行定义和对齐。
