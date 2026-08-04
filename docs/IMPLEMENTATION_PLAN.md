@@ -377,3 +377,20 @@ N0 文档收敛
 ```
 
 N0–N6 与 W0–W6 已全部完成。该既定主线没有后续隐含阶段；不得据此扩展新的 Agent 角色、图/向量数据库、复杂阅读器、第二套存储、未经确认的自动写入、cross-process lock、journal 或 bundle。
+
+## 14. 已确认的下一主线：S0–S5
+
+用户已另行确认 W6 之后的生产化与检索升级。它不是 W0–W6 的隐含扩展，具体执行以 [S 系列生产化与检索升级实施计划](S_PRODUCTION_HARDENING_AND_RETRIEVAL_PLAN.md) 为唯一阶段顺序和验收边界：
+
+```text
+S0 本地文件读取沙箱
+→ S1 AsyncSqliteSaver + LangGraph State 唯一工作流状态
+→ S2 持久化队列 + 单一 Vault Writer + 崩溃恢复
+→ S3 Legacy 安全退役
+→ S4 SQLite FTS5 增量索引
+→ S5 可选语义与混合检索
+```
+
+S1 的固定职责是：Workflow State 保存任务阶段、提案、确认和结果；Runtime Registry 只保存 session/task/thread 映射、恢复调度租约与必要事件，不能形成第二状态机。LangGraph 自定义类型的未来 serializer 警告明确延期，不在 S1 处理。
+
+S0–S5 当前均未开始。每阶段必须单独实现、验收、记录和提交，不得提前实现后续阶段。

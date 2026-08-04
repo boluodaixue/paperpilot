@@ -4,7 +4,9 @@
 
 ## 当前判断
 
-N0–N6 与 LLM Wiki + Obsidian 的 W0–W6 已完成。CLI、Web 和评测继续进入同一个 Research Workflow；旧 Manager / Planner / DAG / AgentPool / Evidence Graph 链路已经删除。W6 只收口 Memory 入口、会话绑定、legacy 只读迁移、可观测性和固定离线评测，没有改变 Research AgentGraph、Research Workflow、fork、递归、checkpointer 或 N6 Red/Blue，也没有引入第二套知识存储。
+N0–N6 与 LLM Wiki + Obsidian 的 W0–W6 已完成并提交。CLI、Web 和评测继续进入同一个 Research Workflow；旧 Manager / Planner / DAG / AgentPool / Evidence Graph 链路已经删除。W6 只收口 Memory 入口、会话绑定、legacy 只读迁移、可观测性和固定离线评测，没有改变 Research AgentGraph、Research Workflow、fork、递归、checkpointer 或 N6 Red/Blue，也没有引入第二套知识存储。
+
+下一条独立主线 S0–S5 已确认但尚未开始：先收紧文件读取，再用 `AsyncSqliteSaver` 持久化 LangGraph State；其中 LangGraph State 是工作流唯一真实状态，PaperPilot 只保存 session/task/thread 薄索引、恢复租约和必要事件。随后引入单一 Vault Writer、退役活动 Vault 中的 legacy 双份，最后增加可重建的 FTS5 与可选混合检索。详细边界见 [S 系列实施计划](S_PRODUCTION_HARDENING_AND_RETRIEVAL_PLAN.md)。
 
 ## 进度
 
@@ -24,6 +26,12 @@ N0–N6 与 LLM Wiki + Obsidian 的 W0–W6 已完成。CLI、Web 和评测继�
 | W4 Memory 问答与受控新建笔记 | ✅ | 带可打开引用的当前 Memory 回答，确认后才新建笔记并更新 Home |
 | W5 资料导入与整理 | ✅ | file/PDF/text/显式 URL 生成受控提案，确认后写入 attachment/import/note 并线性化 Home |
 | W6 稳定化、迁移与入口收口 | ✅ | CLI/Web 固定 Memory、legacy 显式原子发布、Memory trace 与固定离线评测完成 |
+| S0 本地文件读取沙箱 | ⬜ | 未开始；只读取当前 Memory/受控上传范围 |
+| S1 持久化工作流状态与确认 | ⬜ | 未开始；AsyncSqliteSaver、State 唯一真相、薄 Runtime Registry |
+| S2 单一 Vault Writer | ⬜ | 未开始；持久队列、幂等、journal 与崩溃恢复 |
+| S3 Legacy 安全退役 | ⬜ | 未开始；活动 Vault 只留 managed Memory，历史指针可解析 |
+| S4 持久化全文检索 | ⬜ | 未开始；可重建的 SQLite FTS5 增量索引 |
+| S5 可选语义与混合检索 | ⬜ | 未开始；严格 Memory 范围的关键词/语义/WikiLink 融合 |
 
 ## N0 已确定的架构决策
 
@@ -203,6 +211,17 @@ W5 没有实现 CLI 导入收口、legacy 迁移、文件树、内置阅读器�
 - 没有新增领域模型、Service、Repository、持久索引、Agent、第二套存储、内置阅读器、cross-process lock、journal 或 bundle。
 
 详见 [W6 实施记录](W6_STABILIZATION_MIGRATION_AND_ENTRY.md)。W0–W6 既定主线至此完成，没有开始计划外阶段。
+
+## S0–S5 已确认，尚未开始
+
+- S0 修复无限制 FileReader 与路径前缀判断，只允许显式 Vault/上传根；
+- S1 使用 `AsyncSqliteSaver`，研究、笔记、导入和迁移确认进入 LangGraph State/interrupt；Runtime Registry 不复制工作流正文或状态；
+- S2 让所有产品 Vault 写入进入持久化队列，由单一 Writer 使用 staging、journal、哈希和幂等键发布；
+- S3 在安全迁移、历史路径映射和外部可恢复归档完成后，从活动 Vault 退役 legacy 根目录；
+- S4 从 Markdown 增量构建可删除重建的 SQLite FTS5；
+- S5 在严格 Memory 范围内增加可选多语言 embedding 与混合排序。
+
+执行与验收的唯一边界见 [S 系列生产化与检索升级实施计划](S_PRODUCTION_HARDENING_AND_RETRIEVAL_PLAN.md)。当前没有把任何 S 阶段标记为完成或开始。
 
 ## 历史基础
 

@@ -122,6 +122,7 @@ LLM Wiki + Obsidian 主线已完成：Obsidian 负责 Markdown 阅读、编辑�
 - [W4 实施记录](docs/W4_MEMORY_QA_CONTROLLED_NOTES.md)
 - [W5 实施记录](docs/W5_CONTROLLED_IMPORTS.md)
 - [W6 实施记录](docs/W6_STABILIZATION_MIGRATION_AND_ENTRY.md)
+- [S0–S5 生产化与检索升级计划](docs/S_PRODUCTION_HARDENING_AND_RETRIEVAL_PLAN.md)
 
 W6 专项为 `39 passed, 1 warning`，原 N1–N6 回归为 `160 passed, 1 warning`，N1–N6 + W0–W5 前序集合为 `411 passed, 1 warning`，包含 W6 的仓库全量回归为 `450 passed, 1 warning`；固定离线 `memory_wiki` 评测为 `5/5 passed`。pytest warning 为既有 `StarletteDeprecationWarning`。
 
