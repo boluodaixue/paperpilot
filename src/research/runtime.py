@@ -13,11 +13,12 @@ import uuid
 from collections.abc import Mapping
 from contextlib import contextmanager
 from pathlib import Path
-from typing import Any, Iterable
+from typing import Any, AsyncIterator, Iterable
 
 import yaml
 from langgraph.checkpoint.base import BaseCheckpointSaver
 from langgraph.checkpoint.memory import InMemorySaver
+from langgraph.types import Command
 
 from ..models.model_router import ModelRouter
 from ..tools import (
@@ -30,6 +31,7 @@ from ..tools import (
     MockWebSearchTool,
     NotepadTool,
     WebSearchTool,
+    file_reader_scope,
 )
 from ..utils.tracing import (
     flush_tracing,
@@ -159,7 +161,7 @@ def build_research_tools(config: dict[str, Any]) -> list[Any]:
         "web_search": MockWebSearchTool() if mock_mode else WebSearchTool(),
         "browser": MockBrowserTool() if mock_mode else BrowserTool(),
         "arxiv_reader": ArxivReaderTool(use_mock=mock_mode),
-        "file_reader": FileReaderTool(allowed_base_dir=None),
+        "file_reader": FileReaderTool(),
         "code_sandbox": CodeSandboxTool(use_mock=mock_mode),
         "calculator": CalculatorTool(),
         "notepad": NotepadTool(),
@@ -259,6 +261,33 @@ class ResearchRuntime:
     def new_thread_id() -> str:
         return f"research-{uuid.uuid4().hex}"
 
+    @contextmanager
+    def _research_file_scope(self, memory_id: str | None):
+        """Authorize FileReader only for one explicitly selected managed Memory."""
+        if memory_id is None or memory_id == LEGACY_MEMORY_ID:
+            with file_reader_scope(None):
+                yield
+            return
+
+        # Some embedding callers construct a deliberately minimal Runtime around a
+        # custom graph. Missing store authority must disable FileReader rather than
+        # widening access or breaking the unrelated graph operation.
+        if getattr(self, "memory_store", None) is None:
+            with file_reader_scope(None):
+                yield
+            return
+
+        descriptor = self.get_memory(memory_id)
+        vault_root = Path(self.memory_store.root).resolve(strict=True)
+        lexical_root = vault_root.joinpath(*Path(descriptor.relative_path).parts)
+        memory_root = lexical_root.resolve(strict=True)
+        if memory_root == vault_root or not memory_root.is_relative_to(vault_root):
+            raise ValueError("selected Memory file scope escapes the configured Vault")
+        if memory_root != lexical_root:
+            raise ValueError("selected Memory file scope cannot traverse a linked path")
+        with file_reader_scope({"memory": memory_root}):
+            yield
+
     async def start(
         self,
         question: str,
@@ -279,15 +308,16 @@ class ResearchRuntime:
             depth=0,
         )
         with _memory_trace("paperpilot.research.start", memory_id) as observation:
-            result = await self.graph.ainvoke(
-                create_research_workflow_state(
-                    question,
-                    identity,
-                    self.limits,
-                    memory_id=memory_id,
-                ),
-                config={"configurable": {"thread_id": root_thread_id}},
-            )
+            with self._research_file_scope(memory_id):
+                result = await self.graph.ainvoke(
+                    create_research_workflow_state(
+                        question,
+                        identity,
+                        self.limits,
+                        memory_id=memory_id,
+                    ),
+                    config={"configurable": {"thread_id": root_thread_id}},
+                )
             brief = result.get("brief")
             observation.add_output(
                 {
@@ -307,12 +337,13 @@ class ResearchRuntime:
         state = await self.get_state(thread_id)
         memory_id = state.get("memory_id")
         with _memory_trace("paperpilot.research.review", memory_id) as observation:
-            result = await resume_research_workflow(
-                self.graph,
-                thread_id=thread_id,
-                action=action,
-                feedback=feedback,
-            )
+            with self._research_file_scope(memory_id):
+                result = await resume_research_workflow(
+                    self.graph,
+                    thread_id=thread_id,
+                    action=action,
+                    feedback=feedback,
+                )
             workflow_result = result.get("workflow_result")
             manifest = getattr(workflow_result, "memory_manifest", None)
             observation.add_output(
@@ -332,6 +363,40 @@ class ResearchRuntime:
                 }
             )
             return result
+
+    async def stream_confirm(self, thread_id: str) -> AsyncIterator[Any]:
+        """Confirm one paused run while preserving its scoped FileReader context."""
+        state = await self.get_state(thread_id)
+        memory_id = state.get("memory_id")
+        config = {"configurable": {"thread_id": thread_id}}
+        with _memory_trace("paperpilot.research.review", memory_id) as observation:
+            with self._research_file_scope(memory_id):
+                async for update in self.graph.astream(
+                    Command(resume={"action": "confirm"}),
+                    config=config,
+                    stream_mode="updates",
+                    subgraphs=True,
+                ):
+                    yield update
+            final_state = await self.get_state(thread_id)
+            workflow_result = final_state.get("workflow_result")
+            manifest = getattr(workflow_result, "memory_manifest", None)
+            observation.add_output(
+                {
+                    "memory_id": memory_id,
+                    "thread_id": thread_id,
+                    "action": "confirm",
+                    "write_paths": (
+                        [
+                            manifest.report_path,
+                            *manifest.evidence_paths,
+                            *manifest.source_paths,
+                        ]
+                        if manifest is not None
+                        else []
+                    ),
+                }
+            )
 
     async def run_auto_confirmed(
         self,

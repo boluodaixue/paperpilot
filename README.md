@@ -75,6 +75,8 @@ memory/
 
 每个长期 Memory 使用稳定 `memory_id` 定位。报告通过完整 Vault 相对 WikiLink 链接证据，证据链接论文、网页或文件来源；导入资料的原始内容、可定位提取和整理笔记分别进入 `attachments/`、`imports/` 和 `notes/`。关系只由 Markdown WikiLink 和 Obsidian backlinks 表达，不建设独立 Evidence Graph。
 
+Research FileReader 默认不可用。每次运行只授权当前 managed Memory（受控调用方可另行绑定本次上传目录），模型只看到虚拟相对路径；绝对路径、路径逃逸、symlink/junction/reparse、读取竞态、非法类型和超限内容都会被拒绝。
+
 ### 简单完成判断
 
 当前不实现 RCS。Agent 根据任务完成情况、关键结论的来源、未解决问题、信息增量和硬预算判断继续或停止。RCS 只有在未来有真实评测数据时才可能作为可插拔辅助能力加入。
@@ -122,6 +124,7 @@ LLM Wiki + Obsidian 主线已完成：Obsidian 负责 Markdown 阅读、编辑�
 - [W4 实施记录](docs/W4_MEMORY_QA_CONTROLLED_NOTES.md)
 - [W5 实施记录](docs/W5_CONTROLLED_IMPORTS.md)
 - [W6 实施记录](docs/W6_STABILIZATION_MIGRATION_AND_ENTRY.md)
+- [S0 实施记录](docs/S0_FILE_READER_SANDBOX.md)
 - [S0–S5 生产化与检索升级计划](docs/S_PRODUCTION_HARDENING_AND_RETRIEVAL_PLAN.md)
 
 W6 专项为 `39 passed, 1 warning`，原 N1–N6 回归为 `160 passed, 1 warning`，N1–N6 + W0–W5 前序集合为 `411 passed, 1 warning`，包含 W6 的仓库全量回归为 `450 passed, 1 warning`；固定离线 `memory_wiki` 评测为 `5/5 passed`。pytest warning 为既有 `StarletteDeprecationWarning`。

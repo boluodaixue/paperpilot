@@ -299,14 +299,14 @@ W0–W6 已完成。LLM Wiki 继续复用唯一 `ResearchRuntime`、`MarkdownMem
 - 不为了兼容旧代码复制领域模型、Repository 或服务；
 - 不恢复已删除的旧角色包装或建立长期兼容层。
 
-## 12. 已确认但未实现的 S 系列目标
+## 12. S0 已实现与后续 S 系列目标
 
 W6 的当前行为保持有效，直至对应 S 阶段通过验收。下一主线只做生产化和检索升级，不改变 Research AgentGraph、fork、递归、N6 Red/Blue 或 Markdown 知识真相源：
 
-- S0 将 FileReader 限定到当前 Memory 与受控上传根；
+- S0 已将 FileReader 改为默认拒绝和每次运行显式授权：当前研究只绑定选中的 managed Memory，受控调用方可绑定本次上传根；模型只看到虚拟相对路径，真实路径、link/reparse/TOCTOU、文件类型、大小、读取量和解码均受限；
 - S1 使用 `AsyncSqliteSaver` 持久化 Workflow State，并以 LangGraph State 作为任务阶段、提案、确认和结果的唯一真实状态；PaperPilot 只保留 session/task/thread 查找、恢复租约和必要事件 outbox；
 - S2 通过持久队列和单一 Vault Writer 串行发布所有产品写入，并用 staging、journal、内容哈希和幂等恢复解决多文件崩溃一致性；
 - S3 在显式确认、安全归档和历史路径映射后退役活动 Vault 中的 legacy 根文件，不再长期保留活动双份；
 - S4/S5 构建可从 Markdown 删除重建的 FTS5 与可选混合索引；索引不是第二知识真相源，也不得反向覆盖 Markdown。
 
-完整顺序、明确不做和验收标准见 [S 系列实施计划](S_PRODUCTION_HARDENING_AND_RETRIEVAL_PLAN.md)。S0–S5 当前均未开始。
+完整顺序、明确不做和验收标准见 [S 系列实施计划](S_PRODUCTION_HARDENING_AND_RETRIEVAL_PLAN.md)。S0 已完成，详见 [S0 实施记录](S0_FILE_READER_SANDBOX.md)；S1–S5 尚未开始。
