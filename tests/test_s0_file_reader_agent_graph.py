@@ -2,13 +2,14 @@
 from __future__ import annotations
 
 import json
+from pathlib import Path
 from typing import Any
 
 import pytest
 
 from src.research.agent_graph import build_research_agent_graph, create_research_agent_state
 from src.research.models import AgentLimits, ExecutionIdentity, ResearchResult, ResearchTask
-from src.tools.file_reader import FileReaderError
+from src.tools.file_reader import FileReaderError, FileReaderTool, file_reader_scope
 
 
 def _tool_call(path: str) -> dict[str, Any]:
@@ -197,3 +198,33 @@ async def test_unavailable_reader_is_unoffered_but_a_forged_call_is_denied_once(
     assert len(tool_messages) == 1
     assert "not authorized" in tool_messages[0]["content"]
     assert forged_argument not in tool_messages[0]["content"]
+
+
+@pytest.mark.asyncio
+async def test_graph_built_deny_all_exposes_reader_in_later_runtime_scope(
+    tmp_path: Path,
+) -> None:
+    memory = tmp_path / "M-runtime"
+    note = memory / "notes" / "N-approved.md"
+    note.parent.mkdir(parents=True)
+    note.write_text("Runtime-scoped evidence.", encoding="utf-8")
+    policy = FilePolicy("notes/N-approved.md")
+    tool = FileReaderTool()
+    identity = _identity("s0-late-bound-scope")
+    graph = build_research_agent_graph(policy, [tool])
+
+    assert tool.is_available() is False
+    with file_reader_scope({"memory": memory}):
+        final = await graph.ainvoke(
+            create_research_agent_state(
+                ResearchTask("file-task", "Inspect the supplied file."),
+                identity,
+                AgentLimits(max_retries_per_action=1, max_total_retries=1),
+            ),
+            config={"configurable": {"thread_id": identity.thread_id}},
+        )
+
+    assert "file_reader" in policy.offered_tool_names[0]
+    assert final["result"].evidence[0].source_ref == "memory/notes/N-approved.md"
+    assert "Runtime-scoped evidence." in final["result"].evidence[0].finding
+    assert tool.is_available() is False
