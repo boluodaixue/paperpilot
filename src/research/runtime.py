@@ -7,6 +7,8 @@ architecture around the graph.
 """
 from __future__ import annotations
 
+import asyncio
+import hashlib
 import logging
 import os
 import time
@@ -81,6 +83,9 @@ from .workflow import (
 )
 from .vault import LEGACY_MEMORY_ID, scan_legacy_memory_markdown
 
+from .vault_write_queue import VaultWriteQueue
+from .vault_write_service import VaultWriteService
+from .vault_writer import VaultWriter
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 
@@ -257,6 +262,61 @@ def _runtime_setting(
     return float(value)
 
 
+def _chat_db_path(config: dict[str, Any]) -> Path:
+    section = config.get("chat", {})
+    if not isinstance(section, Mapping):
+        raise ValueError("chat configuration must be a mapping")
+    configured = section.get("db_path", "data/chat.db")
+    try:
+        raw_path = os.fspath(configured)
+    except TypeError as exc:
+        raise ValueError("chat.db_path must be a non-empty path-like string") from exc
+    if not isinstance(raw_path, str) or not raw_path.strip():
+        raise ValueError("chat.db_path must be a non-empty path-like string")
+    path = Path(raw_path)
+    return path if path.is_absolute() else PROJECT_ROOT / path
+
+
+def _vault_scope(root: Path) -> str:
+    canonical = os.path.normcase(str(root.resolve()))
+    digest = hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+    return f"vault-{digest}"
+
+
+def _build_vault_write_service(
+    *,
+    config: dict[str, Any],
+    memory_store: MarkdownMemoryStore,
+    write_db_path: str | os.PathLike[str] | None = None,
+    write_queue: VaultWriteQueue | None = None,
+) -> VaultWriteService:
+    expected_scope = _vault_scope(memory_store.root)
+    if write_queue is None:
+        queue = VaultWriteQueue(
+            write_db_path if write_db_path is not None else _chat_db_path(config),
+            vault_scope=expected_scope,
+        )
+    else:
+        queue = write_queue
+        if queue.vault_scope != expected_scope:
+            raise ValueError("Vault write queue scope does not match the Memory Store")
+    lease_seconds = _runtime_setting(config, "lease_seconds", 60)
+    writer = VaultWriter(
+        memory_store.root,
+        queue,
+        job_lease_seconds=lease_seconds,
+    )
+    return VaultWriteService(
+        memory_store,
+        queue,
+        writer,
+        lease_seconds=lease_seconds,
+        coordination_interval_seconds=_runtime_setting(
+            config, "writer_coordination_interval_seconds", 0.1
+        ),
+    )
+
+
 class ResearchRuntime:
     """Shared production facade for starting and resuming root research runs."""
 
@@ -270,6 +330,9 @@ class ResearchRuntime:
         checkpointer: BaseCheckpointSaver,
         limits: AgentLimits,
         report_review_enabled: bool = False,
+        vault_write_service: VaultWriteService | None = None,
+        write_db_path: str | os.PathLike[str] | None = None,
+        write_queue: VaultWriteQueue | None = None,
     ) -> None:
         self.config = config
         self.policy = policy
@@ -278,6 +341,14 @@ class ResearchRuntime:
         self.checkpointer = checkpointer
         self.limits = limits
         self.report_review_enabled = report_review_enabled
+        self.vault_write_service = vault_write_service or _build_vault_write_service(
+            config=config,
+            memory_store=memory_store,
+            write_db_path=write_db_path,
+            write_queue=write_queue,
+        )
+        if self.vault_write_service.memory_store is not memory_store:
+            raise ValueError("Vault write service must share the Runtime Memory Store")
         self.proposal_ttl_seconds = _runtime_setting(
             config, "proposal_ttl_seconds", 86400
         )
@@ -294,15 +365,24 @@ class ResearchRuntime:
             memory_store,
             checkpointer=checkpointer,
             report_review_enabled=report_review_enabled,
+            vault_write_service=self.vault_write_service,
         )
         self.memory_note_graph = build_memory_note_workflow(
-            memory_store, policy, checkpointer=checkpointer
+            memory_store,
+            policy,
+            checkpointer=checkpointer,
+            vault_write_service=self.vault_write_service,
         )
         self.memory_import_graph = build_memory_import_workflow(
-            memory_store, policy, checkpointer=checkpointer
+            memory_store,
+            policy,
+            checkpointer=checkpointer,
+            vault_write_service=self.vault_write_service,
         )
         self.legacy_migration_graph = build_legacy_migration_workflow(
-            memory_store, checkpointer=checkpointer
+            memory_store,
+            checkpointer=checkpointer,
+            vault_write_service=self.vault_write_service,
         )
 
     @staticmethod
@@ -761,7 +841,10 @@ class ResearchRuntime:
         title: str,
         memory_id: str | None = None,
     ) -> MemoryDescriptor:
-        return self.memory_store.create_memory(title, memory_id=memory_id)
+        service = getattr(self, "vault_write_service", None)
+        if service is None:
+            return self.memory_store.create_memory(title, memory_id=memory_id)
+        return service.create_memory(title, memory_id=memory_id)
 
     def list_memories(self) -> tuple[MemoryDescriptor, ...]:
         return self.memory_store.list_memories()
@@ -837,7 +920,12 @@ class ResearchRuntime:
         with _memory_trace(
             "paperpilot.memory.legacy_migration.commit", target_memory_id or None
         ) as observation:
-            descriptor = self.memory_store.commit_legacy_memory_migration(proposal)
+            service = getattr(self, "vault_write_service", None)
+            descriptor = (
+                service.commit_legacy_memory_migration(proposal)
+                if service is not None
+                else self.memory_store.commit_legacy_memory_migration(proposal)
+            )
             observation.add_output(
                 {
                     "status": "committed",
@@ -899,7 +987,12 @@ class ResearchRuntime:
         with _memory_trace(
             "paperpilot.memory.note.commit", proposal.memory_id
         ) as observation:
-            result = self.memory_store.commit_memory_note(proposal)
+            service = getattr(self, "vault_write_service", None)
+            result = (
+                service.commit_memory_note(proposal)
+                if service is not None
+                else self.memory_store.commit_memory_note(proposal)
+            )
             observation.add_output(dict(result))
             return result
 
@@ -968,7 +1061,12 @@ class ResearchRuntime:
         with _memory_trace(
             "paperpilot.memory.import.commit", getattr(proposal, "memory_id", None)
         ) as observation:
-            result = self.memory_store.commit_memory_import(proposal)
+            service = getattr(self, "vault_write_service", None)
+            result = (
+                service.commit_memory_import(proposal)
+                if service is not None
+                else self.memory_store.commit_memory_import(proposal)
+            )
             observation.add_output(
                 {
                     key: value
@@ -1004,21 +1102,28 @@ def build_research_runtime(
     tools: Iterable[Any] | None = None,
     memory_store: MarkdownMemoryStore | None = None,
     checkpointer: BaseCheckpointSaver | None = None,
+    write_db_path: str | os.PathLike[str] | None = None,
+    write_queue: VaultWriteQueue | None = None,
+    vault_write_service: VaultWriteService | None = None,
 ) -> ResearchRuntime:
     """Construct the single production Research Workflow dependency graph."""
     effective_config = config if config is not None else load_config(config_path)
+    effective_store = (
+        memory_store
+        if memory_store is not None
+        else MarkdownMemoryStore(vault_root_from_config(effective_config))
+    )
     return ResearchRuntime(
         config=effective_config,
         policy=policy if policy is not None else _build_policy(effective_config),
         tools=list(tools) if tools is not None else build_research_tools(effective_config),
-        memory_store=(
-            memory_store
-            if memory_store is not None
-            else MarkdownMemoryStore(vault_root_from_config(effective_config))
-        ),
+        memory_store=effective_store,
         checkpointer=checkpointer if checkpointer is not None else InMemorySaver(),
         limits=limits_from_config(effective_config),
         report_review_enabled=_report_review_enabled(effective_config),
+        vault_write_service=vault_write_service,
+        write_db_path=write_db_path,
+        write_queue=write_queue,
     )
 
 
@@ -1044,8 +1149,10 @@ async def open_research_runtime(
             tools=tools,
             memory_store=memory_store,
             checkpointer=saver,
+            write_db_path=path,
         )
         try:
+            await asyncio.to_thread(runtime.vault_write_service.startup_recover)
             yield runtime
         finally:
             await runtime.close(shutdown=True)

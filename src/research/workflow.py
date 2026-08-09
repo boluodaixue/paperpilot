@@ -43,6 +43,7 @@ from .rendering import (
 from .report_review import review_final_report
 from .retrieval import MarkdownMemoryIndex, MemorySearchHit
 from .vault import validate_frontmatter, validate_memory_id
+from .vault_write_service import VaultWriteService
 
 
 __all__ = [
@@ -549,6 +550,7 @@ def build_research_workflow(
     *,
     checkpointer: BaseCheckpointSaver | None = None,
     report_review_enabled: bool = False,
+    vault_write_service: VaultWriteService | None = None,
 ) -> Any:
     """Build the root workflow around the same homogeneous Research AgentGraph."""
     tool_list = list(tools)
@@ -759,6 +761,14 @@ def build_research_workflow(
                     result,
                     state["identity"],
                 )
+            elif vault_write_service is not None:
+                report_markdown, manifest = await asyncio.to_thread(
+                    vault_write_service.persist_research,
+                    brief,
+                    result,
+                    state["identity"],
+                    memory_id=memory_id,
+                )
             else:
                 report_markdown, manifest = await asyncio.to_thread(
                     memory_store.persist_research,
@@ -791,13 +801,13 @@ def build_research_workflow(
             "report_review": None,
         }
 
-    async def postprocess_report(
+    async def review_report(
         state: ResearchWorkflowState,
         config: RunnableConfig,
     ) -> dict[str, Any]:
         validate_workflow_state(state, config)
         if not report_review_enabled:
-            return {"report_review": None, "workflow_status": "completed"}
+            return {"report_review": None}
 
         brief = state.get("brief")
         result = state.get("result")
@@ -812,7 +822,7 @@ def build_research_workflow(
         if not isinstance(manifest, MemoryManifest):
             raise TypeError("report review requires a MemoryManifest")
 
-        with _workflow_trace("postprocess_report", state) as observation:
+        with _workflow_trace("review_report", state) as observation:
             try:
                 final_report, outcome = await review_final_report(
                     policy,
@@ -820,20 +830,6 @@ def build_research_workflow(
                     result,
                     manifest,
                 )
-                workflow_result = ResearchWorkflowResult(
-                    brief=brief,
-                    research_result=result,
-                    report_markdown=final_report,
-                    memory_manifest=manifest,
-                    report_review=outcome,
-                    memory_id=state.get("memory_id"),
-                )
-                if final_report != original_report:
-                    await asyncio.to_thread(
-                        memory_store.replace_report,
-                        manifest.report_path,
-                        final_report,
-                    )
                 observation.add_output(
                     {
                         "applied": outcome.applied,
@@ -844,22 +840,12 @@ def build_research_workflow(
                 )
                 return {
                     "report_markdown": final_report,
-                    "workflow_result": workflow_result,
                     "report_review": outcome,
-                    "workflow_status": "completed",
                 }
             except Exception as exc:
                 outcome = ReportReviewOutcome(
                     applied=False,
                     fallback_reason=f"{type(exc).__name__}: {exc}",
-                )
-                workflow_result = ResearchWorkflowResult(
-                    brief=brief,
-                    research_result=result,
-                    report_markdown=original_report,
-                    memory_manifest=manifest,
-                    report_review=outcome,
-                    memory_id=state.get("memory_id"),
                 )
                 observation.add_output(
                     {
@@ -872,10 +858,103 @@ def build_research_workflow(
                 )
                 return {
                     "report_markdown": original_report,
-                    "workflow_result": workflow_result,
                     "report_review": outcome,
-                    "workflow_status": "completed",
                 }
+
+    async def postprocess_report(
+        state: ResearchWorkflowState,
+        config: RunnableConfig,
+    ) -> dict[str, Any]:
+        """Apply one checkpointed review result without re-running Red/Blue."""
+        validate_workflow_state(state, config)
+        brief = state.get("brief")
+        result = state.get("result")
+        reviewed_report = state.get("report_markdown")
+        manifest = state.get("memory_manifest")
+        persisted = state.get("workflow_result")
+        outcome = state.get("report_review")
+        if not isinstance(brief, ResearchBrief):
+            raise TypeError("report postprocess requires a ResearchBrief")
+        if not isinstance(result, ResearchResult):
+            raise TypeError("report postprocess requires a ResearchResult")
+        if not isinstance(reviewed_report, str) or not reviewed_report.strip():
+            raise TypeError("report postprocess requires reviewed Markdown")
+        if not isinstance(manifest, MemoryManifest):
+            raise TypeError("report postprocess requires a MemoryManifest")
+        if not isinstance(persisted, ResearchWorkflowResult):
+            raise TypeError("report postprocess requires the persisted workflow result")
+        if outcome is not None and not isinstance(outcome, ReportReviewOutcome):
+            raise TypeError("report postprocess requires a ReportReviewOutcome")
+        original_report = persisted.report_markdown
+
+        with _workflow_trace("postprocess_report", state) as observation:
+            try:
+                if reviewed_report != original_report:
+                    memory_id = state.get("memory_id")
+                    if memory_id is not None and vault_write_service is not None:
+                        await asyncio.to_thread(
+                            vault_write_service.replace_report,
+                            manifest.report_path,
+                            reviewed_report,
+                            memory_id=memory_id,
+                            original_markdown=original_report,
+                            manifest=manifest,
+                            origin_thread_id=state["identity"].root_thread_id,
+                        )
+                    else:
+                        await asyncio.to_thread(
+                            memory_store.replace_report,
+                            manifest.report_path,
+                            reviewed_report,
+                        )
+                final_report = reviewed_report
+                final_outcome = outcome
+            except Exception as exc:
+                try:
+                    final_report = await asyncio.to_thread(
+                        memory_store.read_text,
+                        manifest.report_path,
+                    )
+                except Exception as read_exc:
+                    final_report = original_report
+                    reason = (
+                        f"{type(exc).__name__}: {exc}; latest report could not be read: "
+                        f"{type(read_exc).__name__}: {read_exc}"
+                    )
+                else:
+                    reason = f"{type(exc).__name__}: {exc}"
+                final_outcome = ReportReviewOutcome(
+                    applied=False,
+                    issues=() if outcome is None else outcome.issues,
+                    edits=(),
+                    fallback_reason=reason,
+                )
+
+            workflow_result = ResearchWorkflowResult(
+                brief=brief,
+                research_result=result,
+                report_markdown=final_report,
+                memory_manifest=manifest,
+                report_review=final_outcome,
+                memory_id=state.get("memory_id"),
+            )
+            observation.add_output(
+                {
+                    "applied": bool(final_outcome and final_outcome.applied),
+                    "issue_count": 0 if final_outcome is None else len(final_outcome.issues),
+                    "edit_count": 0 if final_outcome is None else len(final_outcome.edits),
+                    "fallback": bool(final_outcome and final_outcome.fallback_reason),
+                    "fallback_reason": (
+                        None if final_outcome is None else final_outcome.fallback_reason
+                    ),
+                }
+            )
+            return {
+                "report_markdown": final_report,
+                "workflow_result": workflow_result,
+                "report_review": final_outcome,
+                "workflow_status": "completed",
+            }
 
     def route_after_review(state: ResearchWorkflowState) -> str:
         if state.get("workflow_status") in {"cancelled", "expired"}:
@@ -889,6 +968,7 @@ def build_research_workflow(
     builder.add_node("prepare_research", prepare_research)
     builder.add_node("research_agent", research_agent_graph)
     builder.add_node("persist_result", persist_result)
+    builder.add_node("review_report", review_report)
     builder.add_node("postprocess_report", postprocess_report)
     builder.add_edge(START, "draft_brief")
     builder.add_edge("draft_brief", "review_brief")
@@ -904,7 +984,8 @@ def build_research_workflow(
     builder.add_edge("revise_brief", "review_brief")
     builder.add_edge("prepare_research", "research_agent")
     builder.add_edge("research_agent", "persist_result")
-    builder.add_edge("persist_result", "postprocess_report")
+    builder.add_edge("persist_result", "review_report")
+    builder.add_edge("review_report", "postprocess_report")
     builder.add_edge("postprocess_report", END)
     return builder.compile(checkpointer=effective_checkpointer)
 

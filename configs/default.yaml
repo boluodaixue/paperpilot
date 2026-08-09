@@ -53,6 +53,8 @@ runtime:
   terminal_retention_seconds: 604800
   lease_seconds: 60
   sweep_interval_seconds: 5
+  # Polling interval used only while a caller waits for the durable Vault Writer.
+  writer_coordination_interval_seconds: 0.1
 
 tools:
   enabled:

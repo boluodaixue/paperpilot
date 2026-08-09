@@ -83,7 +83,7 @@ Research FileReader 默认不可用。每次运行只授权当前 managed Memory
 
 ## 当前仓库状态
 
-N0–N6、W0–W6 与生产化 S0–S1 已完成。CLI、Web 和评测统一通过 `src/research/runtime.py` 进入同一个 Research Workflow；旧 Orchestrator、Planner DAG、AgentPool、独立 Summarizer、Evidence Store/Graph 和旧实验体系已经退出代码库。
+N0–N6、W0–W6 与生产化 S0–S2 已完成。CLI、Web 和评测统一通过 `src/research/runtime.py` 进入同一个 Research Workflow；所有产品级 managed Vault 写入由持久队列和单一 Writer 发布；旧 Orchestrator、Planner DAG、AgentPool、独立 Summarizer、Evidence Store/Graph 和旧实验体系已经退出代码库。
 
 目前已经具备：
 

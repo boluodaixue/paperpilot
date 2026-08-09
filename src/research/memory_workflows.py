@@ -30,6 +30,7 @@ from .models import (
     MemoryNoteProposal,
 )
 from .vault import LEGACY_MEMORY_ID
+from .vault_write_service import VaultWriteService
 
 
 WorkflowStatus = Literal[
@@ -365,6 +366,7 @@ def build_memory_note_workflow(
     *,
     checkpointer: BaseCheckpointSaver,
     clock: Callable[[], float] = time.time,
+    vault_write_service: VaultWriteService | None = None,
 ) -> Any:
     async def build_answer(
         state: MemoryNoteWorkflowState,
@@ -448,7 +450,15 @@ def build_memory_note_workflow(
         try:
             result = _exact_note_result(memory_store, proposal)
             if result is None:
-                result = {"status": "committed", **memory_store.commit_memory_note(proposal)}
+                committed = (
+                    vault_write_service.commit_memory_note(
+                        proposal,
+                        origin_thread_id=state["thread_id"],
+                    )
+                    if vault_write_service is not None
+                    else memory_store.commit_memory_note(proposal)
+                )
+                result = {"status": "committed", **committed}
         except (MemoryWriteConflictError, FileExistsError, ValueError) as exc:
             return _failure(state, exc)
         return {"workflow_status": "committed", "result": result}
@@ -554,6 +564,7 @@ def build_memory_import_workflow(
     checkpointer: BaseCheckpointSaver,
     clock: Callable[[], float] = time.time,
     url_fetcher: Callable[[str], Any] | None = None,
+    vault_write_service: VaultWriteService | None = None,
 ) -> Any:
     async def prepare_import(
         state: MemoryImportWorkflowState,
@@ -626,7 +637,14 @@ def build_memory_import_workflow(
         try:
             result = _exact_import_result(memory_store, proposal)
             if result is None:
-                result = dict(memory_store.commit_memory_import(proposal))
+                result = dict(
+                    vault_write_service.commit_memory_import(
+                        proposal,
+                        origin_thread_id=state["thread_id"],
+                    )
+                    if vault_write_service is not None
+                    else memory_store.commit_memory_import(proposal)
+                )
         except (MemoryWriteConflictError, FileExistsError, ValueError) as exc:
             return _failure(state, exc)
         return {"workflow_status": "committed", "result": result}
@@ -693,6 +711,7 @@ def build_legacy_migration_workflow(
     *,
     checkpointer: BaseCheckpointSaver,
     clock: Callable[[], float] = time.time,
+    vault_write_service: VaultWriteService | None = None,
 ) -> Any:
     def prepare_migration(
         state: LegacyMigrationWorkflowState,
@@ -736,7 +755,14 @@ def build_legacy_migration_workflow(
         try:
             result = _exact_legacy_result(memory_store, proposal)
             if result is None:
-                descriptor = memory_store.commit_legacy_memory_migration(proposal)
+                descriptor = (
+                    vault_write_service.commit_legacy_memory_migration(
+                        proposal,
+                        origin_thread_id=state["thread_id"],
+                    )
+                    if vault_write_service is not None
+                    else memory_store.commit_legacy_memory_migration(proposal)
+                )
                 result = {
                     "status": "committed",
                     "source_memory_id": LEGACY_MEMORY_ID,
