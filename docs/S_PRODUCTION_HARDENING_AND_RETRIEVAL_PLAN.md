@@ -2,7 +2,7 @@
 
 ## 1. 状态与边界
 
-本计划于 2026-08-28 确认，是 N0–N6 与 W0–W6 全部完成后的下一条独立主线。S0 已完成；S1–S5 尚未开始实现。每个阶段必须在上一阶段完成专项、前序与全量回归并单独提交后才能开始。
+本计划于 2026-08-28 确认，是 N0–N6 与 W0–W6 全部完成后的下一条独立主线。S0–S1 已完成；S2–S5 尚未开始实现。每个阶段必须在上一阶段完成专项、前序与全量回归并单独提交后才能开始。
 
 W6 的提交 `b8e5e1c` 是本计划的冻结基线。W0–W6 的实施记录继续描述当时已经交付的行为；S 系列只通过新的阶段记录改变未来行为，不回写历史完成结论。
 
@@ -23,7 +23,7 @@ S 系列不新增 Manager、Planner、Summarizer、Wiki Agent、Review Agent 或
 | 阶段 | 状态 | 目标 | 产品结果 |
 |---|---|---|---|
 | S0 | ✅ | 本地文件读取沙箱 | Research 工具只能读取明确授权的 Vault/上传范围 |
-| S1 | ⬜ | 持久化工作流状态与确认 | 重启后可定位并恢复任务，LangGraph State 是唯一工作流状态 |
+| S1 | ✅ | 持久化工作流状态与确认 | 重启后可定位并恢复任务，LangGraph State 是唯一工作流状态 |
 | S2 | ⬜ | 单一 Vault Writer 与崩溃一致性 | 所有产品写入串行、幂等、可恢复，不出现可见半成品 |
 | S3 | ⬜ | Legacy 安全退役 | 迁移后活动 Vault 只保留 managed Memory，历史指针在当前版本仍可解析 |
 | S4 | ⬜ | 持久化全文检索 | 从 Markdown 增量构建可丢弃的 FTS5 索引 |
@@ -90,6 +90,8 @@ Runtime Registry 不得保存 Research Brief、提案正文、回答正文、工
 
 ## 5. S1：持久化工作流状态与确认
 
+状态：已完成。实现和验收见 [S1 实施记录](S1_PERSISTENT_WORKFLOW_STATE.md)。
+
 ### 目标
 
 使用 `AsyncSqliteSaver` 让所有需要暂停/确认的产品 Workflow 跨服务重启恢复，同时保持 LangGraph State 为唯一工作流状态，避免 Runtime Registry 形成第二状态机。
@@ -102,8 +104,9 @@ Runtime Registry 不得保存 Research Brief、提案正文、回答正文、工
 - 将 Memory 保存笔记、受控导入和 legacy 迁移分别包入最小 LangGraph Workflow，提案、来源快照、内容哈希、确认和最终路径只保存在各自 State/checkpoint；
 - 用 `Command(resume=...)` 确认或取消，不再依赖 `_MEMORY_ANSWERS`、`_MEMORY_NOTE_PROPOSALS`、`_MEMORY_IMPORT_PROPOSALS`、`_LEGACY_MIGRATION_PROPOSALS` 等进程内提案字典；
 - 建立薄 Runtime Registry，只记录 session/task/thread 映射、workflow 类型、过期时间和恢复租约；
-- 启动时扫描未终结 registry 记录，通过 checkpoint 判断等待、完成、失败或需要重新调度；
-- 提案 TTL 到期时将对应 Workflow 明确终结为 expired；删除 session 时取消其未终结 Workflow 并删除/失效 registry 与 outbox；
+- 启动时扫描未终结 registry 记录，通过 checkpoint 判断等待、完成、失败或需要重新调度；身份不一致只隔离错误 locator，不删除权威 checkpoint；
+- 执行期间持续续租，丢失租约的本地执行器停止；旧租约到期后 sweeper 可重新领取并继续 running Workflow；
+- 提案 TTL 到期时将对应 Workflow 明确终结为 expired；删除 session 时先租用全部关联 Workflow，再以 SQLite 事务线性化删除 Chat、registry 与 outbox，最后删除已核验 checkpoint；
 - 对确认、完成、失败建立最小事件 outbox；普通 SSE 进度在重连时由 checkpoint 快照替代；
 - checkpoint 数据库与现有 Chat Store 可以位于同一 SQLite 文件，但表、迁移和职责必须隔离。
 

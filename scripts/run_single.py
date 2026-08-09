@@ -6,7 +6,9 @@ import argparse
 import asyncio
 import logging
 import sys
+from contextlib import asynccontextmanager
 from pathlib import Path
+from typing import AsyncIterator
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 if str(PROJECT_ROOT) not in sys.path:
@@ -19,15 +21,55 @@ from scripts._workflow_cli import (
     run_reviewed_workflow,
     vault_name_from_config,
 )
-from src.research.runtime import build_research_runtime, load_config, setup_logging
+from src.memory.chat_store import ChatStore
+from src.research.runtime import (
+    ResearchRuntime,
+    build_research_runtime,
+    load_config,
+    open_research_runtime,
+    setup_logging,
+)
+from src.research.runtime_registry import RuntimeRegistry
+
+
+_DEFAULT_BUILD_RESEARCH_RUNTIME = build_research_runtime
+
+
+def _checkpoint_db_path(config: dict) -> Path:
+    configured = Path(str(config.get("chat", {}).get("db_path", "data/chat.db")))
+    return configured if configured.is_absolute() else PROJECT_ROOT / configured
+
+
+@asynccontextmanager
+async def _open_runtime(config: dict) -> AsyncIterator[ResearchRuntime]:
+    """Own the product saver while retaining the established test injection seam."""
+    if build_research_runtime is not _DEFAULT_BUILD_RESEARCH_RUNTIME:
+        runtime = build_research_runtime(config=config)
+        try:
+            yield runtime
+        finally:
+            await runtime.close(shutdown=True)
+        return
+
+    async with open_research_runtime(
+        _checkpoint_db_path(config),
+        config=config,
+    ) as runtime:
+        yield runtime
 
 
 async def _run(args: argparse.Namespace) -> str:
     config = load_config(args.config)
     vault_name = vault_name_from_config(config)
-    runtime = build_research_runtime(config=config)
-    thread_id = args.thread_id or runtime.new_thread_id()
-    try:
+    async with _open_runtime(config) as runtime:
+        thread_id = args.thread_id or runtime.new_thread_id()
+        session_id = f"cli-single-{thread_id}"
+        registry: RuntimeRegistry | None = None
+        if build_research_runtime is _DEFAULT_BUILD_RESEARCH_RUNTIME:
+            database = _checkpoint_db_path(config)
+            chat_store = ChatStore(str(database))
+            chat_store.set_meta(session_id, title=session_id)
+            registry = RuntimeRegistry(database)
         memory_id = require_memory(
             runtime,
             getattr(args, "memory_id", None),
@@ -37,6 +79,8 @@ async def _run(args: argparse.Namespace) -> str:
             args.query,
             thread_id=thread_id,
             memory_id=memory_id,
+            session_id=session_id,
+            registry=registry,
             auto_confirm=args.yes,
         )
         return format_result_locations(
@@ -44,8 +88,6 @@ async def _run(args: argparse.Namespace) -> str:
             result,
             vault_name=vault_name,
         )
-    finally:
-        await runtime.close(shutdown=True)
 
 
 def main() -> None:

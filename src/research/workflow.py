@@ -4,10 +4,12 @@ from __future__ import annotations
 import asyncio
 import json
 import re
+import time
 from contextlib import contextmanager
 from dataclasses import asdict
 from typing import Any, Iterable, TypedDict
 
+import yaml
 from langchain_core.runnables import RunnableConfig
 from langgraph.checkpoint.base import BaseCheckpointSaver
 from langgraph.checkpoint.memory import InMemorySaver
@@ -16,7 +18,7 @@ from langgraph.types import Command, interrupt
 
 from ..utils.tracing import trace_block, trace_context
 from .agent_graph import build_research_agent_graph, create_research_agent_state
-from .memory import MarkdownMemoryStore
+from .memory import MarkdownMemoryStore, MemoryWriteConflictError
 from .models import (
     AgentLimits,
     EvidenceItem,
@@ -29,9 +31,18 @@ from .models import (
     ResearchWorkflowResult,
 )
 from .policy import call_policy
+from .rendering import (
+    managed_note_id,
+    render_evidence_note,
+    render_report,
+    render_source_note,
+    report_note_id,
+    safe_note_id,
+    source_note_id,
+)
 from .report_review import review_final_report
 from .retrieval import MarkdownMemoryIndex, MemorySearchHit
-from .vault import validate_memory_id
+from .vault import validate_frontmatter, validate_memory_id
 
 
 __all__ = [
@@ -46,6 +57,12 @@ class ResearchWorkflowState(TypedDict, total=False):
     """Fields used by the outer workflow and embedded Research AgentGraph."""
 
     question: str
+    workflow_type: str
+    workflow_status: str
+    thread_id: str
+    session_id: str | None
+    created_at: float
+    expires_at: float | None
     memory_id: str | None
     retrieved_memory: list[dict[str, Any]]
     brief: ResearchBrief | None
@@ -56,6 +73,7 @@ class ResearchWorkflowState(TypedDict, total=False):
     limits: AgentLimits
     task: ResearchTask
     messages: list[dict[str, Any]]
+    notepad_entries: list[dict[str, Any]]
     iteration: int
     tool_calls_used: int
     pending_tool_calls: list[dict[str, Any]]
@@ -84,9 +102,171 @@ class ResearchWorkflowState(TypedDict, total=False):
     memory_manifest: MemoryManifest | None
     workflow_result: ResearchWorkflowResult | None
     report_review: ReportReviewOutcome | None
+    failure_code: str | None
 
 
 _JSON_FENCE = re.compile(r"```(?:json)?\s*(.*?)\s*```", re.IGNORECASE | re.DOTALL)
+
+
+def _managed_research_timestamp(
+    report_markdown: str,
+    *,
+    memory_id: str,
+    root_thread_id: str,
+) -> str:
+    """Recover the one timestamp used by an already-published managed bundle."""
+    lines = report_markdown.splitlines(keepends=True)
+    if not lines or lines[0].rstrip("\r\n") != "---":
+        raise MemoryWriteConflictError(
+            "research persist replay conflict: existing report has no frontmatter"
+        )
+    closing = next(
+        (
+            index
+            for index, line in enumerate(lines[1:], start=1)
+            if line.rstrip("\r\n") == "---"
+        ),
+        None,
+    )
+    if closing is None:
+        raise MemoryWriteConflictError(
+            "research persist replay conflict: existing report frontmatter is not closed"
+        )
+    try:
+        raw_frontmatter = yaml.safe_load("".join(lines[1:closing]))
+        if not isinstance(raw_frontmatter, dict):
+            raise ValueError("frontmatter must be a mapping")
+        frontmatter = validate_frontmatter(raw_frontmatter)
+    except (TypeError, ValueError, yaml.YAMLError) as exc:
+        raise MemoryWriteConflictError(
+            "research persist replay conflict: existing report frontmatter is invalid"
+        ) from exc
+    if (
+        frontmatter.get("type") != "report"
+        or frontmatter.get("memory_id") != memory_id
+        or frontmatter.get("root_thread_id") != root_thread_id
+    ):
+        raise MemoryWriteConflictError(
+            "research persist replay conflict: existing report identity does not match checkpoint"
+        )
+    created_at = frontmatter.get("created_at")
+    updated_at = frontmatter.get("updated_at")
+    if not isinstance(created_at, str) or updated_at != created_at:
+        raise MemoryWriteConflictError(
+            "research persist replay conflict: existing report timestamp is not stable"
+        )
+    return created_at
+
+
+def _reuse_existing_research_commit(
+    memory_store: MarkdownMemoryStore,
+    brief: ResearchBrief,
+    result: ResearchResult,
+    identity: ExecutionIdentity,
+    *,
+    memory_id: str | None,
+) -> tuple[str, MemoryManifest] | None:
+    """Return an exact prior commit, or reject an unsafe persist-node replay."""
+    report_note = report_note_id(identity.root_thread_id)
+    base_path = f"Memories/{memory_id}/" if memory_id is not None else ""
+    report_path = f"{base_path}reports/{report_note}.md"
+    try:
+        existing_report = memory_store.read_text(report_path)
+    except FileNotFoundError:
+        return None
+
+    timestamp = (
+        _managed_research_timestamp(
+            existing_report,
+            memory_id=memory_id,
+            root_thread_id=identity.root_thread_id,
+        )
+        if memory_id is not None
+        else None
+    )
+    unique_evidence = list(
+        {item.evidence_id: item for item in result.evidence}.values()
+    )
+    evidence_note_by_id = {
+        evidence.evidence_id: (
+            managed_note_id("Evidence", evidence.evidence_id)
+            if memory_id is not None
+            else safe_note_id("Evidence", evidence.evidence_id)
+        )
+        for evidence in unique_evidence
+    }
+    source_note_by_ref: dict[str, str] = {}
+    for evidence in unique_evidence:
+        source_note_by_ref.setdefault(evidence.source_ref, source_note_id(evidence))
+
+    expected_report = render_report(
+        brief,
+        result,
+        report_note=report_note,
+        evidence_notes=evidence_note_by_id,
+        root_thread_id=identity.root_thread_id,
+        memory_id=memory_id,
+        created_at=timestamp,
+        updated_at=timestamp,
+    )
+    expected_files: list[tuple[str, str]] = []
+    source_paths: list[str] = []
+    for source_ref, source_note in source_note_by_ref.items():
+        evidence = next(item for item in unique_evidence if item.source_ref == source_ref)
+        source_path = f"{base_path}sources/{source_note}.md"
+        source_paths.append(source_path)
+        expected_files.append(
+            (
+                source_path,
+                render_source_note(
+                    source_note,
+                    evidence,
+                    memory_id=memory_id,
+                    created_at=timestamp,
+                    updated_at=timestamp,
+                ),
+            )
+        )
+
+    evidence_paths: list[str] = []
+    for evidence in unique_evidence:
+        evidence_note = evidence_note_by_id[evidence.evidence_id]
+        evidence_path = f"{base_path}evidence/{evidence_note}.md"
+        evidence_paths.append(evidence_path)
+        expected_files.append(
+            (
+                evidence_path,
+                render_evidence_note(
+                    evidence,
+                    evidence_note=evidence_note,
+                    source_note=source_note_by_ref[evidence.source_ref],
+                    memory_id=memory_id,
+                    created_at=timestamp,
+                    updated_at=timestamp,
+                ),
+            )
+        )
+
+    if existing_report != expected_report:
+        raise MemoryWriteConflictError(
+            "research persist replay conflict: existing report content does not match checkpoint"
+        )
+    for path, expected_markdown in expected_files:
+        try:
+            existing_markdown = memory_store.read_text(path)
+        except FileNotFoundError as exc:
+            raise MemoryWriteConflictError(
+                f"research persist replay conflict: committed bundle is missing {path}"
+            ) from exc
+        if existing_markdown != expected_markdown:
+            raise MemoryWriteConflictError(
+                f"research persist replay conflict: committed content changed at {path}"
+            )
+    return existing_report, MemoryManifest(
+        report_path=report_path,
+        evidence_paths=tuple(evidence_paths),
+        source_paths=tuple(source_paths),
+    )
 
 
 def _validate_root_state(
@@ -106,6 +286,8 @@ def _validate_root_state(
         raise ValueError(
             "LangGraph configurable.thread_id must match identity.thread_id"
         )
+    if state.get("thread_id", identity.thread_id) != identity.thread_id:
+        raise ValueError("workflow thread_id must match identity.thread_id")
 
 
 @contextmanager
@@ -278,33 +460,44 @@ def _assistant_message(response: dict[str, Any]) -> dict[str, Any]:
     return message
 
 
-def _review_payload(brief: ResearchBrief) -> dict[str, Any]:
-    return {
+def _review_payload(
+    brief: ResearchBrief,
+    state: ResearchWorkflowState,
+) -> dict[str, Any]:
+    payload: dict[str, Any] = {
         "kind": "research_brief_confirmation",
         "brief": asdict(brief),
-        "allowed_actions": ["confirm", "modify"],
+        "allowed_actions": ["confirm", "modify", "cancel"],
+        "workflow_id": state["thread_id"],
+        "session_id": state.get("session_id"),
+        "memory_id": state.get("memory_id"),
     }
+    if state.get("expires_at") is not None:
+        payload["expires_at"] = state["expires_at"]
+    return payload
 
 
-def _parse_review(value: Any) -> tuple[bool, str | None]:
+def _parse_review(value: Any) -> tuple[str, str | None]:
     if isinstance(value, str):
         clean = value.strip()
         if clean.lower() in {"confirm", "confirmed", "approve", "approved", "确认"}:
-            return True, None
+            return "confirm", None
         if not clean:
             raise ValueError("review response cannot be empty")
-        return False, clean
+        return "modify", clean
     if not isinstance(value, dict):
         raise ValueError("review response must be a string or object")
     action = str(value.get("action") or "").strip().lower()
     if action == "confirm":
-        return True, None
+        return "confirm", None
     if action == "modify":
         feedback = str(value.get("feedback") or value.get("message") or "").strip()
         if not feedback:
             raise ValueError("modify action requires feedback")
-        return False, feedback
-    raise ValueError("review action must be confirm or modify")
+        return "modify", feedback
+    if action in {"cancel", "expire"}:
+        return action, None
+    raise ValueError("review action must be confirm, modify, cancel, or expire")
 
 
 def create_research_workflow_state(
@@ -313,12 +506,24 @@ def create_research_workflow_state(
     limits: AgentLimits | None = None,
     *,
     memory_id: str | None = None,
+    session_id: str | None = None,
+    created_at: float | None = None,
+    expires_at: float | None = None,
 ) -> ResearchWorkflowState:
     """Create the root workflow input used for the first ``ainvoke`` call."""
     if memory_id is not None:
         validate_memory_id(memory_id)
+    created = time.time() if created_at is None else float(created_at)
+    if expires_at is not None and float(expires_at) <= created:
+        raise ValueError("expires_at must be later than created_at")
     return ResearchWorkflowState(
         question=question,
+        workflow_type="research",
+        workflow_status="drafting",
+        thread_id=identity.thread_id,
+        session_id=session_id,
+        created_at=created,
+        expires_at=float(expires_at) if expires_at is not None else None,
         memory_id=memory_id,
         retrieved_memory=[],
         brief=None,
@@ -327,10 +532,12 @@ def create_research_workflow_state(
         confirmed=False,
         identity=identity,
         limits=limits or AgentLimits(),
+        notepad_entries=[],
         report_markdown=None,
         memory_manifest=None,
         workflow_result=None,
         report_review=None,
+        failure_code=None,
         result=None,
     )
 
@@ -410,6 +617,7 @@ def build_research_workflow(
             "alignment_messages": [*messages, _assistant_message(response)],
             "revision_feedback": None,
             "confirmed": False,
+            "workflow_status": "waiting_confirmation",
         }
 
     def review_brief(
@@ -420,11 +628,24 @@ def build_research_workflow(
         brief = state.get("brief")
         if not isinstance(brief, ResearchBrief):
             raise TypeError("draft_brief must produce a ResearchBrief")
-        response = interrupt(_review_payload(brief))
-        confirmed, feedback = _parse_review(response)
+        response = interrupt(_review_payload(brief, state))
+        action, feedback = _parse_review(response)
+        expires_at = state.get("expires_at")
+        if action != "expire" and expires_at is not None and time.time() >= expires_at:
+            action = "expire"
+            feedback = None
         return {
-            "confirmed": confirmed,
+            "confirmed": action == "confirm",
             "revision_feedback": feedback,
+            "workflow_status": (
+                "cancelled"
+                if action == "cancel"
+                else "expired"
+                if action == "expire"
+                else "running"
+                if action == "confirm"
+                else "revising"
+            ),
         }
 
     async def revise_brief(
@@ -464,6 +685,7 @@ def build_research_workflow(
             "alignment_messages": [*messages, _assistant_message(response)],
             "revision_feedback": None,
             "confirmed": False,
+            "workflow_status": "waiting_confirmation",
         }
 
     def prepare_research(
@@ -497,13 +719,15 @@ def build_research_workflow(
             constraints=brief.constraints,
             require_evidence=True,
         )
-        return dict(
+        prepared = dict(
             create_research_agent_state(
                 task,
                 state["identity"],
                 state["limits"],
             )
         )
+        prepared["workflow_status"] = "running"
+        return prepared
 
     async def persist_result(
         state: ResearchWorkflowState,
@@ -518,7 +742,17 @@ def build_research_workflow(
             raise TypeError("Research AgentGraph completed without a ResearchResult")
         with _workflow_trace("persist", state) as observation:
             memory_id = state.get("memory_id")
-            if memory_id is None:
+            replayed = await asyncio.to_thread(
+                _reuse_existing_research_commit,
+                memory_store,
+                brief,
+                result,
+                state["identity"],
+                memory_id=memory_id,
+            )
+            if replayed is not None:
+                report_markdown, manifest = replayed
+            elif memory_id is None:
                 report_markdown, manifest = await asyncio.to_thread(
                     memory_store.persist_research,
                     brief,
@@ -563,7 +797,7 @@ def build_research_workflow(
     ) -> dict[str, Any]:
         validate_workflow_state(state, config)
         if not report_review_enabled:
-            return {"report_review": None}
+            return {"report_review": None, "workflow_status": "completed"}
 
         brief = state.get("brief")
         result = state.get("result")
@@ -612,6 +846,7 @@ def build_research_workflow(
                     "report_markdown": final_report,
                     "workflow_result": workflow_result,
                     "report_review": outcome,
+                    "workflow_status": "completed",
                 }
             except Exception as exc:
                 outcome = ReportReviewOutcome(
@@ -639,9 +874,12 @@ def build_research_workflow(
                     "report_markdown": original_report,
                     "workflow_result": workflow_result,
                     "report_review": outcome,
+                    "workflow_status": "completed",
                 }
 
     def route_after_review(state: ResearchWorkflowState) -> str:
+        if state.get("workflow_status") in {"cancelled", "expired"}:
+            return "terminal"
         return "prepare_research" if state.get("confirmed") else "revise_brief"
 
     builder = StateGraph(ResearchWorkflowState)
@@ -660,6 +898,7 @@ def build_research_workflow(
         {
             "prepare_research": "prepare_research",
             "revise_brief": "revise_brief",
+            "terminal": END,
         },
     )
     builder.add_edge("revise_brief", "review_brief")
@@ -677,7 +916,7 @@ async def resume_research_workflow(
     action: str,
     feedback: str | None = None,
 ) -> ResearchWorkflowState:
-    """Resume one interrupted brief review with a confirm or modify decision."""
+    """Resume one interrupted brief review with a confirm, modify, or stop decision."""
     payload: dict[str, Any] = {"action": action}
     if feedback is not None:
         payload["feedback"] = feedback

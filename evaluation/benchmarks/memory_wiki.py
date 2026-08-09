@@ -8,6 +8,8 @@ import tempfile
 from pathlib import Path
 from typing import Any, Awaitable, Callable
 
+from langgraph.checkpoint.memory import InMemorySaver
+
 from evaluation.report import EvaluationReport
 from src.research.memory import MarkdownMemoryStore, MemoryWriteConflictError
 from src.research.memory_dialogue import answer_memory, propose_memory_note
@@ -364,7 +366,12 @@ async def _continued_research_case() -> dict[str, bool]:
         selected_before = (root / selected_path).read_bytes()
         policy = _OfflinePolicy()
         tool = _OfflineTool()
-        graph = build_research_workflow(policy, [tool], store)
+        graph = build_research_workflow(
+            policy,
+            [tool],
+            store,
+            checkpointer=InMemorySaver(),
+        )
         thread_id = "memory-wiki-offline"
         identity = ExecutionIdentity(thread_id, None, thread_id, 0)
         paused = await graph.ainvoke(

@@ -11,6 +11,7 @@ import logging
 import sqlite3
 import threading
 import time
+from collections.abc import Mapping
 from pathlib import Path
 from typing import Optional
 
@@ -34,6 +35,8 @@ class ChatStore:
     def _connect(self) -> sqlite3.Connection:
         conn = sqlite3.connect(self.db_path, check_same_thread=False)
         conn.row_factory = sqlite3.Row
+        conn.execute("PRAGMA foreign_keys = ON")
+        conn.execute("PRAGMA busy_timeout = 5000")
         return conn
 
     def _ensure_tables(self) -> None:
@@ -200,6 +203,68 @@ class ChatStore:
                 conn.execute("DELETE FROM session_meta WHERE session_id = ?", (session_id,))
                 conn.commit()
                 return n
+            finally:
+                conn.close()
+
+    def delete_session_with_workflow_leases(
+        self,
+        session_id: str,
+        lease_tokens: Mapping[str, str],
+        *,
+        now: float | None = None,
+    ) -> tuple[int, tuple[str, ...]]:
+        """Atomically delete chat state and the exactly leased workflow locators.
+
+        ``session_meta`` owns the foreign-key cascade for runtime locators and
+        outbox rows.  Requiring an exact set of live lease tokens gives session
+        deletion one SQLite linearization point without copying workflow state
+        into Chat Store.
+        """
+        current = time.time() if now is None else float(now)
+        tokens = dict(lease_tokens)
+        with self._lock:
+            conn = self._connect()
+            try:
+                conn.execute("BEGIN IMMEDIATE")
+                rows = conn.execute(
+                    "SELECT task_id, thread_id, lease_owner, lease_until "
+                    "FROM runtime_workflows WHERE session_id = ? "
+                    "ORDER BY task_id",
+                    (session_id,),
+                ).fetchall()
+                task_ids = {str(row["task_id"]) for row in rows}
+                if task_ids != set(tokens):
+                    raise RuntimeError(
+                        "session workflow set changed during deletion"
+                    )
+                for row in rows:
+                    task_id = str(row["task_id"])
+                    if (
+                        row["lease_owner"] != tokens[task_id]
+                        or row["lease_until"] is None
+                        or float(row["lease_until"]) < current
+                    ):
+                        raise RuntimeError(
+                            "session workflow lease was lost during deletion"
+                        )
+                n = int(
+                    conn.execute(
+                        "SELECT COUNT(*) FROM chat_messages WHERE session_id = ?",
+                        (session_id,),
+                    ).fetchone()[0]
+                )
+                thread_ids = tuple(str(row["thread_id"]) for row in rows)
+                conn.execute(
+                    "DELETE FROM chat_messages WHERE session_id = ?", (session_id,)
+                )
+                conn.execute(
+                    "DELETE FROM session_meta WHERE session_id = ?", (session_id,)
+                )
+                conn.commit()
+                return n, thread_ids
+            except Exception:
+                conn.rollback()
+                raise
             finally:
                 conn.close()
 

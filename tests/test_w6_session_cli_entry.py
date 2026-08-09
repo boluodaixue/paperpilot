@@ -16,12 +16,12 @@ from src.memory.chat_store import ChatStore
 from src.research.memory import MarkdownMemoryStore
 from src.research.models import (
     MemoryAnswer,
-    MemoryCitation,
     MemoryImportProposal,
     MemoryNoteProposal,
 )
 from src.research.vault import LEGACY_MEMORY_ID
 from src.research.runtime import build_research_runtime
+from tests._checkpoint_web_runtime import build_checkpointed_web_runtime
 
 
 def test_chat_store_adds_only_nullable_memory_id_and_binds_once(tmp_path: Path) -> None:
@@ -61,127 +61,28 @@ def test_chat_store_adds_only_nullable_memory_id_and_binds_once(tmp_path: Path) 
     assert listed["session"]["memory_id"] == "M-alpha"
 
 
-class _WebRuntime:
-    def __init__(self, root: Path) -> None:
-        self.memory_store = MarkdownMemoryStore(root)
-        self.memory_store.create_memory("Alpha", "M-alpha")
-        self.memory_store.create_memory("Beta", "M-beta")
-        legacy_report = root / "reports" / "Report-old.md"
-        legacy_report.parent.mkdir(parents=True)
-        legacy_report.write_text(
-            "# Existing report\n\nLegacybaseline is supported.\n",
-            encoding="utf-8",
-        )
-        self.counter = 0
-
-    def get_memory(self, memory_id: str):
-        return self.memory_store.get_memory(memory_id)
-
-    def list_memories(self):
-        return self.memory_store.list_memories()
-
-    def get_memory_option(self, memory_id: str):
-        if memory_id == LEGACY_MEMORY_ID:
-            if not (self.memory_store.root / "reports" / "Report-old.md").is_file():
-                raise FileNotFoundError(memory_id)
-            return {
-                "memory_id": LEGACY_MEMORY_ID,
-                "title": "Existing Memory (read-only)",
-                "relative_path": None,
-                "created_at": None,
-                "updated_at": None,
-                "read_only": True,
-                "can_migrate": True,
-                "file_count": 1,
-            }
-        descriptor = self.get_memory(memory_id)
-        return {
-            **descriptor.__dict__,
-            "read_only": False,
-            "can_migrate": False,
-            "file_count": None,
-        }
-
-    def list_memory_options(self):
-        return tuple(
-            self.get_memory_option(item.memory_id) for item in self.list_memories()
-        ) + (self.get_memory_option(LEGACY_MEMORY_ID),)
-
-    def create_memory(self, title: str):
-        return self.memory_store.create_memory(title)
-
-    def prepare_legacy_memory_migration(self, title: str, memory_id: str):
-        return self.memory_store.prepare_legacy_memory_migration(title, memory_id)
-
-    def commit_legacy_memory_migration(self, proposal):
-        return self.memory_store.commit_legacy_memory_migration(proposal)
-
-    def new_thread_id(self) -> str:
-        self.counter += 1
-        return f"research-{self.counter}"
-
-    async def start(self, question: str, *, thread_id: str, memory_id=None):
-        brief = {
-            "question": question,
-            "objective": question,
-            "scope": [],
-            "directions": [],
-            "constraints": [],
-            "expected_output": "Markdown",
-            "revision": 0,
-            "memory_id": memory_id,
-        }
-        return {"__interrupt__": (SimpleNamespace(value={
-            "kind": "research_brief_confirmation", "brief": brief,
-        }),)}
-
-    async def answer_memory(self, memory_id: str, question: str) -> MemoryAnswer:
-        if memory_id == LEGACY_MEMORY_ID:
-            citation = MemoryCitation(
-                relative_path="reports/Report-old.md",
-                title="Existing report",
-                wikilink="[[reports/Report-old]]",
-            )
-        else:
-            citation = MemoryCitation(
-                relative_path=f"Memories/{memory_id}/Home.md",
-                title="Home",
-                wikilink=f"[[Memories/{memory_id}/Home]]",
-            )
-        return MemoryAnswer(
-            answer_id=f"Answer-{self.counter + 1}",
-            memory_id=memory_id,
-            question=question,
-            markdown="Grounded",
-            citations=(citation,),
-            insufficient_evidence=(),
-        )
-
-    async def close(self, *, shutdown: bool = False) -> None:
-        return None
-
-
 @pytest.fixture()
 def bound_web_client(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
-    runtime = _WebRuntime(tmp_path / "Vault")
+    root = tmp_path / "Vault"
+    runtime = build_checkpointed_web_runtime(root)
+    runtime.create_memory("Alpha", memory_id="M-alpha")
+    runtime.create_memory("Beta", memory_id="M-beta")
+    legacy_report = root / "reports" / "Report-old.md"
+    legacy_report.parent.mkdir(parents=True)
+    legacy_report.write_text(
+        "# Existing report\n\nKnown Legacybaseline is supported.\n",
+        encoding="utf-8",
+    )
     database = tmp_path / "chat.db"
     monkeypatch.setattr(server, "CHAT_DB_PATH", str(database))
     monkeypatch.setattr(server, "_config", {"research": {}})
     server.get_chat_store._store = None
+    server.get_runtime_registry._registry = None
     server.get_research_runtime._runtime = runtime
-    server._TASKS.clear()
-    server._MEMORY_ANSWERS.clear()
-    server._MEMORY_NOTE_PROPOSALS.clear()
-    server._MEMORY_IMPORT_PROPOSALS.clear()
-    server._LEGACY_MIGRATION_PROPOSALS.clear()
     with TestClient(server.app) as client:
         yield client, database
-    server._TASKS.clear()
-    server._MEMORY_ANSWERS.clear()
-    server._MEMORY_NOTE_PROPOSALS.clear()
-    server._MEMORY_IMPORT_PROPOSALS.clear()
-    server._LEGACY_MIGRATION_PROPOSALS.clear()
     server.get_chat_store._store = None
+    server.get_runtime_registry._registry = None
     server.get_research_runtime._runtime = None
 
 
@@ -214,7 +115,6 @@ def test_web_session_binding_covers_answer_import_note_and_research(
         json={"session_id": "fixed", "memory_id": "M-alpha", "message": "Research"},
     )
     assert aligned.status_code == 200
-    server._TASKS[aligned.json()["task_id"]].status = "done"
     assert client.post(
         "/api/alignment",
         json={"session_id": "fixed", "memory_id": "M-beta", "message": "Switch"},
@@ -242,7 +142,6 @@ def test_w6_web_runtime_rejects_missing_memory_before_creating_legacy_work(
     assert "missing-memory" not in {
         item["session_id"] for item in client.get("/api/sessions").json()
     }
-    assert not server._TASKS
 
 
 def test_static_web_uses_session_binding_instead_of_last_report() -> None:
@@ -538,58 +437,10 @@ async def test_repl_answers_legacy_read_only_and_migrates_without_switching(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    class LegacyCliRuntime:
-        def __init__(self, root: Path) -> None:
-            self.memory_store = MarkdownMemoryStore(root)
-            report = root / "reports" / "Report-old.md"
-            report.parent.mkdir(parents=True)
-            report.write_text("# Old\n\nLegacybaseline.\n", encoding="utf-8")
-
-        def get_memory_option(self, memory_id: str):
-            if memory_id == LEGACY_MEMORY_ID:
-                return {
-                    "memory_id": memory_id,
-                    "title": "Existing Memory (read-only)",
-                    "read_only": True,
-                    "can_migrate": True,
-                }
-            descriptor = self.memory_store.get_memory(memory_id)
-            return {
-                "memory_id": descriptor.memory_id,
-                "title": descriptor.title,
-                "read_only": False,
-                "can_migrate": False,
-            }
-
-        def list_memory_options(self):
-            return (self.get_memory_option(LEGACY_MEMORY_ID),)
-
-        async def answer_memory(self, memory_id: str, question: str):
-            return MemoryAnswer(
-                "A-legacy",
-                memory_id,
-                question,
-                "Grounded [[reports/Report-old]]",
-                (
-                    MemoryCitation(
-                        "reports/Report-old.md",
-                        "Old",
-                        "[[reports/Report-old]]",
-                    ),
-                ),
-                (),
-            )
-
-        def prepare_legacy_memory_migration(self, title: str, memory_id: str):
-            return self.memory_store.prepare_legacy_memory_migration(title, memory_id)
-
-        def commit_legacy_memory_migration(self, proposal):
-            return self.memory_store.commit_legacy_memory_migration(proposal)
-
-        async def close(self, *, shutdown: bool = False):
-            return None
-
-    runtime = LegacyCliRuntime(tmp_path / "Vault")
+    runtime = build_checkpointed_web_runtime(tmp_path / "Vault")
+    report = runtime.memory_store.root / "reports" / "Report-old.md"
+    report.parent.mkdir(parents=True, exist_ok=True)
+    report.write_text("# Old\n\nKnown legacy baseline.\n", encoding="utf-8")
     values = iter(
         [
             "memories",

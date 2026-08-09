@@ -12,6 +12,8 @@ from dataclasses import asdict
 from pathlib import Path
 from typing import Any
 
+from langgraph.checkpoint.memory import InMemorySaver
+
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
@@ -56,7 +58,7 @@ async def _evaluate_research_bench(
     bench = ResearchBench()
     questions = bench.get_questions(domain=domain, n=num_questions)
     report = EvaluationReport(name="ResearchBench_Evaluation", num_questions=len(questions))
-    runtime = build_research_runtime(config=config)
+    runtime = build_research_runtime(config=config, checkpointer=InMemorySaver())
     try:
         for index, question in enumerate(questions, 1):
             question_id = question["id"]
@@ -120,7 +122,7 @@ async def _evaluate_hotpotqa(
     questions = bench.get_samples(n=num_questions, shuffle=True)
     report = EvaluationReport(name="HotpotQA_PaperPilot_Evaluation", num_questions=len(questions))
     predictions: list[dict[str, Any]] = []
-    runtime = build_research_runtime(config=config)
+    runtime = build_research_runtime(config=config, checkpointer=InMemorySaver())
     try:
         for index, question in enumerate(questions, 1):
             query = question["query"]

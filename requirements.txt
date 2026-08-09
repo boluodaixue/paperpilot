@@ -8,6 +8,7 @@ python-dotenv>=1.0
 
 # LangGraph execution and Langfuse observability
 langgraph>=1.0.0,<2.0.0
+langgraph-checkpoint-sqlite>=3.1.1,<4.0.0
 langfuse>=4.0.0,<5.0.0
 
 # Research tools

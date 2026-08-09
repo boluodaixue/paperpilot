@@ -83,7 +83,7 @@ Research FileReader 默认不可用。每次运行只授权当前 managed Memory
 
 ## 当前仓库状态
 
-N0–N6 已完成。CLI、Web 和评测统一通过 `src/research/runtime.py` 进入同一个 Research Workflow；旧 Orchestrator、Planner DAG、AgentPool、独立 Summarizer、Evidence Store/Graph 和旧实验体系已经退出代码库。
+N0–N6、W0–W6 与生产化 S0–S1 已完成。CLI、Web 和评测统一通过 `src/research/runtime.py` 进入同一个 Research Workflow；旧 Orchestrator、Planner DAG、AgentPool、独立 Summarizer、Evidence Store/Graph 和旧实验体系已经退出代码库。
 
 目前已经具备：
 
@@ -98,6 +98,7 @@ N0–N6 已完成。CLI、Web 和评测统一通过 `src/research/runtime.py` �
 - N5 生产入口：CLI/Web 用户确认与恢复、SSE 事件回放、结构化评测结果和架构回归测试。
 - N6 可选报告审查：原报告持久化后的单次 Red/Blue、确定性动作重放、结构保护与失败降级，默认关闭。
 - W0–W6 LLM Wiki + Obsidian：长期多 Memory、Obsidian 打开、记忆辅助继续研究、当前 Memory 问答与受控笔记、PDF/文本/显式 URL 的受控导入，以及固定会话 Memory、legacy 只读迁移和离线评测。
+- S0–S1 生产化基础：文件读取默认拒绝并按当前 Memory 授权；产品工作流使用 `AsyncSqliteSaver`，重启后从 LangGraph State 恢复研究、笔记、导入与迁移确认，薄 Runtime Registry 只保存定位、租约和必要 outbox。
 
 N6 已完成验收：关键专项与回归为 `65 passed, 1 warning`，全量回归为 `160 passed, 1 warning`；全量中的 warning 是既有 `StarletteDeprecationWarning`。
 
@@ -124,6 +125,8 @@ LLM Wiki + Obsidian 主线已完成：Obsidian 负责 Markdown 阅读、编辑�
 - [W4 实施记录](docs/W4_MEMORY_QA_CONTROLLED_NOTES.md)
 - [W5 实施记录](docs/W5_CONTROLLED_IMPORTS.md)
 - [W6 实施记录](docs/W6_STABILIZATION_MIGRATION_AND_ENTRY.md)
+- [S0 实施记录](docs/S0_FILE_READER_SANDBOX.md)
+- [S1 实施记录](docs/S1_PERSISTENT_WORKFLOW_STATE.md)
 - [S0 实施记录](docs/S0_FILE_READER_SANDBOX.md)
 - [S0–S5 生产化与检索升级计划](docs/S_PRODUCTION_HARDENING_AND_RETRIEVAL_PLAN.md)
 

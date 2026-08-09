@@ -15,13 +15,18 @@
   - Notepad：非结构化、个人化、临时性，用于单个 Agent 的"思维草稿"
 
 设计要点：
-  - 纯内存实现（session 级），不持久化
+  - 直接调用保留实例内草稿；Agent 调用由 checkpoint State 绑定快照
+  - ContextVar 隔离并发 thread/child，不把草稿变成跨 Agent Memory
   - 支持 CRUD：write / read / list / clear
   - 每条笔记带 timestamp 和 category（conclusion / todo / question / source）
 """
 from __future__ import annotations
 
+import math
 import time
+from collections.abc import Iterable, Iterator, Mapping
+from contextlib import contextmanager
+from contextvars import ContextVar
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -52,6 +57,71 @@ class NotepadTool:
 
     def __init__(self) -> None:
         self._notes: list[NotepadEntry] = []
+        self._bound_notes: ContextVar[list[NotepadEntry] | None] = ContextVar(
+            f"paperpilot_notepad_{id(self)}",
+            default=None,
+        )
+
+    def fork(self) -> NotepadTool:
+        """Return an empty child-local tool instance.
+
+        Agent checkpoints, rather than a parent tool instance, carry scoped notes.
+        Keeping forks empty prevents a child from inheriting its parent's scratchpad.
+        """
+        return type(self)()
+
+    @staticmethod
+    def _entry_from_value(value: Mapping[str, Any]) -> NotepadEntry:
+        content = value.get("content", "")
+        category = value.get("category", "conclusion")
+        source = value.get("source", "")
+        timestamp = value.get("timestamp", time.time())
+        if not isinstance(content, str):
+            raise ValueError("notepad entry content must be a string")
+        if not isinstance(category, str):
+            raise ValueError("notepad entry category must be a string")
+        if not isinstance(source, str):
+            raise ValueError("notepad entry source must be a string")
+        if isinstance(timestamp, bool) or not isinstance(timestamp, (int, float)):
+            raise ValueError("notepad entry timestamp must be a finite number")
+        timestamp_value = float(timestamp)
+        if not math.isfinite(timestamp_value):
+            raise ValueError("notepad entry timestamp must be a finite number")
+        return NotepadEntry(
+            content=content,
+            category=category,
+            timestamp=timestamp_value,
+            source=source,
+        )
+
+    @classmethod
+    def _entries_from_snapshot(
+        cls,
+        entries: Iterable[Mapping[str, Any]],
+    ) -> list[NotepadEntry]:
+        return [cls._entry_from_value(value) for value in entries]
+
+    def _active_notes(self) -> list[NotepadEntry]:
+        bound = self._bound_notes.get()
+        return self._notes if bound is None else bound
+
+    @contextmanager
+    def bind_snapshot(
+        self,
+        entries: Iterable[Mapping[str, Any]],
+    ) -> Iterator[NotepadTool]:
+        """Temporarily bind one checkpoint-owned scratchpad to this async context.
+
+        The input is copied on entry. Mutations therefore remain local to the
+        current ContextVar scope until the caller explicitly checkpoints
+        :meth:`to_dict`. Outside a scope, the historical instance-local API is
+        unchanged for demos and direct callers.
+        """
+        token = self._bound_notes.set(self._entries_from_snapshot(entries))
+        try:
+            yield self
+        finally:
+            self._bound_notes.reset(token)
 
     def get_openai_tool_schema(self) -> dict:
         return {
@@ -135,7 +205,7 @@ class NotepadTool:
             确认信息。
         """
         entry = NotepadEntry(content=content, category=category, source=source)
-        self._notes.append(entry)
+        self._active_notes().append(entry)
         return f"[Notepad] Written ({category}): {content[:80]}{'...' if len(content) > 80 else ''}"
 
     async def read(self, category: str | None = None, max_entries: int = 10) -> str:
@@ -151,7 +221,7 @@ class NotepadTool:
         Returns:
             格式化的笔记列表。
         """
-        notes = self._notes
+        notes = self._active_notes()
         if category:
             notes = [n for n in notes if n.category == category]
 
@@ -175,7 +245,7 @@ class NotepadTool:
 
         """列出所有笔记类型及其数量。"""
         from collections import Counter
-        counts = Counter(n.category for n in self._notes)
+        counts = Counter(n.category for n in self._active_notes())
         if not counts:
             return "[Notepad] No notes."
         lines = ["=== Notepad Categories ==="]
@@ -193,13 +263,15 @@ class NotepadTool:
             category: 只清空指定类型。为 None 时清空全部。
         """
         if category is None:
-            count = len(self._notes)
-            self._notes.clear()
+            notes = self._active_notes()
+            count = len(notes)
+            notes.clear()
             return f"[Notepad] Cleared all {count} notes."
 
-        before = len(self._notes)
-        self._notes = [n for n in self._notes if n.category != category]
-        removed = before - len(self._notes)
+        notes = self._active_notes()
+        before = len(notes)
+        notes[:] = [n for n in notes if n.category != category]
+        removed = before - len(notes)
         return f"[Notepad] Cleared {removed} notes in category '{category}'."
 
     async def search(self, keyword: str, max_entries: int = 5) -> str:
@@ -212,7 +284,9 @@ class NotepadTool:
             keyword: 搜索关键词。
             max_entries: 最多返回多少条。
         """
-        matches = [n for n in self._notes if keyword.lower() in n.content.lower()]
+        matches = [
+            n for n in self._active_notes() if keyword.lower() in n.content.lower()
+        ]
         if not matches:
             return f"[Notepad] No notes matching '{keyword}'."
 
@@ -236,5 +310,5 @@ class NotepadTool:
                 "timestamp": n.timestamp,
                 "source": n.source,
             }
-            for n in self._notes
+            for n in self._active_notes()
         ]

@@ -46,6 +46,14 @@ research:
 chat:
   db_path: "data/chat.db"
 
+runtime:
+  # Workflow state/checkpoints and the thin registry share chat.db but use
+  # independent tables. These values control confirmation lifecycle only.
+  proposal_ttl_seconds: 86400
+  terminal_retention_seconds: 604800
+  lease_seconds: 60
+  sweep_interval_seconds: 5
+
 tools:
   enabled:
     - web_search

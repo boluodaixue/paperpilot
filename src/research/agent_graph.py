@@ -19,6 +19,7 @@ from langgraph.checkpoint.memory import InMemorySaver
 from langgraph.graph import END, START, StateGraph
 
 from ..tools.file_reader import FileReaderError
+from ..tools.notepad import NotepadTool
 from ..utils.tracing import trace_block, trace_context
 from .fork_policy import (
     FORK_TOOL_NAME,
@@ -54,6 +55,7 @@ class ResearchAgentState(TypedDict):
     identity: ExecutionIdentity
     limits: AgentLimits
     messages: list[dict[str, Any]]
+    notepad_entries: list[dict[str, Any]]
     iteration: int
     tool_calls_used: int
     pending_tool_calls: list[dict[str, Any]]
@@ -527,6 +529,7 @@ def create_research_agent_state(
         identity=identity,
         limits=limits,
         messages=[],
+        notepad_entries=[],
         iteration=0,
         tool_calls_used=0,
         pending_tool_calls=[],
@@ -785,124 +788,144 @@ def build_research_agent_graph(
         events = list(state["execution_events"])
         stop_reason = state["pending_stop_reason"]
 
-        for call in state["pending_tool_calls"]:
-            if (
-                local_tool_calls >= state["limits"].max_tool_calls
-                or total_tool_calls >= state["subtree_tool_budget"]
-            ):
-                stop_reason = "max_tool_calls_exhausted"
-                break
-            function = call["function"]
-            tool_name = str(function.get("name", ""))
-            raw_arguments = function.get("arguments", "{}")
-            if isinstance(raw_arguments, dict):
-                arguments = raw_arguments
-            else:
-                try:
-                    arguments = json.loads(str(raw_arguments or "{}"))
-                except json.JSONDecodeError:
-                    arguments = {}
-            if not isinstance(arguments, dict):
-                arguments = {}
+        notepad = tool_map.get("notepad")
+        notepad_scope = (
+            notepad.bind_snapshot(state.get("notepad_entries", []))
+            if isinstance(notepad, NotepadTool)
+            else None
+        )
 
-            tool = tool_map.get(tool_name)
-            result: Any
-            error: str | None = None
-            action_retries = 0
-            permanent_error = False
-            with trace_block(
-                f"research_agent.tool.{tool_name or 'unknown'}",
-                run_type="tool",
-                inputs={"tool": tool_name, **_identity_metadata(state["identity"])},
-                tags=["paperpilot", "research-agent", "tool"],
-            ) as observation:
-                while True:
-                    if _remaining_seconds(state) <= 0:
-                        error = "time budget exhausted"
-                        result = {"error": error}
-                        stop_reason = "time_budget_exhausted"
-                        break
-                    local_tool_calls += 1
-                    total_tool_calls += 1
-                    if tool is None:
-                        error = f"unknown tool: {tool_name}"
-                        result = {"error": error}
-                    else:
-                        try:
-                            execution = tool.execute(**arguments)
-                            if inspect.isawaitable(execution):
-                                result = await asyncio.wait_for(
-                                    execution,
-                                    timeout=max(0.001, _remaining_seconds(state)),
-                                )
-                            else:
-                                result = execution
-                            error = None
-                        except asyncio.CancelledError:
-                            raise
-                        except asyncio.TimeoutError:
+        def _checkpointed_notepad() -> list[dict[str, Any]]:
+            if isinstance(notepad, NotepadTool):
+                return notepad.to_dict()
+            return list(state.get("notepad_entries", []))
+
+        if notepad_scope is not None:
+            notepad_scope.__enter__()
+        try:
+            for call in state["pending_tool_calls"]:
+                if (
+                    local_tool_calls >= state["limits"].max_tool_calls
+                    or total_tool_calls >= state["subtree_tool_budget"]
+                ):
+                    stop_reason = "max_tool_calls_exhausted"
+                    break
+                function = call["function"]
+                tool_name = str(function.get("name", ""))
+                raw_arguments = function.get("arguments", "{}")
+                if isinstance(raw_arguments, dict):
+                    arguments = raw_arguments
+                else:
+                    try:
+                        arguments = json.loads(str(raw_arguments or "{}"))
+                    except json.JSONDecodeError:
+                        arguments = {}
+                if not isinstance(arguments, dict):
+                    arguments = {}
+
+                tool = tool_map.get(tool_name)
+                result: Any
+                error: str | None = None
+                action_retries = 0
+                permanent_error = False
+                with trace_block(
+                    f"research_agent.tool.{tool_name or 'unknown'}",
+                    run_type="tool",
+                    inputs={"tool": tool_name, **_identity_metadata(state["identity"])},
+                    tags=["paperpilot", "research-agent", "tool"],
+                ) as observation:
+                    while True:
+                        if _remaining_seconds(state) <= 0:
                             error = "time budget exhausted"
                             result = {"error": error}
                             stop_reason = "time_budget_exhausted"
-                        except FileReaderError as exc:
-                            error = str(exc)
+                            break
+                        local_tool_calls += 1
+                        total_tool_calls += 1
+                        if tool is None:
+                            error = f"unknown tool: {tool_name}"
                             result = {"error": error}
-                            permanent_error = True
-                        except Exception as exc:
-                            error = str(exc)
-                            result = {"error": error}
+                        else:
+                            try:
+                                execution = tool.execute(**arguments)
+                                if inspect.isawaitable(execution):
+                                    result = await asyncio.wait_for(
+                                        execution,
+                                        timeout=max(0.001, _remaining_seconds(state)),
+                                    )
+                                else:
+                                    result = execution
+                                error = None
+                            except asyncio.CancelledError:
+                                raise
+                            except asyncio.TimeoutError:
+                                error = "time budget exhausted"
+                                result = {"error": error}
+                                stop_reason = "time_budget_exhausted"
+                            except FileReaderError as exc:
+                                error = str(exc)
+                                result = {"error": error}
+                                permanent_error = True
+                            except Exception as exc:
+                                error = str(exc)
+                                result = {"error": error}
 
-                    retry_available = min(
-                        state["limits"].max_retries_per_action - action_retries,
-                        state["subtree_retry_budget"] - retries_used,
+                        retry_available = min(
+                            state["limits"].max_retries_per_action - action_retries,
+                            state["subtree_retry_budget"] - retries_used,
+                        )
+                        call_available = min(
+                            state["limits"].max_tool_calls - local_tool_calls,
+                            state["subtree_tool_budget"] - total_tool_calls,
+                        )
+                        if (
+                            error is None
+                            or permanent_error
+                            or stop_reason == "time_budget_exhausted"
+                        ):
+                            break
+                        if retry_available <= 0 or call_available <= 0:
+                            break
+                        action_retries += 1
+                        retries_used += 1
+
+                    if error:
+                        observation.set_error(error)
+                    else:
+                        observation.add_output({"ok": True, "retries": action_retries})
+
+                if error is None:
+                    collected.extend(_extract_evidence(tool_name, arguments, result))
+                events.append(
+                    _event(
+                        "tool_finished",
+                        state["identity"],
+                        tool=tool_name,
+                        ok=error is None,
+                        retries=action_retries,
                     )
-                    call_available = min(
-                        state["limits"].max_tool_calls - local_tool_calls,
-                        state["subtree_tool_budget"] - total_tool_calls,
-                    )
-                    if (
-                        error is None
-                        or permanent_error
-                        or stop_reason == "time_budget_exhausted"
-                    ):
-                        break
-                    if retry_available <= 0 or call_available <= 0:
-                        break
-                    action_retries += 1
-                    retries_used += 1
-
-                if error:
-                    observation.set_error(error)
-                else:
-                    observation.add_output({"ok": True, "retries": action_retries})
-
-            if error is None:
-                collected.extend(_extract_evidence(tool_name, arguments, result))
-            events.append(
-                _event(
-                    "tool_finished",
-                    state["identity"],
-                    tool=tool_name,
-                    ok=error is None,
-                    retries=action_retries,
                 )
-            )
-            new_messages.append(
-                {
-                    "role": "tool",
-                    "tool_call_id": call["id"],
-                    "name": tool_name,
-                    "content": _serialize_tool_result(
-                        result,
-                        state["limits"].max_tool_output_chars,
-                    ),
-                }
-            )
-            if stop_reason == "time_budget_exhausted":
-                break
+                new_messages.append(
+                    {
+                        "role": "tool",
+                        "tool_call_id": call["id"],
+                        "name": tool_name,
+                        "content": _serialize_tool_result(
+                            result,
+                            state["limits"].max_tool_output_chars,
+                        ),
+                    }
+                )
+                if stop_reason == "time_budget_exhausted":
+                    break
+            notepad_entries = _checkpointed_notepad()
+        finally:
+            if notepad_scope is not None:
+                notepad_scope.__exit__(None, None, None)
 
         return {
             "messages": [*state["messages"], *new_messages],
+            "notepad_entries": notepad_entries,
             "tool_calls_used": local_tool_calls,
             "total_tool_calls_used": total_tool_calls,
             "retries_used": retries_used,
