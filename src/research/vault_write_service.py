@@ -3,12 +3,14 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import re
+import shutil
 import threading
 import time
 import uuid
 from collections.abc import Mapping
-from pathlib import PurePosixPath
+from pathlib import Path, PurePosixPath
 from typing import Any
 
 from .memory import MarkdownMemoryStore, MemoryWriteConflictError
@@ -126,6 +128,8 @@ class VaultWriteService:
         coordination_interval_seconds: float = 0.1,
         wait_timeout_seconds: float = 300.0,
         startup_timeout_seconds: float = 60.0,
+        legacy_archive_root: str | os.PathLike[str] | None = None,
+        allow_legacy_copy_only: bool = False,
     ) -> None:
         if writer.queue is not queue:
             raise ValueError("Vault Writer and service must share one queue")
@@ -138,6 +142,10 @@ class VaultWriteService:
         self.coordination_interval_seconds = float(coordination_interval_seconds)
         self.wait_timeout_seconds = float(wait_timeout_seconds)
         self.startup_timeout_seconds = float(startup_timeout_seconds)
+        self.legacy_archive_root = (
+            None if legacy_archive_root is None else Path(legacy_archive_root).resolve(strict=False)
+        )
+        self.allow_legacy_copy_only = bool(allow_legacy_copy_only)
         if self.lease_seconds <= 0:
             raise ValueError("lease_seconds must be positive")
         if self.coordination_interval_seconds <= 0:
@@ -146,6 +154,164 @@ class VaultWriteService:
             raise ValueError("wait_timeout_seconds must be positive")
         if self.startup_timeout_seconds <= 0:
             raise ValueError("startup_timeout_seconds must be positive")
+
+    def _safe_archive_root(self) -> Path:
+        root = self.legacy_archive_root
+        if root is None:
+            raise ValueError(
+                "research.legacy_archive_root must be explicitly configured before legacy migration"
+            )
+        try:
+            resolved = root.resolve(strict=True)
+        except OSError as exc:
+            raise ValueError("configured legacy archive root must already exist") from exc
+        if not resolved.is_dir() or resolved.is_symlink():
+            raise ValueError("configured legacy archive root must be a real directory")
+        vault = self.memory_store.root.resolve(strict=True)
+        if resolved == vault or resolved.is_relative_to(vault):
+            raise ValueError("legacy archive root must be outside the active Vault")
+        current = resolved
+        while True:
+            if current.is_symlink() or bool(getattr(current.lstat(), "st_file_attributes", 0) & 0x400):
+                raise ValueError("legacy archive root cannot traverse a link or reparse point")
+            if current == current.parent:
+                break
+            current = current.parent
+        return resolved
+
+    def _legacy_archive_inventory(self) -> dict[str, str | None]:
+        inventory: dict[str, str | None] = {}
+        root = self.memory_store.root.resolve(strict=True)
+        for name in ("reports", "evidence", "sources"):
+            directory = root / name
+            if not directory.exists():
+                continue
+            if not directory.is_dir() or directory.is_symlink():
+                raise ValueError(f"legacy root is not a safe directory: {name}")
+            inventory[f"{name}/"] = None
+            for current_root, directories, files in os.walk(directory, followlinks=False):
+                current = Path(current_root)
+                for child in sorted(directories):
+                    path = current / child
+                    if path.is_symlink() or bool(getattr(path.lstat(), "st_file_attributes", 0) & 0x400):
+                        raise ValueError("legacy archive cannot contain linked entries")
+                    inventory[f"{path.relative_to(root).as_posix()}/"] = None
+                for child in sorted(files):
+                    path = current / child
+                    if path.is_symlink() or bool(getattr(path.lstat(), "st_file_attributes", 0) & 0x400):
+                        raise ValueError("legacy archive cannot contain linked entries")
+                    inventory[path.relative_to(root).as_posix()] = hashlib.sha256(
+                        path.read_bytes()
+                    ).hexdigest()
+        return dict(sorted(inventory.items()))
+
+    def prepare_legacy_memory_migration(
+        self,
+        title: str,
+        memory_id: str | None = None,
+    ) -> dict[str, object]:
+        """Add the S3 retirement impact and recoverable archive to W6 preview."""
+        if self.legacy_archive_root is None and self.allow_legacy_copy_only:
+            return self.memory_store.prepare_legacy_memory_migration(title, memory_id)
+        proposal = self.memory_store.prepare_legacy_memory_migration(title, memory_id)
+        files = proposal.get("files")
+        if not isinstance(files, tuple):
+            raise ValueError("legacy migration proposal files are invalid")
+        path_mapping = {
+            str(item["source_path"]): str(item["target_path"])
+            for item in files
+            if isinstance(item, Mapping)
+        }
+        dependencies = self.queue.legacy_dependencies(path_mapping)
+        if self.legacy_archive_root is None:
+            proposal["retirement"] = {
+                "affected_sessions": dependencies["sessions"],
+                "affected_manifests": dependencies["manifests"],
+                "archive_inventory": self._legacy_archive_inventory(),
+                "archive_target": None,
+                "blocked_reason": (
+                    "research.legacy_archive_root must be explicitly configured before confirmation"
+                ),
+                "dependency_hash": dependencies["dependency_hash"],
+                "path_mapping": path_mapping,
+            }
+            return proposal
+        archive_root = self._safe_archive_root()
+        archive_target = (
+            archive_root
+            / self.queue.vault_scope
+            / f"{proposal['target_memory_id']}-{proposal['proposal_id']}"
+        )
+        if archive_target.exists():
+            raise FileExistsError(f"legacy archive target already exists: {archive_target}")
+        proposal["retirement"] = {
+            "archive_target": str(archive_target),
+            "archive_inventory": self._legacy_archive_inventory(),
+            "affected_sessions": dependencies["sessions"],
+            "affected_manifests": dependencies["manifests"],
+            "dependency_hash": dependencies["dependency_hash"],
+            "path_mapping": path_mapping,
+        }
+        return proposal
+
+    def resolve_memory_path(self, relative_path: str) -> str:
+        return self.queue.resolve_legacy_path(relative_path) or relative_path
+
+    def prepare_legacy_archive_cleanup(self, migration_id: str) -> dict[str, object]:
+        """Return the exact external archive deletion list; never delete here."""
+        root = self._safe_archive_root()
+        target = Path(self.queue.legacy_archive_target(migration_id)).resolve(strict=True)
+        scope = (root / self.queue.vault_scope).resolve(strict=False)
+        if target.parent != scope or not target.is_dir() or target.is_symlink():
+            raise ValueError("legacy archive target is outside its configured scope")
+        metadata_path = target / ".paperpilot-archive.json"
+        metadata = metadata_path.read_bytes()
+        try:
+            decoded = json.loads(metadata.decode("utf-8"))
+        except (UnicodeError, json.JSONDecodeError) as exc:
+            raise ValueError("legacy archive metadata is invalid") from exc
+        if not isinstance(decoded, Mapping) or decoded.get("migration_id") != migration_id:
+            raise ValueError("legacy archive metadata identity does not match")
+        inventory: dict[str, str | None] = {}
+        for path in target.rglob("*"):
+            relative = path.relative_to(target).as_posix()
+            if path.is_symlink() or bool(getattr(path.lstat(), "st_file_attributes", 0) & 0x400):
+                raise ValueError("legacy archive cleanup cannot traverse linked entries")
+            inventory[relative + ("/" if path.is_dir() else "")] = (
+                None if path.is_dir() else hashlib.sha256(path.read_bytes()).hexdigest()
+            )
+        delete_paths = sorted(inventory, reverse=True)
+        delete_paths.append("./")
+        payload = {
+            "archive_target": str(target),
+            "delete_paths": delete_paths,
+            "metadata_hash": hashlib.sha256(metadata).hexdigest(),
+            "inventory": dict(sorted(inventory.items())),
+            "migration_id": migration_id,
+        }
+        token = hashlib.sha256(
+            json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
+        ).hexdigest()
+        return {**payload, "confirmation_token": token}
+
+    def delete_legacy_archive(
+        self,
+        migration_id: str,
+        *,
+        confirmation_token: str,
+    ) -> dict[str, object]:
+        """Permanently remove only an unchanged archive after a second confirmation."""
+        preview = self.prepare_legacy_archive_cleanup(migration_id)
+        if confirmation_token != preview["confirmation_token"]:
+            raise MemoryWriteConflictError("legacy archive cleanup preview changed")
+        target = Path(str(preview["archive_target"]))
+        shutil.rmtree(target)
+        return {
+            "status": "deleted",
+            "migration_id": migration_id,
+            "archive_target": str(target),
+            "deleted_paths": preview["delete_paths"],
+        }
 
     def _claim_writer(self) -> VaultWriterLease | None:
         return self.queue.claim_writer(

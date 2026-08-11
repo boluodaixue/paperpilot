@@ -266,7 +266,7 @@ async def _repl(args: argparse.Namespace) -> None:
             if command.startswith("migrate-legacy "):
                 try:
                     _, target_memory_id, title = query.split(None, 2)
-                    await run_legacy_migration_workflow(
+                    migration = await run_legacy_migration_workflow(
                         runtime,
                         target_memory_id,
                         title,
@@ -275,6 +275,8 @@ async def _repl(args: argparse.Namespace) -> None:
                         input_fn=input,
                         output_fn=print,
                     )
+                    if isinstance(migration, dict) and migration.get("retired"):
+                        selected_memory_id = str(migration["memory_id"])
                 except ValueError as exc:
                     print(
                         "Legacy migration failed: use "

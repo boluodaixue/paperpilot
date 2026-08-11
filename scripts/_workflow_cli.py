@@ -586,9 +586,10 @@ def confirm_legacy_memory_migration(
         raise ValueError("legacy migration proposal files are invalid")
     sections = [
         "\nLegacy Memory migration preview",
-        f"Source: {proposal.get('source_memory_id')} (kept read-only)",
+        f"Source: {proposal.get('source_memory_id')} (archived outside the active Vault after confirmation)",
         f"Target: {proposal.get('target_memory_id')}",
         f"Home: {proposal.get('home_path')}",
+        f"Retirement: {proposal.get('retirement')}",
         "",
         str(proposal.get("home_markdown") or ""),
     ]
@@ -603,14 +604,13 @@ def confirm_legacy_memory_migration(
             )
         )
     output_fn("\n".join(sections))
-    confirm = input_fn("Publish this exact managed copy? [y/N]: ").strip().lower()
+    confirm = input_fn("Publish and retire this exact legacy snapshot? [y/N]: ").strip().lower()
     if confirm not in {"y", "yes"}:
         output_fn("Migration proposal cancelled; the Vault was not changed.")
         return proposal
     descriptor = runtime.commit_legacy_memory_migration(proposal)
     output_fn(
-        f"Migrated to {descriptor.memory_id}. The legacy root remains read-only; "
-        "switch explicitly when ready."
+        f"Migrated to {descriptor.memory_id}. The legacy root was archived and current-version sessions were rebound."
     )
     return descriptor
 
@@ -829,9 +829,10 @@ async def _run_legacy_migration_workflow_unleased(
         raise ValueError("legacy migration proposal files are invalid")
     sections = [
         "\nLegacy Memory migration preview",
-        f"Source: {proposal.get('source_memory_id')} (kept read-only)",
+        f"Source: {proposal.get('source_memory_id')} (archived outside the active Vault after confirmation)",
         f"Target: {proposal.get('target_memory_id')}",
         f"Home: {proposal.get('home_path')}",
+        f"Retirement: {proposal.get('retirement')}",
         "",
         str(proposal.get("home_markdown") or ""),
     ]
@@ -847,7 +848,7 @@ async def _run_legacy_migration_workflow_unleased(
     action = (
         await _cli_input(
             input_fn,
-            "Publish this exact managed copy? [y/N]: ",
+            "Publish and retire this exact legacy snapshot? [y/N]: ",
             lease=lease,
         )
     ).strip().lower()
@@ -881,8 +882,7 @@ async def _run_legacy_migration_workflow_unleased(
         registry.append_event(workflow_id, "confirmed")
         registry.append_event(workflow_id, "completed")
     output_fn(
-        f"Migrated to {result['memory_id']}. The legacy root remains read-only; "
-        "switch explicitly when ready."
+        f"Migrated to {result['memory_id']}. The legacy root was archived and current-version sessions were rebound."
     )
     return result
 

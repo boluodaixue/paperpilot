@@ -412,9 +412,10 @@ async function openLegacyMigration() {
   currentLegacyMigrationProposal = proposal;
   bindCurrentSession(proposal.session_id, proposal.source_memory_id);
   const sections = [
-    `Source: ${proposal.source_memory_id}（保留只读）`,
+    `Source: ${proposal.source_memory_id}（确认后移出活动 Vault）`,
     `Target: ${proposal.target_memory_id}`,
     `Home: ${proposal.home_path}`,
+    `Archive: ${(proposal.retirement || {}).archive_target || ''}`,
     '', proposal.home_markdown || '',
   ];
   for (const file of proposal.files || []) {
@@ -460,7 +461,12 @@ async function confirmLegacyMigration() {
     $('legacyMigrationCard').hidden = true;
     $('legacyMigrationPreview').textContent = '';
     await loadMemories(sessionMemoryId);
-    alert(`迁移已发布到 ${result.memory_id}；当前会话仍绑定 ${sessionMemoryId}。`);
+    if (!result.switch_is_explicit) {
+      bindCurrentSession(result.session_id, result.memory_id);
+      alert(`迁移已发布到 ${result.memory_id}；legacy 内容已安全归档，会话已切换。`);
+    } else {
+      alert(`迁移副本已发布到 ${result.memory_id}；当前兼容调用未执行 legacy 退役。`);
+    }
   } finally {
     button.disabled = false;
   }
@@ -664,9 +670,10 @@ async function restoreMemoryWorkflows(sid) {
         };
         const proposal = interrupt.proposal;
         const sections = [
-          `Source: ${proposal.source_memory_id}（只读）`,
+          `Source: ${proposal.source_memory_id}（确认后移出活动 Vault）`,
           `Target: ${proposal.target_memory_id}`,
           `Home: ${proposal.home_path}`,
+          `Archive: ${(proposal.retirement || {}).archive_target || ''}`,
           '', proposal.home_markdown || '',
         ];
         for (const file of proposal.files || []) {

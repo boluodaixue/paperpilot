@@ -718,8 +718,15 @@ def build_legacy_migration_workflow(
         config: RunnableConfig,
     ) -> dict[str, Any]:
         _validate_state(state, config, workflow_type="legacy_migration")
-        proposal = memory_store.prepare_legacy_memory_migration(
-            state["title"], state["target_memory_id"]
+        proposal = (
+            vault_write_service.prepare_legacy_memory_migration(
+                state["title"], state["target_memory_id"]
+            )
+            if vault_write_service is not None
+            and hasattr(vault_write_service, "prepare_legacy_memory_migration")
+            else memory_store.prepare_legacy_memory_migration(
+                state["title"], state["target_memory_id"]
+            )
         )
         return {"proposal": proposal, "workflow_status": "waiting_confirmation"}
 
@@ -753,7 +760,11 @@ def build_legacy_migration_workflow(
             raise ValueError("legacy migration commit requires a confirmed proposal")
         proposal = _normalized_legacy_proposal(proposal)
         try:
-            result = _exact_legacy_result(memory_store, proposal)
+            result = (
+                None
+                if proposal.get("retirement") is not None
+                else _exact_legacy_result(memory_store, proposal)
+            )
             if result is None:
                 descriptor = (
                     vault_write_service.commit_legacy_memory_migration(
@@ -768,6 +779,7 @@ def build_legacy_migration_workflow(
                     "source_memory_id": LEGACY_MEMORY_ID,
                     "memory_id": descriptor.memory_id,
                     "descriptor": asdict(descriptor),
+                    "retired": proposal.get("retirement") is not None,
                 }
         except (MemoryWriteConflictError, FileExistsError, ValueError) as exc:
             return _failure(state, exc)

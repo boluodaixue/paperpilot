@@ -237,6 +237,25 @@ def vault_root_from_config(config: dict[str, Any]) -> Path:
     return path if path.is_absolute() else PROJECT_ROOT / path
 
 
+def _legacy_archive_root_from_config(config: dict[str, Any]) -> Path | None:
+    research = _research_config(config)
+    if "legacy_archive_root" not in research:
+        return None
+    configured = research["legacy_archive_root"]
+    try:
+        raw_path = os.fspath(configured)
+    except TypeError as exc:
+        raise ValueError(
+            "research.legacy_archive_root must be a non-empty path-like string"
+        ) from exc
+    if not isinstance(raw_path, str) or not raw_path.strip():
+        raise ValueError(
+            "research.legacy_archive_root must be a non-empty path-like string"
+        )
+    path = Path(raw_path)
+    return path if path.is_absolute() else PROJECT_ROOT / path
+
+
 def _report_review_enabled(config: dict[str, Any]) -> bool:
     research = _research_config(config)
     report_review = research.get("report_review", {})
@@ -301,10 +320,12 @@ def _build_vault_write_service(
         if queue.vault_scope != expected_scope:
             raise ValueError("Vault write queue scope does not match the Memory Store")
     lease_seconds = _runtime_setting(config, "lease_seconds", 60)
+    archive_root = _legacy_archive_root_from_config(config)
     writer = VaultWriter(
         memory_store.root,
         queue,
         job_lease_seconds=lease_seconds,
+        legacy_archive_root=archive_root,
     )
     return VaultWriteService(
         memory_store,
@@ -313,6 +334,10 @@ def _build_vault_write_service(
         lease_seconds=lease_seconds,
         coordination_interval_seconds=_runtime_setting(
             config, "writer_coordination_interval_seconds", 0.1
+        ),
+        legacy_archive_root=archive_root,
+        allow_legacy_copy_only=(
+            archive_root is None and write_db_path is None and write_queue is None
         ),
     )
 
@@ -834,7 +859,13 @@ class ResearchRuntime:
         )
 
     def read_memory(self, relative_path: str) -> str:
-        return self.memory_store.read_text(relative_path)
+        service = getattr(self, "vault_write_service", None)
+        resolved = (
+            service.resolve_memory_path(relative_path)
+            if service is not None
+            else relative_path
+        )
+        return self.memory_store.read_text(resolved)
 
     def create_memory(
         self,
@@ -895,9 +926,11 @@ class ResearchRuntime:
         with _memory_trace(
             "paperpilot.memory.legacy_migration.prepare", LEGACY_MEMORY_ID
         ) as observation:
-            proposal = self.memory_store.prepare_legacy_memory_migration(
-                title,
-                memory_id,
+            service = getattr(self, "vault_write_service", None)
+            proposal = (
+                service.prepare_legacy_memory_migration(title, memory_id)
+                if service is not None
+                else self.memory_store.prepare_legacy_memory_migration(title, memory_id)
             )
             files = proposal["files"]
             observation.add_output(
@@ -935,6 +968,20 @@ class ResearchRuntime:
                 }
             )
             return descriptor
+
+    def prepare_legacy_archive_cleanup(self, migration_id: str) -> dict[str, object]:
+        return self.vault_write_service.prepare_legacy_archive_cleanup(migration_id)
+
+    def delete_legacy_archive(
+        self,
+        migration_id: str,
+        *,
+        confirmation_token: str,
+    ) -> dict[str, object]:
+        return self.vault_write_service.delete_legacy_archive(
+            migration_id,
+            confirmation_token=confirmation_token,
+        )
 
     async def answer_memory(
         self,

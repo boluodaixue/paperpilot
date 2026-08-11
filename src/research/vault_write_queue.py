@@ -268,6 +268,20 @@ class VaultWriteQueue:
                             (lease_owner IS NOT NULL AND lease_until IS NOT NULL)
                         )
                     );
+
+                    CREATE TABLE IF NOT EXISTS legacy_path_mappings (
+                        vault_scope TEXT NOT NULL,
+                        migration_id TEXT NOT NULL,
+                        source_path TEXT NOT NULL,
+                        target_path TEXT NOT NULL,
+                        memory_id TEXT NOT NULL,
+                        archive_target TEXT NOT NULL,
+                        created_at REAL NOT NULL,
+                        PRIMARY KEY (vault_scope, source_path),
+                        UNIQUE (vault_scope, target_path)
+                    );
+                    CREATE INDEX IF NOT EXISTS idx_legacy_path_mappings_migration
+                        ON legacy_path_mappings(vault_scope, migration_id);
                     """
                 )
                 connection.execute(
@@ -277,6 +291,249 @@ class VaultWriteQueue:
                     (self.vault_scope,),
                 )
                 connection.commit()
+            finally:
+                connection.close()
+
+    @staticmethod
+    def _legacy_manifest_paths(content: str) -> tuple[str, ...]:
+        """Extract canonical path strings without treating Chat as knowledge."""
+        try:
+            pointer = json.loads(content)
+        except (TypeError, json.JSONDecodeError):
+            return ()
+        if not isinstance(pointer, Mapping):
+            return ()
+        manifest = pointer.get("manifest")
+        if not isinstance(manifest, Mapping):
+            return ()
+        values: list[str] = []
+        report = manifest.get("report_path")
+        if isinstance(report, str):
+            values.append(report)
+        for key in ("evidence_paths", "source_paths"):
+            paths = manifest.get(key, ())
+            if isinstance(paths, (list, tuple)):
+                values.extend(path for path in paths if isinstance(path, str))
+        return tuple(values)
+
+    def legacy_dependencies(
+        self,
+        source_paths: Mapping[str, str],
+    ) -> dict[str, object]:
+        """Snapshot affected sessions/manifests for an exact S3 preview."""
+        mapping = dict(source_paths)
+        if not mapping or any(not isinstance(key, str) or not isinstance(value, str) for key, value in mapping.items()):
+            raise ValueError("legacy path mapping must contain string paths")
+        with self._lock:
+            connection = self._connect()
+            try:
+                session_table = connection.execute(
+                    "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'session_meta'"
+                ).fetchone()
+                if session_table is None:
+                    raise RuntimeError("session_meta must exist before legacy retirement")
+                sessions = tuple(
+                    str(row[0])
+                    for row in connection.execute(
+                        "SELECT session_id FROM session_meta WHERE memory_id = ? ORDER BY session_id",
+                        ("M-legacy",),
+                    ).fetchall()
+                )
+                manifests: list[dict[str, object]] = []
+                message_table = connection.execute(
+                    "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'chat_messages'"
+                ).fetchone()
+                if message_table is not None:
+                    rows = connection.execute(
+                        "SELECT session_id, message_id, content FROM chat_messages "
+                        "WHERE kind = 'report' ORDER BY session_id, message_id"
+                    ).fetchall()
+                    for row in rows:
+                        paths = self._legacy_manifest_paths(str(row["content"]))
+                        affected = tuple(path for path in paths if path in mapping)
+                        if affected:
+                            manifests.append(
+                                {
+                                    "session_id": str(row["session_id"]),
+                                    "message_id": str(row["message_id"]),
+                                    "legacy_paths": list(affected),
+                                    "content_hash": hashlib.sha256(
+                                        str(row["content"]).encode("utf-8")
+                                    ).hexdigest(),
+                                }
+                            )
+                payload = {
+                    "sessions": list(sessions),
+                    "manifests": manifests,
+                }
+                digest = hashlib.sha256(
+                    json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
+                ).hexdigest()
+                return {**payload, "dependency_hash": digest}
+            finally:
+                connection.close()
+
+    def resolve_legacy_path(self, source_path: str) -> str | None:
+        """Resolve one historical pointer after S3 without rewriting Chat rows."""
+        if not isinstance(source_path, str) or not source_path:
+            raise ValueError("source_path must be a non-empty string")
+        with self._lock:
+            connection = self._connect()
+            try:
+                row = connection.execute(
+                    "SELECT target_path FROM legacy_path_mappings "
+                    "WHERE vault_scope = ? AND source_path = ?",
+                    (self.vault_scope, source_path),
+                ).fetchone()
+                return None if row is None else str(row["target_path"])
+            finally:
+                connection.close()
+
+    def legacy_archive_target(self, migration_id: str) -> str:
+        migration = _required_text(migration_id, field_name="migration_id")
+        with self._lock:
+            connection = self._connect()
+            try:
+                rows = connection.execute(
+                    "SELECT DISTINCT archive_target FROM legacy_path_mappings "
+                    "WHERE vault_scope = ? AND migration_id = ?",
+                    (self.vault_scope, migration),
+                ).fetchall()
+                if not rows:
+                    raise FileNotFoundError(f"legacy migration does not exist: {migration}")
+                if len(rows) != 1:
+                    raise RuntimeError("legacy migration has conflicting archive targets")
+                return str(rows[0]["archive_target"])
+            finally:
+                connection.close()
+
+    def legacy_retirement_complete(
+        self,
+        migration_id: str,
+        memory_id: str,
+        path_mapping: Mapping[str, str],
+    ) -> bool:
+        """Return whether mapping and every former legacy session converged."""
+        mapping = dict(path_mapping)
+        with self._lock:
+            connection = self._connect()
+            try:
+                rows = connection.execute(
+                    "SELECT source_path, target_path, memory_id FROM legacy_path_mappings "
+                    "WHERE vault_scope = ? AND migration_id = ? ORDER BY source_path",
+                    (self.vault_scope, migration_id),
+                ).fetchall()
+                stored = {str(row["source_path"]): str(row["target_path"]) for row in rows}
+                if stored != mapping or any(str(row["memory_id"]) != memory_id for row in rows):
+                    return False
+                remaining = connection.execute(
+                    "SELECT 1 FROM session_meta WHERE memory_id = 'M-legacy' LIMIT 1"
+                ).fetchone()
+                return remaining is None
+            finally:
+                connection.close()
+
+    def commit_legacy_switch(
+        self,
+        job_id: str,
+        lease: VaultWriterLease,
+        *,
+        migration_id: str,
+        memory_id: str,
+        archive_target: str,
+        path_mapping: Mapping[str, str],
+        expected_dependency_hash: str,
+        publish: Callable[[], _T],
+        now: float | None = None,
+    ) -> _T:
+        """Publish the managed tree and metadata at one fenced switch point.
+
+        SQLite changes stay invisible until the filesystem publication succeeds.
+        A process death after the rename but before COMMIT is recovered from the
+        immutable command and the already-published tree.
+        """
+        identity = _required_text(job_id, field_name="job_id")
+        migration = _required_text(migration_id, field_name="migration_id")
+        memory = _required_text(memory_id, field_name="memory_id")
+        archive = _required_text(archive_target, field_name="archive_target")
+        digest = _command_digest(expected_dependency_hash)
+        mapping = dict(path_mapping)
+        if not mapping or any(not isinstance(key, str) or not isinstance(value, str) for key, value in mapping.items()):
+            raise ValueError("legacy path mapping must contain string paths")
+        current = time.time() if now is None else _finite_time(now, field_name="now")
+        with self._lock:
+            connection = self._connect()
+            try:
+                connection.execute("BEGIN IMMEDIATE")
+                self._assert_fence_connection(connection, lease, job_id=identity, now=current)
+                existing = connection.execute(
+                    "SELECT source_path, target_path, memory_id, archive_target "
+                    "FROM legacy_path_mappings WHERE vault_scope = ? AND migration_id = ?",
+                    (self.vault_scope, migration),
+                ).fetchall()
+                if existing:
+                    stored = {str(row["source_path"]): str(row["target_path"]) for row in existing}
+                    if stored != mapping or any(
+                        str(row["memory_id"]) != memory or str(row["archive_target"]) != archive
+                        for row in existing
+                    ):
+                        raise RuntimeError("legacy migration mapping collision")
+                    connection.execute(
+                        "UPDATE session_meta SET memory_id = ?, updated_at = ? WHERE memory_id = 'M-legacy'",
+                        (memory, current),
+                    )
+                    result = publish()
+                    connection.commit()
+                    return result
+                sessions = [
+                    str(row[0])
+                    for row in connection.execute(
+                        "SELECT session_id FROM session_meta WHERE memory_id = ? ORDER BY session_id",
+                        ("M-legacy",),
+                    ).fetchall()
+                ]
+                manifests: list[dict[str, object]] = []
+                rows = connection.execute(
+                    "SELECT session_id, message_id, content FROM chat_messages "
+                    "WHERE kind = 'report' ORDER BY session_id, message_id"
+                ).fetchall()
+                for row in rows:
+                    paths = self._legacy_manifest_paths(str(row["content"]))
+                    affected = [path for path in paths if path in mapping]
+                    if affected:
+                        manifests.append(
+                            {
+                                "session_id": str(row["session_id"]),
+                                "message_id": str(row["message_id"]),
+                                "legacy_paths": affected,
+                                "content_hash": hashlib.sha256(
+                                    str(row["content"]).encode("utf-8")
+                                ).hexdigest(),
+                            }
+                        )
+                snapshot = {"sessions": sessions, "manifests": manifests}
+                observed = hashlib.sha256(
+                    json.dumps(snapshot, sort_keys=True, separators=(",", ":")).encode("utf-8")
+                ).hexdigest()
+                if observed != digest:
+                    raise RuntimeError("legacy sessions or manifests changed after preview")
+                for source, target in sorted(mapping.items()):
+                    connection.execute(
+                        "INSERT INTO legacy_path_mappings "
+                        "(vault_scope, migration_id, source_path, target_path, memory_id, archive_target, created_at) "
+                        "VALUES (?, ?, ?, ?, ?, ?, ?)",
+                        (self.vault_scope, migration, source, target, memory, archive, current),
+                    )
+                connection.execute(
+                    "UPDATE session_meta SET memory_id = ?, updated_at = ? WHERE memory_id = 'M-legacy'",
+                    (memory, current),
+                )
+                result = publish()
+                connection.commit()
+                return result
+            except Exception:
+                connection.rollback()
+                raise
             finally:
                 connection.close()
 
