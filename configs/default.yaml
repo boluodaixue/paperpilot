@@ -58,6 +58,9 @@ runtime:
   sweep_interval_seconds: 5
   # Polling interval used only while a caller waits for the durable Vault Writer.
   writer_coordination_interval_seconds: 0.1
+  # Disposable FTS5 derivative data; Markdown in the Vault remains authoritative.
+  retrieval_db_path: "data/retrieval.db"
+  retrieval_reconciliation_seconds: 300
 
 tools:
   enabled:

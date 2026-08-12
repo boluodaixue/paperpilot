@@ -393,4 +393,4 @@ S0 本地文件读取沙箱
 
 S1 的固定职责是：Workflow State 保存任务阶段、提案、确认和结果；Runtime Registry 只保存 session/task/thread 映射、恢复调度租约与必要事件，不能形成第二状态机。LangGraph 自定义类型的未来 serializer 警告明确延期，不在 S1 处理。
 
-S0–S3 已完成并通过专项与仓库全量回归，结果见 [S0 实施记录](S0_FILE_READER_SANDBOX.md)、[S1 实施记录](S1_PERSISTENT_WORKFLOW_STATE.md)、[S2 实施记录](S2_SINGLE_VAULT_WRITER.md)与 [S3 实施记录](S3_LEGACY_SAFE_RETIREMENT.md)。S4–S5 尚未开始；每阶段仍必须单独实现、验收、记录和提交，不得提前实现后续阶段。
+S0–S4 已完成并通过专项与仓库全量回归，结果见 [S0 实施记录](S0_FILE_READER_SANDBOX.md)、[S1 实施记录](S1_PERSISTENT_WORKFLOW_STATE.md)、[S2 实施记录](S2_SINGLE_VAULT_WRITER.md)、[S3 实施记录](S3_LEGACY_SAFE_RETIREMENT.md)与 [S4 实施记录](S4_PERSISTENT_FULL_TEXT_RETRIEVAL.md)。S5 尚未开始；每阶段仍必须单独实现、验收、记录和提交，不得提前实现后续阶段。
