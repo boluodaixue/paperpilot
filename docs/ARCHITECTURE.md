@@ -309,4 +309,4 @@ W6 的当前行为保持有效，直至对应 S 阶段通过验收。下一主�
 - S3 在显式确认、安全归档和历史路径映射后退役活动 Vault 中的 legacy 根文件，不再长期保留活动双份；
 - S4/S5 构建可从 Markdown 删除重建的 FTS5 与可选混合索引；索引不是第二知识真相源，也不得反向覆盖 Markdown。
 
-完整顺序、明确不做和验收标准见 [S 系列实施计划](S_PRODUCTION_HARDENING_AND_RETRIEVAL_PLAN.md)。S0–S4 已完成，详见 [S0 实施记录](S0_FILE_READER_SANDBOX.md)、[S1 实施记录](S1_PERSISTENT_WORKFLOW_STATE.md)、[S2 实施记录](S2_SINGLE_VAULT_WRITER.md)、[S3 实施记录](S3_LEGACY_SAFE_RETIREMENT.md)与 [S4 实施记录](S4_PERSISTENT_FULL_TEXT_RETRIEVAL.md)；S5 尚未开始。
+完整顺序、明确不做和验收标准见 [S 系列实施计划](S_PRODUCTION_HARDENING_AND_RETRIEVAL_PLAN.md)。S0–S5 已完成，详见 [S0 实施记录](S0_FILE_READER_SANDBOX.md)、[S1 实施记录](S1_PERSISTENT_WORKFLOW_STATE.md)、[S2 实施记录](S2_SINGLE_VAULT_WRITER.md)、[S3 实施记录](S3_LEGACY_SAFE_RETIREMENT.md)、[S4 实施记录](S4_PERSISTENT_FULL_TEXT_RETRIEVAL.md)与 [S5 实施记录](S5_OPTIONAL_SEMANTIC_HYBRID_RETRIEVAL.md)。

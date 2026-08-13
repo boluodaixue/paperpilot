@@ -83,7 +83,7 @@ Research FileReader 默认不可用。每次运行只授权当前 managed Memory
 
 ## 当前仓库状态
 
-N0–N6、W0–W6 与生产化 S0–S4 已完成。CLI、Web 和评测统一通过 `src/research/runtime.py` 进入同一个 Research Workflow；所有产品级 managed Vault 写入由持久队列和单一 Writer 发布；当前 Memory 检索由可删除重建的 SQLite FTS5 派生索引加速；旧 Orchestrator、Planner DAG、AgentPool、独立 Summarizer、Evidence Store/Graph 和旧实验体系已经退出代码库。
+N0–N6、W0–W6 与生产化 S0–S5 已完成。CLI、Web 和评测统一通过 `src/research/runtime.py` 进入同一个 Research Workflow；所有产品级 managed Vault 写入由持久队列和单一 Writer 发布；当前 Memory 检索由可删除重建的 SQLite FTS5 派生索引加速，并可显式开启本地多语言语义与 WikiLink 混合召回；旧 Orchestrator、Planner DAG、AgentPool、独立 Summarizer、Evidence Store/Graph 和旧实验体系已经退出代码库。
 
 目前已经具备：
 
@@ -98,7 +98,7 @@ N0–N6、W0–W6 与生产化 S0–S4 已完成。CLI、Web 和评测统一通�
 - N5 生产入口：CLI/Web 用户确认与恢复、SSE 事件回放、结构化评测结果和架构回归测试。
 - N6 可选报告审查：原报告持久化后的单次 Red/Blue、确定性动作重放、结构保护与失败降级，默认关闭。
 - W0–W6 LLM Wiki + Obsidian：长期多 Memory、Obsidian 打开、记忆辅助继续研究、当前 Memory 问答与受控笔记、PDF/文本/显式 URL 的受控导入，以及固定会话 Memory、legacy 只读迁移和离线评测。
-- S0–S1 生产化基础：文件读取默认拒绝并按当前 Memory 授权；产品工作流使用 `AsyncSqliteSaver`，重启后从 LangGraph State 恢复研究、笔记、导入与迁移确认，薄 Runtime Registry 只保存定位、租约和必要 outbox。
+- S0–S5 生产化与检索：文件读取默认拒绝并按当前 Memory 授权；产品工作流使用 `AsyncSqliteSaver`；单一 Writer 可恢复发布；legacy 安全退役；FTS5 持久索引可删除重建；可选本地多语言语义、关键词和 WikiLink 以确定性 RRF 融合，失败时降级到 S4。
 
 N6 已完成验收：关键专项与回归为 `65 passed, 1 warning`，全量回归为 `160 passed, 1 warning`；全量中的 warning 是既有 `StarletteDeprecationWarning`。
 
@@ -127,7 +127,10 @@ LLM Wiki + Obsidian 主线已完成：Obsidian 负责 Markdown 阅读、编辑�
 - [W6 实施记录](docs/W6_STABILIZATION_MIGRATION_AND_ENTRY.md)
 - [S0 实施记录](docs/S0_FILE_READER_SANDBOX.md)
 - [S1 实施记录](docs/S1_PERSISTENT_WORKFLOW_STATE.md)
-- [S0 实施记录](docs/S0_FILE_READER_SANDBOX.md)
+- [S2 实施记录](docs/S2_SINGLE_VAULT_WRITER.md)
+- [S3 实施记录](docs/S3_LEGACY_SAFE_RETIREMENT.md)
+- [S4 实施记录](docs/S4_PERSISTENT_FULL_TEXT_RETRIEVAL.md)
+- [S5 实施记录](docs/S5_OPTIONAL_SEMANTIC_HYBRID_RETRIEVAL.md)
 - [S0–S5 生产化与检索升级计划](docs/S_PRODUCTION_HARDENING_AND_RETRIEVAL_PLAN.md)
 
 W6 专项为 `39 passed, 1 warning`，原 N1–N6 回归为 `160 passed, 1 warning`，N1–N6 + W0–W5 前序集合为 `411 passed, 1 warning`，包含 W6 的仓库全量回归为 `450 passed, 1 warning`；固定离线 `memory_wiki` 评测为 `5/5 passed`。pytest warning 为既有 `StarletteDeprecationWarning`。
@@ -174,6 +177,8 @@ W6 会把每个 Web 会话永久绑定到第一次显式使用的 `memory_id`，
 S3 已将上述 W6 迁移语义升级为安全退役：产品运行必须显式配置位于 Vault 外且可恢复的 `research.legacy_archive_root`。预览会同时列出受影响会话、历史 manifest、完整旧→新路径映射和归档目标；确认后单一 Writer 发布 managed Memory、持久化旧指针映射、改绑所有当前版本 `M-legacy` 会话，并把根目录移出活动 Vault。旧 Chat 消息原文不改，当前版本读取时通过映射定位 managed Markdown。永久删除外部归档是另一个带完整删除清单和内容哈希令牌的明确动作，迁移确认本身不会删除归档。
 
 S4 将每次查询全量读取 Markdown 正文的检索实现替换为持久化 SQLite FTS5。索引按 Vault 和 `memory_id` 隔离，保存可丢弃的文档/有界分块、内容哈希、mtime、标题、frontmatter 文本和 WikiLink；查询前按 mtime/大小增量同步并周期全哈希 reconciliation，返回前再向真实 Markdown 复核路径归属和 SHA-256。索引默认位于 `runtime.retrieval_db_path`，不写入 Vault 或 `.obsidian/`，删除后会从 Markdown 自动重建。
+
+S5 可通过 `runtime.semantic_retrieval_enabled: true` 显式开启严格限于当前 Memory 的本地多语言语义召回。FTS、语义与 WikiLink 分别召回后以确定性 RRF 合并，embedding 按内容哈希和模型版本缓存在同一 Vault 外派生数据库；默认不下载模型或调用外部服务，模型缺失、失败或返回非法向量时自动降级到 S4 FTS5。默认配置保持语义检索关闭。
 
 ### 单次研究
 

@@ -6,7 +6,7 @@
 
 N0–N6 与 LLM Wiki + Obsidian 的 W0–W6 已完成并提交。CLI、Web 和评测继续进入同一个 Research Workflow；旧 Manager / Planner / DAG / AgentPool / Evidence Graph 链路已经删除。W6 只收口 Memory 入口、会话绑定、legacy 只读迁移、可观测性和固定离线评测，没有改变 Research AgentGraph、Research Workflow、fork、递归、checkpointer 或 N6 Red/Blue，也没有引入第二套知识存储。
 
-独立主线 S0–S5 已进入实施：S0 文件读取沙箱、S1 持久化工作流状态、S2 单一 Vault Writer、S3 Legacy 安全退役和 S4 持久化全文检索已完成。产品 Web/CLI 使用 `AsyncSqliteSaver`；所有 managed Vault 写入由唯一 Writer 可恢复发布；legacy 迁移后活动 Vault 只留 managed Memory。当前 Memory 查询改由 Vault 外的可删除 SQLite FTS5 派生索引召回，增量同步后仍对真实 Markdown 做最终哈希复核。S5 尚未开始。详细边界见 [S 系列实施计划](S_PRODUCTION_HARDENING_AND_RETRIEVAL_PLAN.md)。
+独立主线 S0–S5 已全部完成。产品 Web/CLI 使用 `AsyncSqliteSaver`；所有 managed Vault 写入由唯一 Writer 可恢复发布；legacy 迁移后活动 Vault 只留 managed Memory。当前 Memory 查询由 Vault 外可删除的 SQLite FTS5 索引召回，可显式开启本地多语言语义与 WikiLink 混合排序，最终仍对真实 Markdown 做路径与哈希复核。详细边界见 [S 系列实施计划](S_PRODUCTION_HARDENING_AND_RETRIEVAL_PLAN.md)。
 
 ## 进度
 
@@ -31,7 +31,7 @@ N0–N6 与 LLM Wiki + Obsidian 的 W0–W6 已完成并提交。CLI、Web 和�
 | S2 单一 Vault Writer | ✅ | 持久队列、唯一租约、幂等、同卷 staging/journal、崩溃恢复与外部编辑保护 |
 | S3 Legacy 安全退役 | ✅ | 活动 Vault 只留 managed Memory，历史指针映射、会话改绑与外部可恢复归档完成 |
 | S4 持久化全文检索 | ✅ | 可重建的 SQLite FTS5 文档/分块索引、增量同步、WikiLink 加权与返回前哈希复核 |
-| S5 可选语义与混合检索 | ⬜ | 未开始；严格 Memory 范围的关键词/语义/WikiLink 融合 |
+| S5 可选语义与混合检索 | ✅ | 当前 Memory 的本地多语言 embedding、确定性 RRF、WikiLink 融合与 S4 安全降级 |
 
 ## N0 已确定的架构决策
 
@@ -212,7 +212,7 @@ W5 没有实现 CLI 导入收口、legacy 迁移、文件树、内置阅读器�
 
 详见 [W6 实施记录](W6_STABILIZATION_MIGRATION_AND_ENTRY.md)。W0–W6 既定主线至此完成，没有开始计划外阶段。
 
-## S0–S4 已完成，S5 尚未开始
+## S0–S5 已完成
 
 - S0 已移除无限制 FileReader，以每次运行的虚拟根授权当前 managed Memory/受控上传；真实路径、文件身份、link/reparse/TOCTOU、类型、大小、读取和解码边界均已验收；
 - S1 使用 `AsyncSqliteSaver`，研究、笔记、导入和迁移确认进入 LangGraph State/interrupt；Runtime Registry 不复制工作流正文或状态；
@@ -223,9 +223,9 @@ W5 没有实现 CLI 导入收口、legacy 迁移、文件树、内置阅读器�
 - S2 专项 `116 passed, 1 skipped`，S0–S1 回归 `115 passed, 1 skipped`，N1–N6 回归 `105 passed`，W0–W6 回归 `290 passed`，仓库全量 `681 passed, 2 skipped`；
 - S3 在安全迁移、历史路径映射和外部可恢复归档完成后，从活动 Vault 退役 legacy 根目录；
 - S4 从 Markdown 增量构建可删除重建的 SQLite FTS5；
-- S5 在严格 Memory 范围内增加可选多语言 embedding 与混合排序。
+- S5 在严格 Memory 范围内增加默认关闭的本地多语言 embedding，以确定性 RRF 融合 FTS、语义与 WikiLink；模型缺失或失败时安全降级到 S4。
 
-执行与验收的唯一边界见 [S 系列生产化与检索升级实施计划](S_PRODUCTION_HARDENING_AND_RETRIEVAL_PLAN.md)。S0 结果见 [S0 实施记录](S0_FILE_READER_SANDBOX.md)，S1 结果见 [S1 实施记录](S1_PERSISTENT_WORKFLOW_STATE.md)，S2 结果见 [S2 实施记录](S2_SINGLE_VAULT_WRITER.md)，S3 结果见 [S3 实施记录](S3_LEGACY_SAFE_RETIREMENT.md)，S4 结果见 [S4 实施记录](S4_PERSISTENT_FULL_TEXT_RETRIEVAL.md)；当前没有开始 S5。
+执行与验收的唯一边界见 [S 系列生产化与检索升级实施计划](S_PRODUCTION_HARDENING_AND_RETRIEVAL_PLAN.md)。S0–S5 分别见各阶段实施记录，S5 结果见 [S5 实施记录](S5_OPTIONAL_SEMANTIC_HYBRID_RETRIEVAL.md)。S 系列至此完成。
 
 ## 历史基础
 
