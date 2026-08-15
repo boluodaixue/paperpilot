@@ -1,59 +1,74 @@
-# W0：Memory/Vault 契约与安全基础
+# Memory / Vault 契约
 
-## 状态
+## 设计目标
 
-已完成（2026-08-28）。W0 只建立长期 Memory 与 Vault 的最小契约，没有开始 W1 的多 Memory 研究写入。
+PaperPilot 使用一个 Markdown Vault 承载多个长期 Memory。契约必须让 PaperPilot、Obsidian、Chat 会话、LangGraph thread 和派生索引引用同一份知识，同时避免标题修改、路径拼接和跨 Memory 链接破坏身份。
 
-## 目标与边界
+## 长期身份
 
-W0 在不改变 Research AgentGraph、Research Workflow、fork policy、递归上限、checkpointer、Markdown Memory Store、Chat Store 和 N6 可选 Red/Blue 的前提下，定义长期 `memory_id`、Vault 根路径以及 Markdown/frontmatter/WikiLink 的安全边界。
+`memory_id` 使用稳定的 `M-<stable-id>`，不复用生命周期更短的 `session_id` 或 `thread_id`。规范目录只能由 ID 推导：
 
-本阶段没有新增服务、Repository、索引、Agent 角色或自动写入行为，也没有移动或改写既有 Memory 文件。
+```text
+Memories/M-<stable-id>/
+```
 
-## 已完成
+标题和文件名可以改变，但不能改变 `memory_id`。最小 `MemoryDescriptor` 只包含：
 
-- 新增 frozen `MemoryDescriptor`，且只包含 `memory_id`、`title`、`relative_path`、`created_at`、`updated_at`；
-- `memory_id` 使用独立的长期 `M-<stable-id>` 契约，不复用会话级 `session_id` 或执行级 `thread_id`；
-- Memory 的规范目录由 ID 确定为 `Memories/M-<stable-id>/`，标题变化不会改变 ID 或目录；
-- 重复 `memory_id`、非法 ID、非规范 descriptor 路径和时间倒序均由纯函数确定性拒绝；
-- PaperPilot 管理的 Markdown frontmatter 使用平面 YAML Properties，校验稳定 ID、Memory ID、类型、标题、带时区 ISO-8601 时间、来源、状态和字符串 tags；
-- Vault 路径只接受正斜杠分隔的相对 `.md` 路径，拒绝绝对路径、盘符/UNC、`.`、`..`、非 Markdown 后缀、控制字符、Windows ADS、设备名和尾随空格/点；
-- 路径解析以解析后的 Vault 根为边界，已有 symlink/junction 及其下尚不存在的目标都不能逃逸；
-- 新 WikiLink 使用无扩展名的 Vault 根相对完整路径 `Memories/M-.../...`，拒绝裸文件名、歧义路径、链接语法注入和不安全 Windows 路径组件；
-- 默认配置收敛为 `research.vault_root`；旧 `research.memory_root` 仍可读取，两者并存时新键优先；默认物理路径仍为项目下的 `memory/`；
-- 既有 Vault 根目录 `reports/`、`evidence/`、`sources/` 通过只读识别函数暴露为 legacy 布局；识别会忽略逃逸 Vault 的 symlink，不创建、移动或修改文件；
-- 现有 `MarkdownMemoryStore`、`MemoryManifest` 和根目录持久化路径保持不变，因此 N1–N6 调用者不需要迁移。
+- `memory_id`
+- `title`
+- `relative_path`
+- `created_at`
+- `updated_at`
 
-## 安全契约
+重复或非法 ID、非规范目录和时间倒序都会被确定性拒绝。
 
-### 身份与位置
+## Markdown 与 frontmatter
 
-`memory_id` 是长期身份，`relative_path` 只能是由该 ID 推导出的规范目录。标题和未来文件名可以改变，但不能反向生成或修改 `memory_id`。
+PaperPilot 管理的 Markdown 使用平面 YAML Properties。稳定 ID、Memory ID、文档类型、标题、带时区时间、状态、来源和字符串 tags 在写入前经过校验。
 
-### Frontmatter
+Markdown 正文是知识内容的唯一真相源。Chat Store 只保存消息和文件指针；SQLite 索引、embedding cache 和 Runtime Registry 都不能替代或反向覆盖 Markdown。
 
-W0 只定义并校验新 PaperPilot 管理笔记的 frontmatter。既有根目录报告仍按 legacy 只读兼容识别；W0 不在启动时重写旧 frontmatter。
+## 路径契约
 
-### 路径与链接
+Vault 路径只接受正斜杠分隔的相对路径，拒绝：
 
-路径解析与 WikiLink 校验都是无写入的纯契约。W0 没有创建 Memory/Home、写入多 Memory 子目录或扫描索引。调用方在后续阶段写入前仍必须使用这些校验，不能把 Obsidian URI 或用户输入直接当作文件路径。
+- 绝对路径、盘符和 UNC；
+- `.`、`..` 与控制字符；
+- Windows ADS、设备名和尾随空格/点；
+- 非预期文件后缀；
+- symlink、junction、reparse 或解析后逃逸 Vault 的路径。
 
-## 明确未实现
+调用方不能把 Obsidian URI、用户输入或模型文本直接当作文件系统路径。
 
-- W1：新建、列出或选择 Memory，以及把研究写入 `Memories/M-.../`；
-- W2：Obsidian URI、按钮、CLI 输出或前端改动；
-- W3：Memory 扫描、检索、索引、Research Brief 注入或继续研究；
-- W4：Memory 问答、保存为笔记、Home 更新或内容哈希并发控制；
-- W5：资料导入、附件或整理提案；
-- W6：迁移入口、迁移命令或默认产品闭环；
-- 数据库、向量索引、图数据库、第二套存储、新 Agent 角色或自动写入。
+## WikiLink 契约
 
-## 验收结果
+PaperPilot 生成的链接使用无扩展名的 Vault 根相对完整路径：
 
-- W0 专项：`80 passed`；
-- 原 N1–N6 回归：`160 passed, 1 warning`；
-- 包含 W0 的仓库全量回归：`240 passed, 1 warning`；
-- warning 仍是既有 `StarletteDeprecationWarning`；
-- `compileall`、导入检查和 `git diff --check` 通过。
+```markdown
+[[Memories/M-.../evidence/E-...]]
+```
 
-W0 正式完成。W1 尚未开始。
+裸文件名、歧义路径、跨 Memory 写入和 WikiLink 语法注入都被拒绝。报告链接证据，证据链接来源；Obsidian backlinks 提供反向关系，不建立独立 Evidence Graph。
+
+## 目录结构
+
+```text
+Memories/M-.../
+├── Home.md
+├── reports/
+├── evidence/
+├── sources/
+├── notes/
+├── imports/
+└── attachments/
+```
+
+创建 Memory、研究持久化、问答笔记和资料导入都复用同一套身份、路径、frontmatter 和 WikiLink 校验。
+
+## 关键不变量
+
+1. `memory_id` 决定规范目录，标题不能反向改变身份；
+2. 所有 managed 写入必须留在选定 Memory；
+3. 所有引用最终都能解析到真实 Vault 文件；
+4. 外部编辑不能被静默覆盖；
+5. 派生数据库可以删除，Markdown 仍能独立恢复知识和索引。

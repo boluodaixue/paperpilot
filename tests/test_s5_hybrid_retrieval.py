@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import hashlib
+import logging
 import sqlite3
 from pathlib import Path
 
@@ -91,7 +92,10 @@ def test_s5_wikilink_neighbor_is_fused_with_semantic_seed(tmp_path: Path) -> Non
     assert "Memories/M-links/notes/N-policy.md" in paths
 
 
-def test_s5_embedding_failure_has_identical_s4_fallback(tmp_path: Path) -> None:
+def test_s5_embedding_failure_has_identical_s4_fallback(
+    tmp_path: Path,
+    caplog,
+) -> None:
     vault = tmp_path / "Vault"
     store = MarkdownMemoryStore(vault)
     store.create_memory("Fallback", "M-fallback")
@@ -103,13 +107,16 @@ def test_s5_embedding_failure_has_identical_s4_fallback(tmp_path: Path) -> None:
     expected = MarkdownMemoryIndex(store, tmp_path / "fts.db").search(
         "M-fallback", "fallbackneedle"
     )
-    actual = MarkdownMemoryIndex(
-        store,
-        tmp_path / "hybrid.db",
-        embedding_provider=FixedMultilingualEmbeddings(fail=True),
-    ).search("M-fallback", "fallbackneedle")
+    with caplog.at_level(logging.WARNING, logger="src.research.retrieval"):
+        actual = MarkdownMemoryIndex(
+            store,
+            tmp_path / "hybrid.db",
+            embedding_provider=FixedMultilingualEmbeddings(fail=True),
+        ).search("M-fallback", "fallbackneedle")
 
     assert actual == expected
+    assert "using SQLite FTS5" in caplog.text
+    assert "RuntimeError" in caplog.text
 
 
 def test_s5_model_version_replaces_cache_and_stays_rebuildable(tmp_path: Path) -> None:
