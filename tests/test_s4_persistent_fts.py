@@ -12,7 +12,7 @@ from src.research import MarkdownMemoryIndex, MarkdownMemoryStore
 def _write(root: Path, relative: str, markdown: str) -> Path:
     target = root / relative
     target.parent.mkdir(parents=True, exist_ok=True)
-    target.write_text(markdown, encoding="utf-8")
+    target.write_bytes(markdown.encode("utf-8"))
     return target
 
 
@@ -118,9 +118,9 @@ def test_s4_strict_memory_scope_and_hash_revalidation(tmp_path: Path) -> None:
     ]
 
     before = alpha.stat()
-    replacement = "# Alpha\n\nDifferentterm.."
+    replacement = "# Alpha\n\nDifferentterm"
     assert len(replacement.encode("utf-8")) == before.st_size
-    alpha.write_text(replacement, encoding="utf-8")
+    alpha.write_bytes(replacement.encode("utf-8"))
     os.utime(alpha, ns=(before.st_atime_ns, before.st_mtime_ns))
     assert index.search("M-alpha", "scopedneedle") == ()
     assert index.search("M-alpha", "differentterm")[0].relative_path.endswith("N-alpha.md")
