@@ -14,11 +14,14 @@ HotpotQA 是一个经典的 multi-hop QA 数据集，要求模型通过多步推
 from __future__ import annotations
 
 import json
+import logging
 import os
 import random
 import re
 from collections import Counter
 from typing import Any
+
+logger = logging.getLogger(__name__)
 
 
 class HotpotQABenchmark:
@@ -35,9 +38,12 @@ class HotpotQABenchmark:
         "conclusion",
     )
     _EXCLUDED_SECTION_RE = re.compile(
-        r"^(?:sources?|references?|bibliography|参考文献|来源|证据(?:索引)?|evidence(?:\s+index)?)$",
+        r"^(?:research\s+brief|memory\s+context|sources?|references?|bibliography|"
+        r"参考文献|来源|证据(?:索引)?|evidence(?:\s+index)?|"
+        r"evidence-backed\s+details|unresolved|execution)$",
         re.IGNORECASE,
     )
+    _SEMANTIC_MODEL = "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2"
 
     # 内置小规模测试数据（当 HuggingFace 不可用时作为 fallback）
     _MOCK_DATA: list[dict[str, Any]] = [
@@ -53,14 +59,20 @@ class HotpotQABenchmark:
             "answer": "John Hopfield 和 Geoffrey Hinton，以神经网络和机器学习的基础性发现",
             "type": "bridge",
             "level": "medium",
-            "context": [["诺贝尔物理学奖", ["2024 年诺贝尔物理学奖授予机器学习领域。"]], ["Hinton", ["Geoffrey Hinton 是深度学习先驱。"]]],
+            "context": [
+                ["诺贝尔物理学奖", ["2024 年诺贝尔物理学奖授予机器学习领域。"]],
+                ["Hinton", ["Geoffrey Hinton 是深度学习先驱。"]],
+            ],
         },
         {
             "question": "OpenAI 的 GPT 系列模型和 Google 的 Gemini 模型分别由哪家公司开发？",
             "answer": "GPT 由 OpenAI 开发，Gemini 由 Google DeepMind 开发",
             "type": "comparison",
             "level": "easy",
-            "context": [["OpenAI", ["OpenAI 是人工智能研究公司。"]], ["Google", ["Google DeepMind 开发了 Gemini 模型。"]]],
+            "context": [
+                ["OpenAI", ["OpenAI 是人工智能研究公司。"]],
+                ["Google", ["Google DeepMind 开发了 Gemini 模型。"]],
+            ],
         },
         {
             "question": "NVIDIA 的 H100 芯片采用什么制程工艺，主要用于什么场景？",
@@ -74,7 +86,10 @@ class HotpotQABenchmark:
             "answer": "Vaswani 等人，2017 年",
             "type": "bridge",
             "level": "medium",
-            "context": [["Transformer", ["Transformer 架构发表于 2017 年。"]], ["Attention", ["Attention Is All You Need 由 Google 团队发表。"]]],
+            "context": [
+                ["Transformer", ["Transformer 架构发表于 2017 年。"]],
+                ["Attention", ["Attention Is All You Need 由 Google 团队发表。"]],
+            ],
         },
     ]
 
@@ -104,6 +119,7 @@ class HotpotQABenchmark:
             # 尝试通过 datasets 库加载（带 timeout 控制）
             try:
                 import os as _os
+
                 # 设置 HuggingFace 下载 timeout
                 _os.environ.setdefault("HF_HUB_DOWNLOAD_TIMEOUT", "30")
                 from datasets import load_dataset
@@ -151,20 +167,29 @@ class HotpotQABenchmark:
             "level": sample.get("level", "medium"),  # easy / medium / hard
         }
 
-    def get_samples(self, n: int | None = None, shuffle: bool = False) -> list[dict[str, Any]]:
+    def get_samples(
+        self,
+        n: int | None = None,
+        shuffle: bool = False,
+        seed: int | None = None,
+    ) -> list[dict[str, Any]]:
         """
         获取转换后的样本列表。
 
         Args:
             n: 返回前 n 条样本，None 表示全部。
             shuffle: 是否随机打乱顺序。
+            seed: 打乱随机种子。指定后相同数据集会得到相同顺序。
 
         Returns:
             转换后的样本列表。
         """
         samples = [self.to_research_format(s) for s in self.data]
         if shuffle:
-            random.shuffle(samples)
+            if seed is None:
+                random.shuffle(samples)
+            else:
+                random.Random(seed).shuffle(samples)
         if n is not None:
             samples = samples[:n]
         return samples
@@ -182,6 +207,12 @@ class HotpotQABenchmark:
         return text
 
     @staticmethod
+    def answer_tokens(text: str) -> list[str]:
+        """Tokenize English by word and Chinese by character for QA F1."""
+        normalized = HotpotQABenchmark.normalize_answer(text)
+        return re.findall(r"[a-z0-9]+|[\u3400-\u4dbf\u4e00-\u9fff]", normalized)
+
+    @staticmethod
     def exact_match(pred: str, gold: str) -> bool:
         """计算标准化后的精确匹配。"""
         return HotpotQABenchmark.normalize_answer(pred) == HotpotQABenchmark.normalize_answer(gold)
@@ -189,8 +220,8 @@ class HotpotQABenchmark:
     @staticmethod
     def f1_score(pred: str, gold: str) -> float:
         """计算 token-level F1 分数。"""
-        pred_tokens = HotpotQABenchmark.normalize_answer(pred).split()
-        gold_tokens = HotpotQABenchmark.normalize_answer(gold).split()
+        pred_tokens = HotpotQABenchmark.answer_tokens(pred)
+        gold_tokens = HotpotQABenchmark.answer_tokens(gold)
 
         if not pred_tokens and not gold_tokens:
             return 1.0
@@ -300,6 +331,13 @@ class HotpotQABenchmark:
                 if line.strip() == "---":
                     lines = lines[index + 1 :]
                     break
+        # Evaluation-only output instructions are appended to the question and
+        # therefore appear between the H1 title and PaperPilot's Research Brief.
+        # They are metadata, never an answer candidate.
+        for index, line in enumerate(lines):
+            if re.match(r"^\s*#{2,6}\s+research\s+brief\s*$", line, re.IGNORECASE):
+                lines = lines[index:]
+                break
         in_excluded_section = False
         for index, line in enumerate(lines):
             heading_match = re.match(r"^\s*#{1,6}\s+(.+?)\s*$", line)
@@ -381,8 +419,28 @@ class HotpotQABenchmark:
         if not gold_answer or not report:
             return 0.0
 
-        stopwords = {"a", "an", "the", "and", "or", "in", "on", "at", "to", "of", "for", "with", "is", "was", "are", "were", "be", "been", "by"}
-        gold_tokens = [t for t in HotpotQABenchmark.normalize_answer(gold_answer).split() if t not in stopwords and len(t) > 1]
+        stopwords = {
+            "a",
+            "an",
+            "the",
+            "and",
+            "or",
+            "in",
+            "on",
+            "at",
+            "to",
+            "of",
+            "for",
+            "with",
+            "is",
+            "was",
+            "are",
+            "were",
+            "be",
+            "been",
+            "by",
+        }
+        gold_tokens = [token for token in HotpotQABenchmark.answer_tokens(gold_answer) if token not in stopwords]
         if not gold_tokens:
             return 0.0
 
@@ -405,7 +463,19 @@ class HotpotQABenchmark:
         from evaluation.embedder import Embedder
         import numpy as np
 
-        embedder = Embedder()
+        # HotpotQA is English while PaperPilot also ships Chinese mock cases.
+        # Use one multilingual model so the same metric is meaningful for both.
+        embedder = Embedder(
+            model_name=HotpotQABenchmark._SEMANTIC_MODEL,
+            local_files_only=True,
+        )
+        if not embedder.is_available:
+            logger.warning(
+                "Multilingual evaluation model is unavailable; falling back " "to the default cached embedder"
+            )
+            embedder = Embedder(local_files_only=True)
+            if not embedder.is_available:
+                return 0.0
         gold_emb = np.array(embedder.encode(gold_answer))
 
         # 把报告拆成 chunk，分别和 gold_answer 比
@@ -413,10 +483,7 @@ class HotpotQABenchmark:
         if not chunks:
             return 0.0
 
-        try:
-            chunk_embs = np.array(embedder._load_model().encode(chunks, normalize_embeddings=True))
-        except Exception:
-            chunk_embs = np.array([embedder.encode(c) for c in chunks])
+        chunk_embs = np.array(embedder.encode_batch(chunks))
 
         sims = chunk_embs.dot(gold_emb)
         # 返回超过阈值的 chunk 比例（衡量报告中有多少段落和答案语义相关）
@@ -488,7 +555,7 @@ class HotpotQABenchmark:
             # 深度研究指标（如果提供了完整报告）
             report = item.get("report", "")
             if report:
-                depth_metrics = self.evaluate_report(report, gold)
+                depth_metrics = item.get("depth_metrics") or self.evaluate_report(report, gold)
                 entity_cov_sum += depth_metrics["gold_entity_coverage"]
                 sem_cov_sum += depth_metrics["semantic_gold_coverage"]
 

@@ -2,7 +2,7 @@
 评测 Embedder：文本向量化封装
 
 设计决策：
-1. 主模型使用 all-MiniLM-L6-v2（轻量、384维、效果足够）
+1. 默认模型使用 all-MiniLM-L6-v2（轻量、384维、效果足够）
 2. 提供 graceful fallback：当 sentence-transformers 未安装时，
    返回 deterministic random embedding（基于文本hash），确保测试可复现
 3. 单例模型加载 + lazy init，避免重复初始化开销
@@ -27,30 +27,36 @@ logger = logging.getLogger(__name__)
 # 尝试导入 sentence-transformers，未安装时标记
 try:
     from sentence_transformers import SentenceTransformer
+
     _SENTENCE_TRANSFORMERS_AVAILABLE = True
 except ImportError:
     _SENTENCE_TRANSFORMERS_AVAILABLE = False
-    logger.warning(
-        "sentence-transformers not installed. Embedder will use deterministic random fallback."
-    )
+    logger.warning("sentence-transformers not installed. Embedder will use deterministic random fallback.")
 
 
 class Embedder:
     """文本向量化器，封装 sentence-transformers 并提供 fallback。"""
 
-    # 类级别缓存：避免重复加载模型
-    _model_instance: Optional[object] = None
+    # 按模型名缓存，避免先加载英文模型后错误复用于多语言评测。
+    _model_instances: dict[tuple[str, bool], object] = {}
     _model_name: str = "sentence-transformers/all-MiniLM-L6-v2"
     _embedding_dim: int = 384  # all-MiniLM-L6-v2 输出维度
 
-    def __init__(self, model_name: Optional[str] = None) -> None:
+    def __init__(
+        self,
+        model_name: Optional[str] = None,
+        *,
+        local_files_only: bool = False,
+    ) -> None:
         """
         初始化 Embedder。
 
         Args:
             model_name: 指定 sentence-transformers 模型名，None 使用默认 all-MiniLM-L6-v2
+            local_files_only: 只使用本地缓存，禁止评测时隐式下载模型。
         """
         self.model_name = model_name or self._model_name
+        self.local_files_only = local_files_only
         self._model: Optional[object] = None
         self._available = _SENTENCE_TRANSFORMERS_AVAILABLE
 
@@ -61,12 +67,16 @@ class Embedder:
         if self._model is not None:
             return self._model
         # 尝试加载类缓存
-        if Embedder._model_instance is not None:
-            self._model = Embedder._model_instance
+        cache_key = (self.model_name, self.local_files_only)
+        if cache_key in Embedder._model_instances:
+            self._model = Embedder._model_instances[cache_key]
             return self._model
         try:
-            Embedder._model_instance = SentenceTransformer(self.model_name)
-            self._model = Embedder._model_instance
+            self._model = SentenceTransformer(
+                self.model_name,
+                local_files_only=self.local_files_only,
+            )
+            Embedder._model_instances[cache_key] = self._model
             logger.info(f"Loaded embedding model: {self.model_name}")
         except Exception as e:
             logger.error(f"Failed to load embedding model: {e}")
