@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import pytest
 
+from src.evidence.graph import EvidenceGraph
 from src.evidence.store import EvidenceStore
 from src.memory.embedder import Embedder
 from src.orchestrator.orchestrator import Orchestrator
@@ -94,3 +95,61 @@ async def test_extract_evidence_extractor_raises(tmp_path):
     # 不应抛出
     await orch._extract_evidence()
     assert store.count() == 0
+
+
+@pytest.mark.asyncio
+async def test_extract_evidence_builds_graph(tmp_path):
+    """证据提取同时构建 Evidence Graph 的结构边。"""
+
+    class StubExtractor2:
+        max_papers_per_result = 3
+
+        async def extract_from_paper(self, paper, query):
+            return [{"claim": f"Claim from {paper['id']}", "evidence_text": "quote", "confidence": 0.9}]
+
+    store = EvidenceStore(db_path=str(tmp_path / "e.db"), session_id="graph-hook")
+    graph = EvidenceGraph(
+        db_path=str(tmp_path / "e.db"),
+        session_id=store.session_id,
+    )
+    orch = Orchestrator(
+        planner=None,
+        agent_pool=None,
+        evidence_extractor=StubExtractor2(),
+        evidence_store=store,
+        evidence_graph=graph,
+    )
+    orch._query = "graph hook query"
+    orch._results = [
+        _result("t1", AgentStatus.SUCCESS, [_paper("p1"), _paper("p2")]),
+    ]
+    await orch._extract_evidence()
+
+    stats = graph.graph_stats()
+    assert stats["nodes"]["evidence"] == 2
+    assert stats["nodes"]["paper"] == 2
+    assert stats["edges"]["SOURCED_FROM"] == 2
+    assert stats["edges"]["ANSWERS"] == 2
+
+
+@pytest.mark.asyncio
+async def test_extract_evidence_graph_raises_does_not_break(tmp_path):
+    """graph.add_evidence 抛异常时主流程不受影响。"""
+
+    class BoomGraph:
+        def add_evidence(self, ev, evidence_id=None):
+            raise RuntimeError("graph boom")
+
+    store = EvidenceStore(db_path=str(tmp_path / "e.db"), session_id="hook-test")
+    orch = Orchestrator(
+        planner=None,
+        agent_pool=None,
+        evidence_extractor=StubExtractor(),
+        evidence_store=store,
+        evidence_graph=BoomGraph(),
+    )
+    orch._query = "q"
+    orch._results = [_result("t1", AgentStatus.SUCCESS, [_paper("p1")])]
+    await orch._extract_evidence()
+    # 证据本身照常入库，图异常被吞掉
+    assert store.count() == 2

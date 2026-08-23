@@ -47,6 +47,8 @@ class SummarizerAgent(BaseAgent):
         query = context.get("query", "")
         results: list[AgentResult] = context.get("results", [])
         evidence: list = context.get("evidence", [])
+        evidence_relations: list = context.get("evidence_relations", [])
+        evidence_relations_supports: list = context.get("evidence_relations_supports", [])
 
         if not results:
             report = ResearchReport(
@@ -64,7 +66,9 @@ class SummarizerAgent(BaseAgent):
             )
 
         # 构建 synthesis prompt
-        prompt = self._build_synthesis_prompt(query, results, evidence)
+        prompt = self._build_synthesis_prompt(
+            query, results, evidence, evidence_relations, evidence_relations_supports
+        )
         messages = [
             {"role": "system", "content": self._system_prompt()},
             {"role": "user", "content": prompt},
@@ -90,7 +94,7 @@ class SummarizerAgent(BaseAgent):
         token_usage = len(content) // 3  # 简化估算
 
         # 解析报告内容，提取来源和置信度
-        report = self._parse_report(query, content, results, evidence)
+        report = self._parse_report(query, content, results, evidence, evidence_relations)
 
         return AgentResult(
             task_id=task.task_id,
@@ -113,11 +117,18 @@ class SummarizerAgent(BaseAgent):
         )
 
     def _build_synthesis_prompt(
-        self, query: str, results: list[AgentResult], evidence: list | None = None
+        self,
+        query: str,
+        results: list[AgentResult],
+        evidence: list | None = None,
+        evidence_relations: list | None = None,
+        evidence_relations_supports: list | None = None,
     ) -> str:
-        """构建 synthesis prompt，按置信度降序排列结果，并注入证据条目。"""
+        """构建 synthesis prompt，按置信度降序排列结果，并注入证据与关系。"""
         sorted_results = sorted(results, key=lambda r: r.confidence, reverse=True)
         evidence = evidence or []
+        evidence_relations = evidence_relations or []
+        evidence_relations_supports = evidence_relations_supports or []
 
         parts = [
             f"# Research Question\n{query}\n",
@@ -136,6 +147,25 @@ class SummarizerAgent(BaseAgent):
             for ev in evidence:
                 parts.append(f"- [{ev.evidence_id}] {ev.claim} — ({ev.paper_title})")
 
+        if evidence_relations:
+            parts.append("\n# Known Contradictions (resolve these)\n")
+            for r in evidence_relations:
+                parts.append(
+                    f"- [{r.get('source_id')}] vs [{r.get('target_id')}] "
+                    f"(weight {r.get('weight', 0):.2f}): {r.get('source_claim', '')} — "
+                    f"{r.get('target_claim', '')} ({r.get('source_paper', '')} vs "
+                    f"{r.get('target_paper', '')})"
+                )
+
+        if evidence_relations_supports:
+            parts.append("\n# Supporting Relations\n")
+            for r in evidence_relations_supports:
+                parts.append(
+                    f"- [{r.get('source_id')}] SUPPORTS [{r.get('target_id')}] "
+                    f"(weight {r.get('weight', 0):.2f}): {r.get('source_claim', '')} — "
+                    f"{r.get('target_claim', '')}"
+                )
+
         parts.append(
             "\n# Instructions\n"
             "1. Directly write the synthesized report based on the findings above. Do NOT say 'I will synthesize'.\n"
@@ -145,7 +175,9 @@ class SummarizerAgent(BaseAgent):
             "5. Explicitly list all sources cited.\n"
             "6. End with: Overall Confidence: X.XX\n"
             "7. When a statement is supported by one of the Evidence Items above, "
-            "cite it inline as [E-<id>] immediately after that sentence."
+            "cite it inline as [E-<id>] immediately after that sentence.\n"
+            "8. Explicitly address every item in Known Contradictions: for each, state which "
+            "side is better supported by the evidence and why."
         )
         return "\n".join(parts)
 
@@ -155,9 +187,11 @@ class SummarizerAgent(BaseAgent):
         content: str,
         results: list[AgentResult],
         evidence: list | None = None,
+        evidence_relations: list | None = None,
     ) -> ResearchReport:
         """从 LLM 输出中解析 ResearchReport，并基于子任务成功率校准置信度。"""
         evidence = evidence or []
+        evidence_relations = evidence_relations or []
         # 1. 从文本中提取 LLM 自评置信度
         llm_confidence = 0.5
         m = re.search(r"[Oo]verall\s+[Cc]onfidence[:\s]+(0\.\d+|1\.0|1)", content)
@@ -226,4 +260,5 @@ class SummarizerAgent(BaseAgent):
             confidence=confidence,
             num_searches=num_searches,
             evidence=[ev.to_report_dict() for ev in evidence],
+            evidence_relations=[dict(r) for r in evidence_relations],
         )
