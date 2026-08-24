@@ -6,6 +6,8 @@ import pytest
 
 from evaluation.benchmarks.hotpotqa import HotpotQABenchmark
 from scripts.run_eval import (
+    configured_tool_budget,
+    evaluation_config_with_tool_budget,
     evaluate_hotpotqa,
     extract_grounded_hotpotqa_answer,
     smoke_evaluation_config,
@@ -137,6 +139,28 @@ def test_smoke_limits_are_explicit_and_do_not_mutate_default_config() -> None:
         "max_retries_per_action": 1,
         "max_total_retries": 1,
     }
+
+
+def test_evaluation_tool_budget_override_is_recordable_and_non_mutating() -> None:
+    config = {"research": {"limits": {"max_total_tool_calls": 36}}}
+
+    evaluation = evaluation_config_with_tool_budget(config, 84)
+
+    assert configured_tool_budget(config) == 36
+    assert configured_tool_budget(evaluation) == 84
+    assert config["research"]["limits"]["max_total_tool_calls"] == 36
+
+
+def test_research_bench_fixed_ids_and_stratified_selection() -> None:
+    from evaluation.benchmarks.research_bench import ResearchBench
+
+    benchmark = ResearchBench()
+
+    fixed = benchmark.get_questions(question_ids=["fin_001", "tech_001", "med_001"])
+    stratified = benchmark.get_questions(n=11, stratified=True)
+
+    assert [question["id"] for question in fixed] == ["fin_001", "tech_001", "med_001"]
+    assert len({question["domain"] for question in stratified}) == 11
 
 
 def test_evaluate_reuses_precomputed_depth_metrics() -> None:
