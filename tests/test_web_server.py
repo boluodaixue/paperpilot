@@ -20,6 +20,7 @@ def client(tmp_path, monkeypatch) -> TestClient:
     # 指向临时数据库，避免触碰真实 data/memory.db
     db = str(tmp_path / "test.db")
     monkeypatch.setattr(server, "DB_PATH", db)
+    server.get_chat_store._store = None  # 重置 ChatStore 缓存，指向新 db
     return TestClient(server.app)
 
 
@@ -91,3 +92,92 @@ def test_task_result_not_found(client):
 def test_session_graph_not_found(client):
     r = client.get("/api/sessions/no-such-session/graph")
     assert r.status_code == 404
+
+
+# ---------------------------------------------------------------------------
+# 澄清 / 会话消息 / 报告落盘
+# ---------------------------------------------------------------------------
+
+def _stub_policy(json_str: str):
+    class P:
+        def __call__(self, messages):
+            return {"content": json_str}
+    return P()
+
+
+def test_clarify_confirm_writes_proposal(client, monkeypatch):
+    monkeypatch.setattr(
+        server, "_get_clarifier_policy",
+        lambda: _stub_policy(
+            '{"action":"confirm","plan":{"topic":"T","scope":"S","angle":"A",'
+            '"depth":"D","focus_areas":["x","y"]},"research_query":"final query"}'
+        ),
+    )
+    r = client.post("/api/clarify", json={"message": "研究transformer"})
+    assert r.status_code == 200
+    data = r.json()
+    assert data["action"] == "confirm"
+    assert data["session_id"].startswith("web-")
+    assert data["research_query"] == "final query"
+    assert data["plan"]["focus_areas"] == ["x", "y"]
+
+    msgs = client.get(f"/api/sessions/{data['session_id']}/messages").json()
+    assert [m["kind"] for m in msgs] == ["chat", "proposal"]
+    assert msgs[0]["role"] == "user"
+    assert msgs[1]["role"] == "assistant"
+
+
+def test_clarify_ask_stores_question(client, monkeypatch):
+    monkeypatch.setattr(
+        server, "_get_clarifier_policy",
+        lambda: _stub_policy('{"action":"ask","question":"想侧重哪个阶段？"}'),
+    )
+    r = client.post("/api/clarify", json={"session_id": "s1", "message": "研究transformer"})
+    assert r.status_code == 200
+    assert r.json()["action"] == "ask"
+    msgs = client.get("/api/sessions/s1/messages").json()
+    assert msgs[-1]["role"] == "assistant"
+    assert "阶段" in msgs[-1]["content"]
+
+
+def test_sessions_list_uses_chat_title(client):
+    r = client.post("/api/clarify", json={"message": "这是第一条会话消息"})
+    sid = r.json()["session_id"]
+    sessions = client.get("/api/sessions").json()
+    titles = {s["session_id"]: s.get("title", "") for s in sessions}
+    assert sid in titles
+    assert titles[sid].startswith("这是第一条会话消息")
+
+
+def test_session_evidence_endpoint_empty_ok(client):
+    r = client.get("/api/sessions/nonexistent/evidence")
+    assert r.status_code == 200
+    data = r.json()
+    assert data["evidence"] == []
+    assert data["evidence_relations"] == []
+
+
+def test_research_persists_report_to_chat(tmp_path, monkeypatch):
+    """研究完成后报告以 kind='report' 落盘 chat_messages。"""
+    import asyncio
+
+    from web.server import ResearchTask
+
+    monkeypatch.setattr(server, "DB_PATH", str(tmp_path / "t.db"))
+    server.get_chat_store._store = None
+
+    async def fake_run_research(query, config, modules, progress_callback=None):
+        return "# 报告正文"
+
+    def fake_initialize(config, session_id=""):
+        return {}  # initialize_modules 是同步函数
+
+    monkeypatch.setattr("src.core.runner.run_research", fake_run_research)
+    monkeypatch.setattr("src.core.runner.initialize_modules", fake_initialize)
+
+    task = ResearchTask("tid", "sess-x", "q")
+    asyncio.run(server._run_research_task(task))
+    assert task.status == "done"
+    msgs = server.get_chat_store().get_messages("sess-x")
+    assert msgs[-1]["kind"] == "report"
+    assert "报告正文" in msgs[-1]["content"]
