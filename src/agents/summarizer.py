@@ -49,6 +49,7 @@ class SummarizerAgent(BaseAgent):
         evidence: list = context.get("evidence", [])
         evidence_relations: list = context.get("evidence_relations", [])
         evidence_relations_supports: list = context.get("evidence_relations_supports", [])
+        evidence_relations_extends: list = context.get("evidence_relations_extends", [])
 
         if not results:
             report = ResearchReport(
@@ -67,7 +68,12 @@ class SummarizerAgent(BaseAgent):
 
         # 构建 synthesis prompt
         prompt = self._build_synthesis_prompt(
-            query, results, evidence, evidence_relations, evidence_relations_supports
+            query,
+            results,
+            evidence,
+            evidence_relations,
+            evidence_relations_supports,
+            evidence_relations_extends,
         )
         messages = [
             {"role": "system", "content": self._system_prompt()},
@@ -94,13 +100,13 @@ class SummarizerAgent(BaseAgent):
         token_usage = len(content) // 3  # 简化估算
 
         # 解析报告内容，提取来源和置信度
-        # 矛盾 + 支持关系一并写入 report.evidence_relations（_format_report 按 relation 分节渲染）
+        # 矛盾 + 支持 + 扩展关系一并写入 report.evidence_relations（_format_report 按 relation 分节渲染）
         report = self._parse_report(
             query,
             content,
             results,
             evidence,
-            [*evidence_relations, *evidence_relations_supports],
+            [*evidence_relations, *evidence_relations_supports, *evidence_relations_extends],
         )
 
         return AgentResult(
@@ -130,12 +136,14 @@ class SummarizerAgent(BaseAgent):
         evidence: list | None = None,
         evidence_relations: list | None = None,
         evidence_relations_supports: list | None = None,
+        evidence_relations_extends: list | None = None,
     ) -> str:
         """构建 synthesis prompt，按置信度降序排列结果，并注入证据与关系。"""
         sorted_results = sorted(results, key=lambda r: r.confidence, reverse=True)
         evidence = evidence or []
         evidence_relations = evidence_relations or []
         evidence_relations_supports = evidence_relations_supports or []
+        evidence_relations_extends = evidence_relations_extends or []
 
         parts = [
             f"# Research Question\n{query}\n",
@@ -169,6 +177,15 @@ class SummarizerAgent(BaseAgent):
             for r in evidence_relations_supports:
                 parts.append(
                     f"- [{r.get('source_id')}] SUPPORTS [{r.get('target_id')}] "
+                    f"(weight {r.get('weight', 0):.2f}): {r.get('source_claim', '')} — "
+                    f"{r.get('target_claim', '')}"
+                )
+
+        if evidence_relations_extends:
+            parts.append("\n# Related Extensions\n")
+            for r in evidence_relations_extends:
+                parts.append(
+                    f"- [{r.get('source_id')}] EXTENDS [{r.get('target_id')}] "
                     f"(weight {r.get('weight', 0):.2f}): {r.get('source_claim', '')} — "
                     f"{r.get('target_claim', '')}"
                 )
