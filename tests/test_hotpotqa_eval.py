@@ -6,6 +6,7 @@ import pytest
 
 from evaluation.benchmarks.hotpotqa import HotpotQABenchmark
 from scripts.run_eval import (
+    configured_local_tool_budget,
     configured_tool_budget,
     evaluation_config_with_tool_budget,
     evaluate_hotpotqa,
@@ -144,10 +145,12 @@ def test_smoke_limits_are_explicit_and_do_not_mutate_default_config() -> None:
 def test_evaluation_tool_budget_override_is_recordable_and_non_mutating() -> None:
     config = {"research": {"limits": {"max_total_tool_calls": 36}}}
 
-    evaluation = evaluation_config_with_tool_budget(config, 84)
+    evaluation = evaluation_config_with_tool_budget(config, 588, max_tool_calls=84)
 
     assert configured_tool_budget(config) == 36
-    assert configured_tool_budget(evaluation) == 84
+    assert configured_local_tool_budget(config) == 12
+    assert configured_tool_budget(evaluation) == 588
+    assert configured_local_tool_budget(evaluation) == 84
     assert config["research"]["limits"]["max_total_tool_calls"] == 36
 
 
