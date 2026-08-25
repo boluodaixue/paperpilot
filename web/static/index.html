@@ -1,0 +1,426 @@
+<!DOCTYPE html>
+<html lang="zh">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>PaperPilot — 证据中心深度研究</title>
+<script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
+<script src="https://unpkg.com/vis-network/standalone/umd/vis-network.min.js"></script>
+<style>
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body { font-family: "Microsoft YaHei", "PingFang SC", sans-serif; background: #f5f6fa; color: #222; }
+  header { background: linear-gradient(135deg, #1f2937, #374151); color: #fff; padding: 18px 24px; }
+  header h1 { font-size: 22px; }
+  header p { font-size: 12px; color: #9ca3af; margin-top: 4px; }
+
+  .container { max-width: 1100px; margin: 0 auto; padding: 16px; }
+
+  /* 控制区 */
+  .control { background: #fff; border-radius: 10px; padding: 16px; box-shadow: 0 1px 4px rgba(0,0,0,.08); }
+  .control .row { display: flex; gap: 10px; flex-wrap: wrap; align-items: center; }
+  .control input[type=text] { flex: 1; min-width: 280px; padding: 10px 14px; border: 1px solid #d1d5db; border-radius: 8px; font-size: 14px; }
+  .control select { padding: 10px 12px; border: 1px solid #d1d5db; border-radius: 8px; font-size: 14px; background: #fff; }
+  .btn { padding: 10px 22px; border: none; border-radius: 8px; cursor: pointer; font-size: 14px; font-weight: 600; }
+  .btn-primary { background: #2563eb; color: #fff; }
+  .btn-primary:hover { background: #1d4ed8; }
+  .btn-primary:disabled { background: #93c5fd; cursor: not-allowed; }
+  .hint { font-size: 12px; color: #6b7280; margin-top: 8px; }
+
+  /* 进度区 */
+  #progressArea { background: #0f172a; color: #d1d5db; border-radius: 10px; margin-top: 14px; padding: 12px 16px; font-family: Consolas, monospace; font-size: 13px; max-height: 260px; overflow-y: auto; display: none; }
+  #progressArea .ev { margin: 3px 0; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .ev.state { color: #60a5fa; }
+  .ev.task_done { color: #34d399; }
+  .ev.evidence { color: #fbbf24; }
+  .ev.synthesis { color: #c084fc; }
+  .ev.done { color: #34d399; font-weight: 700; }
+  .ev.error { color: #f87171; font-weight: 700; }
+
+  /* 结果区 */
+  #resultArea { display: none; margin-top: 14px; background: #fff; border-radius: 10px; box-shadow: 0 1px 4px rgba(0,0,0,.08); overflow: hidden; }
+  .tabs { display: flex; border-bottom: 2px solid #e5e7eb; background: #f9fafb; }
+  .tab { padding: 12px 20px; cursor: pointer; font-size: 14px; font-weight: 600; color: #6b7280; border-bottom: 3px solid transparent; }
+  .tab.active { color: #2563eb; border-bottom-color: #2563eb; background: #fff; }
+  .tabbody { padding: 20px; display: none; }
+  .tabbody.active { display: block; }
+
+  #reportContent { line-height: 1.75; font-size: 14px; }
+  #reportContent h1, #reportContent h2, #reportContent h3 { margin: 18px 0 10px; }
+  #reportContent p { margin: 8px 0; }
+  #reportContent ul, #reportContent ol { margin: 8px 0 8px 24px; }
+  #reportContent table { border-collapse: collapse; margin: 10px 0; }
+  #reportContent th, #reportContent td { border: 1px solid #d1d5db; padding: 6px 10px; }
+  #reportContent a { color: #2563eb; }
+  #reportContent code { background: #f3f4f6; padding: 2px 5px; border-radius: 4px; }
+  #reportContent blockquote { border-left: 4px solid #e5e7eb; padding-left: 12px; color: #6b7280; }
+
+  table.data { width: 100%; border-collapse: collapse; font-size: 13px; }
+  table.data th, table.data td { border: 1px solid #e5e7eb; padding: 8px 10px; text-align: left; vertical-align: top; }
+  table.data th { background: #f9fafb; font-weight: 600; }
+  .cite-ok { color: #059669; font-weight: 600; }
+  .cite-no { color: #b45309; }
+
+  .rel-card { border: 1px solid #e5e7eb; border-radius: 8px; padding: 12px 14px; margin: 8px 0; font-size: 13px; }
+  .rel-card .rel-tag { display: inline-block; padding: 2px 8px; border-radius: 10px; font-size: 11px; font-weight: 700; margin-right: 8px; }
+  .rel-CONTRADICTS { background: #fde8e8; color: #c53030; }
+  .rel-SUPPORTS { background: #e6f7ec; color: #1a7f37; }
+  .rel-EXTENDS { background: #fef3e2; color: #b45309; }
+
+  #graphBox { width: 100%; height: 620px; border: 1px solid #e5e7eb; border-radius: 8px; }
+  .empty { color: #9ca3af; text-align: center; padding: 40px 0; }
+
+  /* 追问区 */
+  .followup { margin-top: 14px; background: #fff; border-radius: 10px; padding: 14px 16px; box-shadow: 0 1px 4px rgba(0,0,0,.08); display: none; }
+  .followup .row { display: flex; gap: 10px; align-items: center; }
+  .followup input[type=text] { flex: 1; padding: 9px 14px; border: 1px solid #d1d5db; border-radius: 8px; font-size: 14px; }
+  .muted { color: #6b7280; font-size: 12px; }
+</style>
+</head>
+<body>
+
+<header>
+  <h1>PaperPilot</h1>
+  <p>证据中心深度研究 — 规划 · 检索 · 证据提取 · 证据关系图</p>
+</header>
+
+<div class="container">
+  <!-- 控制区 -->
+  <div class="control">
+    <div class="row">
+      <input type="text" id="queryInput" placeholder="输入研究问题，例如：retrieval-augmented generation for medical question answering">
+      <select id="sessionSelect" title="选择已有会话（追问）或新建">
+        <option value="">＋ 新建会话</option>
+      </select>
+      <button class="btn btn-primary" id="runBtn" onclick="startResearch()">开始研究</button>
+    </div>
+    <div class="hint">研究约需数分钟。完成后再输入问题并选择同一会话，可"追问"续接上下文。</div>
+  </div>
+
+  <!-- 进度区 -->
+  <div id="progressArea"></div>
+
+  <!-- 结果区 -->
+  <div id="resultArea">
+    <div class="tabs">
+      <div class="tab active" data-tab="report" onclick="switchTab('report')">报告</div>
+      <div class="tab" data-tab="evidence" onclick="switchTab('evidence')">证据索引</div>
+      <div class="tab" data-tab="relations" onclick="switchTab('relations')">证据关系</div>
+      <div class="tab" data-tab="graph" onclick="switchTab('graph')">证据图</div>
+    </div>
+    <div class="tabbody active" id="tab-report"><div id="reportContent"></div></div>
+    <div class="tabbody" id="tab-evidence"><div id="evidenceContent"></div></div>
+    <div class="tabbody" id="tab-relations"><div id="relationsContent"></div></div>
+    <div class="tabbody" id="tab-graph"><div id="graphBox"></div><div class="muted" style="margin-top:6px">可拖拽 / 滚轮缩放 / 悬停查看详情</div></div>
+  </div>
+
+  <!-- 追问区 -->
+  <div class="followup" id="followupArea">
+    <div class="row">
+      <input type="text" id="followupInput" placeholder="针对同一话题追问（复用当前会话）…">
+      <button class="btn btn-primary" onclick="followup()">追问</button>
+    </div>
+  </div>
+</div>
+
+<script>
+// ------------------------------------------------------------------
+// 全局状态
+// ------------------------------------------------------------------
+let currentTask = null;   // {task_id, session_id}
+let currentResult = null; // 最近一次研究结果
+let eventSource = null;
+
+// ------------------------------------------------------------------
+// 会话列表
+// ------------------------------------------------------------------
+async function loadSessions() {
+  try {
+    const r = await fetch('/api/sessions');
+    const sessions = await r.json();
+    const sel = document.getElementById('sessionSelect');
+    const cur = sel.value;
+    sel.innerHTML = '<option value="">＋ 新建会话</option>';
+    for (const s of sessions) {
+      const opt = document.createElement('option');
+      opt.value = s.session_id;
+      opt.textContent = `${s.session_id}（${s.count} 条记忆）`;
+      sel.appendChild(opt);
+    }
+    if (cur) sel.value = cur;
+  } catch (e) { /* 服务未就绪时静默 */ }
+}
+document.getElementById('sessionSelect').addEventListener('change', (e) => {
+  if (e.target.value) loadSessionGraph(e.target.value, true);
+});
+
+// ------------------------------------------------------------------
+// 开始研究
+// ------------------------------------------------------------------
+async function startResearch() {
+  const query = document.getElementById('queryInput').value.trim();
+  if (!query) { alert('请输入研究问题'); return; }
+  const session_id = document.getElementById('sessionSelect').value;
+
+  const r = await fetch('/api/research', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ query, session_id: session_id || null }),
+  });
+  const data = await r.json();
+  if (!r.ok) { alert(data.detail || '启动失败'); return; }
+
+  currentTask = { task_id: data.task_id, session_id: data.session_id };
+  document.getElementById('runBtn').disabled = true;
+  resetProgress();
+  showProgress(true);
+  logProgress({ type: 'state', state: '已提交，等待调度…' });
+  openEventStream(data.task_id);
+}
+
+// ------------------------------------------------------------------
+// SSE 进度流
+// ------------------------------------------------------------------
+function openEventStream(task_id) {
+  if (eventSource) eventSource.close();
+  eventSource = new EventSource(`/api/tasks/${task_id}/events`);
+  eventSource.onmessage = (e) => {
+    if (!e.data) return;
+    const ev = JSON.parse(e.data);
+    logProgress(ev);
+    if (ev.type === 'done') {
+      eventSource.close();
+      fetchResult(task_id);
+    } else if (ev.type === 'error') {
+      eventSource.close();
+      document.getElementById('runBtn').disabled = false;
+    }
+  };
+  eventSource.onerror = () => { eventSource.close(); };
+}
+
+function resetProgress() {
+  document.getElementById('progressArea').innerHTML = '';
+}
+function showProgress(show) {
+  document.getElementById('progressArea').style.display = show ? 'block' : 'none';
+  document.getElementById('followupArea').style.display = 'none';
+  document.getElementById('resultArea').style.display = 'none';
+}
+
+const STATE_CN = {
+  IDLE: '空闲', PLANNING: '规划', DISPATCHING: '调度', COLLECTING: '收集',
+  SYNTHESIZING: '综合', ADVERSARIAL: '对抗优化', REPLANNING: '重规划', DONE: '完成', FAILED: '失败',
+};
+function logProgress(ev) {
+  const box = document.getElementById('progressArea');
+  const div = document.createElement('div');
+  div.className = 'ev ' + (ev.type || '');
+  const t = new Date().toLocaleTimeString();
+  switch (ev.type) {
+    case 'state':
+      div.textContent = `[${t}] ▸ 阶段: ${STATE_CN[ev.state] || ev.state}`;
+      break;
+    case 'task_done':
+      div.textContent = `[${t}] ✓ 子任务 ${ev.task_id} 完成（${ev.status}，置信度 ${ev.confidence}）`;
+      break;
+    case 'evidence':
+      div.textContent = `[${t}] ◆ 证据 ${ev.evidence_id} 已入库（论文 ${ev.paper_id}，共 ${ev.total} 条）: ${ev.claim}`;
+      break;
+    case 'synthesis':
+      div.textContent = `[${t}] ★ 报告合成完成（置信度 ${ev.confidence}，证据 ${ev.evidence_count} 条）`;
+      break;
+    case 'adversarial':
+      div.textContent = ev.phase === 'done'
+        ? `[${t}] ⚔ 对抗优化完成（${ev.rounds} 轮，置信度 ${ev.confidence}）`
+        : `[${t}] ⚔ 对抗优化 ${ev.phase}`;
+      break;
+    case 'done':
+      div.textContent = `[${t}] ✅ 研究完成`;
+      break;
+    case 'error':
+      div.textContent = `[${t}] ❌ 错误: ${ev.message}`;
+      break;
+    default:
+      div.textContent = `[${t}] ${JSON.stringify(ev)}`;
+  }
+  box.appendChild(div);
+  box.scrollTop = box.scrollHeight;
+}
+
+// ------------------------------------------------------------------
+// 结果获取与渲染
+// ------------------------------------------------------------------
+async function fetchResult(task_id) {
+  const r = await fetch(`/api/tasks/${task_id}/result`);
+  const data = await r.json();
+  if (data.status !== 'done') {
+    if (data.message) logProgress({ type: 'error', message: data.message });
+    document.getElementById('runBtn').disabled = false;
+    return;
+  }
+  currentResult = data;
+  currentTask.session_id = data.session_id;
+  renderAll(data);
+  document.getElementById('runBtn').disabled = false;
+  showProgress(false);
+  document.getElementById('resultArea').style.display = 'block';
+  document.getElementById('followupArea').style.display = 'block';
+  loadSessions(); // 刷新会话下拉
+}
+
+function renderAll(data) {
+  document.getElementById('reportContent').innerHTML =
+    marked.parse(data.report_md || '（无报告内容）');
+  renderEvidence(data);
+  renderRelations(data);
+  renderGraph(data.session_id);
+  switchTab('report');
+}
+
+function renderEvidence(data) {
+  const evidence = data.evidence || [];
+  if (!evidence.length) {
+    document.getElementById('evidenceContent').innerHTML = '<div class="empty">本会话暂无证据</div>';
+    return;
+  }
+  const md = data.report_md || '';
+  const cited = new Set();
+  const re = /\[E-(\d+)\]/g;
+  let m;
+  while ((m = re.exec(md))) cited.add(`E-${m[1]}`);
+
+  let html = `<table class="data"><tr><th>ID</th><th>主张 (Claim)</th><th>来源论文</th><th>置信度</th><th>引用</th></tr>`;
+  for (const ev of evidence) {
+    const isCited = cited.has(ev.evidence_id);
+    html += `<tr>
+      <td><b>${ev.evidence_id || ''}</b></td>
+      <td>${escapeHtml(ev.claim || '')}</td>
+      <td>${escapeHtml(ev.paper_title || '')}<br><span class="muted">${escapeHtml(ev.source_url || '')}</span></td>
+      <td>${ev.confidence != null ? ev.confidence.toFixed(2) : ''}</td>
+      <td class="${isCited ? 'cite-ok' : 'cite-no'}">${isCited ? '已引用' : '未引用'}</td>
+    </tr>`;
+  }
+  html += '</table>';
+  document.getElementById('evidenceContent').innerHTML = html;
+}
+
+function renderRelations(data) {
+  const rels = data.evidence_relations || [];
+  const box = document.getElementById('relationsContent');
+  if (!rels.length) {
+    box.innerHTML = '<div class="empty">本会话暂无证据关系（矛盾/支持/扩展）</div>';
+    return;
+  }
+  const groups = { CONTRADICTS: [], SUPPORTS: [], EXTENDS: [] };
+  for (const r of rels) (groups[r.relation] || (groups[r.relation] = [])).push(r);
+  const CN = { CONTRADICTS: '矛盾', SUPPORTS: '支持', EXTENDS: '扩展' };
+
+  let html = '';
+  for (const [rel, list] of Object.entries(groups)) {
+    if (!list.length) continue;
+    html += `<h3 style="margin:14px 0 6px">${CN[rel] || rel}（${list.length}）</h3>`;
+    for (const r of list) {
+      html += `<div class="rel-card">
+        <span class="rel-tag rel-${r.relation}">${CN[r.relation] || r.relation}</span>
+        <b>[${escapeHtml(r.source_id)}]</b> ${escapeHtml(r.source_claim || '')}
+        &nbsp;→&nbsp;
+        <b>[${escapeHtml(r.target_id)}]</b> ${escapeHtml(r.target_claim || '')}
+        <span class="muted">（weight ${r.weight != null ? r.weight.toFixed(2) : ''}）</span>
+      </div>`;
+    }
+  }
+  box.innerHTML = html;
+}
+
+// ------------------------------------------------------------------
+// 证据图
+// ------------------------------------------------------------------
+let network = null;
+const NODE_COLORS = {
+  evidence: { background: '#4a90d9', border: '#2c5f8a' },
+  paper:    { background: '#7bc96f', border: '#4a9e3d' },
+  topic:    { background: '#b07cd9', border: '#8557ab' },
+};
+const EDGE_COLORS = {
+  SOURCED_FROM: '#a0a0a0', ANSWERS: '#a0a0a0',
+  SUPPORTS: '#2ecc71', CONTRADICTS: '#e74c3c', EXTENDS: '#f39c12',
+};
+async function loadSessionGraph(sid, silent) {
+  if (!sid) return;
+  try {
+    const r = await fetch(`/api/sessions/${encodeURIComponent(sid)}/graph`);
+    if (!r.ok) { if (!silent) alert('该会话暂无证据图'); return; }
+    const data = await r.json();
+    renderGraphData(data);
+  } catch (e) { /* 忽略 */ }
+}
+function renderGraph(sid) {
+  loadSessionGraph(sid, true);
+}
+function renderGraphData(data) {
+  const nodes = (data.nodes || []).map(n => ({
+    id: n.id,
+    label: String(n.label || n.id).slice(0, 30),
+    color: NODE_COLORS[n.type] || NODE_COLORS.evidence,
+    title: `<b>${escapeHtml(n.id)}</b><br>类型: ${n.type}<br>${escapeHtml(n.label || '')}`,
+  }));
+  const edges = (data.edges || []).map(e => ({
+    from: e.source, to: e.target,
+    label: `${String(e.relation).slice(0, 4)} ${e.weight != null ? e.weight.toFixed(2) : ''}`,
+    color: { color: EDGE_COLORS[e.relation] || '#999' },
+  }));
+  if (!nodes.length) { document.getElementById('graphBox').innerHTML = '<div class="empty">该会话暂无证据节点</div>'; return; }
+  const container = document.getElementById('graphBox');
+  container.innerHTML = '';
+  network = new vis.Network(container, { nodes, edges }, {
+    nodes: { shape: 'dot', size: 14, font: { size: 12, face: 'Microsoft YaHei' } },
+    edges: { arrows: 'to', font: { size: 10, strokeWidth: 0 }, smooth: { enabled: true } },
+    physics: { barnesHut: { gravitationalConstant: -3000, springLength: 120 } },
+    interaction: { hover: true, tooltipDelay: 100 },
+  });
+}
+
+// ------------------------------------------------------------------
+// 追问
+// ------------------------------------------------------------------
+async function followup() {
+  if (!currentTask || !currentTask.session_id) return;
+  const query = document.getElementById('followupInput').value.trim();
+  if (!query) { alert('请输入追问内容'); return; }
+  const r = await fetch('/api/research', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ query, session_id: currentTask.session_id }),
+  });
+  const data = await r.json();
+  if (!r.ok) { alert(data.detail || '启动失败'); return; }
+  currentTask = { task_id: data.task_id, session_id: data.session_id };
+  document.getElementById('runBtn').disabled = true;
+  resetProgress();
+  showProgress(true);
+  logProgress({ type: 'state', state: '追问已提交，等待调度…' });
+  openEventStream(data.task_id);
+}
+
+// ------------------------------------------------------------------
+// Tab 切换
+// ------------------------------------------------------------------
+function switchTab(name) {
+  document.querySelectorAll('.tab').forEach(t => t.classList.toggle('active', t.dataset.tab === name));
+  document.querySelectorAll('.tabbody').forEach(t => t.classList.toggle('active', t.id === `tab-${name}`));
+}
+
+// ------------------------------------------------------------------
+// 工具
+// ------------------------------------------------------------------
+function escapeHtml(s) {
+  return String(s).replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+}
+
+// 初始化
+loadSessions();
+document.getElementById('queryInput').addEventListener('keydown', e => { if (e.key === 'Enter') startResearch(); });
+document.getElementById('followupInput').addEventListener('keydown', e => { if (e.key === 'Enter') followup(); });
+</script>
+</body>
+</html>

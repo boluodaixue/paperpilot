@@ -320,7 +320,12 @@ def initialize_modules(config: dict, session_id: str = "") -> dict[str, Any]:
 # ---------------------------------------------------------------------------
 # 研究流程主函数
 # ---------------------------------------------------------------------------
-async def run_research(query: str, config: dict, modules: dict[str, Any]) -> str:
+async def run_research(
+    query: str,
+    config: dict,
+    modules: dict[str, Any],
+    progress_callback=None,
+) -> str:
     """
     执行完整的研究流程。
 
@@ -337,6 +342,7 @@ async def run_research(query: str, config: dict, modules: dict[str, Any]) -> str
         query: 用户输入的研究问题。
         config: 全局配置字典。
         modules: 已初始化的模块实例字典。
+        progress_callback: 可选进度回调，接收结构化事件 dict（Web 前端 SSE 用）。
 
     Returns:
         最终研究报告文本（Markdown 格式）。
@@ -361,6 +367,11 @@ async def run_research(query: str, config: dict, modules: dict[str, Any]) -> str
         enable_evolution=config.get("evolution", {}).get("enabled", False),
     )
 
+    if progress_callback is not None:
+        try:
+            orchestrator.set_progress_callback(progress_callback)
+        except Exception:
+            pass
     report = await orchestrator.run(query, config=run_cfg)
     logger.info(
         f"[Orchestrator] 报告生成完成 | 置信度={report.confidence:.2f} | "
