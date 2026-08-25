@@ -167,7 +167,7 @@ def test_research_persists_report_to_chat(tmp_path, monkeypatch):
     server.get_chat_store._store = None
 
     async def fake_run_research(query, config, modules, progress_callback=None):
-        return "# 报告正文"
+        return "# 报告正文\n\n" + "证据内容 " * 80  # 超过 300 字符阈值，视为正常报告
 
     def fake_initialize(config, session_id=""):
         return {}  # initialize_modules 是同步函数

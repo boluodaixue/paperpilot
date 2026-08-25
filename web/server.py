@@ -144,6 +144,14 @@ async def _run_research_task(task: ResearchTask) -> None:
             )
             elapsed = time.time() - start
 
+            # 合成失败会产出降级短报告（如 "Synthesis failed." 或超时兜底），
+            # 不应当作成功报告落盘展示
+            if len((report_md or "").strip()) < 300:
+                raise RuntimeError(
+                    f"研究报告生成失败（内容过短，{len(report_md or '')} 字符；"
+                    f"可能是合成超时或模型限流）"
+                )
+
             evidence, relations = _collect_evidence_data(modules)
             result = {
                 "task_id": task.task_id,

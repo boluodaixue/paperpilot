@@ -85,6 +85,15 @@ def main() -> None:
         filepath = save_report(report, args.query, args.output_dir)
         logger.info(f"报告已保存: {filepath}")
 
+        # 报告持久化到会话消息（Web UI 侧边栏可回溯）
+        if args.session_id:
+            try:
+                from src.memory.chat_store import ChatStore
+                ChatStore().add(args.session_id, "assistant", "report", report)
+                logger.info(f"[Chat] 报告已写入会话消息: {args.session_id}")
+            except Exception as e:
+                logger.warning(f"[Chat] 报告写入会话消息失败: {e}")
+
         print("\n" + "=" * 60)
         print("最终研究报告")
         print("=" * 60)

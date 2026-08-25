@@ -495,12 +495,12 @@ class Orchestrator:
 
     async def _do_synthesizing(self) -> OrchestratorState:
         """调用 SummarizerAgent 合成研究报告。"""
-        # 创建合成任务
+        # 创建合成任务（超时走配置：慢速推理模型单次合成可能超过 5 分钟）
         synth_task = SubTask(
             task_id="synthesize_final",
             task_type=TaskType.ANALYZE,  # 使用 ANALYZE 类型，实际由 SummarizerAgent 处理
             description="Synthesize all sub-task results into a final research report.",
-            timeout_seconds=300,
+            timeout_seconds=getattr(self._config, "synthesis_timeout_seconds", 600),
         )
 
         context = {

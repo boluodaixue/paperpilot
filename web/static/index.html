@@ -248,20 +248,21 @@ async function sendMessage() {
       body: JSON.stringify({ session_id: currentSessionId, message: text }),
     });
     const data = await r.json();
-    if (!r.ok) { el.remove(); appendBubble('assistant', data.detail || '澄清失败'); return; }
+    el.remove();
+    if (!r.ok) { appendBubble('assistant', data.detail || '澄清失败'); return; }
 
     currentSessionId = data.session_id;
-    el.remove();
     if (data.action === 'ask') {
-      appendBubble('assistant', data.question);
+      appendBubble('assistant', data.question || '（请补充研究背景）');
     } else {
-      currentProposal = { plan: data.plan, research_query: data.research_query };
+      currentProposal = { plan: data.plan || {}, research_query: data.research_query || '' };
       showProposalCard(currentProposal);
     }
     $('chatHeaderSub').textContent = `会话 ${data.session_id}`;
     loadSessions();
   } catch (e) {
-    el.textContent = '请求失败，请重试'; el.className = 'msg assistant';
+    el.remove();
+    appendBubble('assistant', '请求失败，请重试');
   } finally {
     sendLock = false;
   }
