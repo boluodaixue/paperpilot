@@ -394,6 +394,17 @@ class Orchestrator:
                 if r.status != AgentStatus.SUCCESS:
                     continue
                 papers = extract_papers_from_result(r, max_papers=max_papers)
+                # 轨迹中没有 arxiv 论文（Agent 常用 web_search）时，按子任务主题主动补取
+                if not papers:
+                    task = self._task_map.get(r.task_id)
+                    query = ""
+                    if task and getattr(task, "search_hints", None):
+                        query = task.search_hints[0]
+                    if not query and task and getattr(task, "description", None):
+                        query = task.description
+                    if not query:
+                        query = self._query
+                    papers = await self.evidence_extractor.fetch_papers(query, max_papers)
                 for paper in papers:
                     pid = paper.get("id", "")
                     if not pid or pid in self._seen_papers:

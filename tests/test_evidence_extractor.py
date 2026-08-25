@@ -163,3 +163,32 @@ async def test_extract_respects_max_claims():
     extractor = EvidenceExtractor(policy=policy, max_claims_per_paper=2)
     claims = await extractor.extract_from_paper(_paper("p1", "X", "abstract"), "q")
     assert len(claims) == 2
+
+
+# ---------------------------------------------------------------------------
+# EvidenceExtractor.fetch_papers（论文补取）
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_fetch_papers_with_fetcher():
+    async def fetcher(query, max_results):
+        return [_paper("p1", "One"), _paper("p2", "Two"), {"id": "", "title": "no id"}]
+
+    extractor = EvidenceExtractor(policy=FakePolicy("{}"), paper_fetcher=fetcher)
+    papers = await extractor.fetch_papers("some query", 3)
+    assert [p["id"] for p in papers] == ["p1", "p2"]  # 无 id 的被过滤
+
+
+@pytest.mark.asyncio
+async def test_fetch_papers_without_fetcher():
+    extractor = EvidenceExtractor(policy=FakePolicy("{}"))
+    assert await extractor.fetch_papers("q") == []
+
+
+@pytest.mark.asyncio
+async def test_fetch_papers_fetcher_raises():
+    async def boom(query, max_results):
+        raise RuntimeError("network down")
+
+    extractor = EvidenceExtractor(policy=FakePolicy("{}"), paper_fetcher=boom)
+    assert await extractor.fetch_papers("q") == []

@@ -60,6 +60,9 @@ def test_build_synthesis_prompt_no_evidence():
     agent = SummarizerAgent(name="summarizer", policy=ReportPolicy(""))
     prompt = agent._build_synthesis_prompt("test query", [_result()], [])
     assert "# Evidence Items" not in prompt
+    # 无证据时不给出引用指令，避免模型编造 [E-x]
+    assert "cite it inline as [E-<id>]" not in prompt
+    assert "Known Contradictions" not in prompt
 
 
 def _relation(eid1: str, eid2: str, relation: str = "CONTRADICTS") -> dict:

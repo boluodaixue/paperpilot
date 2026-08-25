@@ -166,19 +166,26 @@ class SummarizerAgent(BaseAgent):
                     f"{r.get('target_claim', '')}"
                 )
 
-        parts.append(
-            "\n# Instructions\n"
+        instructions = [
             "1. Directly write the synthesized report based on the findings above. Do NOT say 'I will synthesize'.\n"
             "2. The report MUST be comprehensive and detailed (at least 3000 Chinese characters or 2000 English words).\n"
             "3. Structure: Executive Summary → Background → Key Findings (with details) → Analysis → Comparisons → Implications → Conclusion.\n"
             "4. Resolve any contradictions between sources.\n"
             "5. Explicitly list all sources cited.\n"
-            "6. End with: Overall Confidence: X.XX\n"
-            "7. When a statement is supported by one of the Evidence Items above, "
-            "cite it inline as [E-<id>] immediately after that sentence.\n"
-            "8. Explicitly address every item in Known Contradictions: for each, state which "
-            "side is better supported by the evidence and why."
-        )
+            "6. End with: Overall Confidence: X.XX",
+        ]
+        # 指令仅在证据存在时给出，避免模型对不存在的 Evidence Items 编造引用
+        if evidence:
+            instructions.append(
+                "7. When a statement is supported by one of the Evidence Items above, "
+                "cite it inline as [E-<id>] immediately after that sentence."
+            )
+        if evidence_relations:
+            instructions.append(
+                "8. Explicitly address every item in Known Contradictions: for each, state which "
+                "side is better supported by the evidence and why."
+            )
+        parts.append("\n# Instructions\n" + "\n".join(instructions))
         return "\n".join(parts)
 
     def _parse_report(

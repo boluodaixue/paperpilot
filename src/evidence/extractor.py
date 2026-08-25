@@ -123,10 +123,24 @@ class EvidenceExtractor:
         policy: Any,
         max_claims_per_paper: int = 5,
         max_papers_per_result: int = 3,
+        paper_fetcher: Any | None = None,
     ) -> None:
         self.policy = policy
         self.max_claims_per_paper = max(1, max_claims_per_paper)
         self.max_papers_per_result = max(1, max_papers_per_result)
+        # 论文补取器：轨迹中没有 arxiv 论文时按主题主动检索
+        self.paper_fetcher = paper_fetcher
+
+    async def fetch_papers(self, query: str, max_papers: int | None = None) -> list[dict]:
+        """按主题检索论文（依赖注入的 fetcher，无则返回空）。"""
+        if self.paper_fetcher is None:
+            return []
+        try:
+            papers = await self.paper_fetcher(query, max_papers or self.max_papers_per_result)
+            return [p for p in papers if isinstance(p, dict) and p.get("id")]
+        except Exception as e:
+            logger.warning(f"[Evidence] 论文补取失败 ({query[:40]}...): {type(e).__name__}: {e}")
+            return []
 
     async def extract_from_paper(self, paper: dict, query: str) -> list[dict]:
         """从单篇论文摘要提取 claim 列表。任何失败返回空列表。"""
