@@ -154,6 +154,34 @@ async def test_run_carries_evidence_relations():
     assert report.evidence_relations[0]["relation"] == "CONTRADICTS"
 
 
+@pytest.mark.asyncio
+async def test_run_carries_supports_into_report():
+    """SUPPORTS 关系也要写入 report.evidence_relations（供 _format_report 渲染支持节）。"""
+
+    content = (
+        "# Report\n\n"
+        "The supporting relation was verified. [E-1]\n\n"
+        "Overall Confidence: 0.8"
+    )
+    agent = SummarizerAgent(name="summarizer", policy=ReportPolicy(content))
+    supports = [_relation("E-1", "E-3", relation="SUPPORTS")]
+    task = SubTask(task_id="synthesize_final", task_type=TaskType.ANALYZE, description="synth")
+    result = await agent.run(
+        task,
+        {
+            "query": "q",
+            "results": [_result()],
+            "evidence": [],
+            "evidence_relations": [],
+            "evidence_relations_supports": supports,
+        },
+    )
+    assert result.status == AgentStatus.SUCCESS
+    report = result.output
+    assert len(report.evidence_relations) == 1
+    assert report.evidence_relations[0]["relation"] == "SUPPORTS"
+
+
 def test_format_report_renders_evidence_index():
     report = ResearchReport(
         query="q",

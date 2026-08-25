@@ -61,6 +61,14 @@ PROMPT_SELF_VERIFY = """请验证以下修复后的研究报告是否存在新�
 {fixes}
 """
 
+# 证据引用标记保留指令（PaperPilot）：对抗改写不得删除 [E-x]
+PRESERVE_CITATIONS_INSTRUCTION = (
+    "5. CRITICAL: Preserve all [E-<数字>] evidence citation markers exactly as they appear "
+    "in the original report. These reference a structured evidence index that is rendered "
+    "separately; do NOT modify, renumber, or remove them."
+)
+
+
 PROMPT_IN_PLACE_FIX = """请根据以下审查意见，对研究报告进行【原地修正】。
 
 要求：
@@ -68,6 +76,7 @@ PROMPT_IN_PLACE_FIX = """请根据以下审查意见，对研究报告进行【�
 2. 保持原文结构和叙述风格不变。
 3. 所有修改必须基于提供的 sources，不能引入新信息。
 4. 输出修正后的完整段落。
+""" + PRESERVE_CITATIONS_INSTRUCTION + """
 
 请按以下 JSON 格式输出：
 {
@@ -97,6 +106,7 @@ PROMPT_SUPPLEMENTARY_SEARCH = """请根据以下审查意见，对研究报告�
 1. 对无 source 支撑的 claim，使用搜索结果补充证据。
 2. 如果搜索结果无法证实，则删除该 claim 或标注为"未经证实"。
 3. 输出修正后的完整报告。
+""" + PRESERVE_CITATIONS_INSTRUCTION + """
 
 请按以下 JSON 格式输出：
 {
@@ -126,6 +136,7 @@ PROMPT_REMOVAL = """请根据以下审查意见，对研究报告进行【移除
 1. 删除高置信度幻觉段落或无法验证的 claim。
 2. 删除后确保上下文连贯，必要时添加过渡句。
 3. 输出修正后的完整报告。
+""" + PRESERVE_CITATIONS_INSTRUCTION + """
 
 请按以下 JSON 格式输出：
 {
@@ -184,7 +195,7 @@ class BlueAgent:
         执行流程：
         1. 按优先级对 issues 排序。
         2. 逐个执行修复（in_place / search / removal）。
-        3. 每轮修复后执行 self_verify，检测是否引入新问题。
+        3. 整轮修复完成后执行一次 self_verify，检测是否引入新问题。
         4. 返回修复后的报告和所有 FixOperation 记录。
 
         Args:
@@ -213,7 +224,9 @@ class BlueAgent:
             op = await self._fix_single_issue(current, issue)
             operations.append(op)
 
-            # self_verify：检查修复是否引入新矛盾
+        # self_verify：整轮修复完成后统一检查一次（而非每个 issue 各一次），
+        # 结果仅记录审计，不触发回滚；慢模型下可省去 (N-1) 次 LLM 调用
+        if operations:
             verify_pass, verify_issues = await self._self_verify(
                 original_content, current.content, operations
             )
