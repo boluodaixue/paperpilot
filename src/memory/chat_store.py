@@ -56,7 +56,79 @@ class ChatStore:
                 conn.execute(
                     "CREATE INDEX IF NOT EXISTS idx_messages_session ON chat_messages(session_id)"
                 )
+                conn.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS session_meta (
+                        session_id TEXT PRIMARY KEY,
+                        title TEXT NOT NULL DEFAULT '',
+                        pinned INTEGER NOT NULL DEFAULT 0,
+                        sort_order REAL NOT NULL DEFAULT 0,
+                        updated_at REAL NOT NULL
+                    )
+                    """
+                )
                 conn.commit()
+            finally:
+                conn.close()
+
+    def set_meta(self, session_id: str, title: str | None = None, pinned: bool | None = None) -> None:
+        """更新会话元数据（重命名/置顶），UPSERT 语义。"""
+        with self._lock:
+            conn = self._connect()
+            try:
+                if title is not None:
+                    conn.execute(
+                        """
+                        INSERT INTO session_meta (session_id, title, pinned, sort_order, updated_at)
+                        VALUES (?, ?, 0, 0, ?)
+                        ON CONFLICT(session_id) DO UPDATE SET title = excluded.title, updated_at = excluded.updated_at
+                        """,
+                        (session_id, title, time.time()),
+                    )
+                if pinned is not None:
+                    conn.execute(
+                        """
+                        INSERT INTO session_meta (session_id, title, pinned, sort_order, updated_at)
+                        VALUES (?, '', ?, 0, ?)
+                        ON CONFLICT(session_id) DO UPDATE SET pinned = excluded.pinned, updated_at = excluded.updated_at
+                        """,
+                        (session_id, 1 if pinned else 0, time.time()),
+                    )
+                conn.commit()
+            finally:
+                conn.close()
+
+    def set_sort_order(self, session_ids: list[str]) -> None:
+        """批量设置排序位置（拖拽后的新顺序）。"""
+        with self._lock:
+            conn = self._connect()
+            try:
+                for i, sid in enumerate(session_ids):
+                    conn.execute(
+                        """
+                        INSERT INTO session_meta (session_id, title, pinned, sort_order, updated_at)
+                        VALUES (?, '', 0, ?, ?)
+                        ON CONFLICT(session_id) DO UPDATE SET sort_order = excluded.sort_order, updated_at = excluded.updated_at
+                        """,
+                        (sid, float(i), time.time()),
+                    )
+                conn.commit()
+            finally:
+                conn.close()
+
+    def delete_session(self, session_id: str) -> int:
+        """删除会话的聊天记录与元数据，返回删除的消息条数。"""
+        with self._lock:
+            conn = self._connect()
+            try:
+                cur = conn.execute(
+                    "SELECT COUNT(*) FROM chat_messages WHERE session_id = ?", (session_id,)
+                )
+                n = int(cur.fetchone()[0])
+                conn.execute("DELETE FROM chat_messages WHERE session_id = ?", (session_id,))
+                conn.execute("DELETE FROM session_meta WHERE session_id = ?", (session_id,))
+                conn.commit()
+                return n
             finally:
                 conn.close()
 
@@ -113,17 +185,21 @@ class ChatStore:
                 conn.close()
 
     def list_sessions(self) -> list[dict]:
-        """返回侧边栏会话列表：{session_id, title, last_update, count}。
+        """返回侧边栏会话列表：{session_id, title, pinned, last_update, count}。
 
-        title = 该 session 第一条 user 消息的前 15 字；无 user 消息则用 session_id。
-        按 last_update 倒序。
+        title 优先级：session_meta.title（自定义重命名）> 首条 user 消息前 15 字
+        > session_id。排序：pinned 置顶优先，组内按 sort_order（拖拽顺序），
+        最后按 last_update 兜底。
         """
         with self._lock:
             conn = self._connect()
             try:
                 cur = conn.execute(
-                    "SELECT session_id, role, content, timestamp FROM chat_messages "
-                    "ORDER BY session_id, message_id"
+                    "SELECT cm.session_id, cm.role, cm.content, cm.timestamp, "
+                    "sm.title AS meta_title, sm.pinned, sm.sort_order "
+                    "FROM chat_messages cm "
+                    "LEFT JOIN session_meta sm ON sm.session_id = cm.session_id "
+                    "ORDER BY cm.session_id, cm.message_id"
                 )
                 rows = cur.fetchall()
             finally:
@@ -133,7 +209,13 @@ class ChatStore:
         for r in rows:
             sid = r["session_id"]
             group = by_session.setdefault(
-                sid, {"session_id": sid, "title": sid, "last_update": 0.0, "count": 0, "_first_user": None}
+                sid,
+                {
+                    "session_id": sid, "title": sid, "last_update": 0.0,
+                    "count": 0, "_first_user": None,
+                    "pinned": bool(r["pinned"]), "sort_order": r["sort_order"] or 0.0,
+                    "_meta_title": r["meta_title"] or "",
+                },
             )
             group["count"] += 1
             group["last_update"] = max(group["last_update"], r["timestamp"])
@@ -143,12 +225,14 @@ class ChatStore:
         result = []
         for g in by_session.values():
             first_user = g.pop("_first_user", None)
-            title = (first_user[:15] if first_user else g["session_id"])
+            title = g["_meta_title"] or (first_user[:15] if first_user else g["session_id"])
             result.append({
                 "session_id": g["session_id"],
                 "title": title,
+                "pinned": bool(g["pinned"]),
+                "sort_order": g["sort_order"],
                 "last_update": g["last_update"],
                 "count": g["count"],
             })
-        result.sort(key=lambda s: s["last_update"], reverse=True)
+        result.sort(key=lambda s: (not s["pinned"], s["sort_order"], -s["last_update"]))
         return result

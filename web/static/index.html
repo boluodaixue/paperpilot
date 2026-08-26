@@ -19,12 +19,20 @@
                    background: #2563eb; color: #fff; font-size: 13px; font-weight: 600; }
   #newSessionBtn:hover { background: #1d4ed8; }
   #sessionList { flex: 1; overflow-y: auto; padding: 0 8px 12px; }
-  .sess-row { padding: 9px 10px; margin-bottom: 3px; border-radius: 8px; cursor: pointer; font-size: 12px; color: #d1d5db; }
+  .sess-row { position: relative; padding: 9px 10px; margin-bottom: 3px; border-radius: 8px; cursor: pointer; font-size: 12px; color: #d1d5db; }
   .sess-row:hover { background: #374151; }
   .sess-row.active { background: #2563eb; color: #fff; }
-  .sess-row .t { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .sess-row.pinned .t::before { content: '📌 '; }
+  .sess-row.dragging { opacity: .45; }
+  .sess-row .t { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; padding-right: 52px; }
   .sess-row .m { font-size: 11px; color: #9ca3af; margin-top: 2px; }
   .sess-row.active .m { color: #bfdbfe; }
+  .sess-row .actions { position: absolute; right: 6px; top: 6px; display: none; gap: 2px; background: rgba(31,41,55,.92); border-radius: 6px; padding: 1px; }
+  .sess-row:hover .actions { display: flex; }
+  .sess-row.active .actions { background: rgba(37,99,235,.95); }
+  .sess-row .actions button { background: none; border: none; cursor: pointer; font-size: 12px; padding: 2px 4px; border-radius: 4px; color: inherit; }
+  .sess-row .actions button:hover { background: rgba(255,255,255,.22); }
+  .sess-row .rename-input { width: 100%; padding: 4px 6px; border-radius: 6px; border: 1px solid #2563eb; font-size: 12px; }
 
   /* ---------- 主区 ---------- */
   #main { flex: 1; display: flex; flex-direction: column; min-width: 0; }
@@ -159,12 +167,97 @@ async function loadSessions() {
   list.innerHTML = '';
   for (const s of sessions) {
     const div = document.createElement('div');
-    div.className = 'sess-row' + (s.session_id === currentSessionId ? ' active' : '');
-    div.innerHTML = `<div class="t">${escapeHtml(s.title || s.session_id)}</div>` +
-      `<div class="m">${fmtTime(s.last_update)} · ${s.count} 条</div>`;
-    div.onclick = () => selectSession(s.session_id);
+    div.className = 'sess-row' + (s.pinned ? ' pinned' : '') +
+      (s.session_id === currentSessionId ? ' active' : '');
+    div.draggable = true;
+    div.dataset.sid = s.session_id;
+    div.innerHTML = `
+      <div class="t">${escapeHtml(s.title || s.session_id)}</div>
+      <div class="m">${fmtTime(s.last_update)} · ${s.count} 条</div>
+      <div class="actions">
+        <button title="重命名" data-act="rename">✏️</button>
+        <button title="${s.pinned ? '取消置顶' : '置顶'}" data-act="pin">📌</button>
+        <button title="删除" data-act="del">🗑️</button>
+      </div>`;
+    div.querySelector('.actions').addEventListener('click', (e) => {
+      const btn = e.target.closest('button');
+      if (!btn) return;
+      e.stopPropagation();
+      const act = btn.dataset.act;
+      if (act === 'rename') renameSession(s.session_id, s.title || '');
+      else if (act === 'pin') togglePin(s.session_id, !s.pinned);
+      else if (act === 'del') deleteSession(s.session_id);
+    });
+    div.addEventListener('click', (e) => {
+      if (e.target.closest('.actions')) return;
+      selectSession(s.session_id);
+    });
+    div.addEventListener('dragstart', (e) => { dragSid = s.session_id; div.classList.add('dragging'); });
+    div.addEventListener('dragend', () => div.classList.remove('dragging'));
+    div.addEventListener('dragover', (e) => e.preventDefault());
+    div.addEventListener('drop', (e) => { e.preventDefault(); reorderSessions(dragSid, s.session_id); });
     list.appendChild(div);
   }
+}
+
+let dragSid = null;
+
+async function renameSession(sid, currentTitle) {
+  const row = document.querySelector(`.sess-row[data-sid="${CSS.escape(sid)}"]`);
+  if (!row) return;
+  const t = row.querySelector('.t');
+  const input = document.createElement('input');
+  input.className = 'rename-input';
+  input.value = currentTitle;
+  t.replaceWith(input);
+  input.focus();
+  input.select();
+  let done = false;
+  const commit = async (save) => {
+    if (done) return; done = true;
+    const val = input.value.trim();
+    if (save && val && val !== currentTitle) {
+      await fetch(`/api/sessions/${encodeURIComponent(sid)}`, {
+        method: 'PATCH', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ title: val }),
+      });
+    }
+    loadSessions();
+  };
+  input.addEventListener('keydown', (e) => {
+    if (e.key === 'Enter') commit(true);
+    else if (e.key === 'Escape') commit(false);
+  });
+  input.addEventListener('blur', () => commit(true));
+}
+
+async function togglePin(sid, pinned) {
+  await fetch(`/api/sessions/${encodeURIComponent(sid)}/pin`, {
+    method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ pinned }),
+  });
+  loadSessions();
+}
+
+async function deleteSession(sid) {
+  if (!confirm('删除该会话将同时删除其证据/关系/记忆，不可恢复。确定删除？')) return;
+  await fetch(`/api/sessions/${encodeURIComponent(sid)}`, { method: 'DELETE' });
+  if (currentSessionId === sid) newSession();
+  loadSessions();
+}
+
+async function reorderSessions(fromSid, toSid) {
+  const rows = [...document.querySelectorAll('#sessionList .sess-row')];
+  const ids = rows.map(r => r.dataset.sid);
+  const fi = ids.indexOf(fromSid), ti = ids.indexOf(toSid);
+  if (fi < 0 || ti < 0 || fi === ti) return;
+  ids.splice(fi, 1);
+  ids.splice(ti, 0, fromSid);
+  await fetch('/api/sessions/order', {
+    method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ session_ids: ids }),
+  });
+  loadSessions();
 }
 function fmtTime(ts) {
   if (!ts) return '';
