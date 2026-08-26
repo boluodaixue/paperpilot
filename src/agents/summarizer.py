@@ -9,6 +9,7 @@
 """
 from __future__ import annotations
 
+import asyncio
 import json
 import re
 from typing import Any
@@ -84,7 +85,8 @@ class SummarizerAgent(BaseAgent):
             # 合成任务不需要工具调用，临时禁用 tools 避免模型进入 tool-calling 模式
             old_tools = getattr(self.policy, "tools", None)
             self.policy.tools = None
-            response = self.policy(messages)
+            # 同步 LLM 调用放入线程池，避免阻塞 asyncio 事件循环（合成可能耗时数分钟）
+            response = await asyncio.to_thread(self.policy, messages)
             self.policy.tools = old_tools
         except RuntimeError as e:
             return AgentResult(

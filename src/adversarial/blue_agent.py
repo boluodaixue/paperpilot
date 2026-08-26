@@ -10,6 +10,7 @@ Blue Agent 接收 Red Agent 的 Verdict，按优先级排序并执行三类修�
 """
 from __future__ import annotations
 
+import asyncio
 import copy
 from typing import Any
 
@@ -284,7 +285,7 @@ class BlueAgent:
             {"role": "system", "content": SYSTEM_BLUE_AGENT},
             {"role": "user", "content": prompt},
         ]
-        resp = self.policy(messages)
+        resp = await asyncio.to_thread(self.policy, messages)
         raw = resp.content or ""
 
         fixed_content, changes = self._parse_fix_json(raw)
@@ -339,7 +340,7 @@ class BlueAgent:
             {"role": "system", "content": SYSTEM_BLUE_AGENT},
             {"role": "user", "content": prompt},
         ]
-        resp = self.policy(messages)
+        resp = await asyncio.to_thread(self.policy, messages)
         raw = resp.content or ""
 
         fixed_content, changes = self._parse_fix_json(raw)
@@ -369,7 +370,7 @@ class BlueAgent:
             {"role": "system", "content": SYSTEM_BLUE_AGENT},
             {"role": "user", "content": prompt},
         ]
-        resp = self.policy(messages)
+        resp = await asyncio.to_thread(self.policy, messages)
         raw = resp.content or ""
 
         fixed_content, removed = self._parse_removal_json(raw)
@@ -411,7 +412,7 @@ class BlueAgent:
             {"role": "system", "content": SYSTEM_BLUE_AGENT},
             {"role": "user", "content": prompt},
         ]
-        resp = self.policy(messages)
+        resp = await asyncio.to_thread(self.policy, messages)
         raw = resp.content or ""
 
         try:

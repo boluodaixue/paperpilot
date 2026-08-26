@@ -230,7 +230,10 @@ class Orchestrator:
         """
         try:
             memory_ctx = self._build_memory_context()
-            self._dag = self.planner.generate_plan(self._query, memory_ctx)
+            # generate_plan 是同步方法（内部做阻塞 LLM 调用），放入线程池避免卡死事件循环
+            self._dag = await asyncio.to_thread(
+                self.planner.generate_plan, self._query, memory_ctx
+            )
             # 从 planner 获取完整的 SubTask 信息（包括 description、search_hints 等）
             self._task_map = self.planner.get_task_map_from_dag(self._dag, self.planner._last_raw_json)
             if not self._task_map:
@@ -629,11 +632,13 @@ class Orchestrator:
         print(f"[Replan] Round {self._replan_count}/{self._config.max_replan_rounds}. Failed tasks: {[t.task_id for t in failed_tasks]}")
 
         try:
-            new_dag = self.planner.replan(
-                query=self._query,
-                failed_tasks=failed_tasks,
-                existing_results=self._results,
-                reason=reason,
+            # replan 是同步方法（内部做阻塞 LLM 调用），放入线程池避免卡死事件循环
+            new_dag = await asyncio.to_thread(
+                self.planner.replan,
+                self._query,
+                failed_tasks,
+                self._results,
+                reason,
             )
             self._dag = new_dag
             self._task_map = self.planner.get_task_map_from_dag(self._dag, self.planner._last_raw_json)

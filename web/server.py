@@ -247,6 +247,15 @@ async def task_result(task_id: str) -> dict:
     return {"status": "done", **task.result}
 
 
+@app.get("/api/sessions/{sid}/active-task")
+async def session_active_task(sid: str) -> dict:
+    """查询某会话是否有正在运行的研究任务（前端切换会话后重连 SSE 用）。"""
+    for task in _TASKS.values():
+        if task.session_id == sid and task.status == "running":
+            return {"task_id": task.task_id, "status": "running"}
+    return {"task_id": None, "status": "idle"}
+
+
 @app.get("/api/sessions")
 async def list_sessions() -> list:
     """侧边栏会话列表：优先聊天记录（含首条消息预览），补老会话（仅有记忆/证据）。"""
