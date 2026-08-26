@@ -94,6 +94,7 @@
   .rel-SUPPORTS { background: #e6f7ec; color: #1a7f37; }
   .rel-EXTENDS { background: #fef3e2; color: #b45309; }
   #graphBox { width: 100%; height: 480px; border: 1px solid #e5e7eb; border-radius: 8px; }
+  .rc-graph { width: 100%; height: 480px; border: 1px solid #e5e7eb; border-radius: 8px; }
   .empty { color: #9ca3af; text-align: center; padding: 34px 0; font-size: 13px; }
 
   /* ---------- 输入栏 ---------- */
@@ -547,6 +548,13 @@ function switchTab(tabEl, name) {
   const card = tabEl.closest('.report-card');
   card.querySelectorAll('.tab').forEach(t => t.classList.toggle('active', t.dataset.tab === name));
   card.querySelectorAll('.tabbody').forEach(t => t.classList.toggle('active', t.dataset.name === name));
+  // 图中继：容器从隐藏变可见后，重绘力导向图并适配视野
+  if (name === 'graph') {
+    const g = card.querySelector('.rc-graph');
+    if (g && g._net) {
+      setTimeout(() => { g._net.redraw(); g._net.fit(); }, 50);
+    }
+  }
 }
 
 function renderEvidenceTable(container, evidence, reportMd) {
@@ -604,7 +612,8 @@ async function renderGraph(container, sid) {
     }));
     if (!nodes.length) { container.innerHTML = '<div class="empty">该会话暂无证据节点</div>'; return; }
     container.innerHTML = '';
-    new vis.Network(container, { nodes, edges }, {
+    // 容器在隐藏的 tab 里初始化时尺寸为 0，需在激活 tab 后 redraw/fit
+    container._net = new vis.Network(container, { nodes, edges }, {
       nodes: { shape:'dot', size:14, font:{ size:11, face:'Microsoft YaHei' } },
       edges: { arrows:'to', font:{ size:9, strokeWidth:0 }, smooth:{ enabled:true } },
       physics: { barnesHut:{ gravitationalConstant:-3000, springLength:120 } },
