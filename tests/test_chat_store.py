@@ -22,6 +22,16 @@ def test_add_and_get_roundtrip(tmp_path):
     assert [m["message_id"] for m in msgs] == ["M-1", "M-2"]
 
 
+def test_message_ids_are_sorted_by_numeric_sequence(tmp_path):
+    store = _new_store(tmp_path)
+    for index in range(12):
+        store.add("s1", "user", "chat", f"message-{index + 1}")
+
+    assert [item["message_id"] for item in store.get_messages("s1")] == [
+        f"M-{index}" for index in range(1, 13)
+    ]
+
+
 def test_session_isolation(tmp_path):
     store = _new_store(tmp_path)
     store.add("s1", "user", "chat", "A")

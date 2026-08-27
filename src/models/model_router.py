@@ -86,7 +86,7 @@ class ModelRouter:
             backend_names: 指定要扫描的后端名称列表。为 None 时扫描全部已知后端
                           （deepseek, vllm, openai, mimo 及任何自定义前缀）。
 
-        常用于"主模型用 DeepSeek，Red Agent 用 MiMo"的场景。
+        常用于生产 Research Agent 与外部评测 Judge 选择不同后端的场景。
         """
         ensure_env_loaded()
         backends: dict[str, VLLMPolicy] = {}

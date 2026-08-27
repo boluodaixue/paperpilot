@@ -25,7 +25,8 @@ src/research/
 ├── workflow.py        # 用户对齐、确认、根图启动和完成
 ├── fork_policy.py     # 三项 fork 条件与硬限制
 ├── memory.py          # Markdown Memory Store
-└── rendering.py       # 报告、证据和来源 Markdown 渲染
+├── rendering.py       # 报告、证据和来源 Markdown 渲染
+└── runtime.py         # CLI/Web/评测共用的生产装配入口
 ```
 
 目录名可以根据现有包结构微调，但不得重新拆出 Planner、Summarizer、Evidence Store、Fork Controller 或 Manager Service。
@@ -248,6 +249,10 @@ src/research/
 
 ## 9. N5：迁移入口与清理旧实现
 
+### 状态
+
+已完成（2026-08-28）。实施记录见 [N5_ENTRY_MIGRATION_AND_LEGACY_CLEANUP.md](N5_ENTRY_MIGRATION_AND_LEGACY_CLEANUP.md)。
+
 ### 目标
 
 让 CLI、Web 和评测使用新 Workflow，并清除不再适用的旧架构。
@@ -342,4 +347,4 @@ N0 文档收敛
 → Future LLM Wiki
 ```
 
-下一次编码只进入 N5。N5 会修改 CLI、Web、评测与删除 legacy 模块，必须在开始前再确认具体迁移/删除清单。遇到需要新增独立 Agent 角色、存储服务、图数据库、评分引擎或 fork 领域系统的设计，应停止扩展并先重新核对 [ARCHITECTURE.md](ARCHITECTURE.md)。
+下一次编码只进入 N6 的可选 Red/Blue。不得把 N6 扩展为新的研究 Agent 角色、存储服务、图数据库、评分引擎或 fork 领域系统；遇到此类设计应停止扩展并先重新核对 [ARCHITECTURE.md](ARCHITECTURE.md)。

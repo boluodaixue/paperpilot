@@ -6,7 +6,7 @@ evaluation/benchmarks/hotpotqa.py
 HotpotQA 多跳问答评测适配器。
 
 HotpotQA 是一个经典的 multi-hop QA 数据集，要求模型通过多步推理/检索
-连接多条信息才能回答问题。本适配器将其转换为 DeepResearch Agent 的输入格式，
+连接多条信息才能回答问题。本适配器将其转换为 PaperPilot 的输入格式，
 并计算 pass@k、exact match、F1 等评测指标。
 ================================================================================
 """
@@ -292,6 +292,14 @@ class HotpotQABenchmark:
         )
 
         lines = report.splitlines()
+        # PaperPilot report notes start with YAML frontmatter. Metadata values
+        # are not answer candidates, so remove the leading block before either
+        # explicit-label extraction or first-body fallback.
+        if lines and lines[0].strip() == "---":
+            for index, line in enumerate(lines[1:], 1):
+                if line.strip() == "---":
+                    lines = lines[index + 1 :]
+                    break
         in_excluded_section = False
         for index, line in enumerate(lines):
             heading_match = re.match(r"^\s*#{1,6}\s+(.+?)\s*$", line)
@@ -394,7 +402,7 @@ class HotpotQABenchmark:
         if not gold_answer or not report:
             return 0.0
 
-        from src.memory.embedder import Embedder
+        from evaluation.embedder import Embedder
         import numpy as np
 
         embedder = Embedder()

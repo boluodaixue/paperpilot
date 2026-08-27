@@ -73,7 +73,7 @@ class RuleBasedMetrics:
             return 0.0
 
         import numpy as np
-        from src.memory.embedder import Embedder
+        from evaluation.embedder import Embedder
 
         embedder = Embedder()
 
@@ -170,6 +170,7 @@ class RuleBasedMetrics:
             r"\[来源[：:]",
             r"【来源[：:]",
             r"\(来源[：:]",
+            r"\[\[evidence/[^\]|]+(?:\|[^\]]+)?\]\]",
             r"https?://",
             r"arxiv\.org",
         ]
@@ -177,7 +178,7 @@ class RuleBasedMetrics:
         cited_paragraphs = 0
         for para in paragraphs:
             for pattern in citation_patterns:
-                if re.search(pattern, para):
+                if re.search(pattern, para, re.IGNORECASE):
                     cited_paragraphs += 1
                     break
 

@@ -3,7 +3,7 @@
 """
 scripts/run_benchmark.py
 ================================================================================
-DeepResearch Agent 定量评测脚本
+PaperPilot 定量评测脚本
 
 评测设计：
     对比 "单轮 LLM 直接回答" vs "Agent 完整流程" 的研究质量。
@@ -13,7 +13,7 @@ DeepResearch Agent 定量评测脚本
     2. accuracy (1-5): 信息是否准确、有无幻觉
     3. source_count: 引用来源数量
     4. report_length: 报告字数
-    5. confidence: 系统给出的置信度
+    5. workflow counters: evidence/thread/tool/token/retry/status
 
 用法：
     python scripts/run_benchmark.py --queries_file data/benchmark_queries.txt
@@ -38,17 +38,21 @@ if str(PROJECT_ROOT) not in sys.path:
 # 单轮 LLM baseline（直接问 DeepSeek，不走 Agent）
 # ---------------------------------------------------------------------------
 def run_baseline(query: str, config: dict) -> dict:
-    """用默认后端直接调用 LLM，返回报告文本。"""
+    """Use the configured research backend directly, without the Agent workflow."""
     from src.models.model_router import ModelRouter
 
-    policy = ModelRouter.create_backend("deepseek")
+    model_config = config.get("model", {})
+    backend = model_config.get("backend_mapping", {}).get(
+        "research", model_config.get("backend")
+    )
+    policy = ModelRouter.create_backend(backend)
     messages = [
         {
             "role": "system",
             "content": (
                 "You are a research assistant. Answer the user's question "
                 "with a comprehensive, well-structured report in Markdown. "
-                "Cite sources if possible. End with: Overall Confidence: X.XX"
+                "Cite sources if possible."
             ),
         },
         {"role": "user", "content": query},
@@ -67,44 +71,43 @@ def run_baseline(query: str, config: dict) -> dict:
 # Agent 完整流程
 # ---------------------------------------------------------------------------
 async def run_agent(query: str, config: dict) -> dict:
-    """跑完整 Agent 流程，返回报告。"""
-    from src.core.runner import initialize_modules, run_research
+    """Run one explicitly auto-confirmed production workflow."""
+    from scripts.run_eval import workflow_metrics
+    from src.research.runtime import build_research_runtime
 
-    modules = initialize_modules(config)
-    report_md = await run_research(query, config, modules)
-
-    # 简单解析元信息
-    confidence = 0.0
-    if "**置信度**:" in report_md:
-        try:
-            line = [l for l in report_md.splitlines() if "**置信度**:" in l][0]
-            confidence = float(line.split(":")[-1].strip())
-        except (IndexError, ValueError):
-            pass
-
-    return {
-        "query": query,
-        "content": report_md,
-        "length": len(report_md),
-        "source_count": report_md.count("http"),
-        "confidence": confidence,
-    }
-
-
-# ---------------------------------------------------------------------------
-# MiMo 2.5 Pro 自动评分（LLM-as-Judge）
-# ---------------------------------------------------------------------------
-def auto_score(report_a: str, report_b: str, query: str) -> dict:
-    """
-    调用 MiMo 2.5 Pro 对两份报告做对比评分。
-    MiMo 作为 Judge 后端，从覆盖面、准确性、结构、引用四个维度打分。
-    """
-    from src.core.judge import LLMJudge
+    runtime = build_research_runtime(config=config)
     try:
-        judge = LLMJudge(backend="mimo")
+        result = await runtime.run_auto_confirmed(
+            query, thread_id=runtime.new_thread_id()
+        )
+        report_md = result.report_markdown
+        return {
+            "query": query,
+            "content": report_md,
+            "length": len(report_md),
+            **workflow_metrics(result),
+        }
+    finally:
+        await runtime.close()
+
+
+# ---------------------------------------------------------------------------
+# 配置驱动的自动评分（LLM-as-Judge）
+# ---------------------------------------------------------------------------
+def auto_score(report_a: str, report_b: str, query: str, config: dict) -> dict:
+    """
+    使用配置中的 Judge 后端对两份报告做对比评分。
+    """
+    from evaluation.judge import LLMJudge
+    try:
+        model_config = config.get("model", {})
+        backend = model_config.get("backend_mapping", {}).get(
+            "judge", model_config.get("backend")
+        )
+        judge = LLMJudge(backend=backend)
         return judge.compare_two(report_a, report_b, query)
     except Exception as e:
-        print(f"[AutoScore] MiMo Judge 评分失败: {e}")
+        print(f"[AutoScore] Judge 评分失败: {e}")
     return {}
 
 
@@ -112,10 +115,11 @@ def auto_score(report_a: str, report_b: str, query: str) -> dict:
 # 主流程
 # ---------------------------------------------------------------------------
 async def main() -> None:
-    parser = argparse.ArgumentParser(description="DeepResearch Agent Benchmark")
+    parser = argparse.ArgumentParser(description="PaperPilot Benchmark")
     parser.add_argument("--queries_file", type=str, default=None, help="每行一个查询问题的文件")
     parser.add_argument("--queries", type=str, nargs="+", default=None, help="直接在命令行传入问题")
     parser.add_argument("--output", type=str, default="outputs/benchmark_results.json", help="结果输出路径")
+    parser.add_argument("--config", type=str, default=None, help="配置文件路径")
     parser.add_argument("--skip_baseline", action="store_true", help="跳过 baseline，只跑 Agent")
     parser.add_argument("--skip_agent", action="store_true", help="跳过 Agent，只跑 baseline")
     args = parser.parse_args()
@@ -137,8 +141,8 @@ async def main() -> None:
     print(f"[Benchmark] 评测问题数: {len(queries)}")
 
     # 加载配置
-    from src.core.runner import load_config
-    config = load_config()
+    from src.research.runtime import load_config
+    config = load_config(args.config)
 
     results = []
 
@@ -165,12 +169,24 @@ async def main() -> None:
             agent_result = await run_agent(query, config)
             agent_result["elapsed"] = round(time.time() - t0, 2)
             record["agent"] = agent_result
-            print(f"[Agent] 字数={agent_result['length']}, 来源数={agent_result['source_count']}, 置信度={agent_result.get('confidence', 0):.2f}, 耗时={agent_result['elapsed']}s")
+            print(
+                f"[Agent] 字数={agent_result['length']}, "
+                f"证据={agent_result['evidence_count']}, 来源={agent_result['source_count']}, "
+                f"线程={agent_result['thread_count']}, 工具调用={agent_result['tool_calls_used']}, "
+                f"tokens={agent_result['estimated_tokens_used']}, "
+                f"重试={agent_result['retries_used']}, 状态={agent_result['status']}, "
+                f"耗时={agent_result['elapsed']}s"
+            )
 
         # Auto score (if both available)
         if record["baseline"] and record["agent"]:
             print("[Benchmark] Auto-scoring...")
-            scores = auto_score(record["baseline"]["content"], record["agent"]["content"], query)
+            scores = auto_score(
+                record["baseline"]["content"],
+                record["agent"]["content"],
+                query,
+                config,
+            )
             record["scores"] = scores
             if scores:
                 print(f"[Score] {json.dumps(scores, ensure_ascii=False, indent=2)}")
@@ -193,7 +209,12 @@ async def main() -> None:
             print(f"  Baseline: {b['length']}字, {b['source_count']}来源, {b['elapsed']}s")
         if r["agent"]:
             a = r["agent"]
-            print(f"  Agent:    {a['length']}字, {a['source_count']}来源, conf={a.get('confidence', 0):.2f}, {a['elapsed']}s")
+            print(
+                f"  Agent:    {a['length']}字, {a['evidence_count']}证据, "
+                f"{a['source_count']}来源, {a['thread_count']}线程, "
+                f"{a['tool_calls_used']}工具调用, {a['estimated_tokens_used']}tokens, "
+                f"{a['retries_used']}重试, status={a['status']}, {a['elapsed']}s"
+            )
 
     # 统计显著性：收集每道题每个维度的配对分数
     if not args.skip_baseline and not args.skip_agent:

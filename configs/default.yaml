@@ -1,271 +1,54 @@
-# =============================================================================
-# DeepResearchAgent 全局默认配置文件
-# =============================================================================
-# 本文件定义了系统的全局参数、模型接口、各模块开关及超参数。
-# 子模块可以通过加载此文件并覆盖特定键来实现自定义配置。
-# =============================================================================
-
 system:
-  # 系统名称与版本号
-  name: "DeepResearchAgent"
-  version: "0.1.0"
-  # 日志级别: DEBUG / INFO / WARNING / ERROR
+  name: "PaperPilot"
+  version: "0.2.0"
   log_level: "INFO"
-  # 工作目录，用于存放临时文件与输出报告
-  work_dir: "./outputs"
+  work_dir: "outputs"
 
+# One policy drives alignment, research, tool use, fork decisions, and summary.
+# The evaluation judge is external to the Research AgentGraph.
 model:
-  # ---------------------------------------------------------------------------
-  # 多后端 LLM 配置
-  # ---------------------------------------------------------------------------
-  # 后端选择策略:
-  #   - "deepseek"  : 使用 DeepSeek API（需配置 .env 中的 DEEPSEEK_API_KEY）
-  #   - "vllm"      : 使用本地 vLLM 服务（默认 http://localhost:8000/v1）
-  #   - "openai"    : 使用 OpenAI API（需配置 .env 中的 OPENAI_API_KEY）
-  #   - "auto"      : 自动检测，优先使用已配置 API Key 的远程后端
-  #
-  # 所有敏感信息（API Key、URL）均从 .env / .env.local 读取，
-  # 修改此 YAML 即可切换后端，无需改动源码。
-  # ---------------------------------------------------------------------------
-  backend: "deepseek"          # 默认后端名称
-
-  # 以下为向后兼容的显式配置（优先级低于 .env）。
-  # 推荐做法：在 .env 中配置，此处留空或注释掉。
-  # base_model: "Qwen/Qwen2.5-7B-Instruct"
-  # base_url: "http://localhost:8000/v1"
-  # api_key: "EMPTY"
-
-  # 通用采样参数（可被 .env 中对应后端的参数覆盖）
-  temperature: 0.7
-  top_p: 1.0
-  max_tokens: 2048
-  max_retries: 3
-  retry_delay: 2.0
-
-  # ---------------------------------------------------------------------------
-  # 【唯一入口】模块级采样参数管理
-  # ---------------------------------------------------------------------------
-  # 设计原则：
-  #   - 生成结构化输出（JSON / DAG）→ temperature 低（0.1-0.3）
-  #   - 评分 / 攻击 / 修复 → temperature 极低（0.1），确保一致性
-  #   - 研究 / 合成 → temperature 中等（0.5-0.7），保留一定创造性
-  #   - 摘要 / 压缩 → temperature 低（0.1），不需要创造性
-  #
-  # ⚠️ 重要：所有模块的采样参数（temperature / max_tokens / top_p）
-  #     仅此一处定义，Agent YAML 中不再重复。
-  #     避免 configs/agents/*.yaml 与此处不一致导致的配置漂移。
-  # ---------------------------------------------------------------------------
+  backend: "deepseek"
   backend_sampling:
-    # DeepSeek 后端的全局默认采样参数
     deepseek:
       temperature: 0.7
       max_tokens: 4096
       top_p: 1.0
-
-    # MiMo 后端的全局默认采样参数
-    mimo:
-      temperature: 0.3
-      max_tokens: 4096
-      top_p: 1.0
-
-    # 模块级覆盖（优先级高于后端全局默认）
-    # 格式: 模块名 -> {temperature, max_tokens, top_p, model_name}
-    # model_name 可覆盖 .env 中的默认模型，实现"同端点多模型分工"。
-    # 注意：当前火山 coding 套餐 key 只支持 deepseek-v4-flash（实测其他模型均 404），
-    # 所以轻量模块默认也走 flash；将来有了快速模型再取消注释切换：
-    #   red_agent/blue_agent/judge/compressor/extractor:
-    #     model_name: "deepseek-chat"   # 或把 backend_mapping 对应模块改成 "mimo"
     modules:
-      planner:
-        temperature: 0.3       # 生成 JSON DAG 需要确定性
-        max_tokens: 4096
-      solver:
-        temperature: 0.7       # 研究需要一定创造性
-        max_tokens: 4096
-      summarizer:
-        temperature: 0.5       # 合成报告：流畅但不发散
-        max_tokens: 16384      # 报告可能很长，给足 token 预算
-      red_agent:
-        temperature: 0.1       # 攻击必须严谨，几乎不需要随机性
-        max_tokens: 4096
-      blue_agent:
-        temperature: 0.3       # 修复需要确定性
+      research:
+        temperature: 0.7
         max_tokens: 4096
       judge:
-        temperature: 0.1       # 评分标准必须一致，避免漂移
+        temperature: 0.1
         max_tokens: 2048
-      compressor:
-        temperature: 0.1       # 摘要是结构化任务
-        max_tokens: 2048
-      extractor:
-        temperature: 0.1       # 证据提取：确定性 JSON 输出
-        max_tokens: 1024
-
-  # ---------------------------------------------------------------------------
-  # 后端分工映射（哪个模块用哪个后端）
-  # ---------------------------------------------------------------------------
   backend_mapping:
-    # 若留空，所有模块均使用上面的 default backend
-    solver: "deepseek"        # 主研究 Agent：DeepSeek Flash（强推理）
-    planner: "deepseek"       # 规划器：DeepSeek Flash
-    summarizer: "deepseek"    # 合成器：DeepSeek Flash
-    judge: "deepseek"         # 评分器（原 mimo，Cloudflare 403 不可用）
-    red_agent: "deepseek"     # 对抗攻击（原 mimo）
-    blue_agent: "deepseek"    # 对抗修复（原 mimo）
-    compressor: "deepseek"    # 上下文压缩（原 mimo）
-    extractor: "deepseek"     # 证据提取：DeepSeek（JSON 结构化）
+    research: "deepseek"
+    judge: "deepseek"
 
-orchestrator:
-  # M1: Multi-Agent Orchestrator 配置
-  # 同时运行的最大子 Agent 数量
-  max_concurrent: 5
-  # 全局超时时间（秒）：火山推理模型单次调用可达 8-9 分钟，
-  # 9 子任务的完整研究需 20-30 分钟，给足预算
-  global_timeout_seconds: 2400
-  # 单次报告合成超时（秒）：合成 prompt 大，慢模型可能超过 5 分钟
-  synthesis_timeout_seconds: 900
-  # 最大重规划（replan）轮数，防止无限循环
-  max_replan_rounds: 3
-  # 单次规划最多拆分的子问题数量
-  max_sub_questions: 10
-  # Research Loop（Phase 3+4）：按证据缺口动态补派子任务，直到覆盖充分
-  enable_research_loop: true
-  # 最大 Research Loop 迭代轮数
-  max_research_rounds: 3
-  # 全 run 最大子任务总数（防无限 fork）
-  max_total_tasks: 12
-  # 每轮最多补派的任务数
-  max_gap_tasks_per_round: 2
-  # 子主题证据量低于此值视为缺口
-  min_evidence_per_topic: 2
-  # 连续 N 轮证据无增长则判饱和停止
-  saturation_no_growth_rounds: 1
-  # 子 Agent 执行失败后的最大重试次数
-  max_subagent_retries: 2
+research:
+  memory_root: "memory"
+  limits:
+    max_iterations: 8
+    max_tool_calls: 12
+    max_tool_output_chars: 12000
+    max_children: 4
+    max_fork_depth: 2
+    max_total_threads: 7
+    max_total_tool_calls: 36
+    max_elapsed_seconds: 300.0
+    max_total_tokens: 120000
+    max_retries_per_action: 1
+    max_total_retries: 6
 
-planner:
-  # M2: Adaptive Planner 配置
-  # 每个子 Agent 最多允许的搜索/执行轮数
-  max_search_rounds_per_subagent: 5
-  # 是否启用动态计划调整（replan）
-  enable_replan: true
-  # 计划执行完成后是否自动进行完整性检查
-  enable_completeness_check: true
-
-compressor:
-  # M3: Context Compressor 配置
-  # 压缩前允许的最大上下文长度（token 数）
-  max_context_length: 16000
-  # 为输出保留的 token 预算（避免压缩后无法生成回答）
-  output_reserve_tokens: 2048
-  # L1 粗过滤阈值：低于此相似度的文档直接丢弃
-  l1_threshold: 0.6
-  # L2 细过滤阈值：中等相似度，进入摘要候选池
-  l2_threshold: 0.8
-  # L3 保留阈值：高于此相似度的原始文本完整保留
-  l3_threshold: 0.95
-  # 用于语义相似度计算的 embedding 模型
-  embedding_model: "all-MiniLM-L6-v2"
-  # 是否启用多级压缩（L1-L3）
-  enable_multilevel: true
-
-memory:
-  # M4: Shared Memory Store 配置
-  # SQLite 数据库文件路径
-  db_path: "data/memory.db"
-  # 内存表中最大条目数，超过则触发淘汰
-  max_entries: 10000
-  # 去重相似度阈值：高于此值视为重复记忆，不重复写入
-  similarity_threshold_dup: 0.92
-  # 冲突检测阈值：高于此值但内容矛盾时触发冲突消解
-  similarity_threshold_conflict: 0.65
-  # 每写入多少条后执行一次自动淘汰（LRU）
-  evict_interval: 100
-  # 是否启用向量化索引（加速相似度检索）
-  enable_vector_index: true
-
-evidence:
-  # PaperPilot: Evidence 提取层配置
-  # 总开关：启用后从 arxiv 论文摘要提取结构化证据并写入报告证据索引
-  enabled: true
-  # Evidence Graph：构建证据关系图（矛盾/支持/扩展），并写入报告"证据关系"节
-  enable_graph: true
-  # SUPPORTS 相似度下界（0.65~0.92 之间的带：反义→CONTRADICTS，否则→EXTENDS）
-  supports_threshold: 0.75
-  # 每个子任务结果最多收割的论文数（控制 token 成本）
-  max_papers_per_result: 3
-  # 每篇论文最多提取的 claim 数
-  max_claims_per_paper: 5
-
-adversarial:
-  # M5: Red-Blue Adversarial Loop 配置
-  # 总开关：默认关闭（当前火山 key 只有 deepseek-v4-flash 推理模型，
-  # 单次调用 8-9 分钟；确认快速模型可用后再开启）。
-  # 开启后请把 judge/red_agent/blue_agent 切到快速后端（见 model.backend_sampling.modules 注释）。
-  enabled: false
-  # Red-Blue 对抗最大轮数（10 轮在慢模型上会跑数小时；2 轮通常已有主要收益）
-  max_rounds: 2
-  # Blue Agent 输出质量分阈值，达到此分即可提前终止对抗
-  score_threshold: 7.5
-  # 相邻两轮评分差异阈值，低于此值视为收敛，提前终止
-  delta_threshold: 0.5
-  # 是否保存每轮对抗日志
-  # 注意：采样参数已移至 model.backend_sampling.modules，此处不再使用
-  save_logs: true
-
-evolution:
-  # M6: Self-Evolution Engine 配置
-  # 总开关：是否启用在线自进化训练
-  enabled: false
-  # 进化总轮数（GRPO 迭代次数）
-  num_rounds: 20
-  # 每轮采样的 query 数量
-  batch_size: 32
-  # 每组 query 的采样组大小（GRPO group size）
-  group_size: 8
-  # 单条轨迹最大交互轮数
-  grpo_steps: 50
-  # LoRA 微调学习率
-  learning_rate: 5.0e-6
-  # KL 散度惩罚系数
-  kl_coef: 0.01
-  # LoRA 低秩维度
-  lora_rank: 16
-  # 评委模型集成数量（多数投票降低方差）
-  judge_ensemble_size: 3
-  # 每隔多少轮在保留校准集上验证一次
-  held_out_calib_interval: 5
-  # 每隔多少轮执行一次符号规则学习
-  symbolic_learning_interval: 3
+chat:
+  db_path: "data/chat.db"
 
 tools:
-  # 工具模块全局配置
-  execution:
-    # 单一工具的总尝试次数（包含第一次调用）
-    max_attempts: 2
-    retry_delay_seconds: 0.25
-    # 主工具持续失败后，仅调用列表中第一个实际可用的替代工具
-    fallbacks:
-      web_search: [arxiv_reader]
-      arxiv_reader: [web_search]
-      browser: [web_search]
+  enabled:
+    - web_search
+    - browser
+    - arxiv_reader
+    - file_reader
+    - calculator
+    - notepad
   web_search:
-    enabled: true
-    # mock_mode: 无真实搜索 API 时返回模拟结果，用于快速调试
     mock_mode: false
-    # 单次搜索返回的最大结果数
-    max_results: 10
-    # 搜索结果摘要最大 token 数
-    snippet_max_tokens: 512
-  arxiv_reader:
-    enabled: true
-    # 单次 ArXiv 查询最多获取的论文数
-    max_papers: 5
-    # 论文摘要最大 token 数
-    abstract_max_tokens: 1024
-  code_sandbox:
-    enabled: false
-    # 代码执行超时（秒）
-    timeout_seconds: 30
-    # 允许的最大内存（MB）
-    memory_limit_mb: 512

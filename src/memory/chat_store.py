@@ -1,8 +1,8 @@
 """
-ChatStore：会话对话消息的 SQLite 持久化（Web UI 侧边栏 + 历史消息 + 研究报告留档）。
+ChatStore：会话对话消息的 SQLite 持久化（Web UI 侧边栏 + 历史消息）。
 
-独立于 M4 记忆存储：Web 端维护"用户-澄清-研究方案-报告"的完整对话流，
-重启服务器后仍可回溯。仿 EvidenceStore 的锁/连接/建表模式。
+研究正文只写入 Markdown Memory Store；聊天记录中的报告消息仅保存
+manifest 路径引用。重启服务器后仍可回溯会话。使用独立的锁、连接与建表逻辑。
 """
 
 from __future__ import annotations
@@ -19,13 +19,13 @@ logger = logging.getLogger(__name__)
 # 消息类型
 KIND_CHAT = "chat"        # 普通对话（澄清问答）
 KIND_PROPOSAL = "proposal"  # 研究方案确认卡
-KIND_REPORT = "report"    # 研究报告（Markdown，持久化留档）
+KIND_REPORT = "report"    # Markdown Memory Store manifest 路径引用
 
 
 class ChatStore:
     """chat_messages 表 CRUD + 会话列表（含首条消息预览）。"""
 
-    def __init__(self, db_path: str = "data/memory.db") -> None:
+    def __init__(self, db_path: str = "data/chat.db") -> None:
         self.db_path = db_path
         self._lock = threading.RLock()
         Path(db_path).parent.mkdir(parents=True, exist_ok=True)
@@ -171,13 +171,14 @@ class ChatStore:
         return message_id
 
     def get_messages(self, session_id: str) -> list[dict]:
-        """按 message_id 升序返回该 session 全部消息。"""
+        """按 message_id 的数字序号返回该 session 全部消息。"""
         with self._lock:
             conn = self._connect()
             try:
                 cur = conn.execute(
                     "SELECT message_id, role, kind, content, timestamp "
-                    "FROM chat_messages WHERE session_id = ? ORDER BY message_id",
+                    "FROM chat_messages WHERE session_id = ? "
+                    "ORDER BY CAST(SUBSTR(message_id, 3) AS INTEGER), timestamp",
                     (session_id,),
                 )
                 return [dict(r) for r in cur.fetchall()]
@@ -199,7 +200,8 @@ class ChatStore:
                     "sm.title AS meta_title, sm.pinned, sm.sort_order "
                     "FROM chat_messages cm "
                     "LEFT JOIN session_meta sm ON sm.session_id = cm.session_id "
-                    "ORDER BY cm.session_id, cm.message_id"
+                    "ORDER BY cm.session_id, "
+                    "CAST(SUBSTR(cm.message_id, 3) AS INTEGER), cm.timestamp"
                 )
                 rows = cur.fetchall()
             finally:

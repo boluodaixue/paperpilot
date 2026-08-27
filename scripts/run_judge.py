@@ -3,7 +3,7 @@
 """
 scripts/run_judge.py
 ================================================================================
-MiMo Judge 深度评分入口脚本。
+PaperPilot Judge 深度评分入口脚本。
 
 对单篇研究报告进行 5 维度专家评分，输出结构化 JSON。
 
@@ -24,18 +24,36 @@ PROJECT_ROOT = Path(__file__).resolve().parent.parent
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-from src.core.judge import LLMJudge
+from evaluation.judge import LLMJudge
+from src.research.runtime import load_config
+
+
+def _judge_backend(config: dict, override: str | None = None) -> str | None:
+    if override:
+        return override
+    model_config = config.get("model", {})
+    return model_config.get("backend_mapping", {}).get(
+        "judge", model_config.get("backend")
+    )
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="MiMo Judge 深度评分")
+    parser = argparse.ArgumentParser(description="PaperPilot Judge 深度评分")
     parser.add_argument("--report_file", type=str, default=None, help="报告文件路径（Markdown）")
     parser.add_argument("--report_text", type=str, default=None, help="报告文本内容")
     parser.add_argument("--query", type=str, required=True, help="原始研究问题")
     parser.add_argument("--ground_truth_file", type=str, default=None, help="ground_truth JSON 文件")
     parser.add_argument("--output", type=str, default=None, help="评分结果输出 JSON 路径")
-    parser.add_argument("--backend", type=str, default="mimo", help="Judge 后端名称")
+    parser.add_argument("--config", type=str, default=None, help="配置文件路径")
+    parser.add_argument(
+        "--backend",
+        type=str,
+        default=None,
+        help="显式覆盖配置中的 model.backend_mapping.judge",
+    )
     args = parser.parse_args()
+    config = load_config(args.config)
+    backend = _judge_backend(config, args.backend)
 
     # 读取报告
     if args.report_file:
@@ -53,15 +71,15 @@ def main() -> None:
         with open(args.ground_truth_file, "r", encoding="utf-8") as f:
             ground_truth = json.load(f)
 
-    print(f"[Judge] 正在用 {args.backend} 对报告进行深度评分...")
-    judge = LLMJudge(backend=args.backend)
+    print(f"[Judge] 正在用 {backend} 对报告进行深度评分...")
+    judge = LLMJudge(backend=backend)
     result = judge.score_single(report_text, args.query, ground_truth)
 
     if "error" in result:
         print(f"[Judge] 评分失败: {result['error']}")
         sys.exit(1)
 
-    print("\n===== MiMo Judge 评分结果 =====")
+    print("\n===== Judge 评分结果 =====")
     print(f"整体质量: {result['overall']['score']:.1f}/10 — {result['overall']['reason']}")
     print(f"平均分: {result['average']:.2f}")
     print("\n各维度:")

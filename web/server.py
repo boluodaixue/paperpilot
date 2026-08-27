@@ -1,429 +1,425 @@
 #!/usr/bin/env python3
-# -*- coding: utf-8 -*-
-"""
-web/server.py
-================================================================================
-PaperPilot Web 服务器：FastAPI + SSE 进度流 + 单页前端。
-
-研究任务是长任务（数分钟），采用"后台 asyncio 任务 + SSE 流式进度"模式：
-  1. POST /api/research     提交问题，立即返回 task_id + session_id
-  2. GET  /api/tasks/{id}/events   SSE 实时进度流
-  3. GET  /api/tasks/{id}/result   完成后取完整结果
-  4. GET  /api/sessions            历史 session 列表
-  5. GET  /api/sessions/{id}/graph 证据关系图数据（export_json）
-
-单用户本地工具：任务状态只存内存，不落盘；研究任务串行执行
-（WebSearchTool 共享连接池，且火山 key 有速率限制）。
-================================================================================
-"""
-
+"""PaperPilot Web server backed only by the homogeneous Research Workflow."""
 from __future__ import annotations
 
 import asyncio
 import json
 import os
+import sys
 import time
 import uuid
+from collections import Counter
+from contextlib import asynccontextmanager
+from dataclasses import asdict
 from pathlib import Path
-from urllib.parse import quote
+from typing import Any, Iterable
 
-# 将项目根目录加入 sys.path，确保 src 包可导入
+from fastapi import FastAPI, Header, HTTPException
+from fastapi.responses import HTMLResponse, StreamingResponse
+from langgraph.types import Command
+from pydantic import BaseModel
+
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
-import sys  # noqa: E402
-
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
-
-# 锚定工作目录到项目根：configs/db_path/outputs 都是相对路径，
-# 无论服务器从哪里启动都正确解析（否则 data/memory.db 会落到别的目录）
 os.chdir(PROJECT_ROOT)
-
-# 中文 Windows 控制台默认 GBK：orchestrator 打印的 ✓/✗ 字符会触发
-# UnicodeEncodeError，导致整个研究任务崩溃（和 run_single.py 同因）。
-# 统一重配为 UTF-8，errors='replace' 兜底。
 for _stream in (sys.stdout, sys.stderr):
     try:
         _stream.reconfigure(encoding="utf-8", errors="replace")
     except (AttributeError, ValueError):
         pass
 
-from fastapi import FastAPI, HTTPException  # noqa: E402
-from fastapi.responses import HTMLResponse, StreamingResponse  # noqa: E402
-from pydantic import BaseModel  # noqa: E402
-
-from src.utils.env_config import ensure_env_loaded  # noqa: E402
-
-ensure_env_loaded()
-from src.core.runner import load_config  # noqa: E402
+from src.memory.chat_store import KIND_PROPOSAL, KIND_REPORT, ChatStore  # noqa: E402
+from src.research.models import ResearchWorkflowResult  # noqa: E402
+from src.research.runtime import ResearchRuntime, build_research_runtime, load_config  # noqa: E402
 
 STATIC_DIR = Path(__file__).resolve().parent / "static"
 _config = load_config()
-DB_PATH = _config.get("memory", {}).get("db_path", "data/memory.db")
+_configured_chat_db = Path(str(_config.get("chat", {}).get("db_path", "data/chat.db")))
+CHAT_DB_PATH = str(
+    _configured_chat_db if _configured_chat_db.is_absolute()
+    else PROJECT_ROOT / _configured_chat_db
+)
 
-from src.memory.chat_store import KIND_PROPOSAL, KIND_REPORT, ChatStore  # noqa: E402
 
-app = FastAPI(title="PaperPilot", version="0.1.0")
+@asynccontextmanager
+async def _lifespan(_app: FastAPI):
+    yield
+    runtime = getattr(get_research_runtime, "_runtime", None)
+    if runtime is not None:
+        try:
+            await runtime.close(shutdown=True)
+        except Exception as exc:
+            print(f"[Runtime] 关闭失败: {exc}")
+
+
+app = FastAPI(title="PaperPilot", version="0.2.0", lifespan=_lifespan)
 
 
 def get_chat_store() -> ChatStore:
-    """惰性单例 ChatStore（db 锚定到项目根，chdir 已在上方执行）。"""
     store = getattr(get_chat_store, "_store", None)
     if store is None:
-        store = ChatStore(DB_PATH)
+        store = ChatStore(CHAT_DB_PATH)
         get_chat_store._store = store
     return store
 
 
-def _get_clarifier_policy():
-    """澄清用的 LLM policy（短 prompt，max_tokens 收紧）。"""
-    from src.models.model_router import ModelRouter
+def get_research_runtime() -> ResearchRuntime:
+    """Return one process-level runtime, graph, and checkpointer."""
+    runtime = getattr(get_research_runtime, "_runtime", None)
+    if runtime is None:
+        runtime = build_research_runtime()
+        get_research_runtime._runtime = runtime
+    return runtime
 
-    return ModelRouter.create_backend("deepseek", max_tokens=800, temperature=0.1)
-
-
-# ---------------------------------------------------------------------------
-# 任务管理器（内存态）
-# ---------------------------------------------------------------------------
 
 class ResearchTask:
-    """单个研究任务：事件队列 + 状态 + 结果。"""
-
     def __init__(self, task_id: str, session_id: str, query: str) -> None:
-        self.task_id = task_id
-        self.session_id = session_id
-        self.query = query
-        self.events: asyncio.Queue = asyncio.Queue()
-        self.status: str = "running"  # running | done | error
-        self.result: dict | None = None
+        self.task_id = self.thread_id = task_id
+        self.session_id, self.query = session_id, query
+        self.status = "waiting_confirmation"
+        self.result: dict[str, Any] | None = None
         self.error: str | None = None
         self.created_at = time.time()
+        self.events: list[dict[str, Any]] = []
+        self._condition = asyncio.Condition()
+        self._emitted: Counter[str] = Counter()
+
+    async def publish(self, event: dict[str, Any]) -> None:
+        async with self._condition:
+            self.events.append({**event, "sequence": len(self.events) + 1})
+            self._condition.notify_all()
+
+    async def publish_execution_events(self, events: Iterable[dict[str, Any]]) -> None:
+        occurrences: Counter[str] = Counter()
+        for raw in events:
+            if not isinstance(raw, dict) or not raw.get("kind"):
+                continue
+            key = json.dumps(raw, sort_keys=True, ensure_ascii=False, default=str)
+            occurrences[key] += 1
+            if occurrences[key] <= self._emitted[key]:
+                continue
+            self._emitted[key] = occurrences[key]
+            await self.publish({"type": raw["kind"], **raw})
+
+    async def wait_after(self, cursor: int) -> list[dict[str, Any]]:
+        async with self._condition:
+            if len(self.events) <= cursor and self.status not in {"done", "error"}:
+                try:
+                    await asyncio.wait_for(self._condition.wait(), timeout=30)
+                except asyncio.TimeoutError:
+                    return []
+            return [event for event in self.events if event["sequence"] > cursor]
 
 
 _TASKS: dict[str, ResearchTask] = {}
-# 研究任务串行执行（WebSearchTool 共享连接池 + API 速率限制）
 _RUN_SEMAPHORE = asyncio.Semaphore(1)
 
 
-class ResearchRequest(BaseModel):
-    query: str
+class AlignmentRequest(BaseModel):
     session_id: str | None = None
-
-
-def _collect_evidence_data(modules: dict) -> tuple[list, list]:
-    """从 store/graph 收集结构化证据与关系（公开 API，不依赖私有状态）。"""
-    evidence: list = []
-    store = modules.get("evidence_store")
-    if store is not None:
-        evidence = [ev.to_report_dict() for ev in store.get_all()]
-    relations: list = []
-    graph = modules.get("evidence_graph")
-    if graph is not None:
-        for r in graph.get_contradictions(limit=20):
-            relations.append(r.to_dict())
-        for r in graph.get_supports(limit=10):
-            relations.append(r.to_dict())
-        for r in graph.get_extends(limit=10):
-            relations.append(r.to_dict())
-    return evidence, relations
-
-
-def _export_session_vault(session_id: str) -> str | None:
-    """把会话导出为 Obsidian Vault（报告 + 证据 + 关系），返回 vault 目录绝对路径。
-
-    无报告返回 None（手动端点据此 404；自动导出路径静默跳过）。
-    """
-    from src.evidence.graph import EvidenceGraph
-    from src.evidence.obsidian_export import export_session_vault
-    from src.evidence.store import EvidenceStore
-
-    # 1. 报告（chat_messages 里最后一条 kind=report）
-    report_md = ""
-    for m in get_chat_store().get_messages(session_id):
-        if m.get("kind") == "report":
-            report_md = m.get("content", "")
-    if not report_md:
-        return None
-
-    # 2. 证据（全量对象，含 evidence_text）
-    evidence = EvidenceStore(db_path=DB_PATH, session_id=session_id).get_all()
-
-    # 3. 关系
-    relations: list = []
-    graph = EvidenceGraph(db_path=DB_PATH, session_id=session_id)
-    for r in graph.get_contradictions():
-        relations.append(r)
-    for r in graph.get_supports():
-        relations.append(r)
-    for r in graph.get_extends():
-        relations.append(r)
-
-    return export_session_vault(
-        session_id, report_md, evidence, relations, output_root=str(PROJECT_ROOT / "outputs" / "obsidian")
-    )
-
-
-async def _run_research_task(task: ResearchTask) -> None:
-    """后台执行完整研究流程，进度事件推入 task.events。"""
-    try:
-        async with _RUN_SEMAPHORE:
-            from src.core.runner import initialize_modules, run_research
-
-            config = load_config()
-            modules = initialize_modules(config, session_id=task.session_id)
-
-            start = time.time()
-            report_md = await run_research(
-                task.query,
-                config,
-                modules,
-                progress_callback=lambda ev: task.events.put_nowait(ev),
-            )
-            elapsed = time.time() - start
-
-            # 合成失败会产出降级短报告（如 "Synthesis failed." 或超时兜底），
-            # 不应当作成功报告落盘展示
-            if len((report_md or "").strip()) < 300:
-                raise RuntimeError(
-                    f"研究报告生成失败（内容过短，{len(report_md or '')} 字符；"
-                    f"可能是合成超时或模型限流）"
-                )
-
-            evidence, relations = _collect_evidence_data(modules)
-            result = {
-                "task_id": task.task_id,
-                "session_id": task.session_id,
-                "query": task.query,
-                "elapsed": round(elapsed, 1),
-                "report_md": report_md,
-                "evidence": evidence,
-                "evidence_relations": relations,
-            }
-
-            # 研究报告持久化到会话消息（重启服务器后可回溯历史）
-            try:
-                get_chat_store().add(task.session_id, "assistant", KIND_REPORT, report_md)
-            except Exception as e:
-                print(f"[Chat] 报告落盘失败: {e}")
-            # PaperPilot: 自动导出 Obsidian Vault（失败不影响主流程）
-            try:
-                vault = await asyncio.to_thread(_export_session_vault, task.session_id)
-                if vault:
-                    result["vault_path"] = vault
-                    print(f"[Obsidian] 已导出 Vault: {vault}")
-            except Exception as e:
-                print(f"[Obsidian] 自动导出失败: {e}")
-
-            # 报告持久化和自动导出都已结束后再通知前端，避免用户立即手动导出时并发覆盖。
-            # Obsidian 导出是 best-effort：失败不影响研究任务成功。
-            task.result = result
-            task.status = "done"
-            await task.events.put({"type": "done", "session_id": task.session_id})
-    except Exception as e:
-        task.status = "error"
-        task.error = str(e)
-        await task.events.put({"type": "error", "message": str(e)[:500]})
-
-
-def _get_task(task_id: str) -> ResearchTask:
-    task = _TASKS.get(task_id)
-    if task is None:
-        raise HTTPException(status_code=404, detail=f"任务不存在: {task_id}")
-    return task
-
-
-# ---------------------------------------------------------------------------
-# 路由
-# ---------------------------------------------------------------------------
-
-@app.get("/", response_class=HTMLResponse)
-async def index() -> str:
-    html_path = STATIC_DIR / "index.html"
-    if not html_path.exists():
-        raise HTTPException(status_code=500, detail="前端页面缺失")
-    return html_path.read_text(encoding="utf-8")
-
-
-@app.post("/api/research")
-async def start_research(req: ResearchRequest) -> dict:
-    query = (req.query or "").strip()
-    if not query:
-        raise HTTPException(status_code=400, detail="query 不能为空")
-
-    session_id = (req.session_id or "").strip() or f"web-{uuid.uuid4().hex[:8]}"
-    task_id = uuid.uuid4().hex[:12]
-
-    task = ResearchTask(task_id, session_id, query)
-    _TASKS[task_id] = task
-    asyncio.create_task(_run_research_task(task))
-
-    return {"task_id": task_id, "session_id": session_id, "status": "running"}
-
-
-@app.get("/api/tasks/{task_id}/events")
-async def task_events(task_id: str) -> StreamingResponse:
-    """SSE 进度流：推送 state/task_done/evidence/synthesis/done/error 事件。"""
-    task = _get_task(task_id)
-
-    async def event_stream():
-        # 任务已完成才连接：直接发最终状态后结束
-        if task.status in ("done", "error") and task.events.empty():
-            ev = {"type": "done"} if task.status == "done" else {"type": "error", "message": task.error or ""}
-            yield f"data: {json.dumps(ev, ensure_ascii=False)}\n\n"
-            return
-        while True:
-            try:
-                ev = await asyncio.wait_for(task.events.get(), timeout=30)
-            except asyncio.TimeoutError:
-                # 心跳，保持连接
-                yield ": keep-alive\n\n"
-                continue
-            yield f"data: {json.dumps(ev, ensure_ascii=False)}\n\n"
-            if ev.get("type") in ("done", "error"):
-                break
-
-    return StreamingResponse(event_stream(), media_type="text/event-stream")
-
-
-@app.get("/api/tasks/{task_id}/result")
-async def task_result(task_id: str) -> dict:
-    task = _get_task(task_id)
-    if task.status == "running":
-        raise HTTPException(status_code=202, detail="任务仍在执行")
-    if task.status == "error":
-        return {"task_id": task_id, "status": "error", "message": task.error or ""}
-    return {"status": "done", **task.result}
-
-
-@app.get("/api/sessions/{sid}/active-task")
-async def session_active_task(sid: str) -> dict:
-    """查询某会话是否有正在运行的研究任务（前端切换会话后重连 SSE 用）。"""
-    for task in _TASKS.values():
-        if task.session_id == sid and task.status == "running":
-            return {"task_id": task.task_id, "status": "running"}
-    return {"task_id": None, "status": "idle"}
-
-
-@app.get("/api/sessions")
-async def list_sessions() -> list:
-    """侧边栏会话列表：优先聊天记录（含首条消息预览），补老会话（仅有记忆/证据）。"""
-    sessions = get_chat_store().list_sessions()
-    known = {s["session_id"] for s in sessions}
-    try:
-        from src.memory.memory_store import SharedMemoryStore
-
-        legacy = SharedMemoryStore(db_path=DB_PATH, session_id="")
-        for s in legacy.list_sessions():
-            if s["session_id"] not in known:
-                sessions.append({
-                    "session_id": s["session_id"],
-                    "title": s["session_id"],
-                    "pinned": False,
-                    "sort_order": 0.0,
-                    "last_update": s["last_update"],
-                    "count": s["count"],
-                })
-    except Exception:
-        pass
-    # 与 ChatStore.list_sessions 同款排序：置顶优先 → 拖拽顺序 → 更新时间兜底
-    sessions.sort(key=lambda s: (
-        not s.get("pinned", False),
-        s.get("sort_order", 0.0),
-        -s.get("last_update", 0),
-    ))
-    return sessions
-
-
-class ClarifyRequest(BaseModel):
-    session_id: str | None = None
+    task_id: str | None = None
     message: str
 
 
-@app.post("/api/clarify")
-async def clarify(req: ClarifyRequest) -> dict:
-    """研究前澄清：追加用户消息，调 clarifier，返回 ask（追问）或 confirm（研究方案）。"""
-    message = (req.message or "").strip()
-    if not message:
-        raise HTTPException(status_code=400, detail="消息不能为空")
-
-    session_id = (req.session_id or "").strip() or f"web-{uuid.uuid4().hex[:8]}"
-    store = get_chat_store()
-    store.add(session_id, "user", "chat", message)
-    history = store.get_messages(session_id)
-
-    from web.clarifier import run_clarifier
-
-    try:
-        result = await asyncio.to_thread(
-            run_clarifier, _get_clarifier_policy(), history, message
-        )
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"澄清失败: {e}")
-
-    if result["action"] == "confirm":
-        plan = result.get("plan") or {}
-        proposal = {
-            "topic": plan.get("topic", ""),
-            "scope": plan.get("scope", ""),
-            "angle": plan.get("angle", ""),
-            "depth": plan.get("depth", ""),
-            "focus_areas": plan.get("focus_areas") or [],
-        }
-        research_query = result.get("research_query", message)
-        store.add(
-            session_id,
-            "assistant",
-            KIND_PROPOSAL,
-            json.dumps({"plan": proposal, "research_query": research_query}, ensure_ascii=False),
-        )
-        return {
-            "session_id": session_id,
-            "action": "confirm",
-            "plan": proposal,
-            "research_query": research_query,
-        }
-
-    store.add(session_id, "assistant", "chat", result["question"])
-    return {"session_id": session_id, "action": "ask", "question": result["question"]}
-
-
-@app.get("/api/sessions/{sid}/messages")
-async def session_messages(sid: str) -> list:
-    """返回某会话的完整消息历史（含研究报告留档）。"""
-    return get_chat_store().get_messages(sid)
-
-
-@app.get("/api/sessions/{sid}/evidence")
-async def session_evidence(sid: str) -> dict:
-    """某会话的结构化证据 + 关系（供历史报告卡渲染，不依赖内存任务态）。"""
-    from src.evidence.graph import EvidenceGraph
-    from src.evidence.store import EvidenceStore
-
-    try:
-        store = EvidenceStore(db_path=DB_PATH, session_id=sid)
-        evidence = [ev.to_report_dict() for ev in store.get_all()]
-    except Exception:
-        evidence = []
-    relations: list = []
-    try:
-        graph = EvidenceGraph(db_path=DB_PATH, session_id=sid)
-        for r in graph.get_contradictions(limit=20):
-            relations.append(r.to_dict())
-        for r in graph.get_supports(limit=10):
-            relations.append(r.to_dict())
-        for r in graph.get_extends(limit=10):
-            relations.append(r.to_dict())
-    except Exception:
-        pass
-    return {"evidence": evidence, "evidence_relations": relations, "session_id": sid}
+class ResearchRequest(BaseModel):
+    task_id: str
+    session_id: str | None = None
 
 
 class SessionRename(BaseModel):
     title: str
 
 
+class SessionPin(BaseModel):
+    pinned: bool
+
+
+class SessionOrder(BaseModel):
+    session_ids: list[str]
+
+
+def _get_task(task_id: str) -> ResearchTask:
+    if task_id not in _TASKS:
+        raise HTTPException(status_code=404, detail=f"任务不存在: {task_id}")
+    return _TASKS[task_id]
+
+
+def _active_task(session_id: str) -> ResearchTask | None:
+    matches = [
+        task for task in _TASKS.values()
+        if task.session_id == session_id
+        and task.status in {"waiting_confirmation", "running"}
+    ]
+    return max(matches, key=lambda item: item.created_at) if matches else None
+
+
+def _interrupt_brief(state: dict[str, Any]) -> dict[str, Any]:
+    interrupts = state.get("__interrupt__") or ()
+    if len(interrupts) != 1:
+        raise RuntimeError("workflow did not pause for one brief review")
+    payload = interrupts[0].value
+    if not isinstance(payload, dict) or payload.get("kind") != "research_brief_confirmation":
+        raise RuntimeError("workflow returned an invalid review payload")
+    return payload["brief"]
+
+
+def _proposal_pointer(task: ResearchTask, brief: dict[str, Any]) -> str:
+    return json.dumps(
+        {"task_id": task.task_id, "thread_id": task.thread_id, "brief": brief},
+        ensure_ascii=False,
+    )
+
+
+def _report_pointer(task: ResearchTask, result: ResearchWorkflowResult) -> dict[str, Any]:
+    return {
+        "task_id": task.task_id,
+        "thread_id": task.thread_id,
+        "manifest": asdict(result.memory_manifest),
+    }
+
+
+def _latest_report_pointer(session_id: str) -> dict[str, Any] | None:
+    for message in reversed(get_chat_store().get_messages(session_id)):
+        if message.get("kind") == KIND_REPORT:
+            try:
+                value = json.loads(message.get("content") or "")
+            except (TypeError, json.JSONDecodeError):
+                continue
+            if isinstance(value, dict) and isinstance(value.get("manifest"), dict):
+                return value
+    return None
+
+
+def _expanded_messages(session_id: str) -> list[dict[str, Any]]:
+    messages = get_chat_store().get_messages(session_id)
+    runtime: ResearchRuntime | None = None
+    for message in messages:
+        if message.get("kind") != KIND_REPORT:
+            continue
+        try:
+            pointer = json.loads(message["content"])
+            manifest = pointer["manifest"]
+            runtime = runtime or get_research_runtime()
+            message["content"] = runtime.read_memory(manifest["report_path"])
+            message["manifest"] = manifest
+            message["thread_id"] = pointer.get("thread_id")
+        except (KeyError, TypeError, ValueError, OSError, json.JSONDecodeError):
+            message["content"] = "报告文件暂时不可读取。"
+    return messages
+
+
+def _event_lists(value: Any) -> Iterable[list[dict[str, Any]]]:
+    if isinstance(value, dict):
+        for key, child in value.items():
+            if key == "execution_events" and isinstance(child, list):
+                yield child
+            else:
+                yield from _event_lists(child)
+    elif isinstance(value, tuple):
+        for child in value:
+            yield from _event_lists(child)
+
+
+async def _stream_confirm(task: ResearchTask) -> dict[str, Any]:
+    runtime = get_research_runtime()
+    config = {"configurable": {"thread_id": task.thread_id}}
+    async for update in runtime.graph.astream(
+        Command(resume={"action": "confirm"}),
+        config=config,
+        stream_mode="updates",
+        subgraphs=True,
+    ):
+        for events in _event_lists(update):
+            await task.publish_execution_events(events)
+    state = await runtime.get_state(task.thread_id)
+    await task.publish_execution_events(state.get("execution_events", []))
+    return state
+
+
+async def _run_research_task(task: ResearchTask) -> None:
+    try:
+        async with _RUN_SEMAPHORE:
+            started = time.time()
+            state = await _stream_confirm(task)
+            workflow_result = state.get("workflow_result")
+            if not isinstance(workflow_result, ResearchWorkflowResult):
+                raise RuntimeError("workflow ended without a structured result")
+            research_result = workflow_result.research_result
+            task.result = {
+                "task_id": task.task_id,
+                "thread_id": task.thread_id,
+                "session_id": task.session_id,
+                "query": task.query,
+                "elapsed": round(time.time() - started, 1),
+                "research_status": research_result.status.value,
+                "stop_reason": research_result.stop_reason,
+                "report_md": workflow_result.report_markdown,
+                "evidence": [asdict(item) for item in research_result.evidence],
+                "manifest": asdict(workflow_result.memory_manifest),
+            }
+            try:
+                get_chat_store().add(
+                    task.session_id, "assistant", KIND_REPORT,
+                    json.dumps(_report_pointer(task, workflow_result), ensure_ascii=False),
+                )
+            except Exception as exc:
+                print(f"[Chat] 报告引用落盘失败: {exc}")
+            task.status = "done"
+            await task.publish({
+                "type": "done", "thread_id": task.thread_id,
+                "parent_thread_id": None, "root_thread_id": task.thread_id,
+                "session_id": task.session_id,
+            })
+    except Exception as exc:
+        task.status, task.error = "error", str(exc)
+        await task.publish({
+            "type": "error", "message": str(exc)[:500],
+            "thread_id": task.thread_id, "parent_thread_id": None,
+            "root_thread_id": task.thread_id,
+        })
+
+
+@app.get("/", response_class=HTMLResponse)
+async def index() -> str:
+    path = STATIC_DIR / "index.html"
+    if not path.exists():
+        raise HTTPException(status_code=500, detail="前端页面缺失")
+    return path.read_text(encoding="utf-8")
+
+
+@app.post("/api/alignment")
+async def align_research(req: AlignmentRequest) -> dict[str, Any]:
+    message = (req.message or "").strip()
+    if not message:
+        raise HTTPException(status_code=400, detail="消息不能为空")
+    runtime, store = get_research_runtime(), get_chat_store()
+    if req.task_id:
+        task = _get_task(req.task_id)
+        if req.session_id and req.session_id != task.session_id:
+            raise HTTPException(status_code=409, detail="task 与 session 不匹配")
+        if task.status != "waiting_confirmation":
+            raise HTTPException(status_code=409, detail="任务当前不等待方案修改")
+        store.add(task.session_id, "user", "chat", message)
+        try:
+            state = await runtime.review(task.thread_id, "modify", feedback=message)
+        except Exception as exc:
+            raise HTTPException(status_code=500, detail=f"方案修改失败: {exc}") from exc
+    else:
+        session_id = (req.session_id or "").strip() or f"web-{uuid.uuid4().hex[:8]}"
+        if _active_task(session_id):
+            raise HTTPException(status_code=409, detail="该会话已有待确认或运行中的研究")
+        thread_id = runtime.new_thread_id()
+        task = ResearchTask(thread_id, session_id, message)
+        _TASKS[thread_id] = task
+        store.add(session_id, "user", "chat", message)
+        try:
+            state = await runtime.start(message, thread_id=thread_id)
+        except Exception as exc:
+            task.status, task.error = "error", str(exc)
+            raise HTTPException(status_code=500, detail=f"研究说明生成失败: {exc}") from exc
+    brief = _interrupt_brief(state)
+    store.add(task.session_id, "assistant", KIND_PROPOSAL, _proposal_pointer(task, brief))
+    task.status = "waiting_confirmation"
+    return {
+        "session_id": task.session_id, "task_id": task.task_id,
+        "thread_id": task.thread_id, "status": task.status,
+        "action": "confirm", "brief": brief,
+    }
+
+
+@app.post("/api/research")
+async def start_research(req: ResearchRequest) -> dict[str, Any]:
+    task = _get_task(req.task_id)
+    if req.session_id and req.session_id != task.session_id:
+        raise HTTPException(status_code=409, detail="task 与 session 不匹配")
+    if task.status != "waiting_confirmation":
+        raise HTTPException(status_code=409, detail="任务当前不能确认启动")
+    task.status = "running"
+    await task.publish({
+        "type": "confirmed", "thread_id": task.thread_id,
+        "parent_thread_id": None, "root_thread_id": task.thread_id,
+    })
+    asyncio.create_task(_run_research_task(task))
+    return {"task_id": task.task_id, "thread_id": task.thread_id,
+            "session_id": task.session_id, "status": task.status}
+
+
+@app.get("/api/tasks/{task_id}/events")
+async def task_events(task_id: str, cursor: int = 0,
+                      last_event_id: str | None = Header(None, alias="Last-Event-ID")) -> StreamingResponse:
+    task = _get_task(task_id)
+    try:
+        cursor = max(0, cursor, int(last_event_id or 0))
+    except ValueError:
+        cursor = max(0, cursor)
+
+    async def stream():
+        current = cursor
+        while True:
+            events = await task.wait_after(current)
+            if not events:
+                if task.status in {"done", "error"}:
+                    return
+                yield ": keep-alive\n\n"
+                continue
+            for event in events:
+                current = event["sequence"]
+                yield f"id: {current}\ndata: {json.dumps(event, ensure_ascii=False)}\n\n"
+            if task.status in {"done", "error"} and current >= len(task.events):
+                return
+    return StreamingResponse(stream(), media_type="text/event-stream")
+
+
+@app.get("/api/tasks/{task_id}/result")
+async def task_result(task_id: str) -> dict[str, Any]:
+    task = _get_task(task_id)
+    if task.status in {"waiting_confirmation", "running"}:
+        raise HTTPException(status_code=202, detail="任务尚未完成")
+    if task.status == "error":
+        return {"task_id": task_id, "status": "error", "message": task.error or ""}
+    return {"transport_status": "done", **(task.result or {})}
+
+
+@app.get("/api/sessions/{sid}/active-task")
+async def session_active_task(sid: str) -> dict[str, Any]:
+    task = _active_task(sid)
+    return ({"task_id": None, "status": "idle"} if task is None else
+            {"task_id": task.task_id, "thread_id": task.thread_id, "status": task.status})
+
+
+@app.get("/api/sessions")
+async def list_sessions() -> list[dict[str, Any]]:
+    return get_chat_store().list_sessions()
+
+
+@app.get("/api/sessions/{sid}/messages")
+async def session_messages(sid: str) -> list[dict[str, Any]]:
+    return _expanded_messages(sid)
+
+
+@app.get("/api/sessions/{sid}/evidence")
+async def session_evidence(sid: str) -> dict[str, Any]:
+    pointer = _latest_report_pointer(sid)
+    if pointer is None:
+        return {"session_id": sid, "evidence": [], "sources": []}
+    manifest, runtime = pointer["manifest"], get_research_runtime()
+
+    def read_many(paths: Iterable[str]) -> list[dict[str, str]]:
+        result = []
+        for path in paths:
+            try:
+                result.append({"path": str(path), "markdown": runtime.read_memory(str(path))})
+            except (OSError, ValueError):
+                pass
+        return result
+    return {"session_id": sid,
+            "evidence": read_many(manifest.get("evidence_paths", [])),
+            "sources": read_many(manifest.get("source_paths", []))}
+
+
 @app.patch("/api/sessions/{sid}")
-async def session_rename(sid: str, req: SessionRename) -> dict:
-    """重命名会话（侧边栏标题）。"""
+async def session_rename(sid: str, req: SessionRename) -> dict[str, Any]:
     title = (req.title or "").strip()
     if not title:
         raise HTTPException(status_code=400, detail="标题不能为空")
@@ -431,105 +427,24 @@ async def session_rename(sid: str, req: SessionRename) -> dict:
     return {"session_id": sid, "title": title}
 
 
-class SessionPin(BaseModel):
-    pinned: bool
-
-
 @app.post("/api/sessions/{sid}/pin")
-async def session_pin(sid: str, req: SessionPin) -> dict:
-    """置顶 / 取消置顶会话。"""
+async def session_pin(sid: str, req: SessionPin) -> dict[str, Any]:
     get_chat_store().set_meta(sid, pinned=bool(req.pinned))
     return {"session_id": sid, "pinned": bool(req.pinned)}
 
 
-class SessionOrder(BaseModel):
-    session_ids: list[str]
-
-
 @app.post("/api/sessions/order")
-async def session_order(req: SessionOrder) -> dict:
-    """拖拽排序：session_ids 为新的展示顺序。"""
+async def session_order(req: SessionOrder) -> dict[str, Any]:
     get_chat_store().set_sort_order(req.session_ids)
     return {"ok": True, "count": len(req.session_ids)}
 
 
 @app.delete("/api/sessions/{sid}")
-async def session_delete(sid: str) -> dict:
-    """全量删除会话：聊天记录 + 报告 + 证据 + 关系边 + 记忆 + 冲突。"""
-    import sqlite3 as _sqlite3
-
-    deleted = {"chat": 0, "evidence": 0, "edges": 0, "entries": 0, "conflicts": 0}
-    with _sqlite3.connect(DB_PATH) as conn:
-        tables = {r[0] for r in conn.execute(
-            "SELECT name FROM sqlite_master WHERE type='table'"
-        )}
-        if "entries" in tables:
-            entry_ids = [r[0] for r in conn.execute(
-                "SELECT entry_id FROM entries WHERE session_id = ?", (sid,)
-            )]
-            if entry_ids and "conflicts" in tables:
-                placeholders = ",".join("?" * len(entry_ids))
-                deleted["conflicts"] = conn.execute(
-                    f"DELETE FROM conflicts WHERE entry_id_1 IN ({placeholders}) "
-                    f"OR entry_id_2 IN ({placeholders})",
-                    [*entry_ids, *entry_ids],
-                ).rowcount
-            deleted["entries"] = conn.execute(
-                "DELETE FROM entries WHERE session_id = ?", (sid,)
-            ).rowcount
-        if "evidence" in tables:
-            deleted["evidence"] = conn.execute(
-                "DELETE FROM evidence WHERE session_id = ?", (sid,)
-            ).rowcount
-        if "evidence_edges" in tables:
-            deleted["edges"] = conn.execute(
-                "DELETE FROM evidence_edges WHERE session_id = ?", (sid,)
-            ).rowcount
-        conn.commit()
-    deleted["chat"] = get_chat_store().delete_session(sid)
-    return {"session_id": sid, "deleted": deleted}
-
-
-@app.get("/api/sessions/{sid}/graph")
-async def session_graph(sid: str) -> dict:
-    from src.evidence.graph import EvidenceGraph
-    from src.evidence.store import EvidenceStore
-
-    graph = EvidenceGraph(db_path=DB_PATH, session_id=sid)
-    data = graph.export_json()
-    if not data["nodes"]:
-        raise HTTPException(status_code=404, detail=f"session '{sid}' 没有证据数据")
-
-    # 富化 evidence 节点：前端 label=claim 前 10 字，hover 显示全文/摘录/论文
-    try:
-        detail_by_id = {
-            ev.evidence_id: ev
-            for ev in EvidenceStore(db_path=DB_PATH, session_id=sid).get_all()
-        }
-        for n in data["nodes"]:
-            ev = detail_by_id.get(n["id"])
-            if ev is not None:
-                n["claim"] = ev.claim
-                n["evidence_text"] = ev.evidence_text
-                n["paper_title"] = ev.paper_title
-                n["label"] = ev.claim[:10] if ev.claim else n.get("label", "")
-    except Exception:
-        pass  # 富化失败退回原 label
-
-    return {"nodes": data["nodes"], "edges": data["edges"], "stats": graph.graph_stats()}
-
-
-@app.post("/api/sessions/{sid}/export-obsidian")
-async def session_export_obsidian(sid: str) -> dict:
-    """手动导出会话为 Obsidian Vault；返回 vault 目录路径。"""
-    vault = await asyncio.to_thread(_export_session_vault, sid)
-    if vault is None:
-        raise HTTPException(status_code=404, detail=f"会话 '{sid}' 没有研究报告可导出")
-    n_files = len([p for p in Path(vault).glob("*.md")])
-    normalized_path = vault.replace("\\", "/")
-    return {
-        "session_id": sid,
-        "vault_path": vault,
-        "obsidian_uri": f"obsidian://open?path={quote(normalized_path, safe='')}",
-        "files": n_files,
-    }
+async def session_delete(sid: str) -> dict[str, Any]:
+    if _active_task(sid):
+        raise HTTPException(status_code=409, detail="请等待当前研究结束后再删除会话")
+    deleted = get_chat_store().delete_session(sid)
+    for task_id, task in list(_TASKS.items()):
+        if task.session_id == sid and task.status in {"done", "error"}:
+            _TASKS.pop(task_id, None)
+    return {"session_id": sid, "deleted": {"chat": deleted}}
