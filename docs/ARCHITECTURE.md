@@ -237,16 +237,19 @@ Red/Blue 不参与 fork 决策，不替代研究完成判断，不循环互攻�
 
 当前 `ResearchResult` 不提供 claim 到 evidence 的逐条映射，因此确定性保护只能证明 frontmatter、WikiLink target、URL 和 manifest 等结构没有损坏，不能机械证明每条新增或修改后的表述都语义归因于正确证据。该语义审查由 Red/Blue 基于本次已有 evidence 完成。N6 不为此扩展数据模型；未来若要求可机械证明的强语义归因，必须另行对齐契约与验收边界。
 
-## 8. 后续 LLM Wiki
+## 8. LLM Wiki + Obsidian
 
-LLM Wiki 是 Memory Store 之上的未来能力，不进入当前研究执行核心。它可以：
+LLM Wiki 的目标架构已确认，详见 [LLM Wiki + Obsidian 目标架构](LLM_WIKI_OBSIDIAN_ARCHITECTURE.md)。
 
-- 基于既有报告、证据和来源回答问题；
-- 接收用户新增的论文或资料；
-- 整理、合并和建立新的 WikiLink；
-- 提示相互支持、冲突或值得继续研究的内容。
+核心决策是：
 
-它读取和维护同一 Markdown Memory Store，不引入第二套知识真相源。
+- Obsidian 负责 Markdown 阅读、手工编辑、WikiLink、Backlinks 和图谱，PaperPilot 不重复建造复杂阅读器；
+- 使用一个 PaperPilot Vault 和多个长期 Memory 目录，不默认为每次研究新建独立 Vault；
+- `memory_id` 表示长期知识项目，与会话级 `session_id` 和执行级 `thread_id` 分离；
+- 用户可在 Obsidian 中直接新增或修改 Markdown，PaperPilot 下次对话必须读取最新文件；
+- 普通记忆问答不进入 Research AgentGraph；需要补充研究时仍先进行 Research Brief 用户确认；
+- 对话结果不自动持久化，用户确认“保存为笔记”后才能原子写入；
+- Markdown Vault 仍是唯一知识真相源，本主线不引入图数据库、向量数据库或第二套存储。
 
 ## 9. N5 迁移结果
 
