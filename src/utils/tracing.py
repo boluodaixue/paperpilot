@@ -4,7 +4,7 @@
 
 - ``trace_agent`` / ``trace_tool`` / ``trace_chain`` / ``trace_retriever``
 - ``trace_block``：手动 observation 上下文
-- ``trace_context``：传播 run/session/fork 等关联属性
+- ``trace_context``：传播 execution/session/thread 等关联属性
 - ``create_openai_client``：按开关选择 Langfuse OpenAI drop-in client
 - ``flush_tracing`` / ``shutdown_tracing``：短进程发送与资源释放
 
@@ -14,7 +14,7 @@
 2. 默认不捕获普通函数的输入输出，避免把大型上下文和内部对象上传；
 3. LLM 调用由 Langfuse 官方 OpenAI drop-in client 记录；
 4. 基于 OpenTelemetry 自动保持嵌套 observation 的父子关系；
-5. 为后续 ResearchRun / AgentFork 预留 session、tag 和 metadata 传播接口。
+5. 为研究执行线程提供 session、tag 和 metadata 传播接口。
 """
 from __future__ import annotations
 
@@ -22,7 +22,7 @@ import functools
 import inspect
 import logging
 import re
-from contextlib import ExitStack, contextmanager
+from contextlib import contextmanager, nullcontext
 from typing import Any, Callable
 
 from .env_config import get_env, get_env_bool
@@ -90,8 +90,8 @@ def _safe_metadata(metadata: dict[str, Any] | None) -> dict[str, str] | None:
         return None
     result: dict[str, str] = {}
     for raw_key, raw_value in metadata.items():
-        key = re.sub(r"[^A-Za-z0-9]", "", str(raw_key))[:100]
-        if not key:
+        key = re.sub(r"[^A-Za-z0-9_]", "", str(raw_key))[:100]
+        if not key or raw_value is None:
             continue
         result[key] = str(raw_value)[:200]
     return result or None
@@ -102,6 +102,48 @@ def _safe_tags(tags: list[str] | None) -> list[str] | None:
         return None
     cleaned = [str(tag)[:200] for tag in tags if str(tag).strip()]
     return cleaned or None
+
+
+class _BestEffortContext:
+    """隔离 tracing context 故障，同时保持业务异常和单次执行语义。"""
+
+    def __init__(
+        self,
+        factory: Callable[[], Any],
+        *,
+        fallback: Any,
+        label: str,
+    ) -> None:
+        self._factory = factory
+        self._fallback = fallback
+        self._label = label
+        self._context = None
+        self._active = False
+
+    def __enter__(self) -> Any:
+        try:
+            self._context = self._factory()
+            value = self._context.__enter__()
+            self._active = True
+            return value
+        except Exception as exc:
+            logger.warning("%s进入失败，继续执行主流程: %s", self._label, exc)
+            if self._context is not None:
+                try:
+                    self._context.__exit__(type(exc), exc, exc.__traceback__)
+                except Exception as cleanup_exc:
+                    logger.warning("%s失败后的清理异常: %s", self._label, cleanup_exc)
+            self._context = None
+            return self._fallback
+
+    def __exit__(self, exc_type, exc, traceback) -> bool:
+        if self._active and self._context is not None:
+            try:
+                self._context.__exit__(exc_type, exc, traceback)
+            except Exception as tracing_exc:
+                logger.warning("%s退出失败，不影响主流程: %s", self._label, tracing_exc)
+        # tracing 永远不能吞掉或替换业务异常。
+        return False
 
 
 def create_openai_client(*, base_url: str, api_key: str) -> Any:
@@ -132,67 +174,61 @@ def traceable(
         if not is_tracing_enabled():
             return func
 
-        try:
-            from langfuse import observe, propagate_attributes
-        except Exception as exc:
-            logger.warning("Langfuse observe 加载失败（%s）: %s", func.__name__, exc)
-            return func
-
-        observation_kwargs = {
-            "name": name or func.__name__,
-            "as_type": _observation_type(run_type),
-            "capture_input": _capture_io_enabled(),
-            "capture_output": _capture_io_enabled(),
-        }
-        propagated = {
-            "tags": _safe_tags(tags),
-            "metadata": _safe_metadata(metadata),
-        }
-        propagated = {key: value for key, value in propagated.items() if value is not None}
-
         if inspect.iscoroutinefunction(func):
             @functools.wraps(func)
             async def async_wrapper(*args, **kwargs):
-                with propagate_attributes(**propagated):
-                    return await func(*args, **kwargs)
-
-            observed_async = observe(**observation_kwargs)(async_wrapper)
-            if not flush_on_exit:
-                return observed_async
-
-            @functools.wraps(func)
-            async def async_flush_wrapper(*args, **kwargs):
                 try:
-                    return await observed_async(*args, **kwargs)
+                    inputs = {"args": args, "kwargs": kwargs} if _capture_io_enabled() else None
+                    with trace_context(tags=tags, metadata=metadata):
+                        with trace_block(
+                            name or func.__name__,
+                            run_type=run_type,
+                            inputs=inputs,
+                        ) as run:
+                            try:
+                                result = await func(*args, **kwargs)
+                            except Exception as exc:
+                                run.set_error(str(exc))
+                                raise
+                            if _capture_io_enabled():
+                                run.add_output(result)
+                            return result
                 finally:
-                    # 外层 wrapper 保证 observation 已结束后再发送队列。
-                    flush_tracing()
+                    if flush_on_exit:
+                        # observation 已退出后再发送后台队列。
+                        flush_tracing()
 
-            return async_flush_wrapper
+            return async_wrapper
 
         @functools.wraps(func)
         def sync_wrapper(*args, **kwargs):
-            with propagate_attributes(**propagated):
-                return func(*args, **kwargs)
-
-        observed_sync = observe(**observation_kwargs)(sync_wrapper)
-        if not flush_on_exit:
-            return observed_sync
-
-        @functools.wraps(func)
-        def sync_flush_wrapper(*args, **kwargs):
             try:
-                return observed_sync(*args, **kwargs)
+                inputs = {"args": args, "kwargs": kwargs} if _capture_io_enabled() else None
+                with trace_context(tags=tags, metadata=metadata):
+                    with trace_block(
+                        name or func.__name__,
+                        run_type=run_type,
+                        inputs=inputs,
+                    ) as run:
+                        try:
+                            result = func(*args, **kwargs)
+                        except Exception as exc:
+                            run.set_error(str(exc))
+                            raise
+                        if _capture_io_enabled():
+                            run.add_output(result)
+                        return result
             finally:
-                flush_tracing()
+                if flush_on_exit:
+                    flush_tracing()
 
-        return sync_flush_wrapper
+        return sync_wrapper
 
     return decorator
 
 
 class _DummyRun:
-    def add_output(self, outputs: dict[str, Any]) -> None:
+    def add_output(self, outputs: Any) -> None:
         return None
 
     def add_metadata(self, metadata: dict[str, Any]) -> None:
@@ -208,7 +244,7 @@ class _LangfuseRun:
     def __init__(self, observation: Any) -> None:
         self._observation = observation
 
-    def add_output(self, outputs: dict[str, Any]) -> None:
+    def add_output(self, outputs: Any) -> None:
         try:
             self._observation.update(output=outputs)
         except Exception as exc:
@@ -236,28 +272,30 @@ def trace_context(
     tags: list[str] | None = None,
     metadata: dict[str, Any] | None = None,
 ):
-    """向当前 observation 及其子节点传播研究运行关联信息。"""
+    """向当前 observation 及其子节点传播研究执行关联信息。"""
     if not is_tracing_enabled():
         yield
         return
 
-    try:
-        from langfuse import propagate_attributes
-        kwargs = {
-            "session_id": session_id,
-            "user_id": user_id,
-            "trace_name": trace_name,
-            "tags": _safe_tags(tags),
-            "metadata": _safe_metadata(metadata),
-        }
-        kwargs = {key: value for key, value in kwargs.items() if value is not None}
-        propagation = propagate_attributes(**kwargs)
-    except Exception as exc:
-        logger.warning("Langfuse context 传播失败，继续执行主流程: %s", exc)
-        yield
-        return
+    kwargs = {
+        "session_id": session_id,
+        "user_id": user_id,
+        "trace_name": trace_name,
+        "tags": _safe_tags(tags),
+        "metadata": _safe_metadata(metadata),
+    }
+    kwargs = {key: value for key, value in kwargs.items() if value is not None}
 
-    with propagation:
+    def propagation_factory():
+        from langfuse import propagate_attributes
+
+        return propagate_attributes(**kwargs)
+
+    with _BestEffortContext(
+        propagation_factory,
+        fallback=None,
+        label="Langfuse context",
+    ):
         yield
 
 
@@ -277,25 +315,39 @@ def trace_block(
 
     @contextmanager
     def langfuse_context():
-        stack = ExitStack()
-        try:
-            from langfuse import get_client, propagate_attributes
+        safe_tags = _safe_tags(tags)
+
+        def propagation_factory():
+            if safe_tags is None:
+                return nullcontext()
+            from langfuse import propagate_attributes
+
+            return propagate_attributes(tags=safe_tags)
+
+        def observation_factory():
+            from langfuse import get_client
 
             client = get_client()
-            observation = stack.enter_context(client.start_as_current_observation(
-                    name=name,
-                    as_type=_observation_type(run_type),
-                    input=inputs if _capture_io_enabled() else None,
-                ))
-            stack.enter_context(propagate_attributes(tags=_safe_tags(tags)))
-        except Exception as exc:
-            stack.close()
-            logger.warning("Langfuse observation 创建失败，继续执行主流程: %s", exc)
-            yield _DummyRun()
-            return
+            return client.start_as_current_observation(
+                name=name,
+                as_type=_observation_type(run_type),
+                input=inputs if _capture_io_enabled() else None,
+            )
 
-        with stack:
-            yield _LangfuseRun(observation)
+        with _BestEffortContext(
+            propagation_factory,
+            fallback=None,
+            label="Langfuse attributes",
+        ):
+            with _BestEffortContext(
+                observation_factory,
+                fallback=None,
+                label="Langfuse observation",
+            ) as observation:
+                if observation is None:
+                    yield _DummyRun()
+                else:
+                    yield _LangfuseRun(observation)
 
     return langfuse_context()
 

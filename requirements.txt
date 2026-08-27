@@ -44,6 +44,9 @@ python-dotenv>=1.0
 # Langfuse v4 追踪与可观测性（OpenTelemetry + OpenAI drop-in client）
 langfuse>=4.0.0,<5.0.0
 
+# LangGraph：Phase 1 最小状态编排与内存 checkpoint
+langgraph>=1.0.0,<2.0.0
+
 # 文本向量化（M4 记忆嵌入 + M3 相关性过滤）
 sentence-transformers>=2.5
 

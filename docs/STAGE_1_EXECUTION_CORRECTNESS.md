@@ -1,4 +1,6 @@
-# 阶段 1：执行正确性（实施计划中的 Phase 0）
+# 阶段 1：执行正确性（历史记录）
+
+> 本文只保存当时的执行正确性修复和验收结果，不再定义当前目标架构。现行设计见 [ARCHITECTURE.md](ARCHITECTURE.md)。
 
 日期：2026-08-27
 
@@ -86,3 +88,7 @@ Langfuse 继续作为旁路 tracing：用于观察研究、Agent、工具、检�
 下一阶段是“阶段 2：Fork 领域模型（实施计划 Phase 1）”。范围包括 fork 数据契约、生命周期、SQLite Repository、幂等写入、重启恢复，以及现有 `SubTask`/`AgentResult` 的兼容适配。
 
 `ForkController` 将在 fork 领域模型稳定后进入后续实现，不在本阶段完成范围内。
+
+## 后续架构说明
+
+本文件保留阶段 1 完成时的历史记录。此后的目标架构与实施顺序已经调整，当前定义以 [目标架构](ARCHITECTURE.md) 和 [实施计划](IMPLEMENTATION_PLAN.md) 为准。

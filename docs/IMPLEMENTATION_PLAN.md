@@ -1,448 +1,329 @@
-# PaperPilot 动态 Fork 实施计划
+# PaperPilot 实施计划
 
-> 本计划把现有“DAG 任务并发 + Worker 对象池”迁移为 [目标架构](ARCHITECTURE.md) 定义的“Research Manager 驱动的同质子 Agent 动态 fork 系统”。
+> 本计划是当前唯一有效的开发顺序和验收边界。目标架构以 [ARCHITECTURE.md](ARCHITECTURE.md) 为准，进度以 [ROADMAP.md](ROADMAP.md) 为准。
 
-## 1. 实施约束
+## 1. 实施策略
 
-1. 采用渐进式迁移，不推翻现有可运行主链路。
-2. 每个阶段结束时主分支必须可运行、可回滚。
-3. 先修执行正确性，再引入 fork 抽象，最后升级证据和自主停止。
-4. 新旧路径短期通过 feature flag 并存；新路径达到验收标准后删除兼容层。
-5. 所有新增状态必须可持久化、可测试、可在 Web 进度中观察。
+采用“可运行纵切片”迁移，不围绕旧模块做角色映射：
 
-项目已依次完成阶段 0.5 Langfuse 可观测性基线，以及阶段 1“执行正确性”（本计划 Phase 0）。后续新增的 ResearchRun、AgentFork、Evidence Merge 和 RCS 必须沿用现有 Langfuse 旁路 tracing 适配层，不再引入第二套 provider。
+1. 先建立同质 Research AgentGraph 的最小闭环；
+2. 再接入用户确认和 Markdown Memory Store；
+3. 然后增加同质并行与一层递归 fork；
+4. 新路径通过验收后逐步移除旧编排和旧证据图；
+5. 最后才增加可选 Red/Blue 和 LLM Wiki。
 
-## 2. 目标目录调整
+旧仓库只提供候选能力。每项复用都必须满足新架构接口，不因“已经存在”而保留旧职责。
 
-建议在保持现有目录的基础上新增控制面和领域契约：
+## 2. 目标代码边界
 
-```text
-src/
-├── manager/
-│   ├── research_manager.py       # Run 级决策循环
-│   ├── fork_controller.py        # fork 创建、调度、取消、重试
-│   ├── budget_manager.py         # 全局/单 fork 预算
-│   ├── completion.py             # RCS 与停止原因
-│   └── merge_service.py          # Contribution 验证与幂等合并
-├── domain/
-│   ├── research_run.py
-│   ├── plan.py
-│   ├── fork.py
-│   ├── contribution.py
-│   └── evidence.py
-├── agents/
-│   ├── research_agent.py         # 唯一同质 Worker
-│   ├── gap_analyzer.py
-│   └── synthesizer.py
-├── evidence/
-│   ├── source_store.py
-│   ├── validator.py
-│   ├── relation_classifier.py
-│   └── citation_validator.py
-└── persistence/
-    ├── run_repository.py
-    ├── fork_repository.py
-    └── evidence_repository.py
-```
-
-目录可以分阶段建立；首阶段不要求一次移动现有文件。
-
-## 3. 阶段 1：执行正确性（实施计划中的 Phase 0）✅
-
-完成日期：2026-08-27
-
-### 目标
-
-在引入 fork 前消除会污染新架构的已知正确性问题。
-
-### 已完成
-
-- `VLLMPolicy` 的 tools、messages 和 `was_truncated` 已改为单次调用状态，并支持调用级 `fork`，三个 Worker 的并发隔离已有覆盖；
-- `ModelRouter` 只缓存 Policy 模板，调用方从模板创建隔离实例；
-- `AgentPool` 按精确类型回收，重复释放安全，合成 Agent 的获取与释放纳入完整生命周期；
-- 全局超时且已有成功结果时执行真实降级合成并跳过对抗流程；没有成功结果时明确失败；
-- `Researcher` 的 SEARCH 模式要求达到有效来源门槛；
-- 工具失败支持可配置重试，并在重试耗尽后使用固定 fallback；
-- HotpotQA 评测改为提取短答案，不再把报告标题当作答案；
-- 为上述行为补充回归测试。
-
-### 主要影响文件
-
-- `src/orchestrator/orchestrator.py`
-- `src/orchestrator/agent_pool.py`
-- `src/agents/researcher.py`
-- `src/agents/summarizer.py`
-- `src/models/vllm_policy.py`
-- `src/models/model_router.py`
-- `scripts/run_eval.py`
-
-### 验收标准
-
-- 并发运行三个 Worker 时 tools 和截断状态互不影响；
-- 全局超时且已有有效结果时生成明确标注的降级报告；
-- AgentPool 活跃数在一次 Run 后归零；
-- Search 模式不能在零有效来源时返回成功；
-- 原有测试与新增回归测试全部通过。
-
-### 验收结果
-
-- 阶段 1 专项联合测试：`24 passed`；
-- 全量测试：`173 passed`；
-- 三 Worker 并发场景覆盖 tools、messages 和截断状态隔离。
-
-完整记录见 [阶段 1 执行正确性](STAGE_1_EXECUTION_CORRECTNESS.md)。
-
-## 4. Phase 1：建立 Fork 领域模型
-
-### 目标
-
-让 fork 成为一等领域实体，但暂时仍由现有 Orchestrator 驱动。
-
-### 任务
-
-新增数据契约：
-
-- `ResearchRun`
-- `PlanNode`
-- `ForkSpec`
-- `AgentFork`
-- `ForkBudget`
-- `ForkEvent`
-- `ResearchContribution`
-- `ForkProposal`
-
-新增 fork 生命周期：
+建议把新主路径集中在一个独立包中，避免继续耦合旧 Orchestrator：
 
 ```text
-REQUESTED → APPROVED → RUNNING → MERGING → COMPLETED
-                         ├──────→ FAILED
-                         └──────→ CANCELLED
+src/research/
+├── models.py          # 最小输入、状态、结果和证据契约
+├── agent_graph.py     # 所有根/子/孙 Agent 共用的图
+├── workflow.py        # 用户对齐、确认、根图启动和完成
+├── fork_policy.py     # 三项 fork 条件与硬限制
+├── memory.py          # Markdown Memory Store
+└── rendering.py       # 报告、证据和来源 Markdown 渲染
 ```
 
-新增 SQLite 表和 Repository：
+目录名可以根据现有包结构微调，但不得重新拆出 Planner、Summarizer、Evidence Store、Fork Controller 或 Manager Service。
 
-- `research_runs`
-- `plan_nodes`
-- `agent_forks`
-- `fork_events`
-- `research_contributions`
+## 3. 最小契约
 
-所有表以 `run_id` 隔离；写入支持幂等键。
+编码前先定义并测试以下最小概念，字段只按真实读写增加。
 
-### 兼容策略
+### Research Task
 
-现有 `SubTask` 暂时适配为 `PlanNode`；现有 `AgentResult` 暂时适配为最小版 `ResearchContribution`。不要立即删除旧模型。
+- `task_id`
+- `objective`
+- `context`
+- `expected_output`
+- `constraints`
 
-### 验收标准
+### Execution Context
 
-- 每个被执行的 Plan Node 都对应一个持久化 fork；
-- fork 可以查询 parent、depth、attempt、预算和状态；
-- 重试生成新的 attempt，不覆盖旧记录；
-- 服务重启后仍能读取完整 fork 树；
-- Repository 具有并发写和幂等测试。
+- `thread_id`
+- `parent_thread_id`
+- `root_thread_id`
+- `depth`
+- 工具调用、线程、时间和 token 硬限制
 
-## 5. Phase 2：实现独立同质 Research Agent Fork
+### Research Result
 
-### 目标
+- `task_id`
+- `status`
+- `summary`
+- `findings`
+- `evidence`
+- `unresolved`
+- `child_result_refs`
 
-用 Agent Factory 和 Fork Controller 替代“按任务类型借对象”的核心语义。
+### Evidence Item
 
-### 任务
+- 支持的 finding
+- 来源类型、标题和稳定标识
+- URL、论文标识或文件位置
+- 页码、章节、段落等 locator（可取得时）
+- quote 或 paraphrase，并明确类型
+- 局限或可信度说明
 
-#### Agent Factory
+这些是 Agent 交换协议，不代表四套 Repository 或服务。持久化时统一渲染为 Markdown。
 
-- 每个 fork 创建独立 Research Agent 会话；
-- Policy 调用状态与工具状态隔离；
-- 网络连接池、只读模型配置和 Embedder 等无状态资源可以共享；
-- Agent 身份中包含 `agent_id`、`fork_id`、`parent_fork_id`。
+## 4. N0：文档与架构收敛
 
-#### Fork Context Builder
+### 状态
 
-- 根据 ForkSpec 构建不可变上下文快照；
-- 只注入相关 Evidence ID 和上游 Contribution；
-- 不复制全局 `_memory_store`；
-- 记录本次上下文选择原因和 token 数。
+已完成（2026-08-28）。
 
-#### Fork Controller
+### 工作
 
-- 按 Plan Graph 依赖调度 fork；
-- 执行并发限制、超时、取消和重试；
-- 发出 `fork_requested/started/completed/failed` 事件；
-- 统一结算预算。
+- 把同质 Research AgentGraph 确立为唯一执行核心；
+- 明确外层 Workflow 只负责用户确认和根任务生命周期；
+- 删除重复、冲突的旧开发方案；
+- 将阶段 0、0.5、旧阶段 1 和旧 LangGraph Phase 1 标记为历史；
+- README、架构、实施计划和路线图使用同一术语；
+- 停止继续扩展 Evidence Graph、RCS、Planner DAG、AgentPool 和旧 Orchestrator。
 
-#### 同质 Worker
+### 验收
 
-- 合并 SEARCH/ANALYZE/VERIFY Worker 实现；
-- 通过 `research_mode` 调整局部策略；
-- 所有 Worker 使用相同工具能力和输出协议。
+- 活跃文档不存在 Manager 与子 Agent 异构、独立 Planner/Summarizer、Evidence Graph 或近期 RCS 路线；
+- 文档索引能明确区分现行文档与历史记录；
+- 下一次编码从 N1 开始。
 
-### Feature Flag
-
-增加：
-
-```yaml
-orchestrator:
-  execution_mode: fork_v1   # legacy_pool | fork_v1
-```
-
-### 验收标准
-
-- 初始计划能够 fork 至少三个同质 Agent 并行运行；
-- 前端或日志可区分每个 fork 的身份与研究范围；
-- Agent 间不存在消息、tools、scratchpad 和截断状态共享；
-- 依赖节点只继承声明过的 Contribution/Evidence；
-- legacy 与 fork_v1 在固定离线输入上产生等价结构化结果。
-
-## 6. Phase 3：Evidence-first Contribution 与 Merge
+## 5. N1：单个同质 Research AgentGraph
 
 ### 目标
 
-将子 Agent 回流单位从自然语言 `AgentResult.output` 改为结构化 `ResearchContribution`。
+先证明同一个图能完成“思考—行动—总结”，不实现 fork，不接旧 Planner DAG。
 
-### 任务
+### 工作
 
-#### 统一来源模型
+- 建立最小 graph state，只保存当前任务、执行身份、必要消息、工具结果摘要、证据和完成状态；
+- 实现 `think_and_plan`：理解任务、形成当前行动计划、判断缺失信息；
+- 实现 `decide_next_action`：在调用工具、继续分析、总结返回之间路由；
+- 接入现有搜索、论文、网页和文件工具中真正适合的适配器；
+- 工具结果进入当前线程隔离的上下文，不写全局可变 Agent 状态；
+- 实现本级 `synthesize`，输出统一 Research Result；
+- 接入 checkpointer、Langfuse 和三个线程 ID；
+- 根 Agent 与一个模拟子 Agent 都通过同一图构造函数运行，证明没有两套实现。
 
-论文、网页和用户文件统一进入 `SourceDocument`，至少记录：
+### 不做
 
-- 稳定 source ID；
-- 来源类型和 URL；
-- 标题、作者、日期；
-- 原始文本或内容哈希；
-- 抓取时间和来源质量元数据。
+- 用户确认；
+- 并行或递归 fork；
+- Markdown 持久化；
+- 独立 Planner、Summarizer、Evidence Store；
+- RCS 或 Red/Blue。
 
-#### Evidence Span 验证
+### 验收
 
-- `evidence_text` 必须可在来源文本中定位；
-- 保存页码、章节、段落或字符区间；
-- 无法定位时标记为 rejected/unverified；
-- Claim 与 EvidenceSpan 分离并建立显式关联。
+- 固定任务可以经过至少一次工具调用得到结构化结果；
+- 无工具、工具失败、达到调用上限都能确定性结束；
+- 每项可用 evidence 都带来源与定位信息；
+- 两个线程的消息、工具状态和 checkpoint 完全隔离；
+- 同一个 AgentGraph 可以用 `depth=0` 和 `depth=1` 执行；
+- 关闭或破坏 tracing 不影响研究结果。
 
-#### Contribution Validator
-
-分别验证：
-
-- 来源有效性；
-- 摘录真实性；
-- Claim 原子性；
-- 与研究范围的相关性；
-- Claim 是否被摘录蕴含；
-- 重复和冲突候选。
-
-#### Merge Service
-
-- 以 `contribution_id` 幂等合并；
-- 单条无效证据不影响其他有效贡献；
-- 保存 rejected item 及原因；
-- Merge 后返回新增来源、证据、Claim 和关系数量。
-
-### 验收标准
-
-- 任一 verified Evidence 都能定位回具体 SourceDocument；
-- 伪造或改写的“原文摘录”不能进入 verified 状态；
-- 网页与论文证据使用同一套数据接口；
-- 重复提交同一 Contribution 不产生重复数据；
-- Synthesizer 不再依赖 Worker 的完整对话轨迹。
-
-## 7. Phase 4：图驱动动态 Fork 与受控递归
+## 6. N2：用户对齐、确认与单 Agent 纵向闭环
 
 ### 目标
 
-让 Evidence Graph 的缺口真正产生新的 Agent fork，而不只是追加匿名 SubTask。
+实现用户可以修改研究方向、确认后才执行研究，并得到持久化 Markdown 报告的完整单 Agent 产品流程。
 
-### 任务
+### 工作
 
-#### Gap Contract
+- 外层 Workflow 接收用户问题，由根 Agent 生成简短研究说明：目标、范围、主要方向、限制和预期输出；
+- 使用 LangGraph interrupt 暂停并等待用户确认；
+- 用户修改时更新同一研究说明并再次暂停；
+- 用户确认后调用 N1 的同质 AgentGraph，根执行使用 `thread_id == root_thread_id`；
+- 根 Agent 根据 Research Result 生成最终报告；
+- 实现单一 Markdown Memory Store；
+- 将报告、采用的证据和来源渲染为 Markdown 并一次性提交；
+- 报告使用 `[[Evidence-...]]`，证据使用 `[[Source-...]]`；
+- 失败恢复和重复提交必须幂等。
 
-Gap Analyzer 输出结构化 `ResearchGap`：
+### 不做
 
-- gap ID；
-- 缺失主题或冲突；
-- 重要性；
-- 当前证据状态；
-- 需要的证据类型；
-- 推荐研究范围；
-- 预计信息增量。
+- fork；
+- Evidence Graph 或边；
+- 独立 Evidence Store；
+- Web 图形化 Fork Tree；
+- RCS。
 
-#### Fork Proposal
+### 验收
 
-Gap Analyzer 和子 Agent 都可以提出 ForkProposal。Fork Controller 负责去重和审批。
+- 未确认前不会调用研究工具；
+- 用户可以连续修改研究说明，恢复时保持同一根线程；
+- 确认后完整执行并生成报告、证据和来源 Markdown；
+- 所有 WikiLink 可解析，Obsidian 能自动显示 backlinks；
+- Memory Store 中重复 ID 不产生重复文件；
+- 进程在确认点或研究节点中断后可以从 checkpoint 恢复。
 
-#### 预算与递归
-
-正式启用并验证：
-
-- `max_total_forks`
-- `max_forks_per_round`
-- `max_fork_depth`
-- `max_attempts_per_plan_node`
-- `global_token_budget`
-- `per_fork_token_budget`
-- `global_timeout_seconds`
-- `saturation_no_growth_rounds`
-
-#### Fork 去重
-
-对研究范围、目标证据类型和已有 Plan Node 做语义去重，避免多个 Agent 重复搜索同一问题。
-
-### 验收标准
-
-- Gap 能生成带 `parent_fork_id` 的新 fork；
-- 子 Agent 的 ForkProposal 必须经过中央审批；
-- 达到深度、数量或成本上限时拒绝 fork 并记录原因；
-- 重复研究范围不会被重复执行；
-- 可从持久化数据重建完整 Agent fork 树。
-
-## 8. Phase 5：Research Completion Score
+## 7. N3：同质并行 Fork
 
 ### 目标
 
-用可解释的 RCS 替代“达到轮数/证据无增长就停止”的简化规则。
+让任一 Research Agent 根据统一策略 fork 同质子 Agent，先完成根到子的一层并行。
 
-### 指标
+### 工作
 
-初版建议包含：
+- 实现轻量 fork policy，识别三个条件：可并行、需隔离、预计工具链深度至少三层；
+- 加入硬门槛：任务必须明确、不重复、预算允许、`depth < 2`；
+- 父 Agent 只给子 Agent 传递明确任务、必要背景、期望结果和执行身份；
+- 使用 LangGraph 动态并行分发，每个子任务调用与父级完全相同的 AgentGraph；
+- 子 Agent 独立使用消息、scratchpad、工具和 checkpoint；
+- 父 Agent 汇聚成功、失败和部分完成结果，并执行自己的 `synthesize`；
+- 建立线程父子身份和 Langfuse trace 层级。
 
-| 维度 | 含义 |
-|------|------|
-| Coverage | 计划主题和关键问题的覆盖比例 |
-| Evidence Quality | verified Evidence 的质量与强度 |
-| Source Diversity | 独立来源、来源类型和时间分布 |
-| Conflict Resolution | 重要矛盾是否得到解释或保留不确定性 |
-| Saturation | 最近若干轮新增信息量是否下降 |
-| Cost Penalty | 继续研究的预期收益是否低于成本 |
+### 不做
 
-Completion Evaluator 返回：
+- 孙 Agent；
+- RCS；
+- Fork Tree UI；
+- 独立 ForkController、AgentFactory、AgentPool 或 Fork Repository。
+
+### 验收
+
+- 三种条件分别有固定输入测试；
+- 无依赖任务并行运行，存在依赖的任务不会错误并行；
+- 深链或大上下文任务即使只有一个，也可以为隔离而 fork；
+- 父子 Agent 使用同一图定义和输出契约；
+- 一个子 Agent 失败不丢失其他成功结果；
+- 父 Agent 的最终结果明确包含已采用与未采用的子结果。
+
+## 8. N4：一层递归、硬停止与恢复
+
+### 目标
+
+允许子 Agent 再 fork 一次，同时确保递归、资源和恢复行为可预测。
+
+### 工作
+
+- 允许 `depth=1` 的 Agent 使用与根相同的 fork policy 创建 `depth=2` 的孙 Agent；
+- 在统一入口强制 `depth <= 2`，而不是只依赖 prompt；
+- 孙 Agent 的 fork 请求转换为本地执行或结构化 unresolved 原因；
+- 加入最大总线程数、单 Agent 子线程数、工具调用数、时间、token 和失败重试限制；
+- 使用确定性任务指纹避免同一范围递归重复；
+- 验证多层汇聚、部分失败、取消与 checkpoint 恢复；
+- 将运行事件映射到现有 CLI/Web 的进度输出，只展示必要状态。
+
+### 完成判断
+
+不实现 RCS。任一 Agent 只根据以下信息判断继续或返回：
+
+- 必需任务是否完成；
+- 关键 finding 是否有来源；
+- 是否存在阻断当前任务的 unresolved；
+- 最近行动是否仍产生有效信息；
+- 是否达到任何硬限制。
+
+根 Agent 对整个研究做最终判断，子 Agent 只对自己的任务负责。
+
+### 验收
+
+- 根 → 子 → 孙可执行和汇聚；
+- 孙 Agent 无法继续创建线程；
+- 所有硬限制都有确定性测试；
+- 重复任务不会形成递归循环；
+- 任一层部分失败后仍能返回可用结果和明确限制；
+- 恢复后不会重复执行已经完成的工具调用或重复写入 Memory Store。
+
+## 9. N5：迁移入口与清理旧实现
+
+### 目标
+
+让 CLI、Web 和评测使用新 Workflow，并清除不再适用的旧架构。
+
+### 工作
+
+- 把 CLI 和 Web 研究入口切换到新 Workflow；
+- 保持用户对齐、确认、恢复和最终报告的行为一致；
+- 对固定研究输入比较新旧路径的报告完整性、来源可定位率、失败行为、时间和成本；
+- 确认新路径覆盖实际仍需要的能力后，删除无调用者的旧实现；
+- 删除旧 Orchestrator 状态循环、Planner DAG、AgentPool、独立 Summarizer 和 Gap Analyzer；
+- 删除 Evidence Store、Evidence Graph、关系边、图谱 UI 和只服务这些能力的配置；
+- 清理旧术语、兼容模型和重复测试；
+- 更新启动说明和配置模板。
+
+### 复用审查
+
+每个旧模块只允许三种结论：
+
+- **直接复用**：接口和语义符合新架构；
+- **迁移能力**：保留底层算法或工具，删除旧角色包装；
+- **删除**：与新目标冲突或没有消费者。
+
+不得以降低删除量为目标。
+
+### 验收
+
+- CLI 与 Web 默认只走新 LangGraph 路径；
+- 代码中只有一个 Research AgentGraph；
+- 没有独立 Planner/Summarizer/Evidence Graph/RCS 参与主链路；
+- 全量测试、端到端测试和恢复测试通过；
+- 删除 legacy 后不存在失效导入、配置和文档链接；
+- 新路径的质量收益不是单纯依靠更多 token 或更长时间。
+
+## 10. N6：可选 Red/Blue
+
+### 目标
+
+在稳定最终报告之上增加可关闭的报告审查，不改变研究执行核心。
+
+### 工作
+
+- Red 从事实性、逻辑一致性和引用质量提出结构化问题；
+- Blue 仅通过 `ADD / DELETE / MODIFY / VERIFY` 修改报告；
+- 修改后由根 Agent 检查证据和 WikiLink 是否仍有效；
+- 默认关闭，失败时保留未经优化但有效的原报告；
+- 对开启、关闭、攻击无效和修订破坏引用等路径增加测试。
+
+### 验收
+
+- Red/Blue 不创建研究线程、不修改原始来源、不伪造证据；
+- 开关不改变 AgentGraph、fork policy 和 Memory Store 契约；
+- 修订后的每个关键结论仍可链接到有效证据；
+- 关闭或失败时仍能正常交付报告。
+
+## 11. Future：LLM Wiki
+
+在 N1—N5 稳定后再规划：
+
+- 对 Memory Store 提问；
+- 导入用户论文、网页和笔记；
+- 自动整理 Markdown 与 WikiLink；
+- 发现已有知识之间的关联、冲突和空白；
+- 从 Wiki 中发起新的研究任务。
+
+本阶段不改变 Research AgentGraph，不新增第二套存储。
+
+## 12. 测试顺序
+
+每阶段均按以下顺序验收：
+
+1. 契约和路由单元测试；
+2. 固定离线工具的图流转测试；
+3. 并发、身份隔离和失败测试；
+4. checkpoint 暂停与恢复测试；
+5. Markdown 快照和链接完整性测试；
+6. 当前阶段相关专项测试；
+7. 全量回归。
+
+涉及真实模型、网络或 Langfuse 的测试单独标记，不用外部服务可用性替代确定性验收。
+
+## 13. 立即执行顺序
 
 ```text
-score
-dimension_scores
-decision: continue | stop | stop_with_uncertainty
-stop_reason
-recommended_gaps
+N0 文档收敛
+→ N1 单个同质 Research AgentGraph
+→ N2 用户确认 + Markdown Memory Store
+→ N3 同质并行 fork
+→ N4 一层递归 + 硬停止 + 恢复
+→ N5 切换入口 + 清理 legacy
+→ N6 可选 Red/Blue
+→ Future LLM Wiki
 ```
 
-### 验收标准
-
-- 相同 Evidence Graph 输入产生确定性 RCS 基线结果；
-- 每次继续或停止都有维度分数与可读理由；
-- `saturation_no_growth_rounds` 等配置真实影响行为；
-- 在标注小数据集上校准阈值，不以主观常量作为最终标准。
-
-## 9. Phase 6：证据约束合成与引用验证
-
-### 目标
-
-最终报告只基于经过验证且在预算内选出的 EvidencePackage。
-
-### 任务
-
-- 按主题、重要性、来源多样性和冲突状态选择 EvidencePackage；
-- 分块合成，避免固定字符硬截断；
-- 每个关键结论生成结构化 Citation；
-- Citation Validator 检查存在性、覆盖率和支持关系；
-- 引用不足时返回 Manager 补研究或生成带限制声明的报告；
-- 对抗优化不得删除或伪造结构化 Citation。
-
-### 验收标准
-
-- 报告内所有 Evidence ID 均存在；
-- 关键结论引用覆盖达到配置阈值；
-- 引用支持率可自动评测；
-- 超长研究输入不会静默截掉全部 Evidence；
-- 降级报告明确列出未解决缺口和停止原因。
-
-## 10. Phase 7：Web 可观测性与任务恢复
-
-### 目标
-
-让用户可以看到和理解动态多 Agent 研究过程。
-
-### 任务
-
-- 新增 Agent Tree 视图；
-- 展示 fork 的父节点、深度、研究范围、状态、耗时和预算；
-- 展示每个 fork 新增的来源、Evidence、Claim 和 rejected item；
-- SSE 增加 fork 生命周期、Merge 和 RCS 事件；
-- 任务状态从进程内 `_TASKS` 迁移到持久化 Run Repository；
-- 支持取消、重连和服务重启后的状态恢复；
-- Obsidian 增加 Research Run / Agent Fork 索引笔记，可选择是否导出执行轨迹。
-
-### 验收标准
-
-- 用户能从 UI 回答“哪个 Agent 为什么被 fork、研究了什么、产生了哪些证据”；
-- 页面刷新和服务重启后仍能恢复 Run 与 fork 树；
-- 取消 Run 能终止未开始和正在运行的 fork；
-- 图谱关系筛选、节点详情和 Obsidian 双链继续正常工作。
-
-## 11. Phase 8：评测与清理旧路径
-
-### 目标
-
-证明动态 fork 带来的收益，并删除不再使用的兼容设计。
-
-### 评测拆分
-
-- Fork diversity：不同 Agent 是否探索了不同来源和方向；
-- Fork utility：新增 fork 带来的有效 Evidence 增量；
-- Evidence validity：摘录可定位率、claim 支持率；
-- Citation correctness：引用存在率、支持率、覆盖率；
-- Research completeness：RCS 与人工判断的一致性；
-- Efficiency：token、时间、工具调用和 fork 数；
-- Report quality：事实性、完整性、结构和不确定性表达。
-
-### 消融实验
-
-至少比较：
-
-1. 单 Research Agent；
-2. 固定并发 Worker；
-3. 初始同质 fork，无 Research Loop；
-4. 动态 fork + Gap Analysis；
-5. 动态 fork + Gap Analysis + RCS；
-6. 完整系统 + Citation Validator。
-
-### 清理项
-
-- 删除 `legacy_pool` feature flag；
-- 删除固定角色 Worker 路由；
-- 删除重复的旧 Schema 和适配器；
-- 删除无消费者配置；
-- 更新 README、示例配置和评测报告。
-
-### 验收标准
-
-- 动态 fork 相对固定 Worker 在 Evidence Coverage 或 Citation Correctness 上有稳定收益；
-- 报告平均质量提升不依赖无限增加 token 或运行时间；
-- 全部测试、迁移测试和端到端测试通过；
-- 文档、配置、代码和 Web 展示使用同一套术语。
-
-## 12. 推荐执行顺序
-
-最小可交付链路是：
-
-```text
-Phase 0 正确性
-→ Phase 1 Fork 数据模型
-→ Phase 2 独立同质 Agent
-→ Phase 3 Evidence-first Merge
-→ Phase 4 动态递归 Fork
-→ Phase 5 RCS
-→ Phase 6 引用验证
-→ Phase 7 Web 可观测性
-→ Phase 8 评测与清理
-```
-
-Phase 1～2 完成后，系统才具备真正的“同质子 Agent fork”；Phase 3～5 完成后，才具备“Evidence Graph 驱动的自主动态 fork”；Phase 6～8 完成后，才能将其称为可评测、可审计的完整 PaperPilot。
-
-## 13. 下一阶段开发范围
-
-下一阶段是“阶段 2：Fork 领域模型（实施计划 Phase 1）”，编码范围限定为：
-
-1. 新增 `ResearchRun`、`PlanNode`、`ForkSpec`、`AgentFork`、`ForkBudget`、`ForkEvent`、`ResearchContribution` 和 `ForkProposal` 数据契约；
-2. 新增 Run/Fork/Contribution Repository、SQLite 迁移和幂等写入；
-3. 建立 fork 生命周期、parent/depth/attempt/budget/status 约束；
-4. 增加并发写、幂等、重启恢复和 fork 树重建测试；
-5. 为现有 `SubTask` 与 `AgentResult` 提供兼容适配。
-
-`ForkSpec`、`AgentFork`、`ForkRepository` 和 `ForkController` 在阶段 1 均未实现；其中前三者属于下一阶段，`ForkController` 按本计划在后续独立同质 Agent Fork 阶段实现。
+下一次编码只进入 N1。遇到需要新增独立 Agent 角色、存储服务、图数据库、评分引擎或 fork 领域系统的设计，应停止扩展并先重新核对 [ARCHITECTURE.md](ARCHITECTURE.md)。

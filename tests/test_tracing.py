@@ -2,7 +2,6 @@
 from __future__ import annotations
 
 import asyncio
-import functools
 from contextlib import contextmanager
 
 import langfuse
@@ -41,27 +40,26 @@ def test_requested_tracing_requires_credentials(monkeypatch):
 
 def test_agent_decorator_maps_type_and_propagates_attributes(monkeypatch):
     _enable(monkeypatch)
-    observed: dict = {}
+    started: list[dict] = []
     propagated: list[dict] = []
+    updates: list[dict] = []
 
-    def fake_observe(**kwargs):
-        observed.update(kwargs)
+    class FakeObservation:
+        def update(self, **kwargs):
+            updates.append(kwargs)
 
-        def decorator(func):
-            @functools.wraps(func)
-            def wrapper(*args, **inner_kwargs):
-                return func(*args, **inner_kwargs)
-
-            return wrapper
-
-        return decorator
+    class FakeClient:
+        @contextmanager
+        def start_as_current_observation(self, **kwargs):
+            started.append(kwargs)
+            yield FakeObservation()
 
     @contextmanager
     def fake_propagate(**kwargs):
         propagated.append(kwargs)
         yield
 
-    monkeypatch.setattr(langfuse, "observe", fake_observe)
+    monkeypatch.setattr(langfuse, "get_client", lambda: FakeClient())
     monkeypatch.setattr(langfuse, "propagate_attributes", fake_propagate)
 
     @tracing.trace_agent(
@@ -72,27 +70,29 @@ def test_agent_decorator_maps_type_and_propagates_attributes(monkeypatch):
         return value * 2
 
     assert run(3) == 6
-    assert observed == {
+    assert started == [{
         "name": "research-agent",
         "as_type": "agent",
-        "capture_input": False,
-        "capture_output": False,
-    }
+        "input": None,
+    }]
     assert propagated == [{"tags": ["agent", "fork"]}]
+    assert updates == []
 
 
 @pytest.mark.asyncio
 async def test_async_decorator_preserves_async_execution(monkeypatch):
     _enable(monkeypatch)
 
-    def fake_observe(**kwargs):
-        return lambda func: func
+    class FakeClient:
+        @contextmanager
+        def start_as_current_observation(self, **kwargs):
+            yield object()
 
     @contextmanager
     def fake_propagate(**kwargs):
         yield
 
-    monkeypatch.setattr(langfuse, "observe", fake_observe)
+    monkeypatch.setattr(langfuse, "get_client", lambda: FakeClient())
     monkeypatch.setattr(langfuse, "propagate_attributes", fake_propagate)
 
     @tracing.trace_chain(name="async-chain")
@@ -103,7 +103,7 @@ async def test_async_decorator_preserves_async_execution(monkeypatch):
     assert await run() == "ok"
 
 
-def test_trace_context_propagates_run_attributes(monkeypatch):
+def test_trace_context_propagates_canonical_thread_attributes(monkeypatch):
     _enable(monkeypatch)
     propagated: list[dict] = []
 
@@ -115,19 +115,180 @@ def test_trace_context_propagates_run_attributes(monkeypatch):
     monkeypatch.setattr(langfuse, "propagate_attributes", fake_propagate)
 
     with tracing.trace_context(
-        session_id="session-1",
+        session_id="root-1",
         trace_name="paperpilot.research",
         tags=["run"],
-        metadata={"fork_id": "fork-1", "depth": 2},
+        metadata={
+            "thread_id": "root-1",
+            "parent_thread_id": None,
+            "root_thread_id": "root-1",
+            "depth": 0,
+        },
     ):
         pass
 
     assert propagated == [{
-        "session_id": "session-1",
+        "session_id": "root-1",
         "trace_name": "paperpilot.research",
         "tags": ["run"],
-        "metadata": {"forkid": "fork-1", "depth": "2"},
+        "metadata": {
+            "thread_id": "root-1",
+            "root_thread_id": "root-1",
+            "depth": "0",
+        },
     }]
+
+
+def test_trace_context_enter_failure_does_not_skip_business(monkeypatch):
+    _enable(monkeypatch)
+    calls = 0
+
+    class BrokenPropagation:
+        def __enter__(self):
+            raise RuntimeError("telemetry enter failed")
+
+        def __exit__(self, exc_type, exc, traceback):
+            raise RuntimeError("telemetry cleanup failed")
+
+    monkeypatch.setattr(langfuse, "propagate_attributes", lambda **kwargs: BrokenPropagation())
+
+    with tracing.trace_context(metadata={"thread_id": "root-1"}):
+        calls += 1
+
+    assert calls == 1
+
+
+def test_traceable_construction_failures_run_business_once(monkeypatch):
+    _enable(monkeypatch)
+    calls = 0
+
+    def broken_propagation(**kwargs):
+        raise RuntimeError("telemetry construction failed")
+
+    def broken_client():
+        raise RuntimeError("telemetry client failed")
+
+    monkeypatch.setattr(langfuse, "propagate_attributes", broken_propagation)
+    monkeypatch.setattr(langfuse, "get_client", broken_client)
+
+    @tracing.trace_chain(name="broken-construction", tags=["langgraph"])
+    def run():
+        nonlocal calls
+        calls += 1
+        return "ok"
+
+    assert run() == "ok"
+    assert calls == 1
+
+
+def test_traceable_enter_failures_run_business_once(monkeypatch):
+    _enable(monkeypatch)
+    calls = 0
+
+    class BrokenContext:
+        def __enter__(self):
+            raise RuntimeError("telemetry enter failed")
+
+        def __exit__(self, exc_type, exc, traceback):
+            return False
+
+    class FakeClient:
+        def start_as_current_observation(self, **kwargs):
+            return BrokenContext()
+
+    monkeypatch.setattr(langfuse, "propagate_attributes", lambda **kwargs: BrokenContext())
+    monkeypatch.setattr(langfuse, "get_client", lambda: FakeClient())
+
+    @tracing.trace_chain(name="broken-enter", tags=["langgraph"])
+    def run():
+        nonlocal calls
+        calls += 1
+        return "ok"
+
+    assert run() == "ok"
+    assert calls == 1
+
+
+def test_traceable_exit_failures_run_business_once(monkeypatch):
+    _enable(monkeypatch)
+    calls = 0
+
+    class FakeObservation:
+        def update(self, **kwargs):
+            pass
+
+    class BrokenExitContext:
+        def __init__(self, value=None):
+            self.value = value
+
+        def __enter__(self):
+            return self.value
+
+        def __exit__(self, exc_type, exc, traceback):
+            raise RuntimeError("telemetry exit failed")
+
+    class FakeClient:
+        def start_as_current_observation(self, **kwargs):
+            return BrokenExitContext(FakeObservation())
+
+    monkeypatch.setattr(
+        langfuse,
+        "propagate_attributes",
+        lambda **kwargs: BrokenExitContext(),
+    )
+    monkeypatch.setattr(langfuse, "get_client", lambda: FakeClient())
+
+    @tracing.trace_chain(name="broken-exit", tags=["langgraph"])
+    def run():
+        nonlocal calls
+        calls += 1
+        return "ok"
+
+    assert run() == "ok"
+    assert calls == 1
+
+
+def test_traceable_exit_failure_preserves_original_business_exception(monkeypatch):
+    _enable(monkeypatch)
+    business_error = ValueError("business failure")
+    calls = 0
+
+    class FakeObservation:
+        def update(self, **kwargs):
+            pass
+
+    class BrokenExitContext:
+        def __init__(self, value=None):
+            self.value = value
+
+        def __enter__(self):
+            return self.value
+
+        def __exit__(self, exc_type, exc, traceback):
+            raise RuntimeError("telemetry exit failed")
+
+    class FakeClient:
+        def start_as_current_observation(self, **kwargs):
+            return BrokenExitContext(FakeObservation())
+
+    monkeypatch.setattr(
+        langfuse,
+        "propagate_attributes",
+        lambda **kwargs: BrokenExitContext(),
+    )
+    monkeypatch.setattr(langfuse, "get_client", lambda: FakeClient())
+
+    @tracing.trace_chain(name="business-error", tags=["langgraph"])
+    def run():
+        nonlocal calls
+        calls += 1
+        raise business_error
+
+    with pytest.raises(ValueError) as exc_info:
+        run()
+
+    assert exc_info.value is business_error
+    assert calls == 1
 
 
 def test_trace_context_does_not_swallow_business_exception(monkeypatch):
@@ -209,25 +370,20 @@ async def test_root_chain_flushes_after_observation_finishes(monkeypatch):
     _enable(monkeypatch)
     events: list[str] = []
 
-    def fake_observe(**kwargs):
-        def decorator(func):
-            @functools.wraps(func)
-            async def wrapper(*args, **inner_kwargs):
-                events.append("observation-start")
-                try:
-                    return await func(*args, **inner_kwargs)
-                finally:
-                    events.append("observation-end")
-
-            return wrapper
-
-        return decorator
+    class FakeClient:
+        @contextmanager
+        def start_as_current_observation(self, **kwargs):
+            events.append("observation-start")
+            try:
+                yield object()
+            finally:
+                events.append("observation-end")
 
     @contextmanager
     def fake_propagate(**kwargs):
         yield
 
-    monkeypatch.setattr(langfuse, "observe", fake_observe)
+    monkeypatch.setattr(langfuse, "get_client", lambda: FakeClient())
     monkeypatch.setattr(langfuse, "propagate_attributes", fake_propagate)
     monkeypatch.setattr(tracing, "flush_tracing", lambda: events.append("flush"))
 
@@ -238,3 +394,33 @@ async def test_root_chain_flushes_after_observation_finishes(monkeypatch):
 
     assert await run() == "ok"
     assert events == ["observation-start", "business", "observation-end", "flush"]
+
+
+def test_sdk_flush_failure_does_not_change_business_result(monkeypatch):
+    _enable(monkeypatch)
+    calls = 0
+
+    class FakeClient:
+        @contextmanager
+        def start_as_current_observation(self, **kwargs):
+            yield object()
+
+        def flush(self):
+            raise RuntimeError("telemetry flush failed")
+
+    @contextmanager
+    def fake_propagate(**kwargs):
+        yield
+
+    client = FakeClient()
+    monkeypatch.setattr(langfuse, "get_client", lambda: client)
+    monkeypatch.setattr(langfuse, "propagate_attributes", fake_propagate)
+
+    @tracing.trace_chain(name="root", flush_on_exit=True)
+    def run():
+        nonlocal calls
+        calls += 1
+        return "ok"
+
+    assert run() == "ok"
+    assert calls == 1

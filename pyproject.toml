@@ -34,6 +34,7 @@ dependencies = [
     "pyyaml",
     "python-dotenv>=1.0",  # 多后端 .env 配置支持
     "langfuse>=4.0.0,<5.0.0",  # Agent/LLM 可观测性（OpenTelemetry）
+    "langgraph>=1.0.0,<2.0.0",  # Phase 1 最小状态编排与 checkpoint
     "sentence-transformers",
     "networkx",           # 用于 TextRank 等图算法
     "scikit-learn",
