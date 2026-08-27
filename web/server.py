@@ -25,6 +25,7 @@ import os
 import time
 import uuid
 from pathlib import Path
+from urllib.parse import quote
 
 # 将项目根目录加入 sys.path，确保 src 包可导入
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
@@ -126,6 +127,41 @@ def _collect_evidence_data(modules: dict) -> tuple[list, list]:
     return evidence, relations
 
 
+def _export_session_vault(session_id: str) -> str | None:
+    """把会话导出为 Obsidian Vault（报告 + 证据 + 关系），返回 vault 目录绝对路径。
+
+    无报告返回 None（手动端点据此 404；自动导出路径静默跳过）。
+    """
+    from src.evidence.graph import EvidenceGraph
+    from src.evidence.obsidian_export import export_session_vault
+    from src.evidence.store import EvidenceStore
+
+    # 1. 报告（chat_messages 里最后一条 kind=report）
+    report_md = ""
+    for m in get_chat_store().get_messages(session_id):
+        if m.get("kind") == "report":
+            report_md = m.get("content", "")
+    if not report_md:
+        return None
+
+    # 2. 证据（全量对象，含 evidence_text）
+    evidence = EvidenceStore(db_path=DB_PATH, session_id=session_id).get_all()
+
+    # 3. 关系
+    relations: list = []
+    graph = EvidenceGraph(db_path=DB_PATH, session_id=session_id)
+    for r in graph.get_contradictions():
+        relations.append(r)
+    for r in graph.get_supports():
+        relations.append(r)
+    for r in graph.get_extends():
+        relations.append(r)
+
+    return export_session_vault(
+        session_id, report_md, evidence, relations, output_root=str(PROJECT_ROOT / "outputs" / "obsidian")
+    )
+
+
 async def _run_research_task(task: ResearchTask) -> None:
     """后台执行完整研究流程，进度事件推入 task.events。"""
     try:
@@ -163,14 +199,25 @@ async def _run_research_task(task: ResearchTask) -> None:
                 "evidence_relations": relations,
             }
 
-            task.result = result
-            task.status = "done"
-            await task.events.put({"type": "done", "session_id": task.session_id})
             # 研究报告持久化到会话消息（重启服务器后可回溯历史）
             try:
                 get_chat_store().add(task.session_id, "assistant", KIND_REPORT, report_md)
             except Exception as e:
                 print(f"[Chat] 报告落盘失败: {e}")
+            # PaperPilot: 自动导出 Obsidian Vault（失败不影响主流程）
+            try:
+                vault = await asyncio.to_thread(_export_session_vault, task.session_id)
+                if vault:
+                    result["vault_path"] = vault
+                    print(f"[Obsidian] 已导出 Vault: {vault}")
+            except Exception as e:
+                print(f"[Obsidian] 自动导出失败: {e}")
+
+            # 报告持久化和自动导出都已结束后再通知前端，避免用户立即手动导出时并发覆盖。
+            # Obsidian 导出是 best-effort：失败不影响研究任务成功。
+            task.result = result
+            task.status = "done"
+            await task.events.put({"type": "done", "session_id": task.session_id})
     except Exception as e:
         task.status = "error"
         task.error = str(e)
@@ -446,9 +493,43 @@ async def session_delete(sid: str) -> dict:
 @app.get("/api/sessions/{sid}/graph")
 async def session_graph(sid: str) -> dict:
     from src.evidence.graph import EvidenceGraph
+    from src.evidence.store import EvidenceStore
 
     graph = EvidenceGraph(db_path=DB_PATH, session_id=sid)
     data = graph.export_json()
     if not data["nodes"]:
         raise HTTPException(status_code=404, detail=f"session '{sid}' 没有证据数据")
+
+    # 富化 evidence 节点：前端 label=claim 前 10 字，hover 显示全文/摘录/论文
+    try:
+        detail_by_id = {
+            ev.evidence_id: ev
+            for ev in EvidenceStore(db_path=DB_PATH, session_id=sid).get_all()
+        }
+        for n in data["nodes"]:
+            ev = detail_by_id.get(n["id"])
+            if ev is not None:
+                n["claim"] = ev.claim
+                n["evidence_text"] = ev.evidence_text
+                n["paper_title"] = ev.paper_title
+                n["label"] = ev.claim[:10] if ev.claim else n.get("label", "")
+    except Exception:
+        pass  # 富化失败退回原 label
+
     return {"nodes": data["nodes"], "edges": data["edges"], "stats": graph.graph_stats()}
+
+
+@app.post("/api/sessions/{sid}/export-obsidian")
+async def session_export_obsidian(sid: str) -> dict:
+    """手动导出会话为 Obsidian Vault；返回 vault 目录路径。"""
+    vault = await asyncio.to_thread(_export_session_vault, sid)
+    if vault is None:
+        raise HTTPException(status_code=404, detail=f"会话 '{sid}' 没有研究报告可导出")
+    n_files = len([p for p in Path(vault).glob("*.md")])
+    normalized_path = vault.replace("\\", "/")
+    return {
+        "session_id": sid,
+        "vault_path": vault,
+        "obsidian_uri": f"obsidian://open?path={quote(normalized_path, safe='')}",
+        "files": n_files,
+    }

@@ -68,6 +68,9 @@
 
   /* ---------- 报告卡 ---------- */
   .report-card { background: #fff; border: 1px solid #e5e7eb; border-radius: 12px; overflow: hidden; box-shadow: 0 1px 4px rgba(0,0,0,.06); }
+  .report-card .rc-head { display: flex; justify-content: flex-end; padding: 8px 12px 0; }
+  .report-card .rc-head .btn-ghost { font-size: 12px; padding: 5px 12px; border: 1px solid #e5e7eb; border-radius: 6px; }
+  .report-card .rc-filter { padding: 5px 8px; border: 1px solid #d1d5db; border-radius: 6px; font-size: 12px; }
   .report-card .tabs { display: flex; border-bottom: 2px solid #e5e7eb; background: #f9fafb; }
   .report-card .tab { padding: 10px 18px; cursor: pointer; font-size: 13px; font-weight: 600; color: #6b7280; border-bottom: 3px solid transparent; }
   .report-card .tab.active { color: #2563eb; border-bottom-color: #2563eb; background: #fff; }
@@ -95,6 +98,7 @@
   .rel-EXTENDS { background: #fef3e2; color: #b45309; }
   #graphBox { width: 100%; height: 480px; border: 1px solid #e5e7eb; border-radius: 8px; }
   .rc-graph { width: 100%; height: 480px; border: 1px solid #e5e7eb; border-radius: 8px; }
+  .vis-tooltip { max-width: 520px !important; white-space: pre-wrap !important; line-height: 1.5; }
   .empty { color: #9ca3af; text-align: center; padding: 34px 0; font-size: 13px; }
 
   /* ---------- 输入栏 ---------- */
@@ -530,6 +534,9 @@ function renderReportCard(data) {
   const card = document.createElement('div');
   card.className = 'report-card';
   card.innerHTML = `
+    <div class="rc-head">
+      <button class="btn btn-ghost rc-obsidian" onclick="exportObsidian('${data.session_id}')">📓 在 Obsidian 打开</button>
+    </div>
     <div class="tabs">
       <div class="tab active" data-tab="report" onclick="switchTab(this,'report')">报告</div>
       <div class="tab" data-tab="evidence" onclick="switchTab(this,'evidence')">证据索引</div>
@@ -539,7 +546,18 @@ function renderReportCard(data) {
     <div class="tabbody active" data-name="report"><div class="rc-report"></div></div>
     <div class="tabbody" data-name="evidence"><div class="rc-evidence"></div></div>
     <div class="tabbody" data-name="relations"><div class="rc-relations"></div></div>
-    <div class="tabbody" data-name="graph"><div class="rc-graph"></div><div style="font-size:11px;color:#9ca3af;margin-top:6px">可拖拽 / 滚轮缩放 / 悬停查看详情</div></div>`;
+    <div class="tabbody" data-name="graph">
+      <div style="margin-bottom:8px">
+        <select class="rc-filter" onchange="applyGraphFilter(this)">
+          <option value="all">全部关系</option>
+          <option value="SUPPORTS">仅支持 (SUPPORTS)</option>
+          <option value="CONTRADICTS">仅矛盾 (CONTRADICTS)</option>
+          <option value="EXTENDS">仅扩展 (EXTENDS)</option>
+        </select>
+      </div>
+      <div class="rc-graph"></div>
+      <div style="font-size:11px;color:#9ca3af;margin-top:6px">节点=claim 前 10 字 · 悬停看全文 · 可拖拽/缩放</div>
+    </div>`;
   $('messages').appendChild(card);
 
   card.querySelector('.rc-report').innerHTML = marked.parse(data.report_md || '（无报告内容）');
@@ -547,6 +565,16 @@ function renderReportCard(data) {
   renderRelationsList(card.querySelector('.rc-relations'), data.evidence_relations || []);
   renderGraph(card.querySelector('.rc-graph'), data.session_id);
   scrollToBottom();
+}
+
+async function exportObsidian(sid) {
+  try {
+    const r = await fetch(`/api/sessions/${encodeURIComponent(sid)}/export-obsidian`, { method: 'POST' });
+    const data = await r.json();
+    if (!r.ok) { alert(data.detail || '导出失败'); return; }
+    alert(`已导出到 Obsidian Vault：\n${data.vault_path}\n\n即将尝试用 Obsidian 打开。`);
+    window.location.href = data.obsidian_uri || ('obsidian://open?path=' + encodeURIComponent(data.vault_path));
+  } catch (e) { alert('导出失败: ' + e); }
 }
 
 function switchTab(tabEl, name) {
@@ -599,32 +627,86 @@ function renderRelationsList(container, rels) {
 
 const NODE_COLORS = { evidence:{background:'#4a90d9',border:'#2c5f8a'}, paper:{background:'#7bc96f',border:'#4a9e3d'}, topic:{background:'#b07cd9',border:'#8557ab'} };
 const EDGE_COLORS = { SOURCED_FROM:'#a0a0a0', ANSWERS:'#a0a0a0', SUPPORTS:'#2ecc71', CONTRADICTS:'#e74c3c', EXTENDS:'#f39c12' };
+const SEMANTIC_REL = ['SUPPORTS','CONTRADICTS','EXTENDS'];
+
 async function renderGraph(container, sid) {
   container.innerHTML = '<div class="empty">加载图中…</div>';
   try {
     const r = await fetch(`/api/sessions/${encodeURIComponent(sid)}/graph`);
     if (!r.ok) { container.innerHTML = '<div class="empty">该会话暂无证据图</div>'; return; }
     const data = await r.json();
-    const nodes = (data.nodes||[]).map(n => ({
-      id: n.id, label: String(n.label||n.id).slice(0,30),
-      color: NODE_COLORS[n.type]||NODE_COLORS.evidence,
-      title: `<b>${escapeHtml(n.id)}</b><br>类型: ${n.type}<br>${escapeHtml(n.label||'')}`,
-    }));
-    const edges = (data.edges||[]).map(e => ({
-      from: e.source, to: e.target,
-      label: `${String(e.relation).slice(0,4)} ${e.weight != null ? e.weight.toFixed(2):''}`,
-      color: { color: EDGE_COLORS[e.relation]||'#999' },
-    }));
-    if (!nodes.length) { container.innerHTML = '<div class="empty">该会话暂无证据节点</div>'; return; }
-    container.innerHTML = '';
-    // 容器在隐藏的 tab 里初始化时尺寸为 0，需在激活 tab 后 redraw/fit
-    container._net = new vis.Network(container, { nodes, edges }, {
-      nodes: { shape:'dot', size:14, font:{ size:11, face:'Microsoft YaHei' } },
-      edges: { arrows:'to', font:{ size:9, strokeWidth:0 }, smooth:{ enabled:true } },
-      physics: { barnesHut:{ gravitationalConstant:-3000, springLength:120 } },
-      interaction: { hover:true, tooltipDelay:100 },
-    });
+    if (!(data.nodes || []).length) { container.innerHTML = '<div class="empty">该会话暂无证据节点</div>'; return; }
+    container._graphData = data;
+    drawGraph(container, data, 'all');
   } catch (e) { container.innerHTML = '<div class="empty">图加载失败</div>'; }
+}
+
+function drawGraph(container, data, filter) {
+  const allNodes = data.nodes || [];
+  const allEdges = data.edges || [];
+  const semanticEdges = allEdges.filter(e => SEMANTIC_REL.includes(e.relation));
+  let edges = semanticEdges;
+  let nodes = allNodes.filter(n => n.type === 'evidence');
+
+  if (filter !== 'all') {
+    // 单关系视图只保留该类语义边及其两端证据节点。
+    edges = semanticEdges.filter(e => e.relation === filter);
+    const keepIds = new Set();
+    for (const e of edges) {
+      keepIds.add(e.source);
+      keepIds.add(e.target);
+    }
+    nodes = nodes.filter(n => keepIds.has(n.id));
+  }
+
+  // 筛选会重建网络；先销毁旧实例，避免残留物理模拟和事件监听。
+  if (container._net) {
+    container._net.destroy();
+    container._net = null;
+  }
+
+  if (filter !== 'all' && !edges.length) {
+    const names = { SUPPORTS: '支持', CONTRADICTS: '矛盾', EXTENDS: '扩展' };
+    container.innerHTML = `<div class="empty">当前会话没有“${names[filter] || filter}”关系</div>`;
+    return;
+  }
+  if (!nodes.length) {
+    container.innerHTML = '<div class="empty">该会话暂无证据节点</div>';
+    return;
+  }
+
+  const nodeObjs = nodes.map(n => {
+    const label = String(n.claim || n.label || n.id).slice(0, 10);
+    // vis-network 会把 string title 当纯文本处理；使用换行而不是 HTML 标签，
+    // 配合 .vis-tooltip 的 pre-wrap 安全展示完整 claim、摘录和论文。
+    let title = `${n.id}\n类型：证据\n\n${n.claim || n.label || ''}`;
+    if (n.evidence_text) title += `\n\n原文摘录：${String(n.evidence_text).slice(0, 300)}`;
+    if (n.paper_title) title += `\n\n来源论文：${n.paper_title}`;
+    return { id: n.id, label, color: NODE_COLORS[n.type] || NODE_COLORS.evidence, title };
+  });
+
+  const edgeObjs = edges.map(e => ({
+    from: e.source, to: e.target,
+    label: `${String(e.relation).slice(0, 4)} ${e.weight != null ? e.weight.toFixed(2) : ''}`,
+    color: { color: EDGE_COLORS[e.relation] || '#999' },
+    width: 2,
+  }));
+
+  container.innerHTML = '';
+  // 容器在隐藏的 tab 里初始化时尺寸为 0，需在激活 tab 后 redraw/fit
+  container._net = new vis.Network(container, { nodes: nodeObjs, edges: edgeObjs }, {
+    nodes: { shape: 'dot', size: 14, font: { size: 11, face: 'Microsoft YaHei' } },
+    // EvidenceGraph 的语义边使用 canonical pair 存储，并无可靠方向性，因此不画箭头。
+    edges: { font: { size: 9, strokeWidth: 0 }, smooth: { enabled: true } },
+    physics: { barnesHut: { gravitationalConstant: -3000, springLength: 120 } },
+    interaction: { hover: true, tooltipDelay: 100 },
+  });
+}
+
+function applyGraphFilter(select) {
+  const card = select.closest('.report-card');
+  const g = card.querySelector('.rc-graph');
+  if (g && g._graphData) drawGraph(g, g._graphData, select.value);
 }
 
 // ------------------------------------------------------------------
