@@ -379,6 +379,12 @@ async def run_research(
         synthesis_timeout_seconds=config.get("orchestrator", {}).get("synthesis_timeout_seconds", 600),
         max_replan_rounds=config.get("orchestrator", {}).get("max_replan_rounds", 3),
         max_sub_questions=config.get("orchestrator", {}).get("max_sub_questions", 8),
+        enable_research_loop=config.get("orchestrator", {}).get("enable_research_loop", True),
+        max_research_rounds=config.get("orchestrator", {}).get("max_research_rounds", 3),
+        max_total_tasks=config.get("orchestrator", {}).get("max_total_tasks", 12),
+        max_gap_tasks_per_round=config.get("orchestrator", {}).get("max_gap_tasks_per_round", 2),
+        min_evidence_per_topic=config.get("orchestrator", {}).get("min_evidence_per_topic", 2),
+        saturation_no_growth_rounds=config.get("orchestrator", {}).get("saturation_no_growth_rounds", 1),
         enable_adversarial=config.get("adversarial", {}).get("enabled", True),
         enable_evolution=config.get("evolution", {}).get("enabled", False),
     )

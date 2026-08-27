@@ -38,6 +38,7 @@ class OrchestratorState(Enum):
     PLANNING = "planning"
     DISPATCHING = "dispatching"
     COLLECTING = "collecting"
+    GAP_ANALYSIS = "gap_analysis"
     SYNTHESIZING = "synthesizing"
     ADVERSARIAL = "adversarial"
     REPLANNING = "replanning"
@@ -153,5 +154,12 @@ class RunConfig:
     synthesis_timeout_seconds: int = 600
     max_replan_rounds: int = 3
     max_sub_questions: int = 8
+    # Research Loop（Phase 3+4）：按证据缺口动态补派子任务
+    enable_research_loop: bool = True
+    max_research_rounds: int = 3
+    max_total_tasks: int = 12
+    max_gap_tasks_per_round: int = 2
+    min_evidence_per_topic: int = 2
+    saturation_no_growth_rounds: int = 1
     enable_adversarial: bool = True
     enable_evolution: bool = False
