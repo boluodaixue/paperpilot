@@ -190,6 +190,7 @@ deepresearch-agent/
 - [目标架构](docs/ARCHITECTURE.md)：系统边界、组件、数据契约和主流程；
 - [实施计划](docs/IMPLEMENTATION_PLAN.md)：从当前代码迁移到目标架构的具体阶段；
 - [路线图](docs/ROADMAP.md)：当前完成度和下一阶段优先级；
+- [阶段 0 基线](docs/STAGE_0_BASELINE.md)：重构起点、提交和验证结果；
 - [原始产品设计入口](docs/PaperPilot_Development_Plan.md)；
 - [基于现有 DeepResearch 的改造入口](docs/PaperPilot_DeepResearch_Based_Development_Plan.md)。
 
