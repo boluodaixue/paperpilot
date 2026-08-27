@@ -64,10 +64,10 @@ class ModelRouter:
 
         name = (backend_name or get_env("DEFAULT_LLM_BACKEND", "vllm")).lower().strip()
 
-        # 检查缓存
+        # 缓存中只保留后端模板；调用方始终获得独立的可变调用状态。
         cache_key = f"{name}:{hash(tuple(sorted(override_kwargs.items())))}"
         if cache_key in _BACKEND_CACHE:
-            return _BACKEND_CACHE[cache_key]
+            return _BACKEND_CACHE[cache_key].fork()
 
         # 根据名称读取 .env 配置
         config = ModelRouter._load_backend_config(name)
@@ -76,7 +76,7 @@ class ModelRouter:
         # 创建 VLLMPolicy 实例
         policy = VLLMPolicy(**config)
         _BACKEND_CACHE[cache_key] = policy
-        return policy
+        return policy.fork()
 
     @staticmethod
     def get_all_backends(backend_names: list[str] | None = None) -> dict[str, VLLMPolicy]:

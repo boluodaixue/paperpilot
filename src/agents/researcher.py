@@ -12,11 +12,12 @@
 from __future__ import annotations
 
 import asyncio
+import inspect
 import json
 from typing import Any
 
 from .base_agent import BaseAgent
-from ..orchestrator.schemas import SubTask, AgentResult, AgentStatus
+from ..orchestrator.schemas import SubTask, AgentResult, AgentStatus, TaskType
 from ..utils.tracing import trace_agent, trace_block
 
 
@@ -46,9 +47,18 @@ class ResearcherAgent(BaseAgent):
         policy,
         tools: list | None = None,
         max_turns: int = 10,
+        tool_max_attempts: int = 2,
+        tool_retry_delay_seconds: float = 0.25,
+        tool_fallbacks: dict[str, list[str]] | None = None,
     ) -> None:
         super().__init__(name, policy, tools)
         self.max_turns = max_turns
+        self.tool_max_attempts = max(1, int(tool_max_attempts))
+        self.tool_retry_delay_seconds = max(0.0, float(tool_retry_delay_seconds))
+        self.tool_fallbacks = {
+            str(name): [str(fallback) for fallback in fallbacks]
+            for name, fallbacks in (tool_fallbacks or {}).items()
+        }
         self.tool_map: dict[str, Any] = {t.name: t for t in (tools or [])}
 
     @trace_agent(name="researcher.run", tags=["agent", "researcher"])
@@ -67,15 +77,14 @@ class ResearcherAgent(BaseAgent):
         # 构建任务描述
         task_desc = self._build_task_prompt(task, context)
 
-        # 查询可行性判断：如果任务明显无法通过网络搜索获得答案，直接基于已知信息分析
-        if self._is_non_searchable(task, context):
+        # SEARCH 必须取得有效来源；只有分析/验证任务允许走纯分析路径。
+        if task.task_type != TaskType.SEARCH and self._is_non_searchable(task, context):
             messages = [
                 {"role": "system", "content": self._system_prompt_direct_analysis()},
                 {"role": "user", "content": task_desc},
             ]
             try:
-                # 同步 LLM 调用放入线程池，避免阻塞 asyncio 事件循环
-                response = await asyncio.to_thread(self.policy, messages)
+                response = await self._call_policy(messages, tools=[])
                 content = response.get("content", "") or ""
                 return AgentResult(
                     task_id=task.task_id,
@@ -99,34 +108,23 @@ class ResearcherAgent(BaseAgent):
             {"role": "system", "content": self._system_prompt()},
             {"role": "user", "content": task_desc},
         ]
-
-        # 若 policy 支持 tool 设置，则注册可用工具
-        if hasattr(self.policy, "set_tools") and self.tools:
-            schemas = [t.get_openai_tool_schema() for t in self.tools]
-            self.policy.set_tools(schemas)
+        schemas = [t.get_openai_tool_schema() for t in self.tools]
 
         # 根据任务类型确定 fallback 工具
         desc_lower = (task.description or "").lower()
         academic_keywords = ["论文", "paper", "publication", "学术", "arxiv", "neurips", "icml", "iclr", "scholar", "citation", "文献"]
         fallback_tool = "arxiv_reader" if any(kw in desc_lower for kw in academic_keywords) else "web_search"
+        if fallback_tool not in self.tool_map:
+            fallback_tool = "web_search" if "web_search" in self.tool_map else next(iter(self.tool_map), fallback_tool)
         
-        for turn in range(self.max_turns):
-            # Fallback: if last turn had no tool_calls, force a search instruction
-            if turn > 0 and messages and messages[-1].get("role") == "assistant":
-                last_tool_calls = messages[-1].get("tool_calls", [])
-                if not last_tool_calls:
-                    messages.append({
-                        "role": "user",
-                        "content": (
-                            f"You did not use any tools. "
-                            f"You MUST call the '{fallback_tool}' tool now to search for information. "
-                            f"Do not write a summary without searching first."
-                        ),
-                    })
+        has_valid_source = False
+        had_tool_attempt = False
+        has_usable_tool_result = False
+        last_content = ""
 
+        for turn in range(self.max_turns):
             try:
-                # 使用线程池执行同步 policy，避免阻塞 asyncio 事件循环
-                response = await asyncio.to_thread(self.policy, messages)
+                response = await self._call_policy(messages, tools=schemas)
             except RuntimeError as e:
                 # 上下文长度超限等致命错误
                 trajectory.append({"turn": turn, "error": str(e)})
@@ -140,6 +138,7 @@ class ResearcherAgent(BaseAgent):
                 )
 
             content = response.get("content", "") or ""
+            last_content = content
             tool_calls = response.get("tool_calls", []) or []
 
             trajectory.append({
@@ -152,18 +151,21 @@ class ResearcherAgent(BaseAgent):
             # 估算 token（简化：字符数 / 3）
             total_tokens += len(json.dumps(messages, ensure_ascii=False)) // 3
 
-            # 无工具调用 → 任务完成
+            # SEARCH 未取得有效来源时，模型不得提前结束；写回回答并强制下一轮检索。
             if not tool_calls:
-                # B方案：检测 LLM 回复是否包含明显的工具失败说明
+                if task.task_type == TaskType.SEARCH and not has_valid_source:
+                    messages.append({"role": "assistant", "content": content})
+                    messages.append({
+                        "role": "user",
+                        "content": (
+                            f"No valid source has been collected. You MUST call the "
+                            f"'{fallback_tool}' tool now. A SEARCH task cannot finish without "
+                            "at least one verifiable source."
+                        ),
+                    })
+                    continue
                 if self._is_tool_failure_explanation(content):
-                    return AgentResult(
-                        task_id=task.task_id,
-                        status=AgentStatus.FAILED,
-                        output=content,
-                        trajectory=trajectory,
-                        token_usage=total_tokens,
-                        confidence=0.0,
-                    )
+                    return self._failed_result(task, content, trajectory, total_tokens)
                 confidence = self._extract_confidence(content)
                 return AgentResult(
                     task_id=task.task_id,
@@ -174,8 +176,7 @@ class ResearcherAgent(BaseAgent):
                     confidence=confidence,
                 )
 
-            # 执行工具调用
-            tool_results = []
+            tool_results: list[dict[str, Any]] = []
             for tc in tool_calls:
                 func = tc.get("function", {})
                 tool_name = func.get("name", "")
@@ -184,58 +185,29 @@ class ResearcherAgent(BaseAgent):
                 except json.JSONDecodeError:
                     args = {}
 
-                result = await self._execute_tool(tool_name, args)
-
-                # B方案：检测工具返回结果是否包含 error 字段
-                if isinstance(result, dict) and result.get("error"):
-                    error_msg = result["error"]
-                    trajectory.append({
+                executions = await self._execute_tool_with_recovery(tool_name, args)
+                had_tool_attempt = True
+                for execution in executions:
+                    entry = {
                         "turn": turn,
                         "role": "tool",
                         "tool_call_id": tc.get("id", ""),
-                        "name": tool_name,
-                        "error": error_msg,
-                    })
-                    return AgentResult(
-                        task_id=task.task_id,
-                        status=AgentStatus.FAILED,
-                        output=f"Tool '{tool_name}' failed: {error_msg}",
-                        trajectory=trajectory,
-                        token_usage=total_tokens,
-                        confidence=0.0,
-                    )
+                        **execution,
+                    }
+                    trajectory.append(entry)
 
+                final_execution = executions[-1]
+                result = final_execution["result"]
+                actual_tool = final_execution["actual_tool"]
+                has_usable_tool_result = has_usable_tool_result or not self._is_tool_error(result)
+                has_valid_source = has_valid_source or self._is_valid_source(actual_tool, result, args)
                 tool_results.append({
                     "tool_call_id": tc.get("id", ""),
-                    "name": tool_name,
+                    "name": actual_tool,
+                    "requested_tool": tool_name,
                     "result": result,
+                    "executions": executions,
                 })
-                trajectory.append({
-                    "turn": turn,
-                    "role": "tool",
-                    "tool_call_id": tc.get("id", ""),
-                    "name": tool_name,
-                    "result": result,
-                })
-
-            # 检测搜索结果是否全为空（工具返回了但无有效内容）
-            all_empty = True
-            for tr in tool_results:
-                if tr["name"] == "web_search":
-                    res = tr["result"]
-                    if isinstance(res, dict) and res.get("results"):
-                        for r in res["results"]:
-                            if r.get("snippet", "").strip():
-                                all_empty = False
-                                break
-            
-            # 如果已搜索 2+ 轮或搜索结果全空，强制要求总结
-            search_count = sum(1 for t in trajectory if t.get("role") == "tool" and t.get("name") == "web_search")
-            force_summary = False
-            if search_count >= 2:
-                force_summary = True
-            if all_empty and tool_results:
-                force_summary = True
 
             # 将 assistant message 和 tool results 追加到 messages
             assistant_msg = {
@@ -250,21 +222,196 @@ class ResearcherAgent(BaseAgent):
             messages.append(assistant_msg)
 
             for tr in tool_results:
-                msg_content = json.dumps(tr["result"], ensure_ascii=False, default=str)
-                # 如果强制总结，给工具结果附加提示
-                if force_summary:
-                    msg_content += "\n\n[SYSTEM NOTICE] You have already searched enough. Write your final summary NOW. Do NOT call any more tools."
+                msg_content = json.dumps(
+                    {
+                        "requested_tool": tr["requested_tool"],
+                        "actual_tool": tr["name"],
+                        "executions": tr["executions"],
+                    },
+                    ensure_ascii=False,
+                    default=str,
+                )
                 messages.append({
                     "role": "tool",
                     "tool_call_id": tr["tool_call_id"],
+                    "name": tr["name"],
                     "content": msg_content,
                 })
 
-        # 达到 max_turns
+        if task.task_type == TaskType.SEARCH and not has_valid_source:
+            return self._failed_result(
+                task,
+                last_content or "No valid source was collected.",
+                trajectory,
+                total_tokens,
+            )
+        if had_tool_attempt and not has_usable_tool_result:
+            return self._failed_result(
+                task,
+                last_content or "No tool produced a usable result.",
+                trajectory,
+                total_tokens,
+            )
         return AgentResult(
             task_id=task.task_id,
             status=AgentStatus.TIMEOUT,
             output="Reached max_turns without final answer.",
+            trajectory=trajectory,
+            token_usage=total_tokens,
+            confidence=0.0,
+        )
+
+    async def _call_policy(self, messages: list[dict], *, tools: list[dict]) -> dict:
+        """显式传递本轮工具，且只对确实不支持该参数的旧 policy 降级。"""
+        try:
+            signature = inspect.signature(self.policy)
+        except (TypeError, ValueError):
+            accepts_tools = True
+        else:
+            parameters = signature.parameters.values()
+            accepts_tools = "tools" in signature.parameters or any(
+                parameter.kind == inspect.Parameter.VAR_KEYWORD
+                for parameter in parameters
+            )
+
+        if accepts_tools:
+            return await asyncio.to_thread(self.policy, messages, tools=tools)
+        return await asyncio.to_thread(self.policy, messages)
+
+    async def _execute_tool_with_recovery(
+        self,
+        requested_tool: str,
+        args: dict,
+    ) -> list[dict[str, Any]]:
+        """重试主工具，仍失败时执行第一个已配置且实际可用的替代工具。"""
+        executions: list[dict[str, Any]] = []
+        for attempt in range(1, self.tool_max_attempts + 1):
+            result = await self._execute_tool(requested_tool, args)
+            execution = {
+                "requested_tool": requested_tool,
+                "actual_tool": requested_tool,
+                "attempt": attempt,
+                "fallback_from": None,
+                "result": result,
+            }
+            if self._is_tool_error(result):
+                execution["error"] = self._tool_error_message(result)
+            executions.append(execution)
+            if not self._is_tool_error(result):
+                return executions
+            if attempt < self.tool_max_attempts and self.tool_retry_delay_seconds:
+                await asyncio.sleep(self.tool_retry_delay_seconds)
+
+        fallback = next(
+            (
+                name
+                for name in self.tool_fallbacks.get(requested_tool, [])
+                if name in self.tool_map and name != requested_tool
+            ),
+            None,
+        )
+        if fallback is None:
+            return executions
+
+        fallback_args = self._map_fallback_args(requested_tool, fallback, args)
+        result = await self._execute_tool(fallback, fallback_args)
+        execution = {
+            "requested_tool": requested_tool,
+            "actual_tool": fallback,
+            "attempt": 1,
+            "fallback_from": requested_tool,
+            "result": result,
+        }
+        if self._is_tool_error(result):
+            execution["error"] = self._tool_error_message(result)
+        executions.append(execution)
+        return executions
+
+    @staticmethod
+    def _map_fallback_args(requested_tool: str, fallback: str, args: dict) -> dict:
+        if requested_tool == "web_search" and fallback == "arxiv_reader":
+            mapped = {"query": args.get("query", "")}
+            limit = args.get("top_n", args.get("max_results"))
+            if limit is not None:
+                mapped["max_results"] = limit
+            return mapped
+        if requested_tool == "arxiv_reader" and fallback == "web_search":
+            mapped = {"query": args.get("query") or args.get("paper_id", "")}
+            limit = args.get("max_results", args.get("top_n"))
+            if limit is not None:
+                mapped["top_n"] = limit
+            return mapped
+        if requested_tool == "browser" and fallback == "web_search":
+            return {"query": args.get("url", "")}
+        return dict(args)
+
+    @staticmethod
+    def _is_tool_error(result: Any) -> bool:
+        if isinstance(result, dict) and result.get("error"):
+            return True
+        if isinstance(result, str):
+            lowered = result.strip().lower()
+            return lowered.startswith((
+                "error",
+                "warning",
+                "[browser error]",
+                "[browser warning]",
+                "[filereader error]",
+                "[filereader warning]",
+            ))
+        return False
+
+    @staticmethod
+    def _tool_error_message(result: Any) -> str:
+        if isinstance(result, dict):
+            return str(result.get("error", result))
+        return str(result)
+
+    @classmethod
+    def _is_valid_source(cls, tool_name: str, result: Any, args: dict) -> bool:
+        if cls._is_tool_error(result):
+            return False
+        if tool_name == "web_search":
+            results = result.get("results", []) if isinstance(result, dict) else []
+            return any(
+                isinstance(item, dict)
+                and bool(str(item.get("url", "")).strip())
+                and bool(str(item.get("title", "")).strip() or str(item.get("snippet", "")).strip())
+                for item in results
+            )
+        if tool_name == "arxiv_reader":
+            papers = result.get("papers", []) if isinstance(result, dict) else []
+            return any(
+                isinstance(paper, dict)
+                and bool(str(paper.get("id", "")).strip() or str(paper.get("pdf_url", "")).strip())
+                and bool(str(paper.get("title", "")).strip() or str(paper.get("summary", "")).strip())
+                for paper in papers
+            )
+        if tool_name == "browser":
+            url = str(args.get("url", "")).strip().lower()
+            return url.startswith(("http://", "https://")) and cls._has_substantive_text(result)
+        if tool_name == "file_reader":
+            return cls._has_substantive_text(result)
+        return False
+
+    @classmethod
+    def _has_substantive_text(cls, result: Any) -> bool:
+        if not isinstance(result, str) or cls._is_tool_error(result):
+            return False
+        text = result.strip()
+        return len(text) >= 10 and any(character.isalnum() for character in text)
+
+    @staticmethod
+    def _failed_result(
+        task: SubTask,
+        output: str,
+        trajectory: list[dict],
+        total_tokens: int,
+    ) -> AgentResult:
+        return AgentResult(
+            task_id=task.task_id,
+            status=AgentStatus.FAILED,
+            output=output,
             trajectory=trajectory,
             token_usage=total_tokens,
             confidence=0.0,

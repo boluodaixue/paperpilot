@@ -240,6 +240,15 @@ evolution:
 
 tools:
   # 工具模块全局配置
+  execution:
+    # 单一工具的总尝试次数（包含第一次调用）
+    max_attempts: 2
+    retry_delay_seconds: 0.25
+    # 主工具持续失败后，仅调用列表中第一个实际可用的替代工具
+    fallbacks:
+      web_search: [arxiv_reader]
+      arxiv_reader: [web_search]
+      browser: [web_search]
   web_search:
     enabled: true
     # mock_mode: 无真实搜索 API 时返回模拟结果，用于快速调试

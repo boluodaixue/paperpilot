@@ -24,6 +24,21 @@ from typing import Any
 class HotpotQABenchmark:
     """HotpotQA 评测集加载与评估器。"""
 
+    _SHORT_ANSWER_LIMIT = 200
+    _ANSWER_LABELS = (
+        "短答案",
+        "答案",
+        "结论",
+        "short answer",
+        "final answer",
+        "answer",
+        "conclusion",
+    )
+    _EXCLUDED_SECTION_RE = re.compile(
+        r"^(?:sources?|references?|bibliography|参考文献|来源|证据(?:索引)?|evidence(?:\s+index)?)$",
+        re.IGNORECASE,
+    )
+
     # 内置小规模测试数据（当 HuggingFace 不可用时作为 fallback）
     _MOCK_DATA: list[dict[str, Any]] = [
         {
@@ -209,6 +224,138 @@ class HotpotQABenchmark:
             if HotpotQABenchmark.exact_match(pred, gold):
                 return True
         return False
+
+    # -----------------------------------------------------------------------
+    # 深度报告中的确定性短答案提取
+    # -----------------------------------------------------------------------
+    @classmethod
+    def _clean_answer_candidate(cls, text: str) -> str:
+        """清理 Markdown 装饰并限制评测短答案长度。"""
+        candidate = text.strip()
+        candidate = re.sub(r"^\s*(?:[-*+]\s+|\d+[.)]\s+)", "", candidate)
+        candidate = re.sub(r"^\s*(?:\*\*|__)(.*?)(?:\*\*|__)\s*$", r"\1", candidate)
+        candidate = re.sub(r"\s+", " ", candidate).strip()
+        if len(candidate) <= cls._SHORT_ANSWER_LIMIT:
+            return candidate
+
+        shortened = candidate[: cls._SHORT_ANSWER_LIMIT]
+        sentence_end = max(shortened.rfind(mark) for mark in ("。", "！", "？", ".", "!", "?", ";", "；"))
+        if sentence_end >= 0:
+            shortened = shortened[: sentence_end + 1]
+        return shortened.rstrip()
+
+    @classmethod
+    def _is_excluded_candidate(cls, line: str) -> bool:
+        """排除标题、证据编号、链接和来源条目。"""
+        stripped = line.strip()
+        if not stripped:
+            return True
+        if re.match(r"^#{1,6}\s+", stripped):
+            return True
+        if re.match(r"^(?:evidence(?:\s+id)?|证据(?:\s*id)?)[\s:#：-]*[\w.-]+", stripped, re.IGNORECASE):
+            return True
+        if re.match(r"^\[?E-\d+\]?(?:\s|:|：|-|$)", stripped, re.IGNORECASE):
+            return True
+        if re.match(r"^(?:sources?|references?|bibliography|参考文献|来源)\s*[:：]?\s*$", stripped, re.IGNORECASE):
+            return True
+        if re.match(r"^(?:[-*+]\s*)?(?:https?://|\[[^]]+\]\(https?://)", stripped, re.IGNORECASE):
+            return True
+        if stripped in {"---", "***", "___", "```"}:
+            return True
+        return False
+
+    @classmethod
+    def _extract_short_answer_with_method(
+        cls,
+        report: str,
+        question: str | None = None,
+    ) -> tuple[str, str]:
+        if not report or not report.strip():
+            return "", "empty_report"
+
+        labels = "|".join(re.escape(label) for label in cls._ANSWER_LABELS)
+        inline_label_re = re.compile(
+            rf"^\s*(?:[-*+]\s*)?(?:\*\*|__)?\s*(?P<label>{labels})\s*(?:\*\*|__)?\s*[:：-]\s*(?P<value>.+?)\s*$",
+            re.IGNORECASE,
+        )
+        heading_inline_label_re = re.compile(
+            rf"^\s*#{{1,6}}\s*(?:\*\*|__)?\s*(?P<label>{labels})\s*(?:\*\*|__)?\s*[:：-]\s*(?P<value>.+?)\s*$",
+            re.IGNORECASE,
+        )
+        heading_label_re = re.compile(
+            rf"^\s*#{{1,6}}\s*(?:\*\*|__)?\s*(?P<label>{labels})\s*(?:\*\*|__)?\s*[:：]?\s*$",
+            re.IGNORECASE,
+        )
+        standalone_label_re = re.compile(
+            rf"^\s*(?:\*\*|__)?\s*(?P<label>{labels})\s*(?:\*\*|__)?\s*[:：]?\s*$",
+            re.IGNORECASE,
+        )
+
+        lines = report.splitlines()
+        in_excluded_section = False
+        for index, line in enumerate(lines):
+            heading_match = re.match(r"^\s*#{1,6}\s+(.+?)\s*$", line)
+            if heading_match:
+                heading = re.sub(r"(?:\*\*|__)", "", heading_match.group(1)).strip(" :：")
+                in_excluded_section = bool(cls._EXCLUDED_SECTION_RE.match(heading))
+            elif cls._EXCLUDED_SECTION_RE.match(line.strip().strip(" :：")):
+                in_excluded_section = True
+
+            if in_excluded_section:
+                continue
+
+            inline_match = heading_inline_label_re.match(line) or inline_label_re.match(line)
+            if inline_match:
+                candidate = cls._clean_answer_candidate(inline_match.group("value"))
+                if candidate and not cls._is_excluded_candidate(candidate):
+                    return candidate, f"explicit_{inline_match.group('label').lower().replace(' ', '_')}"
+
+            section_match = heading_label_re.match(line) or standalone_label_re.match(line)
+            if not section_match:
+                continue
+            for following in lines[index + 1 :]:
+                if re.match(r"^\s*#{1,6}\s+", following):
+                    break
+                if cls._is_excluded_candidate(following):
+                    continue
+                candidate = cls._clean_answer_candidate(following)
+                if candidate:
+                    return candidate, f"explicit_{section_match.group('label').lower().replace(' ', '_')}_section"
+
+        in_excluded_section = False
+        normalized_question = cls.normalize_answer(question or "")
+        for line in lines:
+            heading_match = re.match(r"^\s*#{1,6}\s+(.+?)\s*$", line)
+            if heading_match:
+                heading = re.sub(r"(?:\*\*|__)", "", heading_match.group(1)).strip(" :：")
+                in_excluded_section = bool(cls._EXCLUDED_SECTION_RE.match(heading))
+                continue
+            if cls._EXCLUDED_SECTION_RE.match(line.strip().strip(" :：")):
+                in_excluded_section = True
+                continue
+            if in_excluded_section or cls._is_excluded_candidate(line):
+                continue
+
+            candidate = cls._clean_answer_candidate(line)
+            if not candidate:
+                continue
+            if normalized_question and cls.normalize_answer(candidate) == normalized_question:
+                continue
+            return candidate, "first_body_statement"
+
+        return "", "no_valid_candidate"
+
+    @classmethod
+    def extract_short_answer(cls, report: str, question: str | None = None) -> str:
+        """从深度研究报告中提取用于 HotpotQA EM/F1 的短答案。"""
+        answer, _ = cls._extract_short_answer_with_method(report, question)
+        return answer
+
+    @classmethod
+    def short_answer_extraction_method(cls, report: str, question: str | None = None) -> str:
+        """返回短答案提取来源，供评测明细审计。"""
+        _, method = cls._extract_short_answer_with_method(report, question)
+        return method
 
     # -----------------------------------------------------------------------
     # 深度研究评估：把 HotpotQA 当作研究 query，评估完整报告质量
