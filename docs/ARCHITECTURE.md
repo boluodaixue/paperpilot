@@ -166,6 +166,10 @@ return_research_result
 - `parent_thread_id` 必须指向直接父线程；
 - `depth == 2` 时任何 fork 请求都转换为本地执行或带原因返回未完成项。
 
+每次根执行共享同一组硬限制：最大总线程数、单 Agent 子线程数、单 Agent/全局工具调用数、共享截止时间、全局 token 预算和失败重试数。预算在 fork 时分配给子树，子 Agent 返回后由父 Agent 汇总实际用量，不设置独立 BudgetManager。
+
+token 用量优先采用模型返回的 `usage.total_tokens`；无 usage 时使用确定性字符估算。任何一级达到限制都必须返回明确 `stop_reason`。
+
 ## 5. Agent 输入输出边界
 
 父 Agent 给子 Agent 的输入只包含：

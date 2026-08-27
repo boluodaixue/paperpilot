@@ -171,6 +171,10 @@ src/research/
 
 ## 7. N3：同质并行 Fork
 
+### 状态
+
+已完成（2026-08-28）。实施记录见 [N3_HOMOGENEOUS_PARALLEL_FORK.md](N3_HOMOGENEOUS_PARALLEL_FORK.md)。
+
 ### 目标
 
 让任一 Research Agent 根据统一策略 fork 同质子 Agent，先完成根到子的一层并行。
@@ -178,7 +182,7 @@ src/research/
 ### 工作
 
 - 实现轻量 fork policy，识别三个条件：可并行、需隔离、预计工具链深度至少三层；
-- 加入硬门槛：任务必须明确、不重复、预算允许、`depth < 2`；
+- 加入硬门槛：任务必须明确、不重复、预算允许；N3 仅允许 `depth=0` 创建 `depth=1`；
 - 父 Agent 只给子 Agent 传递明确任务、必要背景、期望结果和执行身份；
 - 使用 LangGraph 动态并行分发，每个子任务调用与父级完全相同的 AgentGraph；
 - 子 Agent 独立使用消息、scratchpad、工具和 checkpoint；
@@ -203,6 +207,10 @@ src/research/
 
 ## 8. N4：一层递归、硬停止与恢复
 
+### 状态
+
+已完成（2026-08-28）。实施记录见 [N4_RECURSION_LIMITS_AND_RECOVERY.md](N4_RECURSION_LIMITS_AND_RECOVERY.md)。
+
 ### 目标
 
 允许子 Agent 再 fork 一次，同时确保递归、资源和恢复行为可预测。
@@ -215,7 +223,7 @@ src/research/
 - 加入最大总线程数、单 Agent 子线程数、工具调用数、时间、token 和失败重试限制；
 - 使用确定性任务指纹避免同一范围递归重复；
 - 验证多层汇聚、部分失败、取消与 checkpoint 恢复；
-- 将运行事件映射到现有 CLI/Web 的进度输出，只展示必要状态。
+- 新 Workflow 产生带层级身份的必要运行事件；实际接入 CLI/Web 与默认入口切换在 N5 一并完成。
 
 ### 完成判断
 
@@ -334,4 +342,4 @@ N0 文档收敛
 → Future LLM Wiki
 ```
 
-下一次编码只进入 N3。遇到需要新增独立 Agent 角色、存储服务、图数据库、评分引擎或 fork 领域系统的设计，应停止扩展并先重新核对 [ARCHITECTURE.md](ARCHITECTURE.md)。
+下一次编码只进入 N5。N5 会修改 CLI、Web、评测与删除 legacy 模块，必须在开始前再确认具体迁移/删除清单。遇到需要新增独立 Agent 角色、存储服务、图数据库、评分引擎或 fork 领域系统的设计，应停止扩展并先重新核对 [ARCHITECTURE.md](ARCHITECTURE.md)。

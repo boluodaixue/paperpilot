@@ -8,7 +8,11 @@ import langfuse
 import pytest
 from langgraph.checkpoint.memory import InMemorySaver
 
-from src.research.agent_graph import ResearchAgentState, build_research_agent_graph
+from src.research.agent_graph import (
+    ResearchAgentState,
+    build_research_agent_graph,
+    create_research_agent_state,
+)
 from src.research.models import (
     AgentLimits,
     ExecutionIdentity,
@@ -132,21 +136,7 @@ def _state(
     identity: ExecutionIdentity,
     limits: AgentLimits | None = None,
 ) -> ResearchAgentState:
-    return ResearchAgentState(
-        task=task,
-        identity=identity,
-        limits=limits or AgentLimits(),
-        messages=[],
-        iteration=0,
-        tool_calls_used=0,
-        pending_tool_calls=[],
-        pending_stop_reason=None,
-        observed_evidence=[],
-        draft=None,
-        last_content="",
-        stop_reason=None,
-        result=None,
-    )
+    return create_research_agent_state(task, identity, limits or AgentLimits())
 
 
 def _config(thread_id: str) -> dict:

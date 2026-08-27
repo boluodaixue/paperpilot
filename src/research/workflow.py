@@ -1,4 +1,4 @@
-"""N2 root workflow: align, wait for confirmation, research, and persist."""
+"""Root workflow: align, confirm, run the homogeneous graph, and persist."""
 from __future__ import annotations
 
 import asyncio
@@ -39,7 +39,7 @@ __all__ = [
 
 
 class ResearchWorkflowState(TypedDict, total=False):
-    """Fields used by the N2 outer workflow and embedded N1 AgentGraph."""
+    """Fields used by the outer workflow and embedded Research AgentGraph."""
 
     question: str
     brief: ResearchBrief | None
@@ -53,8 +53,23 @@ class ResearchWorkflowState(TypedDict, total=False):
     iteration: int
     tool_calls_used: int
     pending_tool_calls: list[dict[str, Any]]
+    pending_fork_calls: list[dict[str, Any]]
     pending_stop_reason: str | None
+    completed_fork_fingerprints: list[str]
+    child_thread_ids: list[str]
+    child_results: list[ResearchResult]
     observed_evidence: list[EvidenceItem]
+    deadline_at: float
+    subtree_thread_budget: int
+    subtree_tool_budget: int
+    subtree_token_budget: int
+    subtree_retry_budget: int
+    total_threads_used: int
+    total_tool_calls_used: int
+    estimated_tokens_used: int
+    retries_used: int
+    execution_events: list[dict[str, Any]]
+    lineage_objectives: list[str]
     draft: dict[str, Any] | None
     last_content: str
     stop_reason: str | None
@@ -237,12 +252,16 @@ def build_research_workflow(
     *,
     checkpointer: BaseCheckpointSaver | None = None,
 ) -> Any:
-    """Build the N2 root workflow around the same N1 Research AgentGraph."""
+    """Build the root workflow around the same homogeneous Research AgentGraph."""
     tool_list = list(tools)
+    effective_checkpointer = (
+        checkpointer if checkpointer is not None else InMemorySaver()
+    )
     research_agent_graph = build_research_agent_graph(
         policy,
         tool_list,
         inherit_checkpointer=True,
+        child_checkpointer=effective_checkpointer,
     )
 
     async def draft_brief(
@@ -412,9 +431,7 @@ def build_research_workflow(
     builder.add_edge("prepare_research", "research_agent")
     builder.add_edge("research_agent", "persist_result")
     builder.add_edge("persist_result", END)
-    return builder.compile(
-        checkpointer=checkpointer if checkpointer is not None else InMemorySaver()
-    )
+    return builder.compile(checkpointer=effective_checkpointer)
 
 
 async def resume_research_workflow(

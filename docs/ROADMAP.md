@@ -15,9 +15,9 @@
 | N0 文档与架构收敛 | ✅ | 唯一架构、唯一计划、旧方案退出活跃文档 |
 | N1 单个同质 Research AgentGraph | ✅ | 同一图以不同深度执行并返回带来源的结构化结果 |
 | N2 用户确认与单 Agent 纵向闭环 | ✅ | 可修改、确认、恢复，并写出互链 Markdown |
-| N3 同质并行 Fork | 🔄 下一阶段 | 三种 fork 条件、上下文隔离、并行汇聚和部分失败可用 |
-| N4 一层递归与硬停止 | ⬜ | 根→子→孙可运行，孙不可再 fork，限制与恢复可靠 |
-| N5 入口迁移与旧实现清理 | ⬜ | CLI/Web 只走新路径，旧架构及证据图退出代码库 |
+| N3 同质并行 Fork | ✅ | 三种 fork 条件、上下文隔离、并行汇聚和部分失败可用 |
+| N4 一层递归与硬停止 | ✅ | 根→子→孙可运行，孙不可再 fork，限制与恢复可靠 |
+| N5 入口迁移与旧实现清理 | 🔄 待对齐 | CLI/Web 只走新路径，旧架构及证据图退出代码库 |
 | N6 可选 Red/Blue | ⬜ | 报告可选审查且不破坏证据链接 |
 | Future LLM Wiki | ⬜ | 基于同一 Memory Store 的问答、导入和整理 |
 
@@ -62,16 +62,33 @@ N1 专项 `13 passed`，全量回归 `201 passed`。详见 [N1 实施记录](N1_
 
 N2 专项 `8 passed`，N1+N2 联合专项 `21 passed`，全量回归 `209 passed`。详见 [N2 实施记录](N2_CONFIRMATION_AND_MEMORY.md)。
 
-## 下一阶段：N3
+## N3 已完成
 
-- 实现可并行、需上下文隔离、预计工具链至少三层的轻量 fork policy；
-- 任务明确、不重复、预算允许且 `depth < 2` 时才实际 fork；
-- 父 Agent 只传明确任务和必要背景；
-- 子 Agent 调用与父级完全相同的 Research AgentGraph；
-- 并行汇聚成功、失败和部分结果；
-- 本阶段只实现根到子的一层，不实现孙 Agent。
+- 三种 fork 条件与任务完整性、依赖、去重、深度、子线程预算门槛已实现；
+- 根 Agent 可并发运行同质子 Agent，父子消息、policy、工具和执行身份隔离；
+- 成功、失败和部分完成结果可汇聚，子 Agent 失败不会丢失其他证据；
+- N3 专项 `10 passed`，N1–N3 联合专项 `31 passed`，全量回归 `219 passed`。
 
-N3 不实现 RCS、Fork Tree、ForkController、AgentFactory、AgentPool 或 fork Repository。
+详见 [N3 实施记录](N3_HOMOGENEOUS_PARALLEL_FORK.md)。
+
+## N4 已完成
+
+- 根、子、孙使用同一 AgentGraph，孙级 fork 被硬性拒绝；
+- 总线程、单 Agent 子线程、工具、时间、token 和重试限制已进入可 checkpoint 图状态；
+- 任务指纹与祖先去重防止递归回环；
+- 同一 saver 中的独立子线程可取消和恢复，已完成 sibling 不重复；
+- N4 专项 `17 passed`，N1–N4 联合专项 `48 passed`，全量回归 `236 passed`。
+
+详见 [N4 实施记录](N4_RECURSION_LIMITS_AND_RECOVERY.md)。
+
+## 下一阶段：N5（需先对齐清单）
+
+- 切换 CLI、Web 和评测默认入口；
+- 把 N4 运行事件接入新入口的必要进度输出；
+- 比较新旧固定输入，确认能力覆盖；
+- 在确认的清单内删除旧 Orchestrator、Planner DAG、AgentPool、Summarizer、Evidence Store/Graph 及孤立配置。
+
+N5 会实际修改和删除主线外 legacy 模块，开始前需先与用户确认迁移/删除清单。
 
 ## 历史基础
 
