@@ -87,6 +87,7 @@ SourceDocument → EvidenceSpan → Claim → EvidenceRelation
 - 报告证据索引、关系展示和图谱；
 - FastAPI + SSE Web UI；
 - Obsidian Vault 自动/手动导出；
+- Langfuse v4 + OpenTelemetry 研究链路和 LLM 可观测性；
 - Red-Blue 对抗优化和评测工具。
 
 但当前“动态 fork”仍主要表现为向 DAG 追加 SubTask，再从 AgentPool 获取临时 Worker。独立 Agent 身份、上下文隔离、fork 血缘、持久生命周期、结构化 Contribution、受控递归和完整 RCS 尚待实现。因此当前状态应称为：
@@ -191,6 +192,7 @@ deepresearch-agent/
 - [实施计划](docs/IMPLEMENTATION_PLAN.md)：从当前代码迁移到目标架构的具体阶段；
 - [路线图](docs/ROADMAP.md)：当前完成度和下一阶段优先级；
 - [阶段 0 基线](docs/STAGE_0_BASELINE.md)：重构起点、提交和验证结果；
+- [阶段 0.5 Langfuse](docs/STAGE_0_5_LANGFUSE.md)：动态 fork 前的可观测性基线；
 - [原始产品设计入口](docs/PaperPilot_Development_Plan.md)；
 - [基于现有 DeepResearch 的改造入口](docs/PaperPilot_DeepResearch_Based_Development_Plan.md)。
 

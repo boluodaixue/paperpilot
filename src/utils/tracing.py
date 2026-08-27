@@ -1,70 +1,122 @@
-"""
-LangSmith 追踪集成模块
+"""Langfuse 可观测性适配层。
 
-为 DeepResearch Agent 提供可观测性支持，无需引入 LangChain/LangGraph 依赖。
-核心能力：
-  1. LLM 调用自动追踪（通过 wrap_openai 包装 VLLMPolicy 的 client）
-  2. Agent 流程手动埋点（通过 @traceable 装饰关键方法）
-  3. 环境变量控制开关（LANGSMITH_TRACING=true/false）
+业务模块只依赖本文件提供的稳定接口，不直接依赖 Langfuse SDK：
 
-用法：
-  1. 在 .env 中配置 LangSmith 环境变量
-  2. 系统会自动检测并开启追踪
-  3. 登录 https://smith.langchain.com 查看 trace 树
+- ``trace_agent`` / ``trace_tool`` / ``trace_chain`` / ``trace_retriever``
+- ``trace_block``：手动 observation 上下文
+- ``trace_context``：传播 run/session/fork 等关联属性
+- ``create_openai_client``：按开关选择 Langfuse OpenAI drop-in client
+- ``flush_tracing`` / ``shutdown_tracing``：短进程发送与资源释放
 
-设计原则：
-  - 零侵入：业务代码不感知追踪存在
-  - 可开关：通过环境变量一键启用/禁用
-  - 低成本：禁用时不创建任何 LangSmith 对象
+设计目标：
+
+1. Langfuse 未启用、配置不完整或 SDK 异常时，研究主流程保持可运行；
+2. 默认不捕获普通函数的输入输出，避免把大型上下文和内部对象上传；
+3. LLM 调用由 Langfuse 官方 OpenAI drop-in client 记录；
+4. 基于 OpenTelemetry 自动保持嵌套 observation 的父子关系；
+5. 为后续 ResearchRun / AgentFork 预留 session、tag 和 metadata 传播接口。
 """
 from __future__ import annotations
 
 import functools
+import inspect
 import logging
-import os
-from typing import Any, Callable, TypeVar
+import re
+from contextlib import ExitStack, contextmanager
+from typing import Any, Callable
+
+from .env_config import get_env, get_env_bool
 
 
 logger = logging.getLogger(__name__)
 
-# ---------------------------------------------------------------------------
-# 环境检测
-# ---------------------------------------------------------------------------
+_TRUE_VALUES = {"true", "1", "yes"}
+_STATUS_WARNING_EMITTED = False
+
+
+def _tracing_requested() -> bool:
+    """返回用户是否显式请求开启 Langfuse tracing。"""
+    return (get_env("LANGFUSE_TRACING", "") or "").lower() in _TRUE_VALUES
 
 
 def is_tracing_enabled() -> bool:
-    """检查 LangSmith 追踪是否启用。"""
-    from .env_config import get_env
-    return (get_env("LANGSMITH_TRACING", "") or "").lower() in ("true", "1", "yes")
+    """仅在开关开启且公私钥齐全时启用 Langfuse。"""
+    global _STATUS_WARNING_EMITTED
+
+    if not _tracing_requested():
+        return False
+
+    missing = [
+        key
+        for key in ("LANGFUSE_PUBLIC_KEY", "LANGFUSE_SECRET_KEY")
+        if not get_env(key)
+    ]
+    if missing:
+        if not _STATUS_WARNING_EMITTED:
+            logger.warning(
+                "Langfuse tracing 已请求，但缺少配置：%s；本次运行禁用 tracing",
+                ", ".join(missing),
+            )
+            _STATUS_WARNING_EMITTED = True
+        return False
+    return True
 
 
-# ---------------------------------------------------------------------------
-# OpenAI Client 包装（自动追踪所有 LLM 调用）
-# ---------------------------------------------------------------------------
+def _capture_io_enabled() -> bool:
+    """普通 observation 是否捕获函数入参和返回值，默认关闭。"""
+    return get_env_bool("LANGFUSE_OBSERVE_DECORATOR_IO_CAPTURE_ENABLED", False)
 
 
-def maybe_wrap_openai_client(client: Any) -> Any:
-    """包装 OpenAI 客户端以启用 LangSmith 自动 LLM 追踪。
-
-    Args:
-        client: 原始的 openai.OpenAI 实例。
-
-    Returns:
-        包装后的 client（追踪开启时）或原始 client（追踪关闭时）。
-    """
-    if not is_tracing_enabled():
-        return client
-    try:
-        from langsmith.wrappers import wrap_openai
-        return wrap_openai(client, chat_name="ChatOpenAI")
-    except Exception as e:
-        logger.warning(f"wrap_openai 失败，回退到原始 client: {e}")
-        return client
+def _observation_type(run_type: str) -> str:
+    """把旧的通用 run_type 映射为 Langfuse observation type。"""
+    mapping = {
+        "agent": "agent",
+        "chain": "chain",
+        "tool": "tool",
+        "retriever": "retriever",
+        "llm": "generation",
+        "generation": "generation",
+        "embedding": "embedding",
+        "evaluator": "evaluator",
+        "guardrail": "guardrail",
+        "span": "span",
+    }
+    return mapping.get((run_type or "span").lower(), "span")
 
 
-# ---------------------------------------------------------------------------
-# 兼容装饰器（支持 sync / async / class method）
-# ---------------------------------------------------------------------------
+def _safe_metadata(metadata: dict[str, Any] | None) -> dict[str, str] | None:
+    """清洗为 Langfuse 可传播的短字符串 metadata。"""
+    if not metadata:
+        return None
+    result: dict[str, str] = {}
+    for raw_key, raw_value in metadata.items():
+        key = re.sub(r"[^A-Za-z0-9]", "", str(raw_key))[:100]
+        if not key:
+            continue
+        result[key] = str(raw_value)[:200]
+    return result or None
+
+
+def _safe_tags(tags: list[str] | None) -> list[str] | None:
+    if not tags:
+        return None
+    cleaned = [str(tag)[:200] for tag in tags if str(tag).strip()]
+    return cleaned or None
+
+
+def create_openai_client(*, base_url: str, api_key: str) -> Any:
+    """创建 OpenAI 兼容客户端；启用时使用 Langfuse 官方 drop-in。"""
+    if is_tracing_enabled():
+        try:
+            from langfuse.openai import OpenAI as LangfuseOpenAI
+
+            return LangfuseOpenAI(base_url=base_url, api_key=api_key)
+        except Exception as exc:
+            logger.warning("Langfuse OpenAI client 初始化失败，回退到原始客户端: %s", exc)
+
+    from openai import OpenAI
+
+    return OpenAI(base_url=base_url, api_key=api_key)
 
 
 def traceable(
@@ -72,50 +124,141 @@ def traceable(
     name: str | None = None,
     tags: list[str] | None = None,
     metadata: dict[str, Any] | None = None,
+    flush_on_exit: bool = False,
 ) -> Callable:
-    """兼容装饰器：如果 LangSmith 开启则使用 @traceable，否则为无操作装饰器。
+    """可选 Langfuse 装饰器，兼容同步和异步函数。"""
 
-    支持同步函数、异步函数、类方法。
-
-    Args:
-        run_type: LangSmith run 类型。常用值：
-                  "chain"   — 通用流程块
-                  "llm"     — LLM 调用（wrap_openai 已自动处理，一般不需要手动标）
-                  "tool"    — 工具调用
-                  "agent"   — Agent 执行
-                  "retriever" — 检索操作
-        name: 在 LangSmith UI 中显示的名称。为 None 时使用函数名。
-        tags: 标签列表，用于筛选和分组。
-        metadata: 附加元数据字典。
-
-    用法示例：
-        @traceable(run_type="agent", tags=["m5", "red"])
-        async def attack(self, report): ...
-    """
     def decorator(func: Callable) -> Callable:
-        # 如果追踪未开启，直接返回原函数（零开销）
         if not is_tracing_enabled():
             return func
 
         try:
-            from langsmith import traceable as _ls_traceable
-            # 使用 LangSmith 原生装饰器
-            return _ls_traceable(
-                run_type=run_type,
-                name=name or func.__name__,
-                tags=tags or [],
-                metadata=metadata or {},
-            )(func)
-        except Exception as e:
-            logger.warning(f"[LangSmith] traceable 装饰器应用失败 ({func.__name__}): {e}")
+            from langfuse import observe, propagate_attributes
+        except Exception as exc:
+            logger.warning("Langfuse observe 加载失败（%s）: %s", func.__name__, exc)
             return func
+
+        observation_kwargs = {
+            "name": name or func.__name__,
+            "as_type": _observation_type(run_type),
+            "capture_input": _capture_io_enabled(),
+            "capture_output": _capture_io_enabled(),
+        }
+        propagated = {
+            "tags": _safe_tags(tags),
+            "metadata": _safe_metadata(metadata),
+        }
+        propagated = {key: value for key, value in propagated.items() if value is not None}
+
+        if inspect.iscoroutinefunction(func):
+            @functools.wraps(func)
+            async def async_wrapper(*args, **kwargs):
+                with propagate_attributes(**propagated):
+                    return await func(*args, **kwargs)
+
+            observed_async = observe(**observation_kwargs)(async_wrapper)
+            if not flush_on_exit:
+                return observed_async
+
+            @functools.wraps(func)
+            async def async_flush_wrapper(*args, **kwargs):
+                try:
+                    return await observed_async(*args, **kwargs)
+                finally:
+                    # 外层 wrapper 保证 observation 已结束后再发送队列。
+                    flush_tracing()
+
+            return async_flush_wrapper
+
+        @functools.wraps(func)
+        def sync_wrapper(*args, **kwargs):
+            with propagate_attributes(**propagated):
+                return func(*args, **kwargs)
+
+        observed_sync = observe(**observation_kwargs)(sync_wrapper)
+        if not flush_on_exit:
+            return observed_sync
+
+        @functools.wraps(func)
+        def sync_flush_wrapper(*args, **kwargs):
+            try:
+                return observed_sync(*args, **kwargs)
+            finally:
+                flush_tracing()
+
+        return sync_flush_wrapper
 
     return decorator
 
 
-# ---------------------------------------------------------------------------
-# 手动追踪上下文（用于不便装饰器的场景）
-# ---------------------------------------------------------------------------
+class _DummyRun:
+    def add_output(self, outputs: dict[str, Any]) -> None:
+        return None
+
+    def add_metadata(self, metadata: dict[str, Any]) -> None:
+        return None
+
+    def set_error(self, message: str) -> None:
+        return None
+
+
+class _LangfuseRun:
+    """保留旧 trace_block 调用方式的轻量适配器。"""
+
+    def __init__(self, observation: Any) -> None:
+        self._observation = observation
+
+    def add_output(self, outputs: dict[str, Any]) -> None:
+        try:
+            self._observation.update(output=outputs)
+        except Exception as exc:
+            logger.warning("Langfuse output 更新失败: %s", exc)
+
+    def add_metadata(self, metadata: dict[str, Any]) -> None:
+        try:
+            self._observation.update(metadata=metadata)
+        except Exception as exc:
+            logger.warning("Langfuse metadata 更新失败: %s", exc)
+
+    def set_error(self, message: str) -> None:
+        try:
+            self._observation.update(level="ERROR", status_message=str(message)[:1000])
+        except Exception as exc:
+            logger.warning("Langfuse error 状态更新失败: %s", exc)
+
+
+@contextmanager
+def trace_context(
+    *,
+    session_id: str | None = None,
+    user_id: str | None = None,
+    trace_name: str | None = None,
+    tags: list[str] | None = None,
+    metadata: dict[str, Any] | None = None,
+):
+    """向当前 observation 及其子节点传播研究运行关联信息。"""
+    if not is_tracing_enabled():
+        yield
+        return
+
+    try:
+        from langfuse import propagate_attributes
+        kwargs = {
+            "session_id": session_id,
+            "user_id": user_id,
+            "trace_name": trace_name,
+            "tags": _safe_tags(tags),
+            "metadata": _safe_metadata(metadata),
+        }
+        kwargs = {key: value for key, value in kwargs.items() if value is not None}
+        propagation = propagate_attributes(**kwargs)
+    except Exception as exc:
+        logger.warning("Langfuse context 传播失败，继续执行主流程: %s", exc)
+        yield
+        return
+
+    with propagation:
+        yield
 
 
 def trace_block(
@@ -124,59 +267,84 @@ def trace_block(
     inputs: dict[str, Any] | None = None,
     tags: list[str] | None = None,
 ):
-    """上下文管理器：手动包裹一段代码块。
-
-    用法示例：
-        with trace_block("adversarial_loop", run_type="chain", inputs={"query": q}) as run:
-            report = await loop.run(report)
-            run.add_output({"score": report.final_score})
-    """
+    """手动创建一个 Langfuse observation 上下文。"""
     if not is_tracing_enabled():
-        # 返回一个 dummy context manager
-        class _DummyRun:
-            def add_output(self, outputs: dict) -> None:
-                pass
-        from contextlib import contextmanager
         @contextmanager
-        def _dummy():
+        def dummy_context():
             yield _DummyRun()
-        return _dummy()
 
+        return dummy_context()
+
+    @contextmanager
+    def langfuse_context():
+        stack = ExitStack()
+        try:
+            from langfuse import get_client, propagate_attributes
+
+            client = get_client()
+            observation = stack.enter_context(client.start_as_current_observation(
+                    name=name,
+                    as_type=_observation_type(run_type),
+                    input=inputs if _capture_io_enabled() else None,
+                ))
+            stack.enter_context(propagate_attributes(tags=_safe_tags(tags)))
+        except Exception as exc:
+            stack.close()
+            logger.warning("Langfuse observation 创建失败，继续执行主流程: %s", exc)
+            yield _DummyRun()
+            return
+
+        with stack:
+            yield _LangfuseRun(observation)
+
+    return langfuse_context()
+
+
+def flush_tracing() -> None:
+    """发送后台队列中的 tracing 数据；CLI 等短进程结束前调用。"""
+    if not is_tracing_enabled():
+        return
     try:
-        from langsmith.run_helpers import trace
-        return trace(name=name, run_type=run_type, inputs=inputs or {}, tags=tags or [])
-    except Exception as e:
-        logger.warning(f"[LangSmith] trace_block 创建失败: {e}")
-        from contextlib import contextmanager
-        @contextmanager
-        def _dummy():
-            class _DummyRun:
-                def add_output(self, outputs: dict) -> None:
-                    pass
-            yield _DummyRun()
-        return _dummy()
+        from langfuse import get_client
+
+        get_client().flush()
+    except Exception as exc:
+        logger.warning("Langfuse flush 失败，不影响研究结果: %s", exc)
 
 
-# ---------------------------------------------------------------------------
-# 快捷装饰器（按场景预配置）
-# ---------------------------------------------------------------------------
+def shutdown_tracing() -> None:
+    """关闭 Langfuse 客户端；仅在应用进程真正退出时调用。"""
+    if not is_tracing_enabled():
+        return
+    try:
+        from langfuse import get_client
+
+        get_client().shutdown()
+    except Exception as exc:
+        logger.warning("Langfuse shutdown 失败: %s", exc)
 
 
 def trace_agent(name: str | None = None, tags: list[str] | None = None):
-    """Agent 执行追踪（run_type="chain"，LangSmith 不支持 "agent"）。"""
-    return traceable(run_type="chain", name=name, tags=tags)
+    return traceable(run_type="agent", name=name, tags=tags)
 
 
 def trace_tool(name: str | None = None, tags: list[str] | None = None):
-    """工具调用追踪（run_type="tool"）。"""
     return traceable(run_type="tool", name=name, tags=tags)
 
 
-def trace_chain(name: str | None = None, tags: list[str] | None = None):
-    """通用流程追踪（run_type="chain"）。"""
-    return traceable(run_type="chain", name=name, tags=tags)
+def trace_chain(
+    name: str | None = None,
+    tags: list[str] | None = None,
+    *,
+    flush_on_exit: bool = False,
+):
+    return traceable(
+        run_type="chain",
+        name=name,
+        tags=tags,
+        flush_on_exit=flush_on_exit,
+    )
 
 
 def trace_retriever(name: str | None = None, tags: list[str] | None = None):
-    """检索操作追踪（run_type="retriever"）。"""
     return traceable(run_type="retriever", name=name, tags=tags)

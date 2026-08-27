@@ -13,8 +13,6 @@ import json
 import re
 from typing import Optional
 
-from openai import OpenAI
-
 
 __all__ = ["VLLMPolicy", "OpenAICompatibleDict"]
 
@@ -54,10 +52,9 @@ class VLLMPolicy:
         max_tokens: int = 1024,
         tools: Optional[list[dict]] = None,
     ):
-        raw_client = OpenAI(base_url=base_url, api_key=api_key)
-        # 如果 LangSmith 追踪开启，自动包装 client 以追踪所有 LLM 调用
-        from ..utils.tracing import maybe_wrap_openai_client
-        self.client = maybe_wrap_openai_client(raw_client)
+        # Langfuse 开启时使用其 OpenAI drop-in client；关闭或异常时使用原始客户端。
+        from ..utils.tracing import create_openai_client
+        self.client = create_openai_client(base_url=base_url, api_key=api_key)
         self.model_name = model_name
         self.temperature = temperature
         self.top_p = top_p

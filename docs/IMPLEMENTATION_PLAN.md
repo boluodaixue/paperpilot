@@ -10,6 +10,8 @@
 4. 新旧路径短期通过 feature flag 并存；新路径达到验收标准后删除兼容层。
 5. 所有新增状态必须可持久化、可测试、可在 Web 进度中观察。
 
+在 Phase 0 正确性修复前，项目已经完成阶段 0.5 Langfuse 可观测性基线。后续新增的 ResearchRun、AgentFork、Evidence Merge 和 RCS 必须沿用现有 tracing 适配层，不再引入第二套 provider。
+
 ## 2. 目标目录调整
 
 建议在保持现有目录的基础上新增控制面和领域契约：
