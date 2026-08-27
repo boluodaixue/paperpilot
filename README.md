@@ -81,9 +81,10 @@ memory/
 - Langfuse tracing；
 - LangGraph 最小单线程入口、checkpointer 和线程身份；
 - 新的单个同质 Research AgentGraph：根/子共用同一图，支持工具循环、结构化结果、来源证据、硬停止和线程隔离；
+- N2 根工作流：研究说明、用户反复修改/确认、checkpoint 恢复、最终 Markdown 报告和单一 Memory Store；
 - CLI、Web、评测以及旧研究链路。
 
-N1 已通过 `13` 项专项测试和 `201` 项全量回归。下一步 N2 将实现用户修改/确认、单 Agent 纵向闭环和 Markdown Memory Store；CLI 与 Web 默认入口仍要到 N5 才切换。
+N2 已通过 `8` 项专项测试，N1+N2 联合专项 `21 passed`，全量回归 `209 passed`。下一步 N3 将实现同质并行 fork；CLI 与 Web 默认入口仍要到 N5 才切换。
 
 ## 快速开始
 
@@ -152,6 +153,7 @@ deepresearch-agent/
 - [实施计划](docs/IMPLEMENTATION_PLAN.md)
 - [路线图](docs/ROADMAP.md)
 - [N1 实施记录](docs/N1_HOMOGENEOUS_AGENT_GRAPH.md)
+- [N2 实施记录](docs/N2_CONFIRMATION_AND_MEMORY.md)
 
 ## 明确不做
 

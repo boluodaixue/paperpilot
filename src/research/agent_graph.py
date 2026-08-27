@@ -6,7 +6,6 @@ their task and :class:`ExecutionIdentity`; both execute this exact graph.
 """
 from __future__ import annotations
 
-import asyncio
 import hashlib
 import inspect
 import json
@@ -28,11 +27,13 @@ from .models import (
     ResearchStatus,
     ResearchTask,
 )
+from .policy import call_policy
 
 
 __all__ = [
     "ResearchAgentState",
     "build_research_agent_graph",
+    "create_research_agent_state",
     "run_research_agent",
 ]
 
@@ -160,39 +161,6 @@ def _build_tool_map(tools: Iterable[Any]) -> dict[str, Any]:
             raise TypeError(f"tool {name!r} does not provide execute()")
         result[name] = tool
     return result
-
-
-async def _call_policy(
-    policy: Any,
-    messages: list[dict[str, Any]],
-    schemas: list[dict[str, Any]],
-) -> dict[str, Any]:
-    try:
-        signature = inspect.signature(policy)
-    except (TypeError, ValueError):
-        accepts_tools = True
-    else:
-        accepts_tools = "tools" in signature.parameters or any(
-            parameter.kind == inspect.Parameter.VAR_KEYWORD
-            for parameter in signature.parameters.values()
-        )
-
-    kwargs = {"tools": schemas} if accepts_tools else {}
-    call = getattr(policy, "__call__", policy)
-    if inspect.iscoroutinefunction(call):
-        response = await policy(messages, **kwargs)
-    else:
-        response = await asyncio.to_thread(policy, messages, **kwargs)
-        if inspect.isawaitable(response):
-            response = await response
-
-    if isinstance(response, dict):
-        return response
-    if hasattr(response, "model_dump"):
-        dumped = response.model_dump()
-        if isinstance(dumped, dict):
-            return dumped
-    raise TypeError("policy must return an OpenAI-compatible dict")
 
 
 def _normalize_tool_calls(raw_calls: Any) -> list[dict[str, Any]]:
@@ -367,7 +335,7 @@ def _coerce_strings(value: Any) -> list[str]:
     return [str(item).strip() for item in value if str(item).strip()]
 
 
-def _initial_state(
+def create_research_agent_state(
     task: ResearchTask,
     identity: ExecutionIdentity,
     limits: AgentLimits,
@@ -394,8 +362,11 @@ def build_research_agent_graph(
     tools: Iterable[Any] = (),
     *,
     checkpointer: BaseCheckpointSaver | None = None,
+    inherit_checkpointer: bool = False,
 ) -> Any:
     """Build the one graph shared by root, child, and future grandchild Agents."""
+    if inherit_checkpointer and checkpointer is not None:
+        raise ValueError("cannot set checkpointer when inherit_checkpointer is true")
     tool_list = list(tools)
     tool_map = _build_tool_map(tool_list)
     schemas = _tool_schemas(tool_list)
@@ -431,7 +402,7 @@ def build_research_agent_graph(
 
         with _node_trace("think_and_plan", state) as observation:
             try:
-                response = await _call_policy(policy, state["messages"], schemas)
+                response = await call_policy(policy, state["messages"], schemas)
             except Exception as exc:
                 observation.set_error(str(exc))
                 return {
@@ -630,9 +601,12 @@ def build_research_agent_graph(
     )
     builder.add_edge("use_tools", "think_and_plan")
     builder.add_edge("synthesize", END)
-    return builder.compile(
-        checkpointer=checkpointer if checkpointer is not None else InMemorySaver()
+    effective_checkpointer = (
+        None
+        if inherit_checkpointer
+        else checkpointer if checkpointer is not None else InMemorySaver()
     )
+    return builder.compile(checkpointer=effective_checkpointer)
 
 
 async def run_research_agent(
@@ -652,7 +626,7 @@ async def run_research_agent(
         checkpointer=checkpointer,
     )
     final_state = await graph.ainvoke(
-        _initial_state(task, identity, effective_limits),
+        create_research_agent_state(task, identity, effective_limits),
         config={"configurable": {"thread_id": identity.thread_id}},
     )
     result = final_state.get("result")

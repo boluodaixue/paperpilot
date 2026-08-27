@@ -106,3 +106,35 @@ class ResearchResult:
     stop_reason: str | None = None
     iterations: int = 0
     tool_calls_used: int = 0
+
+
+@dataclass(frozen=True)
+class ResearchBrief:
+    """User-reviewable research direction prepared before any research tools run."""
+
+    question: str
+    objective: str
+    scope: tuple[str, ...]
+    directions: tuple[str, ...]
+    constraints: tuple[str, ...]
+    expected_output: str
+    revision: int = 0
+
+
+@dataclass(frozen=True)
+class MemoryManifest:
+    """Relative Markdown paths written by one idempotent Memory Store commit."""
+
+    report_path: str
+    evidence_paths: tuple[str, ...] = ()
+    source_paths: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True)
+class ResearchWorkflowResult:
+    """Final output of the N2 root workflow."""
+
+    brief: ResearchBrief
+    research_result: ResearchResult
+    report_markdown: str
+    memory_manifest: MemoryManifest
