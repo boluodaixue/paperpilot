@@ -1,4 +1,4 @@
-"""Static guardrails for the post-N5 PaperPilot architecture."""
+"""Regression tests for the post-N5 PaperPilot architecture cleanup."""
 from __future__ import annotations
 
 import re
@@ -86,7 +86,7 @@ def _production_python_files() -> list[Path]:
     )
 
 
-def test_removed_legacy_files_are_absent() -> None:
+def test_removed_old_architecture_files_are_absent() -> None:
     leftovers = [name for name in REMOVED_FILES if (ROOT / name).exists()]
     for directory in REMOVED_SOURCE_DIRS:
         leftovers.extend(
@@ -95,7 +95,7 @@ def test_removed_legacy_files_are_absent() -> None:
     assert leftovers == []
 
 
-def test_production_code_has_no_legacy_imports_or_active_symbols() -> None:
+def test_production_code_has_no_old_architecture_imports_or_active_symbols() -> None:
     import_pattern = re.compile(
         rf"(?:from|import)\s+(?:{'|'.join(re.escape(v) for v in REMOVED_IMPORT_PREFIXES)})\b"
     )
@@ -103,7 +103,7 @@ def test_production_code_has_no_legacy_imports_or_active_symbols() -> None:
     for path in _production_python_files():
         text = path.read_text(encoding="utf-8")
         if import_pattern.search(text):
-            violations.append(f"{path.relative_to(ROOT)}: legacy import")
+            violations.append(f"{path.relative_to(ROOT)}: old architecture import")
         for symbol in REMOVED_ACTIVE_SYMBOLS:
             if symbol in text:
                 violations.append(f"{path.relative_to(ROOT)}: {symbol}")
@@ -127,7 +127,7 @@ def test_packaging_has_no_removed_dependencies_or_entrypoints() -> None:
         assert removed not in pyproject.lower()
 
 
-def test_web_ui_has_no_legacy_graph_or_export_surface() -> None:
+def test_web_ui_has_no_old_graph_or_export_surface() -> None:
     html = (ROOT / "web/static/index.html").read_text(encoding="utf-8")
     for removed in (
         "vis-network",
