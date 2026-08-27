@@ -10,6 +10,7 @@ from __future__ import annotations
 import logging
 import os
 import uuid
+from collections.abc import Mapping
 from pathlib import Path
 from typing import Any, Iterable
 
@@ -132,6 +133,19 @@ def _memory_root(config: dict[str, Any]) -> Path:
     return path if path.is_absolute() else PROJECT_ROOT / path
 
 
+def _report_review_enabled(config: dict[str, Any]) -> bool:
+    research = config.get("research", {})
+    if not isinstance(research, Mapping):
+        raise ValueError("research configuration must be a mapping")
+    report_review = research.get("report_review", {})
+    if not isinstance(report_review, Mapping):
+        raise ValueError("research.report_review must be a mapping")
+    value = report_review.get("enabled", False)
+    if not isinstance(value, bool):
+        raise ValueError("research.report_review.enabled must be a boolean")
+    return value
+
+
 class ResearchRuntime:
     """Shared production facade for starting and resuming root research runs."""
 
@@ -144,6 +158,7 @@ class ResearchRuntime:
         memory_store: MarkdownMemoryStore,
         checkpointer: BaseCheckpointSaver,
         limits: AgentLimits,
+        report_review_enabled: bool = False,
     ) -> None:
         self.config = config
         self.policy = policy
@@ -151,11 +166,13 @@ class ResearchRuntime:
         self.memory_store = memory_store
         self.checkpointer = checkpointer
         self.limits = limits
+        self.report_review_enabled = report_review_enabled
         self.graph = build_research_workflow(
             policy,
             self.tools,
             memory_store,
             checkpointer=checkpointer,
+            report_review_enabled=report_review_enabled,
         )
 
     @staticmethod
@@ -245,4 +262,5 @@ def build_research_runtime(
         ),
         checkpointer=checkpointer if checkpointer is not None else InMemorySaver(),
         limits=limits_from_config(effective_config),
+        report_review_enabled=_report_review_enabled(effective_config),
     )

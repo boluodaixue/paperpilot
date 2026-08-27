@@ -178,6 +178,38 @@ class MemoryManifest:
 
 
 @dataclass(frozen=True)
+class ReportIssue:
+    """One structured Red review finding about the final report."""
+
+    category: str
+    target: str
+    description: str
+
+
+@dataclass(frozen=True)
+class ReportEdit:
+    """One Blue report-only operation; it never mutates research evidence."""
+
+    operation: str
+    target: str
+    replacement: str = ""
+
+
+@dataclass(frozen=True)
+class ReportReviewOutcome:
+    """Auditable result of the optional final-report Red/Blue pass."""
+
+    applied: bool
+    issues: tuple[ReportIssue, ...] = ()
+    edits: tuple[ReportEdit, ...] = ()
+    fallback_reason: str | None = None
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "issues", tuple(self.issues))
+        object.__setattr__(self, "edits", tuple(self.edits))
+
+
+@dataclass(frozen=True)
 class ResearchWorkflowResult:
     """Final output of the root research workflow."""
 
@@ -185,3 +217,4 @@ class ResearchWorkflowResult:
     research_result: ResearchResult
     report_markdown: str
     memory_manifest: MemoryManifest
+    report_review: ReportReviewOutcome | None = None

@@ -26,6 +26,8 @@ model:
 
 research:
   memory_root: "memory"
+  report_review:
+    enabled: false
   limits:
     max_iterations: 8
     max_tool_calls: 12

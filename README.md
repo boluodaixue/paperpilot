@@ -24,7 +24,7 @@ PaperPilot 先由根 Research Agent 与用户对齐研究目标。用户确认�
    └── 汇聚并总结本级结果
 → 根 Agent 生成最终报告
 → 报告、证据、来源写入 Markdown Memory Store
-→ 可选 Red/Blue
+→ 可选 Red/Blue 单次报告后处理（默认关闭）
 ```
 
 完整定义见 [目标架构](docs/ARCHITECTURE.md)，具体步骤见 [实施计划](docs/IMPLEMENTATION_PLAN.md)，当前进度见 [路线图](docs/ROADMAP.md)。
@@ -72,7 +72,7 @@ memory/
 
 ## 当前仓库状态
 
-N0–N5 已完成。CLI、Web 和评测统一通过 `src/research/runtime.py` 进入同一个 Research Workflow；旧 Orchestrator、Planner DAG、AgentPool、独立 Summarizer、Evidence Store/Graph 和旧实验体系已经退出代码库。
+N0–N6 已完成。CLI、Web 和评测统一通过 `src/research/runtime.py` 进入同一个 Research Workflow；旧 Orchestrator、Planner DAG、AgentPool、独立 Summarizer、Evidence Store/Graph 和旧实验体系已经退出代码库。
 
 目前已经具备：
 
@@ -85,8 +85,23 @@ N0–N5 已完成。CLI、Web 和评测统一通过 `src/research/runtime.py` �
 - N3 一级同质并行 fork：三种触发条件、依赖和预算门槛、父子上下文/实例/身份隔离、并行汇聚与部分失败保留；
 - N4 有界递归：根→子→孙、祖先去重、总线程/工具/时间/token/重试限制、共享 saver 下的取消与恢复；
 - N5 生产入口：CLI/Web 用户确认与恢复、SSE 事件回放、结构化评测结果和架构回归测试。
+- N6 可选报告审查：原报告持久化后的单次 Red/Blue、确定性动作重放、结构保护与失败降级，默认关闭。
 
-N5 完成后的全量回归为 `119 passed`。下一步仅进入可选 N6 Red/Blue，不提前恢复或扩展旧架构。
+N6 已完成验收：关键专项与回归为 `65 passed, 1 warning`，全量回归为 `160 passed, 1 warning`；全量中的 warning 是既有 `StarletteDeprecationWarning`。
+
+### 可选报告审查
+
+N6 只处理已经成功持久化的最终 Markdown 报告，由 `research.report_review.enabled` 控制且默认关闭。开启时，系统复用本次运行的同一个 policy 做一次 Red 审查和一次 Blue 修订；这两次调用不暴露工具、不 fork，也不创建新的 LangGraph 线程。
+
+- Red 只输出事实性、逻辑一致性、引用质量三类结构化问题；
+- Blue 只允许 `ADD`、`DELETE`、`MODIFY`、`VERIFY` 四种动作；
+- 根工作流按顺序确定性重放 Blue 动作，重放结果必须与 Blue 返回的完整 Markdown 一致；
+- YAML frontmatter、WikiLink target 与次数、URL 的值与次数以及 manifest 必须保持不变；WikiLink alias 可调整；
+- 任一生成、解析、修订、校验或写回失败，都交付原始已持久化报告。
+
+该能力不是新的 Research Agent 角色、RCS 或评分引擎，也不引入 claim-evidence 新模型或第二套存储。详细边界见 [N6 实施记录](docs/N6_OPTIONAL_REPORT_REVIEW.md)。
+
+下一阶段仅为 Future LLM Wiki，尚未开始。
 
 ## 快速开始
 
@@ -159,6 +174,7 @@ deepresearch-agent/
 - [N3 实施记录](docs/N3_HOMOGENEOUS_PARALLEL_FORK.md)
 - [N4 实施记录](docs/N4_RECURSION_LIMITS_AND_RECOVERY.md)
 - [N5 实施记录](docs/N5_ENTRY_MIGRATION_AND_LEGACY_CLEANUP.md)
+- [N6 实施记录](docs/N6_OPTIONAL_REPORT_REVIEW.md)
 
 ## 明确不做
 
