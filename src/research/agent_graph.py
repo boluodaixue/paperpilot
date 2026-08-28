@@ -78,11 +78,20 @@ class ResearchAgentState(TypedDict):
     lineage_objectives: list[str]
     draft: dict[str, Any] | None
     last_content: str
+    last_assessed_evidence_count: int
+    last_assessed_source_count: int
+    stagnant_evidence_rounds: int
+    completion_ready_rounds: int
+    completion_requested: bool
+    completion_reason: str | None
     stop_reason: str | None
     result: ResearchResult | None
 
 
 _JSON_FENCE = re.compile(r"```(?:json)?\s*(.*?)\s*```", re.IGNORECASE | re.DOTALL)
+_COMPLETION_MIN_RESEARCH_ITERATIONS = 2
+_COMPLETION_READY_ROUNDS = 2
+_COMPLETION_STAGNANT_ROUNDS = 2
 
 
 def _event(
@@ -191,6 +200,10 @@ When the task is complete, stop calling tools and return one JSON object:
   "findings": ["atomic finding"],
   "unresolved": ["remaining uncertainty"]
 }}
+After tool or child results, a checkpointed completion assessment may report
+the evidence floor, remaining requirements, or information saturation. Treat
+that assessment as a control instruction: do not collect redundant sources,
+and finalize without tools when it requests finalization.
 Do not wrap the final JSON in commentary. There is no separate Planner,
 Manager, or Summarizer Agent.
 """
@@ -441,6 +454,72 @@ def _coerce_strings(value: Any) -> list[str]:
     return [str(item).strip() for item in value if str(item).strip()]
 
 
+def _completion_requirements(task: ResearchTask) -> list[str]:
+    """Return user-confirmed research directions used by the lightweight gate."""
+    context = task.context if isinstance(task.context, dict) else {}
+    values: list[str] = []
+    for field in ("research_gaps", "directions", "scope"):
+        raw = context.get(field, [])
+        if isinstance(raw, str):
+            raw = [raw]
+        if isinstance(raw, (list, tuple)):
+            values.extend(str(item).strip() for item in raw if str(item).strip())
+    return list(dict.fromkeys(values))
+
+
+def _completion_source_target(
+    task: ResearchTask,
+    identity: ExecutionIdentity,
+) -> int:
+    """Bound the evidence eligibility target without pretending to score quality."""
+    baseline = 4 if identity.depth == 0 else 3
+    requirement_count = len(_completion_requirements(task))
+    if requirement_count <= 0:
+        return baseline
+    return min(12, max(baseline, requirement_count * 2))
+
+
+def _completion_message(
+    state: ResearchAgentState,
+    *,
+    source_count: int,
+    new_evidence: int,
+    new_sources: int,
+    force_finalize: bool,
+    saturated: bool = False,
+) -> str:
+    requirements = _completion_requirements(state["task"])
+    requirement_text = (
+        "\n".join(f"- {item}" for item in requirements)
+        if requirements
+        else f"- {state['task'].objective}"
+    )
+    if saturated:
+        decision = (
+            "The research has produced no new source-locatable evidence for two "
+            "consecutive assessed rounds. Return a partial final JSON now."
+        )
+    elif force_finalize:
+        decision = (
+            "The lightweight completion gate has been eligible for two consecutive "
+            "rounds. Return the final JSON now without calling tools. Mark status "
+            "partial and list concrete unresolved items if any requirement is not "
+            "actually supported."
+        )
+    else:
+        decision = (
+            "The evidence floor is now eligible. Before using another tool, identify "
+            "one concrete unsupported requirement. If none exists, return the final "
+            "JSON without tool calls; avoid collecting redundant sources."
+        )
+    return (
+        "COMPLETION ASSESSMENT\n"
+        f"Distinct source-locatable sources: {source_count}. "
+        f"This round added {new_evidence} evidence items and {new_sources} sources.\n"
+        f"Requirements to verify:\n{requirement_text}\n\n{decision}"
+    )
+
+
 def _fork_policy_instance(policy: Any) -> Any:
     fork = getattr(policy, "fork", None)
     if callable(fork):
@@ -576,6 +655,12 @@ def create_research_agent_state(
         ),
         draft=None,
         last_content="",
+        last_assessed_evidence_count=0,
+        last_assessed_source_count=0,
+        stagnant_evidence_rounds=0,
+        completion_ready_rounds=0,
+        completion_requested=False,
+        completion_reason=None,
         stop_reason=None,
         result=None,
     )
@@ -635,6 +720,8 @@ def build_research_agent_graph(
         config: RunnableConfig,
     ) -> dict[str, Any]:
         _validate_invocation(state, config)
+        completion_requested = bool(state.get("completion_requested", False))
+        completion_reason = state.get("completion_reason")
         if state["stop_reason"]:
             return {"pending_tool_calls": [], "pending_fork_calls": []}
         if state["iteration"] >= state["limits"].max_iterations:
@@ -667,7 +754,11 @@ def build_research_agent_graph(
         with _node_trace("think_and_plan", state) as observation:
             # Tool availability can be bound per async research run, so resolve
             # schemas here instead of freezing a deny-all scope at graph compile.
-            schemas = [*_tool_schemas(tool_list), fork_tool_schema()]
+            schemas = (
+                []
+                if completion_requested
+                else [*_tool_schemas(tool_list), fork_tool_schema()]
+            )
             action_retries = 0
             while True:
                 try:
@@ -710,7 +801,11 @@ def build_research_agent_graph(
             token_exhausted = token_charge >= remaining_tokens
 
             content = str(response.get("content") or "")
-            calls = _normalize_tool_calls(response.get("tool_calls"))
+            calls = (
+                []
+                if completion_requested
+                else _normalize_tool_calls(response.get("tool_calls"))
+            )
             assistant_message: dict[str, Any] = {
                 "role": "assistant",
                 "content": content,
@@ -725,6 +820,8 @@ def build_research_agent_graph(
                 "iteration": state["iteration"] + 1,
                 "last_content": content,
                 "pending_stop_reason": None,
+                "completion_requested": False,
+                "completion_reason": None,
                 "estimated_tokens_used": state["estimated_tokens_used"] + token_charge,
                 "retries_used": state["retries_used"] + action_retries,
             }
@@ -734,6 +831,21 @@ def build_research_agent_graph(
                 update["draft"] = _parse_draft(content)
                 update["stop_reason"] = "token_budget_exhausted"
                 observation.add_output({"action": "stop", "reason": "token_budget"})
+                return update
+            if completion_requested:
+                update["pending_tool_calls"] = []
+                update["pending_fork_calls"] = []
+                update["draft"] = _parse_draft(content)
+                if completion_reason == "evidence_saturated":
+                    update["stop_reason"] = "evidence_saturated"
+                elif not content.strip():
+                    update["stop_reason"] = "completion_finalize_failed"
+                observation.add_output(
+                    {
+                        "action": "synthesize",
+                        "completion_reason": completion_reason,
+                    }
+                )
                 return update
             if not calls:
                 update["pending_tool_calls"] = []
@@ -776,6 +888,124 @@ def build_research_agent_graph(
                 {"action": "use_tool", "tool_calls": len(update["pending_tool_calls"])}
             )
             return update
+
+    def assess_completion(
+        state: ResearchAgentState,
+        config: RunnableConfig,
+    ) -> dict[str, Any]:
+        """Apply a checkpointed, explainable completion gate without a new Agent."""
+        _validate_invocation(state, config)
+        evidence = _deduplicate_evidence(state["observed_evidence"])
+        sources = {item.source_ref for item in evidence if item.source_ref}
+        evidence_count = len(evidence)
+        source_count = len(sources)
+        new_evidence = max(
+            0,
+            evidence_count - int(state.get("last_assessed_evidence_count", 0)),
+        )
+        new_sources = max(
+            0,
+            source_count - int(state.get("last_assessed_source_count", 0)),
+        )
+        stagnant_rounds = (
+            int(state.get("stagnant_evidence_rounds", 0)) + 1
+            if new_evidence == 0 and new_sources == 0
+            else 0
+        )
+        source_target = _completion_source_target(state["task"], state["identity"])
+        eligible = (
+            state["task"].require_evidence
+            and state["iteration"] >= _COMPLETION_MIN_RESEARCH_ITERATIONS
+            and source_count >= source_target
+        )
+        ready_rounds = (
+            int(state.get("completion_ready_rounds", 0)) + 1
+            if eligible
+            else 0
+        )
+        update: dict[str, Any] = {
+            "last_assessed_evidence_count": evidence_count,
+            "last_assessed_source_count": source_count,
+            "stagnant_evidence_rounds": stagnant_rounds,
+            "completion_ready_rounds": ready_rounds,
+            "completion_requested": False,
+            "completion_reason": None,
+        }
+
+        if state["stop_reason"] or state["draft"] is not None:
+            outcome = "synthesize"
+        elif ready_rounds >= _COMPLETION_READY_ROUNDS:
+            update["messages"] = [
+                *state["messages"],
+                {
+                    "role": "user",
+                    "content": _completion_message(
+                        state,
+                        source_count=source_count,
+                        new_evidence=new_evidence,
+                        new_sources=new_sources,
+                        force_finalize=True,
+                    ),
+                },
+            ]
+            update["completion_requested"] = True
+            update["completion_reason"] = "evidence_sufficient"
+            outcome = "finalize"
+        elif (
+            evidence
+            and stagnant_rounds >= _COMPLETION_STAGNANT_ROUNDS
+        ):
+            update["messages"] = [
+                *state["messages"],
+                {
+                    "role": "user",
+                    "content": _completion_message(
+                        state,
+                        source_count=source_count,
+                        new_evidence=new_evidence,
+                        new_sources=new_sources,
+                        force_finalize=True,
+                        saturated=True,
+                    ),
+                },
+            ]
+            update["completion_requested"] = True
+            update["completion_reason"] = "evidence_saturated"
+            outcome = "finalize_partial"
+        elif ready_rounds == 1:
+            update["messages"] = [
+                *state["messages"],
+                {
+                    "role": "user",
+                    "content": _completion_message(
+                        state,
+                        source_count=source_count,
+                        new_evidence=new_evidence,
+                        new_sources=new_sources,
+                        force_finalize=False,
+                    ),
+                },
+            ]
+            outcome = "verify_gaps"
+        else:
+            outcome = "continue"
+
+        update["execution_events"] = [
+            *state["execution_events"],
+            _event(
+                "completion_assessed",
+                state["identity"],
+                outcome=outcome,
+                evidence_count=evidence_count,
+                source_count=source_count,
+                new_evidence=new_evidence,
+                new_sources=new_sources,
+                source_target=source_target,
+                stagnant_rounds=stagnant_rounds,
+                ready_rounds=ready_rounds,
+            ),
+        ]
+        return update
 
     async def _execute_pending_tools(
         state: ResearchAgentState,
@@ -1251,13 +1481,19 @@ def build_research_agent_graph(
             return "fork_children"
         if state["pending_tool_calls"]:
             return "use_tools"
-        return "synthesize"
+        return "assess_completion"
+
+    def route_after_assessment(state: ResearchAgentState) -> str:
+        if state["stop_reason"] or state["draft"] is not None:
+            return "synthesize"
+        return "think_and_plan"
 
     builder = StateGraph(ResearchAgentState)
     builder.add_node("prepare", prepare)
     builder.add_node("think_and_plan", think_and_plan)
     builder.add_node("use_tools", use_tools)
     builder.add_node("fork_children", fork_children)
+    builder.add_node("assess_completion", assess_completion)
     builder.add_node("synthesize", synthesize)
     builder.add_edge(START, "prepare")
     builder.add_edge("prepare", "think_and_plan")
@@ -1267,11 +1503,19 @@ def build_research_agent_graph(
         {
             "fork_children": "fork_children",
             "use_tools": "use_tools",
+            "assess_completion": "assess_completion",
+        },
+    )
+    builder.add_edge("use_tools", "assess_completion")
+    builder.add_edge("fork_children", "assess_completion")
+    builder.add_conditional_edges(
+        "assess_completion",
+        route_after_assessment,
+        {
+            "think_and_plan": "think_and_plan",
             "synthesize": "synthesize",
         },
     )
-    builder.add_edge("use_tools", "think_and_plan")
-    builder.add_edge("fork_children", "think_and_plan")
     builder.add_edge("synthesize", END)
     return builder.compile(checkpointer=effective_checkpointer)
 

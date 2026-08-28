@@ -173,7 +173,9 @@ async def test_fixed_tool_path_returns_structured_source_locatable_result() -> N
         "prepare",
         "think_and_plan",
         "use_tools",
+        "assess_completion",
         "think_and_plan",
+        "assess_completion",
         "synthesize",
     ]
 
@@ -272,6 +274,101 @@ async def test_hard_limits_stop_the_loop_deterministically(
     assert result.status == ResearchStatus.PARTIAL
     assert result.stop_reason == reason
     assert reason in result.unresolved
+
+
+@pytest.mark.asyncio
+async def test_completion_gate_finalizes_after_two_evidence_ready_rounds() -> None:
+    class GrowingWebTool(FixedWebTool):
+        def __init__(self) -> None:
+            super().__init__()
+            self.round = 0
+
+        async def execute(self, **kwargs) -> dict:
+            self.round += 1
+            return {
+                "results": [
+                    {
+                        "title": f"Source {self.round}-{index}",
+                        "url": f"https://example.com/{self.round}/{index}",
+                        "snippet": f"Evidence from round {self.round}, item {index}.",
+                    }
+                    for index in range(2)
+                ]
+            }
+
+    class GateAwarePolicy:
+        def __init__(self) -> None:
+            self.finalized_without_tools = False
+
+        def __call__(self, messages, *, tools=None):
+            if tools == []:
+                self.finalized_without_tools = True
+                return _final("Enough independent evidence was collected.", "Grounded finding.")
+            return {"content": "", "tool_calls": [_tool_call()]}
+
+    policy = GateAwarePolicy()
+    tool = GrowingWebTool()
+    identity = _root_identity("root-completion-gate")
+    graph = build_research_agent_graph(policy, [tool])
+
+    final = await graph.ainvoke(
+        _state(
+            ResearchTask(
+                "completion-gate",
+                "Assess a bounded topic.",
+                context={"directions": ["direction one", "direction two"]},
+            ),
+            identity,
+            AgentLimits(max_iterations=8, max_tool_calls=20, max_total_tool_calls=20),
+        ),
+        config=_config(identity.thread_id),
+    )
+
+    result = final["result"]
+    assert result.status == ResearchStatus.COMPLETED
+    assert result.stop_reason is None
+    assert result.tool_calls_used == 3
+    assert policy.finalized_without_tools is True
+    assessments = [
+        event
+        for event in final["execution_events"]
+        if event["kind"] == "completion_assessed"
+    ]
+    assert assessments[-2]["outcome"] == "finalize"
+    assert assessments[-1]["outcome"] == "synthesize"
+
+
+@pytest.mark.asyncio
+async def test_completion_gate_stops_two_rounds_without_new_evidence() -> None:
+    class FinalizeAwareAlwaysToolPolicy:
+        def __call__(self, messages, *, tools=None):
+            if tools == []:
+                return _final(
+                    "Research saturated without additional independent evidence.",
+                    "Only one stable source was found.",
+                    status="partial",
+                )
+            return {"content": "", "tool_calls": [_tool_call()]}
+
+    identity = _root_identity("root-evidence-saturated")
+    graph = build_research_agent_graph(
+        FinalizeAwareAlwaysToolPolicy(),
+        [FixedWebTool()],
+    )
+    final = await graph.ainvoke(
+        _state(
+            ResearchTask("evidence-saturated", "Find repeatable evidence."),
+            identity,
+            AgentLimits(max_iterations=8, max_tool_calls=20, max_total_tool_calls=20),
+        ),
+        config=_config(identity.thread_id),
+    )
+
+    result = final["result"]
+    assert result.status == ResearchStatus.PARTIAL
+    assert result.stop_reason == "evidence_saturated"
+    assert result.tool_calls_used == 3
+    assert result.iterations == 4
 
 
 @pytest.mark.asyncio

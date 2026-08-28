@@ -7,6 +7,7 @@
 | 能力 | 状态 | 结果 |
 |---|---|---|
 | 同质 Research AgentGraph | ✅ | 根、子、孙复用同一图，fork 与全树预算可恢复 |
+| 轻量完成门 | ✅ | 来源底线、缺口复核、信息饱和与硬停止可解释 |
 | Research Workflow | ✅ | Brief 修改/确认、interrupt、SQLite checkpoint 和重启恢复 |
 | Markdown Memory | ✅ | 多 `memory_id`、报告/证据/来源/笔记/导入和 WikiLink |
 | Obsidian 接入 | ✅ | 安全打开 Memory、报告和引用，不写 `.obsidian/` |
@@ -15,7 +16,7 @@
 | 单一 Vault Writer | ✅ | 持久队列、lease、staging/journal、幂等和崩溃恢复 |
 | 持久化检索 | ✅ | FTS5 增量索引、最终哈希复核和可删除重建 |
 | 可选混合检索 | ✅ | 本地多语言语义 + FTS + WikiLink，失败降级 |
-| 离线自动化验收 | ✅ | `702 passed, 2 skipped` |
+| 离线自动化验收 | ✅ | `716 passed, 2 skipped` |
 
 ## 当前优先级
 
