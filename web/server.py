@@ -19,7 +19,6 @@ from typing import Any, Iterable, Literal
 
 from fastapi import FastAPI, Header, HTTPException
 from fastapi.responses import HTMLResponse, StreamingResponse
-from langgraph.types import Command
 from pydantic import BaseModel, ConfigDict
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
@@ -521,13 +520,7 @@ def _event_lists(value: Any) -> Iterable[list[dict[str, Any]]]:
 
 async def _stream_confirm(task: ResearchTask) -> dict[str, Any]:
     runtime = get_research_runtime()
-    config = {"configurable": {"thread_id": task.thread_id}}
-    async for update in runtime.graph.astream(
-        Command(resume={"action": "confirm"}),
-        config=config,
-        stream_mode="updates",
-        subgraphs=True,
-    ):
+    async for update in runtime.stream_confirm(task.thread_id):
         for events in _event_lists(update):
             await task.publish_execution_events(events)
     state = await runtime.get_state(task.thread_id)

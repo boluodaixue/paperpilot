@@ -10,6 +10,7 @@ import re
 import time
 from contextlib import contextmanager
 from dataclasses import asdict
+from pathlib import PurePosixPath, PureWindowsPath
 from typing import Any, Iterable, TypedDict
 
 from langchain_core.runnables import RunnableConfig
@@ -17,6 +18,7 @@ from langgraph.checkpoint.base import BaseCheckpointSaver
 from langgraph.checkpoint.memory import InMemorySaver
 from langgraph.graph import END, START, StateGraph
 
+from ..tools.file_reader import FileReaderError
 from ..utils.tracing import trace_block, trace_context
 from .fork_policy import (
     FORK_TOOL_NAME,
@@ -207,6 +209,9 @@ def _task_prompt(task: ResearchTask) -> str:
 def _tool_schemas(tools: Iterable[Any]) -> list[dict[str, Any]]:
     schemas: list[dict[str, Any]] = []
     for tool in tools:
+        availability = getattr(tool, "is_available", None)
+        if callable(availability) and availability() is False:
+            continue
         factory = getattr(tool, "get_openai_tool_schema", None)
         if not callable(factory):
             raise TypeError(f"tool {tool!r} does not provide get_openai_tool_schema()")
@@ -365,16 +370,47 @@ def _extract_evidence(tool_name: str, args: dict[str, Any], result: Any) -> list
         )
         if found:
             evidence.append(found)
-    elif tool_name == "file_reader":
+    elif tool_name == "file_reader" and isinstance(result, dict):
+        path = result.get("path")
+        file_format = result.get("format")
+        content = result.get("content")
+        truncated = result.get("truncated")
+        if (
+            not isinstance(path, str)
+            or file_format not in {"text", "markdown", "pdf", "csv", "json", "docx"}
+            or not isinstance(content, str)
+            or not isinstance(truncated, bool)
+        ):
+            return evidence
+        clean_path = path.strip()
+        relative = PurePosixPath(clean_path)
+        windows_path = PureWindowsPath(clean_path)
+        if (
+            not clean_path
+            or clean_path != path
+            or "\\" in clean_path
+            or ":" in clean_path
+            or str(relative) != clean_path
+            or relative.is_absolute()
+            or windows_path.is_absolute()
+            or bool(windows_path.drive)
+            or any(part in {"", ".", ".."} for part in clean_path.split("/"))
+            or len(relative.parts) < 2
+            or relative.parts[0] not in {"memory", "upload"}
+        ):
+            return evidence
+        limitations = "File excerpt; preserve page or section details when available."
+        if truncated:
+            limitations += " Reader output was truncated to the configured limit."
         found = _evidence_item(
-            finding=str(result)[:1000],
+            finding=content[:1000],
             source_type="file",
-            title=args.get("file_path"),
-            source_ref=args.get("file_path"),
-            locator=args.get("file_path"),
-            excerpt=str(result)[:4000],
+            title=clean_path,
+            source_ref=clean_path,
+            locator=clean_path,
+            excerpt=content[:4000],
             excerpt_type="quote",
-            limitations="File excerpt; preserve page or section details when available.",
+            limitations=limitations,
         )
         if found:
             evidence.append(found)
@@ -771,6 +807,7 @@ def build_research_agent_graph(
             result: Any
             error: str | None = None
             action_retries = 0
+            permanent_error = False
             with trace_block(
                 f"research_agent.tool.{tool_name or 'unknown'}",
                 run_type="tool",
@@ -805,6 +842,10 @@ def build_research_agent_graph(
                             error = "time budget exhausted"
                             result = {"error": error}
                             stop_reason = "time_budget_exhausted"
+                        except FileReaderError as exc:
+                            error = str(exc)
+                            result = {"error": error}
+                            permanent_error = True
                         except Exception as exc:
                             error = str(exc)
                             result = {"error": error}
@@ -817,7 +858,11 @@ def build_research_agent_graph(
                         state["limits"].max_tool_calls - local_tool_calls,
                         state["subtree_tool_budget"] - total_tool_calls,
                     )
-                    if error is None or stop_reason == "time_budget_exhausted":
+                    if (
+                        error is None
+                        or permanent_error
+                        or stop_reason == "time_budget_exhausted"
+                    ):
                         break
                     if retry_available <= 0 or call_available <= 0:
                         break

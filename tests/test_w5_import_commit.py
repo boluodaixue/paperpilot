@@ -151,7 +151,15 @@ def _proposal(
 
 
 @pytest.fixture
-def store(tmp_path: Path) -> MarkdownMemoryStore:
+def store(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> MarkdownMemoryStore:
+    monkeypatch.setattr(
+        MarkdownMemoryStore,
+        "_timestamp",
+        staticmethod(lambda: STAMP),
+    )
     value = MarkdownMemoryStore(tmp_path / "Vault")
     value.create_memory("W5 imports", "M-w5")
     return value

@@ -85,8 +85,8 @@ def create_tools(mock_mode: bool = USE_MOCK):
     # 3. arxiv_reader（mock 模式通过 use_mock 参数控制）
     tools["arxiv_reader"] = ArxivReaderTool(use_mock=mock_mode)
 
-    # 4. file_reader（始终本地运行，demo 中不限制目录）
-    tools["file_reader"] = FileReaderTool(allowed_base_dir=None)
+    # 4. file_reader（默认 deny-all；单次读取时显式绑定临时目录）
+    tools["file_reader"] = FileReaderTool()
 
     # 5. code_sandbox（mock 模式通过 use_mock 参数控制）
     tools["code_sandbox"] = CodeSandboxTool(use_mock=mock_mode)
@@ -195,6 +195,8 @@ async def test_tools_individually(tools: dict) -> list[str]:
     print("\n📁 file_reader: 读取临时测试文件 ...")
     tmp_path = None
     try:
+        from src.tools import file_reader_scope
+
         with tempfile.NamedTemporaryFile(
             mode="w", suffix=".txt", delete=False, encoding="utf-8"
         ) as f:
@@ -207,8 +209,13 @@ async def test_tools_individually(tools: dict) -> list[str]:
             )
             tmp_path = f.name
 
-        r = await tools["file_reader"].execute(tmp_path)
-        preview = r.split("\n")[-4:]  # 取最后几行数据
+        safe_path = Path(tmp_path)
+        with file_reader_scope({"upload": safe_path.parent}):
+            r = await tools["file_reader"].execute(
+                root="upload",
+                path=safe_path.name,
+            )
+        preview = r["content"].split("\n")[-4:]  # 取最后几行数据
         print(f"   ✓ 读取成功")
         for line in preview:
             print(f"     {line}")
