@@ -166,6 +166,10 @@ class ResearchBrief:
     constraints: tuple[str, ...]
     expected_output: str
     revision: int = 0
+    memory_id: str | None = None
+    memory_paths: tuple[str, ...] = ()
+    known_information: tuple[str, ...] = ()
+    research_gaps: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
