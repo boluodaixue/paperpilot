@@ -591,7 +591,6 @@ def build_research_agent_graph(
         raise ValueError("cannot set checkpointer when inherit_checkpointer is true")
     tool_list = list(tools)
     tool_map = _build_tool_map(tool_list)
-    schemas = [*_tool_schemas(tool_list), fork_tool_schema()]
     effective_checkpointer = (
         None
         if inherit_checkpointer
@@ -663,6 +662,9 @@ def build_research_agent_graph(
             }
 
         with _node_trace("think_and_plan", state) as observation:
+            # Tool availability can be bound per async research run, so resolve
+            # schemas here instead of freezing a deny-all scope at graph compile.
+            schemas = [*_tool_schemas(tool_list), fork_tool_schema()]
             action_retries = 0
             while True:
                 try:
