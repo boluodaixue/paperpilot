@@ -9,6 +9,7 @@
 3. [ROADMAP.md](ROADMAP.md)：当前完成度和下一阶段；
 4. [LLM_WIKI_OBSIDIAN_ARCHITECTURE.md](LLM_WIKI_OBSIDIAN_ARCHITECTURE.md)：LLM Wiki + Obsidian 主线的目标架构附录；
 5. [LLM_WIKI_OBSIDIAN_IMPLEMENTATION_PLAN.md](LLM_WIKI_OBSIDIAN_IMPLEMENTATION_PLAN.md)：W0–W6 的具体实施与验收附录。
+6. [S_PRODUCTION_HARDENING_AND_RETRIEVAL_PLAN.md](S_PRODUCTION_HARDENING_AND_RETRIEVAL_PLAN.md)：W6 之后已确认但尚未开始的 S0–S5 生产化与检索升级计划。
 
 若现有代码、注释、历史记录或提交说明与现行文档冲突，以 `ARCHITECTURE.md` 为准。
 
@@ -39,7 +40,7 @@
 - [W5_CONTROLLED_IMPORTS.md](W5_CONTROLLED_IMPORTS.md)：PDF/文本/显式 URL 导入、可定位提取、受控整理提案与确认后成组写入的实现和验收结果。
 - [W6_STABILIZATION_MIGRATION_AND_ENTRY.md](W6_STABILIZATION_MIGRATION_AND_ENTRY.md)：CLI/Web 固定 Memory、legacy 只读迁移、可观测性与固定离线评测的实现和验收结果。
 
-LLM Wiki + Obsidian 主线的 W0–W6 已全部完成；没有开始计划外的新阶段。
+LLM Wiki + Obsidian 主线的 W0–W6 已全部完成。S0–S5 已另行确认但尚未开始，具体边界见 [S 系列实施计划](S_PRODUCTION_HARDENING_AND_RETRIEVAL_PLAN.md)。
 
 ## 已清理文档
 
