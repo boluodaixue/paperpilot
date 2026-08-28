@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 import os
 import re
 import sqlite3
@@ -10,7 +11,7 @@ import threading
 import time
 from dataclasses import dataclass, replace
 from pathlib import Path, PurePosixPath
-from typing import Mapping
+from typing import Any, Mapping, Sequence
 
 import yaml
 
@@ -32,7 +33,7 @@ _SUMMARY_MAX_CHARS = 320
 _DEFAULT_INDEX_DB = Path(__file__).resolve().parents[2] / "data" / "retrieval.db"
 _CHUNK_MAX_CHARS = 3000
 _DEFAULT_RECONCILIATION_SECONDS = 300.0
-_INDEX_CONFIGS: dict[str, tuple[Path, float]] = {}
+_INDEX_CONFIGS: dict[str, _PersistentRetrievalConfig] = {}
 _INDEX_CONFIGS_LOCK = threading.Lock()
 _ENGLISH_STOPWORDS = frozenset(
     {
@@ -102,6 +103,15 @@ class MemorySearchHit:
     score: int
     modified_ns: int
     content_hash: str
+
+
+@dataclass(frozen=True)
+class _PersistentRetrievalConfig:
+    db_path: Path
+    reconciliation_seconds: float
+    semantic_enabled: bool
+    semantic_model: str
+    semantic_local_files_only: bool
 
 
 @dataclass(frozen=True)
@@ -235,16 +245,50 @@ def configure_persistent_retrieval(
     db_path: str | os.PathLike[str],
     *,
     reconciliation_seconds: float = _DEFAULT_RECONCILIATION_SECONDS,
+    semantic_enabled: bool = False,
+    semantic_model: str = "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2",
+    semantic_local_files_only: bool = True,
 ) -> None:
     """Bind product configuration to one Vault without changing Markdown state."""
     if reconciliation_seconds <= 0:
         raise ValueError("retrieval.reconciliation_seconds must be positive")
+    if not isinstance(semantic_enabled, bool) or not isinstance(semantic_local_files_only, bool):
+        raise ValueError("semantic retrieval flags must be booleans")
+    if not isinstance(semantic_model, str) or not semantic_model.strip():
+        raise ValueError("semantic retrieval model must be a non-empty string")
     key = os.path.normcase(str(memory_store.root.resolve(strict=False)))
     with _INDEX_CONFIGS_LOCK:
-        _INDEX_CONFIGS[key] = (
-            Path(db_path).resolve(strict=False),
-            float(reconciliation_seconds),
+        _INDEX_CONFIGS[key] = _PersistentRetrievalConfig(
+            db_path=Path(db_path).resolve(strict=False),
+            reconciliation_seconds=float(reconciliation_seconds),
+            semantic_enabled=semantic_enabled,
+            semantic_model=semantic_model.strip(),
+            semantic_local_files_only=semantic_local_files_only,
         )
+
+
+class _SentenceTransformerProvider:
+    """Lazy local embedding adapter; failures are handled by S4 fallback."""
+
+    def __init__(self, model_id: str, *, local_files_only: bool) -> None:
+        self.model_id = model_id
+        self.local_files_only = local_files_only
+        self._model: Any | None = None
+
+    def embed(self, texts: Sequence[str]) -> list[list[float]]:
+        if self._model is None:
+            from sentence_transformers import SentenceTransformer
+
+            self._model = SentenceTransformer(
+                self.model_id,
+                local_files_only=self.local_files_only,
+            )
+        vectors = self._model.encode(
+            list(texts),
+            normalize_embeddings=True,
+            show_progress_bar=False,
+        )
+        return [[float(value) for value in vector] for vector in vectors]
 
 
 class MarkdownMemoryIndex:
@@ -256,13 +300,16 @@ class MarkdownMemoryIndex:
         db_path: str | os.PathLike[str] | None = None,
         *,
         reconciliation_seconds: float = _DEFAULT_RECONCILIATION_SECONDS,
+        semantic_enabled: bool | None = None,
+        embedding_provider: Any | None = None,
     ) -> None:
         self.memory_store = memory_store
         config_key = os.path.normcase(str(self.memory_store.root.resolve(strict=False)))
         with _INDEX_CONFIGS_LOCK:
             configured = _INDEX_CONFIGS.get(config_key)
         if db_path is None and configured is not None:
-            db_path, reconciliation_seconds = configured
+            db_path = configured.db_path
+            reconciliation_seconds = configured.reconciliation_seconds
         self.db_path = Path(db_path) if db_path is not None else _DEFAULT_INDEX_DB
         self.db_path = self.db_path.resolve(strict=False)
         vault_root = self.memory_store.root.resolve(strict=False)
@@ -271,6 +318,26 @@ class MarkdownMemoryIndex:
         if reconciliation_seconds <= 0:
             raise ValueError("reconciliation_seconds must be positive")
         self.reconciliation_seconds = float(reconciliation_seconds)
+        configured_enabled = configured.semantic_enabled if configured else False
+        self.semantic_enabled = configured_enabled if semantic_enabled is None else semantic_enabled
+        if not isinstance(self.semantic_enabled, bool):
+            raise ValueError("semantic_enabled must be a boolean")
+        if embedding_provider is not None:
+            self.semantic_enabled = True
+            self.embedding_provider = embedding_provider
+        elif self.semantic_enabled:
+            model_id = (
+                configured.semantic_model
+                if configured
+                else "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2"
+            )
+            local_only = configured.semantic_local_files_only if configured else True
+            self.embedding_provider = _SentenceTransformerProvider(
+                model_id,
+                local_files_only=local_only,
+            )
+        else:
+            self.embedding_provider = None
         canonical_root = os.path.normcase(str(vault_root))
         self.vault_scope = hashlib.sha256(canonical_root.encode("utf-8")).hexdigest()
         self._lock = threading.RLock()
@@ -311,6 +378,20 @@ class MarkdownMemoryIndex:
                         memory_id TEXT NOT NULL,
                         last_full_reconcile REAL NOT NULL,
                         PRIMARY KEY (vault_scope, memory_id)
+                    );
+                    CREATE TABLE IF NOT EXISTS memory_embedding_chunks (
+                        vault_scope TEXT NOT NULL,
+                        memory_id TEXT NOT NULL,
+                        relative_path TEXT NOT NULL,
+                        chunk_id TEXT NOT NULL,
+                        content_hash TEXT NOT NULL,
+                        model_id TEXT NOT NULL,
+                        dimension INTEGER NOT NULL,
+                        vector_json TEXT NOT NULL,
+                        PRIMARY KEY (
+                            vault_scope, memory_id, relative_path,
+                            chunk_id, content_hash, model_id
+                        )
                     );
                     CREATE VIRTUAL TABLE IF NOT EXISTS memory_chunks_fts USING fts5(
                         vault_scope UNINDEXED,
@@ -505,6 +586,10 @@ class MarkdownMemoryIndex:
                         "DELETE FROM memory_chunks_fts WHERE vault_scope = ? AND memory_id = ? AND relative_path = ?",
                         (self.vault_scope, memory_id, relative_path),
                     )
+                    connection.execute(
+                        "DELETE FROM memory_embedding_chunks WHERE vault_scope = ? AND memory_id = ? AND relative_path = ?",
+                        (self.vault_scope, memory_id, relative_path),
+                    )
                 for value in updates:
                     relative_path = str(value["relative_path"])
                     if value["metadata_only"]:
@@ -522,6 +607,10 @@ class MarkdownMemoryIndex:
                         continue
                     connection.execute(
                         "DELETE FROM memory_chunks_fts WHERE vault_scope = ? AND memory_id = ? AND relative_path = ?",
+                        (self.vault_scope, memory_id, relative_path),
+                    )
+                    connection.execute(
+                        "DELETE FROM memory_embedding_chunks WHERE vault_scope = ? AND memory_id = ? AND relative_path = ?",
                         (self.vault_scope, memory_id, relative_path),
                     )
                     connection.execute(
@@ -609,6 +698,10 @@ class MarkdownMemoryIndex:
                     (self.vault_scope, memory_id),
                 )
                 connection.execute(
+                    "DELETE FROM memory_embedding_chunks WHERE vault_scope = ? AND memory_id = ?",
+                    (self.vault_scope, memory_id),
+                )
+                connection.execute(
                     "DELETE FROM memory_index_state WHERE vault_scope = ? AND memory_id = ?",
                     (self.vault_scope, memory_id),
                 )
@@ -682,7 +775,14 @@ class MarkdownMemoryIndex:
     def _fts_expression(terms: tuple[str, ...]) -> str:
         return " OR ".join(f'"{term.replace(chr(34), chr(34) * 2)}"' for term in terms)
 
-    def _rank(self, memory_id: str, terms: tuple[str, ...], limit: int) -> tuple[MemorySearchHit, ...]:
+    def _rank(
+        self,
+        memory_id: str,
+        terms: tuple[str, ...],
+        limit: int,
+        *,
+        include_links: bool = True,
+    ) -> tuple[MemorySearchHit, ...]:
         notes = self._notes[memory_id]
         notes_by_path = {note.hit.relative_path: note for note in notes}
         with self._lock:
@@ -706,21 +806,24 @@ class MarkdownMemoryIndex:
         for note in notes:
             stems.setdefault(Path(note.hit.relative_path).stem.casefold(), []).append(note.hit.relative_path)
         notes_by_stem = {key: tuple(sorted(value)) for key, value in stems.items()}
-        links = {
-            note.hit.relative_path: self._linked_paths(note, notes_by_path, notes_by_stem, memory_id)
-            for note in notes
-        }
         scores = {path: 0 for path in notes_by_path}
         for path in candidate_paths:
             note = notes_by_path.get(path)
             if note is not None:
                 scores[path] = self._text_score(note, terms)
         seeds = {path for path, score in scores.items() if score > 0}
-        for seed in seeds:
-            neighbors = set(links[seed])
-            neighbors.update(path for path, targets in links.items() if seed in targets)
-            for neighbor in neighbors:
-                scores[neighbor] = max(scores[neighbor], 3)
+        if include_links:
+            links = {
+                note.hit.relative_path: self._linked_paths(
+                    note, notes_by_path, notes_by_stem, memory_id
+                )
+                for note in notes
+            }
+            for seed in seeds:
+                neighbors = set(links[seed])
+                neighbors.update(path for path, targets in links.items() if seed in targets)
+                for neighbor in neighbors:
+                    scores[neighbor] = max(scores[neighbor], 3)
         ranked: list[MemorySearchHit] = []
         for path, score in scores.items():
             if score <= 0:
@@ -728,6 +831,234 @@ class MarkdownMemoryIndex:
             note = notes_by_path[path]
             summary = _matching_summary(note.body, note.hit.title, terms) if path in seeds else note.hit.summary
             ranked.append(replace(note.hit, score=score, summary=summary))
+        ranked.sort(key=lambda hit: (-hit.score, hit.relative_path.casefold(), hit.relative_path))
+        return tuple(ranked[:limit])
+
+    @staticmethod
+    def _normalized_vector(raw: Sequence[object]) -> tuple[float, ...]:
+        if isinstance(raw, (str, bytes)) or not raw:
+            raise ValueError("embedding vector must be a non-empty numeric sequence")
+        values: list[float] = []
+        for value in raw:
+            if isinstance(value, bool) or not isinstance(value, (int, float)):
+                raise ValueError("embedding vector contains a non-numeric value")
+            number = float(value)
+            if not math.isfinite(number):
+                raise ValueError("embedding vector contains a non-finite value")
+            values.append(number)
+        magnitude = math.sqrt(sum(value * value for value in values))
+        if magnitude <= 0:
+            raise ValueError("embedding vector has zero magnitude")
+        return tuple(value / magnitude for value in values)
+
+    def _semantic_paths(
+        self,
+        memory_id: str,
+        query: str,
+        limit: int,
+    ) -> tuple[str, ...]:
+        provider = self.embedding_provider
+        if provider is None:
+            raise RuntimeError("semantic embedding provider is unavailable")
+        model_id = getattr(provider, "model_id", None)
+        if not isinstance(model_id, str) or not model_id.strip():
+            raise ValueError("embedding provider model_id must be a non-empty string")
+        model_id = model_id.strip()
+        with self._lock:
+            connection = self._connect()
+            try:
+                rows = connection.execute(
+                    "SELECT relative_path, chunk_id, content_hash, title, body "
+                    "FROM memory_chunks_fts WHERE vault_scope = ? AND memory_id = ? "
+                    "ORDER BY relative_path, chunk_id",
+                    (self.vault_scope, memory_id),
+                ).fetchall()
+                cached_rows = connection.execute(
+                    "SELECT relative_path, chunk_id, content_hash, dimension, vector_json "
+                    "FROM memory_embedding_chunks WHERE vault_scope = ? AND memory_id = ? AND model_id = ?",
+                    (self.vault_scope, memory_id, model_id),
+                ).fetchall()
+            finally:
+                connection.close()
+
+        valid_keys = {
+            (str(row["relative_path"]), str(row["chunk_id"]), str(row["content_hash"]))
+            for row in rows
+        }
+        stale_keys: list[tuple[str, str, str]] = []
+        cached: dict[tuple[str, str, str], tuple[float, ...]] = {}
+        for row in cached_rows:
+            key = (
+                str(row["relative_path"]),
+                str(row["chunk_id"]),
+                str(row["content_hash"]),
+            )
+            if key not in valid_keys:
+                stale_keys.append(key)
+                continue
+            vector = self._normalized_vector(json.loads(str(row["vector_json"])))
+            if len(vector) != int(row["dimension"]):
+                raise ValueError("cached embedding dimension is invalid")
+            cached[key] = vector
+
+        missing = [
+            row
+            for row in rows
+            if (
+                str(row["relative_path"]),
+                str(row["chunk_id"]),
+                str(row["content_hash"]),
+            )
+            not in cached
+        ]
+        if missing:
+            texts = [f'{row["title"]}\n\n{row["body"]}' for row in missing]
+            raw_vectors = provider.embed(texts)
+            if len(raw_vectors) != len(missing):
+                raise ValueError("embedding provider returned an unexpected vector count")
+            for row, raw_vector in zip(missing, raw_vectors, strict=True):
+                vector = self._normalized_vector(raw_vector)
+                key = (
+                    str(row["relative_path"]),
+                    str(row["chunk_id"]),
+                    str(row["content_hash"]),
+                )
+                cached[key] = vector
+        query_vectors = provider.embed([query])
+        if len(query_vectors) != 1:
+            raise ValueError("embedding provider returned an unexpected query vector count")
+        query_vector = self._normalized_vector(query_vectors[0])
+
+        # Model inference can be slow. Only hold SQLite's write lease while
+        # publishing the already-computed derivative cache.
+        with self._lock:
+            connection = self._connect()
+            try:
+                connection.execute("BEGIN IMMEDIATE")
+                connection.execute(
+                    "DELETE FROM memory_embedding_chunks WHERE vault_scope = ? AND memory_id = ? AND model_id <> ?",
+                    (self.vault_scope, memory_id, model_id),
+                )
+                for key in stale_keys:
+                    connection.execute(
+                        "DELETE FROM memory_embedding_chunks WHERE vault_scope = ? AND memory_id = ? "
+                        "AND relative_path = ? AND chunk_id = ? AND content_hash = ? AND model_id = ?",
+                        (self.vault_scope, memory_id, *key, model_id),
+                    )
+                for row in missing:
+                    key = (
+                        str(row["relative_path"]),
+                        str(row["chunk_id"]),
+                        str(row["content_hash"]),
+                    )
+                    vector = cached[key]
+                    connection.execute(
+                        "INSERT OR REPLACE INTO memory_embedding_chunks "
+                        "(vault_scope, memory_id, relative_path, chunk_id, content_hash, model_id, dimension, vector_json) "
+                        "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                        (
+                            self.vault_scope,
+                            memory_id,
+                            *key,
+                            model_id,
+                            len(vector),
+                            json.dumps(vector),
+                        ),
+                    )
+                connection.commit()
+            except Exception:
+                connection.rollback()
+                raise
+            finally:
+                connection.close()
+
+        scores: dict[str, float] = {}
+        for row in rows:
+            key = (
+                str(row["relative_path"]),
+                str(row["chunk_id"]),
+                str(row["content_hash"]),
+            )
+            vector = cached[key]
+            if len(vector) != len(query_vector):
+                raise ValueError("embedding dimensions do not match")
+            score = sum(left * right for left, right in zip(vector, query_vector, strict=True))
+            path = str(row["relative_path"])
+            scores[path] = max(score, scores.get(path, -1.0))
+        ranked = sorted(
+            (item for item in scores.items() if item[1] > 0),
+            key=lambda item: (-item[1], item[0].casefold(), item[0]),
+        )
+        return tuple(path for path, _score in ranked[:limit])
+
+    def _wiki_paths(
+        self,
+        memory_id: str,
+        seeds: Sequence[str],
+        limit: int,
+    ) -> tuple[str, ...]:
+        notes = self._notes[memory_id]
+        notes_by_path = {note.hit.relative_path: note for note in notes}
+        stems: dict[str, list[str]] = {}
+        for note in notes:
+            stems.setdefault(Path(note.hit.relative_path).stem.casefold(), []).append(
+                note.hit.relative_path
+            )
+        notes_by_stem = {key: tuple(sorted(value)) for key, value in stems.items()}
+        links = {
+            note.hit.relative_path: self._linked_paths(
+                note, notes_by_path, notes_by_stem, memory_id
+            )
+            for note in notes
+        }
+        ranked: list[str] = []
+        seen = set(seeds)
+        for seed in seeds:
+            if seed not in notes_by_path:
+                continue
+            neighbors = set(links[seed])
+            neighbors.update(path for path, targets in links.items() if seed in targets)
+            for neighbor in sorted(neighbors, key=lambda item: (item.casefold(), item)):
+                if neighbor not in seen:
+                    seen.add(neighbor)
+                    ranked.append(neighbor)
+                    if len(ranked) >= limit:
+                        return tuple(ranked)
+        return tuple(ranked)
+
+    def _hybrid_rank(
+        self,
+        memory_id: str,
+        query: str,
+        terms: tuple[str, ...],
+        limit: int,
+    ) -> tuple[MemorySearchHit, ...]:
+        candidate_limit = max(50, limit * 10)
+        text_hits = (
+            self._rank(memory_id, terms, candidate_limit, include_links=False)
+            if terms
+            else ()
+        )
+        text_paths = tuple(hit.relative_path for hit in text_hits)
+        semantic_paths = self._semantic_paths(memory_id, query, candidate_limit)
+        seeds = tuple(dict.fromkeys((*text_paths, *semantic_paths)))
+        wiki_paths = self._wiki_paths(memory_id, seeds, candidate_limit)
+
+        scores: dict[str, float] = {}
+        for weight, paths in ((2.0, text_paths), (1.0, semantic_paths), (0.5, wiki_paths)):
+            for rank, path in enumerate(paths, start=1):
+                scores[path] = scores.get(path, 0.0) + weight / (60 + rank)
+        notes_by_path = {
+            note.hit.relative_path: note for note in self._notes[memory_id]
+        }
+        text_by_path = {hit.relative_path: hit for hit in text_hits}
+        ranked: list[MemorySearchHit] = []
+        for path, score in scores.items():
+            note = notes_by_path.get(path)
+            if note is None:
+                continue
+            summary = text_by_path.get(path, note.hit).summary
+            ranked.append(replace(note.hit, score=round(score * 1_000_000), summary=summary))
         ranked.sort(key=lambda hit: (-hit.score, hit.relative_path.casefold(), hit.relative_path))
         return tuple(ranked[:limit])
 
@@ -779,26 +1110,54 @@ class MarkdownMemoryIndex:
                 self.sync(memory_id)
                 terms = _query_terms(query)
                 results: tuple[MemorySearchHit, ...] = ()
-                if terms:
+                retrieval_mode = "fts5"
+                fallback_reason: str | None = None
+                if self.semantic_enabled and query.strip():
+                    try:
+                        results = self._hybrid_rank(memory_id, query, terms, limit)
+                        retrieval_mode = "hybrid"
+                    except Exception as exc:
+                        retrieval_mode = "fts5_fallback"
+                        fallback_reason = type(exc).__name__
+                        results = self._rank(memory_id, terms, limit) if terms else ()
+                elif terms:
                     results = self._rank(memory_id, terms, limit)
+                if results:
                     if any(not self._valid_hit(memory_id, hit) for hit in results):
                         self.sync(memory_id, force_hash=True)
+                        try:
+                            reranked = (
+                                self._hybrid_rank(memory_id, query, terms, limit)
+                                if retrieval_mode == "hybrid"
+                                else self._rank(memory_id, terms, limit) if terms else ()
+                            )
+                        except Exception as exc:
+                            retrieval_mode = "fts5_fallback"
+                            fallback_reason = type(exc).__name__
+                            reranked = self._rank(memory_id, terms, limit) if terms else ()
                         results = tuple(
-                            hit
-                            for hit in self._rank(memory_id, terms, limit)
-                            if self._valid_hit(memory_id, hit)
+                            hit for hit in reranked if self._valid_hit(memory_id, hit)
                         )[:limit]
-                observation.add_output(
-                    {
-                        "memory_id": memory_id,
-                        "query_term_count": len(terms),
-                        "hit_count": len(results),
-                        "retrieved_files": [
-                            {"path": hit.relative_path, "score": hit.score}
-                            for hit in results
-                        ],
-                    }
-                )
+                trace_output: dict[str, object] = {
+                    "memory_id": memory_id,
+                    "query_term_count": len(terms),
+                    "hit_count": len(results),
+                    "retrieved_files": [
+                        {"path": hit.relative_path, "score": hit.score}
+                        for hit in results
+                    ],
+                }
+                if self.semantic_enabled:
+                    trace_output.update(
+                        {
+                            "retrieval_mode": retrieval_mode,
+                            "embedding_model": getattr(
+                                self.embedding_provider, "model_id", None
+                            ),
+                            "fallback_reason": fallback_reason,
+                        }
+                    )
+                observation.add_output(trace_output)
                 return results
 
 

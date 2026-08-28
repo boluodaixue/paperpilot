@@ -297,7 +297,7 @@ def _chat_db_path(config: dict[str, Any]) -> Path:
     return path if path.is_absolute() else PROJECT_ROOT / path
 
 
-def _retrieval_settings(config: dict[str, Any]) -> tuple[Path, float]:
+def _retrieval_settings(config: dict[str, Any]) -> tuple[Path, float, bool, str, bool]:
     section = config.get("runtime", {})
     if not isinstance(section, Mapping):
         raise ValueError("runtime configuration must be a mapping")
@@ -314,7 +314,19 @@ def _retrieval_settings(config: dict[str, Any]) -> tuple[Path, float]:
     interval = section.get("retrieval_reconciliation_seconds", 300)
     if isinstance(interval, bool) or not isinstance(interval, (int, float)) or interval <= 0:
         raise ValueError("runtime.retrieval_reconciliation_seconds must be a positive number")
-    return path, float(interval)
+    semantic_enabled = section.get("semantic_retrieval_enabled", False)
+    local_files_only = section.get("semantic_local_files_only", True)
+    if not isinstance(semantic_enabled, bool):
+        raise ValueError("runtime.semantic_retrieval_enabled must be a boolean")
+    if not isinstance(local_files_only, bool):
+        raise ValueError("runtime.semantic_local_files_only must be a boolean")
+    semantic_model = section.get(
+        "semantic_embedding_model",
+        "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2",
+    )
+    if not isinstance(semantic_model, str) or not semantic_model.strip():
+        raise ValueError("runtime.semantic_embedding_model must be a non-empty string")
+    return path, float(interval), semantic_enabled, semantic_model.strip(), local_files_only
 
 
 def _vault_scope(root: Path) -> str:
@@ -387,11 +399,20 @@ class ResearchRuntime:
         self.checkpointer = checkpointer
         self.limits = limits
         self.report_review_enabled = report_review_enabled
-        retrieval_db, reconciliation_seconds = _retrieval_settings(config)
+        (
+            retrieval_db,
+            reconciliation_seconds,
+            semantic_enabled,
+            semantic_model,
+            semantic_local_files_only,
+        ) = _retrieval_settings(config)
         configure_persistent_retrieval(
             memory_store,
             retrieval_db,
             reconciliation_seconds=reconciliation_seconds,
+            semantic_enabled=semantic_enabled,
+            semantic_model=semantic_model,
+            semantic_local_files_only=semantic_local_files_only,
         )
         self.vault_write_service = vault_write_service or _build_vault_write_service(
             config=config,

@@ -9,7 +9,7 @@
 3. [ROADMAP.md](ROADMAP.md)：当前完成度和下一阶段；
 4. [LLM_WIKI_OBSIDIAN_ARCHITECTURE.md](LLM_WIKI_OBSIDIAN_ARCHITECTURE.md)：LLM Wiki + Obsidian 主线的目标架构附录；
 5. [LLM_WIKI_OBSIDIAN_IMPLEMENTATION_PLAN.md](LLM_WIKI_OBSIDIAN_IMPLEMENTATION_PLAN.md)：W0–W6 的具体实施与验收附录。
-6. [S_PRODUCTION_HARDENING_AND_RETRIEVAL_PLAN.md](S_PRODUCTION_HARDENING_AND_RETRIEVAL_PLAN.md)：W6 之后的 S0–S5 生产化与检索升级计划；S0–S4 已完成，S5 尚未开始。
+6. [S_PRODUCTION_HARDENING_AND_RETRIEVAL_PLAN.md](S_PRODUCTION_HARDENING_AND_RETRIEVAL_PLAN.md)：W6 之后的 S0–S5 生产化与检索升级计划；S0–S5 已完成。
 
 若现有代码、注释、历史记录或提交说明与现行文档冲突，以 `ARCHITECTURE.md` 为准。
 
@@ -42,8 +42,11 @@
 - [S0_FILE_READER_SANDBOX.md](S0_FILE_READER_SANDBOX.md)：默认拒绝、每次运行虚拟根授权、路径/链接/竞态和内容边界的实现与验收结果。
 - [S1_PERSISTENT_WORKFLOW_STATE.md](S1_PERSISTENT_WORKFLOW_STATE.md)：AsyncSqliteSaver、State 唯一真相、薄 Runtime Registry、TTL/outbox 与重启恢复的实现和验收结果。
 - [S2_SINGLE_VAULT_WRITER.md](S2_SINGLE_VAULT_WRITER.md)：持久写入队列、唯一 Writer、staging/journal、崩溃恢复和外部编辑保护的实现与验收结果。
+- [S3_LEGACY_SAFE_RETIREMENT.md](S3_LEGACY_SAFE_RETIREMENT.md)：legacy 外部归档、历史路径映射、会话改绑与独立清理确认的实现与验收结果。
+- [S4_PERSISTENT_FULL_TEXT_RETRIEVAL.md](S4_PERSISTENT_FULL_TEXT_RETRIEVAL.md)：Vault 外 SQLite FTS5 增量索引、重建和返回前哈希复核的实现与验收结果。
+- [S5_OPTIONAL_SEMANTIC_HYBRID_RETRIEVAL.md](S5_OPTIONAL_SEMANTIC_HYBRID_RETRIEVAL.md)：可选本地多语言 embedding、确定性混合排序和安全降级的实现与验收结果。
 
-LLM Wiki + Obsidian 主线的 W0–W6 与生产化 S0–S4 已完成；S5 尚未开始，具体边界见 [S 系列实施计划](S_PRODUCTION_HARDENING_AND_RETRIEVAL_PLAN.md)。
+LLM Wiki + Obsidian 主线的 W0–W6 与生产化 S0–S5 已完成，具体边界见 [S 系列实施计划](S_PRODUCTION_HARDENING_AND_RETRIEVAL_PLAN.md)。
 
 ## 已清理文档
 

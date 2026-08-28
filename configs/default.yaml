@@ -61,6 +61,11 @@ runtime:
   # Disposable FTS5 derivative data; Markdown in the Vault remains authoritative.
   retrieval_db_path: "data/retrieval.db"
   retrieval_reconciliation_seconds: 300
+  # Optional local multilingual embeddings. Disabled by default: when enabled,
+  # a missing or incompatible model safely falls back to the FTS5 index above.
+  semantic_retrieval_enabled: false
+  semantic_embedding_model: "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2"
+  semantic_local_files_only: true
 
 tools:
   enabled:
