@@ -233,6 +233,50 @@ class MemoryNoteProposal:
 
 
 @dataclass(frozen=True)
+class MemoryImportDuplicate:
+    """Existing import returned without extraction, policy, or writes."""
+
+    memory_id: str
+    import_id: str
+    source_kind: str
+    source_ref: str
+    locator: str
+    content_hash: str
+    attachment_path: str
+    import_path: str
+    note_path: str | None
+    wikilinks: tuple[str, ...]
+
+
+@dataclass(frozen=True)
+class MemoryImportProposal:
+    """Transient, zero-write proposal for one controlled Memory import."""
+
+    proposal_id: str
+    import_id: str
+    note_id: str
+    memory_id: str
+    source_kind: str
+    source_ref: str
+    locator: str
+    media_type: str
+    byte_size: int
+    content_hash: str
+    attachment_path: str
+    attachment_bytes: bytes = field(repr=False)
+    import_path: str
+    import_markdown: str
+    import_wikilink: str
+    note_path: str
+    note_markdown: str
+    note_wikilink: str
+    note_source_paths: tuple[str, ...]
+    home_path: str
+    home_content_hash: str
+    home_markdown: str
+
+
+@dataclass(frozen=True)
 class ReportIssue:
     """One structured Red review finding about the final report."""
 

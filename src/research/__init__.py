@@ -8,9 +8,16 @@ from .agent_graph import (
 from .memory import (
     MarkdownMemoryStore,
     MemoryWriteConflictError,
+    update_memory_home_with_import,
     update_memory_home_with_note,
 )
 from .memory_dialogue import answer_memory, propose_memory_note
+from .memory_import import (
+    MemoryImportLimitError,
+    prepare_memory_file_import,
+    prepare_memory_text_import,
+    prepare_memory_url_import,
+)
 from .obsidian import build_obsidian_open_uri
 from .retrieval import MarkdownMemoryIndex, MemorySearchHit
 from .runtime import (
@@ -36,6 +43,8 @@ from .models import (
     MemoryAnswer,
     MemoryCitation,
     MemoryDescriptor,
+    MemoryImportDuplicate,
+    MemoryImportProposal,
     MemoryManifest,
     MemoryNoteProposal,
     ReportEdit,
@@ -50,11 +59,14 @@ from .models import (
 from .vault import (
     LEGACY_MEMORY_ID,
     LEGACY_ROOT_DIRECTORIES,
+    build_attachment_wikilink,
     build_wikilink,
     detect_legacy_memory_layout,
     ensure_unique_memory_ids,
     memory_relative_path,
+    resolve_memory_attachment_path,
     resolve_vault_markdown_path,
+    validate_memory_attachment_path,
     validate_frontmatter,
     validate_memory_descriptor,
     validate_memory_id,
@@ -70,6 +82,9 @@ __all__ = [
     "LEGACY_MEMORY_ID",
     "LEGACY_ROOT_DIRECTORIES",
     "MemoryDescriptor",
+    "MemoryImportDuplicate",
+    "MemoryImportLimitError",
+    "MemoryImportProposal",
     "MemoryAnswer",
     "MemoryCitation",
     "MemoryManifest",
@@ -88,6 +103,7 @@ __all__ = [
     "ResearchTask",
     "ResearchWorkflowResult",
     "build_obsidian_open_uri",
+    "build_attachment_wikilink",
     "answer_memory",
     "build_research_agent_graph",
     "build_research_runtime",
@@ -102,14 +118,20 @@ __all__ = [
     "load_config",
     "memory_relative_path",
     "propose_memory_note",
+    "prepare_memory_file_import",
+    "prepare_memory_text_import",
+    "prepare_memory_url_import",
     "resolve_vault_markdown_path",
+    "resolve_memory_attachment_path",
     "resume_research_workflow",
     "run_research_agent",
     "setup_logging",
     "update_memory_home_with_note",
+    "update_memory_home_with_import",
     "validate_frontmatter",
     "validate_memory_descriptor",
     "validate_memory_id",
+    "validate_memory_attachment_path",
     "validate_wikilink_target",
     "vault_root_from_config",
 ]

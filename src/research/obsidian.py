@@ -5,7 +5,7 @@ import os
 from pathlib import Path
 from urllib.parse import quote
 
-from .vault import resolve_vault_markdown_path
+from .vault import resolve_memory_attachment_path, resolve_vault_markdown_path
 
 
 def _query_value(value: str) -> str:
@@ -19,7 +19,16 @@ def build_obsidian_open_uri(
     vault_name: str | None = None,
 ) -> str:
     """Build an encoded ``obsidian://open`` URI for one safe Vault note."""
-    target = resolve_vault_markdown_path(vault_root, markdown_relative_path)
+    try:
+        target = resolve_vault_markdown_path(vault_root, markdown_relative_path)
+    except ValueError as markdown_error:
+        try:
+            target = resolve_memory_attachment_path(
+                vault_root,
+                markdown_relative_path,
+            )
+        except ValueError:
+            raise markdown_error
     root = Path(vault_root).resolve(strict=False)
 
     if vault_name is not None:

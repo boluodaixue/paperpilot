@@ -36,11 +36,18 @@ from .memory_dialogue import (
     answer_memory as answer_from_memory,
     propose_memory_note as propose_note_from_memory,
 )
+from .memory_import import (
+    prepare_memory_file_import as prepare_file_import,
+    prepare_memory_text_import as prepare_text_import,
+    prepare_memory_url_import as prepare_url_import,
+)
 from .models import (
     AgentLimits,
     ExecutionIdentity,
     MemoryAnswer,
     MemoryDescriptor,
+    MemoryImportDuplicate,
+    MemoryImportProposal,
     MemoryNoteProposal,
     ResearchBrief,
     ResearchWorkflowResult,
@@ -314,6 +321,49 @@ class ResearchRuntime:
 
     def commit_memory_note(self, proposal: MemoryNoteProposal) -> dict[str, str]:
         return self.memory_store.commit_memory_note(proposal)
+
+    async def prepare_memory_file_import(
+        self,
+        memory_id: str,
+        file_name: str,
+        content: bytes,
+    ) -> MemoryImportProposal | MemoryImportDuplicate:
+        return await prepare_file_import(
+            self.memory_store,
+            self.policy,
+            memory_id,
+            file_name,
+            content,
+        )
+
+    async def prepare_memory_text_import(
+        self,
+        memory_id: str,
+        title: str,
+        text: str,
+    ) -> MemoryImportProposal | MemoryImportDuplicate:
+        return await prepare_text_import(
+            self.memory_store,
+            self.policy,
+            memory_id,
+            title,
+            text,
+        )
+
+    async def prepare_memory_url_import(
+        self,
+        memory_id: str,
+        url: str,
+    ) -> MemoryImportProposal | MemoryImportDuplicate:
+        return await prepare_url_import(
+            self.memory_store,
+            self.policy,
+            memory_id,
+            url,
+        )
+
+    def commit_memory_import(self, proposal: MemoryImportProposal) -> dict[str, Any]:
+        return self.memory_store.commit_memory_import(proposal)
 
     async def close(self, *, shutdown: bool = False) -> None:
         await WebSearchTool.close_session()

@@ -333,7 +333,7 @@ src/research/
 
 ### 状态
 
-W0–W4 已完成，W5–W6 尚未开始。实施与验收结果见 [W0_MEMORY_VAULT_CONTRACT.md](W0_MEMORY_VAULT_CONTRACT.md)、[W1_MULTI_MEMORY_PERSISTENCE.md](W1_MULTI_MEMORY_PERSISTENCE.md)、[W2_OBSIDIAN_MINIMAL_INTEGRATION.md](W2_OBSIDIAN_MINIMAL_INTEGRATION.md)、[W3_CONTINUE_RESEARCH_FROM_MEMORY.md](W3_CONTINUE_RESEARCH_FROM_MEMORY.md) 和 [W4_MEMORY_QA_CONTROLLED_NOTES.md](W4_MEMORY_QA_CONTROLLED_NOTES.md)。
+W0–W5 已完成，W6 尚未开始。实施与验收结果见 [W0_MEMORY_VAULT_CONTRACT.md](W0_MEMORY_VAULT_CONTRACT.md)、[W1_MULTI_MEMORY_PERSISTENCE.md](W1_MULTI_MEMORY_PERSISTENCE.md)、[W2_OBSIDIAN_MINIMAL_INTEGRATION.md](W2_OBSIDIAN_MINIMAL_INTEGRATION.md)、[W3_CONTINUE_RESEARCH_FROM_MEMORY.md](W3_CONTINUE_RESEARCH_FROM_MEMORY.md)、[W4_MEMORY_QA_CONTROLLED_NOTES.md](W4_MEMORY_QA_CONTROLLED_NOTES.md) 和 [W5_CONTROLLED_IMPORTS.md](W5_CONTROLLED_IMPORTS.md)。
 
 具体执行以 [LLM Wiki + Obsidian 实施计划](LLM_WIKI_OBSIDIAN_IMPLEMENTATION_PLAN.md) 为唯一阶段顺序和验收边界：
 
@@ -346,6 +346,8 @@ W0–W4 已完成，W5–W6 尚未开始。实施与验收结果见 [W0_MEMORY_V
 - W6 稳定化、迁移与入口收口。
 
 该主线不改变 Research AgentGraph，不新增第二套存储，不开发复杂 Markdown 阅读器。
+
+W5 已在该边界内完成 PDF/UTF-8 文本、粘贴文本和显式 URL 的 Web 导入：原始内容进入 `attachments/`，可定位提取进入 `imports/`，policy 只生成受控整理提案，用户确认后才在单 PaperPilot 进程的共享 Vault `RLock` 内成组提交。导入使用 `source_ref + locator + content_hash` 精确三元组去重，并保护路径、WikiLink、Markdown、SSRF、Home 并发修改和共享 attachment 回滚边界。W5 不引入 journal、bundle、cross-process lock、Repository、索引或新 Agent；CLI 导入收口、迁移、文件树、内置阅读器和监控均未实现。
 
 ## 12. 测试顺序
 
@@ -374,4 +376,4 @@ N0 文档收敛
 → W0–W6 LLM Wiki + Obsidian
 ```
 
-N6 与 W0–W4 已完成，W5 尚未开始。不得从该主线隐式扩展新的 Agent 角色、图/向量数据库、复杂阅读器、第二套存储或未经确认的自动写入行为。
+N6 与 W0–W5 已完成，W6 尚未开始。不得从该主线隐式扩展新的 Agent 角色、图/向量数据库、复杂阅读器、第二套存储或未经确认的自动写入行为。W6 也不自动承诺为同一 Vault 的多 PaperPilot 进程增加 cross-process lock、journal 或 bundle。

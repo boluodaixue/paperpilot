@@ -177,6 +177,10 @@ W0–W6 是一条主线。每阶段必须在上一阶段验收后再开始，不
 
 ## 8. W5：资料导入与整理
 
+### 状态
+
+已完成（2026-08-28）。实施与验收结果见 [W5_CONTROLLED_IMPORTS.md](W5_CONTROLLED_IMPORTS.md)。
+
 ### 目标
 
 让用户把自有论文、网页或文本放入指定 Memory，同时保留来源和用户确认。
@@ -205,7 +209,22 @@ W0–W6 是一条主线。每阶段必须在上一阶段验收后再开始，不
 - 确认变更不产生断链、路径逃逸或半成品文件；
 - Obsidian 能直接阅读生成笔记和附件链接。
 
+### 实施结果
+
+- Web 支持用户明确选择的 PDF/UTF-8 文本、粘贴文本和显式 URL；原始内容进入 content-addressed `attachments/`，按页/行/网页段定位的提取结果进入 `imports/`；
+- `source_ref + locator + content_hash` 精确三元组在准备和提交内均去重，内容相同但来源不同时只共享 attachment，不丢失来源证明；
+- policy 只能根据有界提取片段与当前 Memory 命中提议标题、摘要、支持、冲突和空白，PaperPilot 过滤伪造 locator/路径/WikiLink/HTML 并确定性生成一篇 Import 和一篇 Note；
+- 未确认时 Vault 不变；确认后在单 PaperPilot 进程共享的 Vault `RLock` 内成组发布 attachment/import/note，用经内容哈希复核的 Home 原子替换作为线性化点，失败回滚保留已被其他完成 Import 引用的共享 attachment；
+- URL 只在显式预览时读取，并限制 scheme/端口/凭据、每跳公网 DNS/IP、重定向、identity encoding、流式大小和总超时；attachment 路径、Markdown、frontmatter、WikiLink、跨 Memory 与 symlink/junction 均经安全校验；
+- W5 专项 `61 passed, 1 warning`，原 N1–N6 + W0–W4 前序回归 `350 passed, 1 warning`，包含 W5 的仓库全量回归 `411 passed, 1 warning`；warning 为既有 `StarletteDeprecationWarning`。
+
+W5 没有实现 CLI 导入收口、legacy 迁移、文件树、内置阅读器、监控、Repository、持久化索引或新 Agent。W5 也不引入 journal、bundle 或 cross-process lock；保证范围是共享同一 Vault `RLock` 的单 PaperPilot 进程，多 PaperPilot 进程同时写同一 Vault 不在 W5 支持面。
+
 ## 9. W6：稳定化、迁移与入口收口
+
+### 状态
+
+尚未开始。W5 的单进程导入契约不自动为 W6 增加 cross-process lock、journal 或 bundle 任务；如需扩展必须另行对齐。
 
 ### 目标
 
@@ -254,4 +273,4 @@ W0 Memory/Vault 契约与安全基础
 → W6 稳定化、迁移与入口收口
 ```
 
-W0–W4 已完成，W5 尚未开始。后续进入 W5 前仍须以其既定范围单独实施和验收；当实现需要增加本计划未定义的数据模型、服务、索引、Agent 角色或自动写入行为时，必须停止扩展并先与用户对齐。
+W0–W5 已完成，W6 尚未开始。后续进入 W6 前仍须以其既定范围单独实施和验收；当实现需要增加本计划未定义的数据模型、服务、索引、Agent 角色或自动写入行为时，必须停止扩展并先与用户对齐。

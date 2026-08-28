@@ -20,6 +20,8 @@ import yaml
 from .models import (
     ExecutionIdentity,
     MemoryDescriptor,
+    MemoryImportDuplicate,
+    MemoryImportProposal,
     MemoryManifest,
     MemoryNoteProposal,
     ResearchBrief,
@@ -36,10 +38,13 @@ from .rendering import (
     source_note_id,
 )
 from .vault import (
+    build_attachment_wikilink,
     build_wikilink,
     memory_relative_path,
+    resolve_memory_attachment_path,
     resolve_vault_markdown_path,
     validate_frontmatter,
+    validate_memory_attachment_path,
     validate_memory_descriptor,
     validate_memory_id,
     validate_wikilink_target,
@@ -55,9 +60,50 @@ _MEMORY_DIRECTORIES = (
     "attachments",
 )
 _HOME_NOTES_HEADING = re.compile(r"^## Notes\s*$")
+_HOME_IMPORTS_HEADING = re.compile(r"^## Imports\s*$")
 _HOME_SECTION_HEADING = re.compile(r"^##\s+")
 _WIKILINK = re.compile(r"\[\[([^\]\r\n]+)\]\]")
 _SHA256 = re.compile(r"^[0-9a-f]{64}$")
+_IMPORT_ID = re.compile(r"^Import-[0-9a-f]{32}$")
+_IMPORT_NOTE_ID = re.compile(r"^Note-import-[0-9a-f]{32}$")
+_IMPORT_MEDIA_EXTENSIONS = {
+    "application/pdf": "pdf",
+    "text/plain": "txt",
+    "text/html": "html",
+}
+_IMPORT_FRONTMATTER_FIELDS = frozenset(
+    {
+        "id",
+        "type",
+        "memory_id",
+        "title",
+        "created_at",
+        "updated_at",
+        "origin",
+        "status",
+        "tags",
+        "source_kind",
+        "source_ref",
+        "locator",
+        "media_type",
+        "byte_size",
+        "content_hash",
+        "attachment_path",
+    }
+)
+_IMPORT_NOTE_FRONTMATTER_FIELDS = frozenset(
+    {
+        "id",
+        "type",
+        "memory_id",
+        "title",
+        "created_at",
+        "updated_at",
+        "origin",
+        "status",
+        "tags",
+    }
+)
 _MAX_HOME_RESTORE_EXCHANGES = 16
 _VAULT_LOCKS: dict[str, threading.RLock] = {}
 _VAULT_LOCKS_GUARD = threading.Lock()
@@ -65,6 +111,20 @@ _VAULT_LOCKS_GUARD = threading.Lock()
 
 class MemoryWriteConflictError(RuntimeError):
     """The Vault changed after a controlled Memory proposal was prepared."""
+
+
+def _import_fingerprint(source_ref: str, locator: str, content_hash: str) -> str:
+    canonical = json.dumps(
+        {
+            "source_ref": source_ref,
+            "locator": locator,
+            "content_hash": content_hash,
+        },
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()[:32]
 
 
 def _windows_replace_file(
@@ -195,6 +255,20 @@ def _parse_wikilink(wikilink: str) -> tuple[str, str | None]:
     return target, alias
 
 
+def _parse_attachment_wikilink(wikilink: str) -> tuple[str, str | None]:
+    if not isinstance(wikilink, str):
+        raise ValueError("attachment wikilink must be a string")
+    match = _WIKILINK.fullmatch(wikilink)
+    if match is None:
+        raise ValueError("attachment wikilink must contain exactly one WikiLink")
+    parts = match.group(1).split("|", 1)
+    target = validate_memory_attachment_path(parts[0])
+    alias = parts[1] if len(parts) == 2 else None
+    if build_attachment_wikilink(target, alias) != wikilink:
+        raise ValueError("attachment wikilink must use canonical target and alias syntax")
+    return target, alias
+
+
 def update_memory_home_with_note(
     home_markdown: str,
     wikilink: str,
@@ -265,6 +339,103 @@ def update_memory_home_with_note(
             core.append(newline)
         section = [*core, f"- {wikilink}{newline}", *trailing]
     lines[heading + 1 : section_end] = section
+    return "".join(lines)
+
+
+def _append_home_section_link(
+    lines: list[str],
+    *,
+    closing: int,
+    heading_pattern: re.Pattern[str],
+    section_name: str,
+    wikilink: str,
+    newline: str,
+) -> None:
+    link_target, _ = _parse_wikilink(wikilink)
+    headings = [
+        index
+        for index, line in enumerate(lines[closing + 1 :], start=closing + 1)
+        if heading_pattern.fullmatch(line.rstrip("\r\n"))
+    ]
+    if len(headings) != 1:
+        raise ValueError(f"Home.md must contain exactly one ## {section_name} section")
+    for match in _WIKILINK.finditer("".join(lines)):
+        existing_target = match.group(1).split("|", 1)[0].strip()
+        if existing_target == link_target:
+            raise ValueError("Home.md already contains the proposed WikiLink")
+
+    heading = headings[0]
+    section_end = len(lines)
+    for index in range(heading + 1, len(lines)):
+        if _HOME_SECTION_HEADING.match(lines[index].rstrip("\r\n")):
+            section_end = index
+            break
+    section = [
+        line
+        for line in lines[heading + 1 : section_end]
+        if line.strip() != "- None yet."
+    ]
+    trailing_start = len(section)
+    while trailing_start and not section[trailing_start - 1].strip():
+        trailing_start -= 1
+    if trailing_start == 0:
+        section = [newline, f"- {wikilink}{newline}", newline]
+    else:
+        core = section[:trailing_start]
+        trailing = section[trailing_start:] or [newline]
+        if core[-1].strip() and not core[-1].lstrip().startswith("-"):
+            core.append(newline)
+        section = [*core, f"- {wikilink}{newline}", *trailing]
+    lines[heading + 1 : section_end] = section
+
+
+def update_memory_home_with_import(
+    home_markdown: str,
+    import_wikilink: str,
+    note_wikilink: str,
+    updated_at: str,
+) -> str:
+    """Update Home Imports and Notes in one deterministic proposal."""
+    if not isinstance(home_markdown, str) or not home_markdown:
+        raise ValueError("home_markdown must be a non-empty string")
+    lines, closing, frontmatter = _frontmatter_parts(home_markdown, label="Home.md")
+    if frontmatter["type"] != "home":
+        raise ValueError("Home.md frontmatter type must be 'home'")
+    validate_frontmatter({**frontmatter, "updated_at": updated_at})
+    updated_lines = [
+        index
+        for index, line in enumerate(lines[1:closing], start=1)
+        if line.startswith("updated_at:")
+    ]
+    if len(updated_lines) != 1:
+        raise ValueError("Home.md must contain exactly one updated_at property")
+
+    newline = "\r\n" if "\r\n" in home_markdown else "\n"
+    updated_index = updated_lines[0]
+    updated_ending = (
+        "\r\n"
+        if lines[updated_index].endswith("\r\n")
+        else "\n" if lines[updated_index].endswith("\n") else ""
+    )
+    lines[updated_index] = (
+        f"updated_at: {json.dumps(updated_at, ensure_ascii=False)}{updated_ending}"
+    )
+    _append_home_section_link(
+        lines,
+        closing=closing,
+        heading_pattern=_HOME_IMPORTS_HEADING,
+        section_name="Imports",
+        wikilink=import_wikilink,
+        newline=newline,
+    )
+    _append_home_section_link(
+        lines,
+        closing=closing,
+        heading_pattern=_HOME_NOTES_HEADING,
+        section_name="Notes",
+        wikilink=note_wikilink,
+        newline=newline,
+    )
     return "".join(lines)
 
 
@@ -339,6 +510,315 @@ class MarkdownMemoryStore:
         except UnicodeDecodeError as exc:
             raise ValueError("Memory Home.md must be UTF-8 Markdown") from exc
         return home_path, markdown, content_hash
+
+    @staticmethod
+    def update_memory_home_with_import(
+        home_markdown: str,
+        import_wikilink: str,
+        note_wikilink: str,
+        updated_at: str,
+    ) -> str:
+        return update_memory_home_with_import(
+            home_markdown,
+            import_wikilink,
+            note_wikilink,
+            updated_at,
+        )
+
+    def _memory_directory(self, memory_id: str, name: str) -> Path:
+        self.get_memory(memory_id)
+        relative_memory = memory_relative_path(memory_id).rstrip("/")
+        relative_directory = f"{memory_relative_path(memory_id)}{name}"
+        self._reject_linked_vault_path(relative_directory)
+        memory_root = self._resolve(relative_memory)
+        directory = self._resolve(relative_directory)
+        if not directory.is_relative_to(memory_root):
+            raise ValueError(f"Memory {name} directory escapes the selected Memory")
+        if not directory.is_dir():
+            raise ValueError(f"Memory {name} directory does not exist")
+        return directory
+
+    def _reject_linked_vault_path(self, relative_path: str) -> None:
+        relative = PurePosixPath(relative_path)
+        if relative.is_absolute() or any(part in {"", ".", ".."} for part in relative.parts):
+            raise ValueError("Memory path must be canonical and Vault-relative")
+        current = self.root
+        is_junction = getattr(os.path, "isjunction", lambda _path: False)
+        for component in relative.parts:
+            current = current / component
+            try:
+                file_attributes = getattr(os.lstat(current), "st_file_attributes", 0)
+            except OSError:
+                file_attributes = 0
+            if (
+                current.is_symlink()
+                or is_junction(current)
+                or bool(file_attributes & 0x400)
+            ):
+                raise ValueError("Memory path cannot traverse a symlink or junction")
+
+    def _resolve_memory_markdown(
+        self,
+        memory_id: str,
+        relative_path: str,
+    ) -> Path:
+        self._reject_linked_vault_path(relative_path)
+        target = resolve_vault_markdown_path(self.root, relative_path)
+        memory_root = self._resolve(
+            memory_relative_path(memory_id).rstrip("/")
+        )
+        if not target.is_relative_to(memory_root):
+            raise ValueError("Markdown path escapes the selected Memory")
+        return target
+
+    @staticmethod
+    def _valid_import_frontmatter(
+        markdown: str,
+        *,
+        memory_id: str,
+    ) -> dict[str, object] | None:
+        try:
+            _, _, frontmatter = _frontmatter_parts(
+                markdown,
+                label="Memory import",
+            )
+        except (TypeError, ValueError):
+            return None
+        if (
+            set(frontmatter) != _IMPORT_FRONTMATTER_FIELDS
+            or frontmatter["type"] != "import"
+            or frontmatter["memory_id"] != memory_id
+            or frontmatter["origin"] != "import"
+            or frontmatter["status"] != "confirmed"
+            or frontmatter["tags"] != ["paperpilot"]
+            or frontmatter["created_at"] != frontmatter["updated_at"]
+            or not isinstance(frontmatter["source_kind"], str)
+            or frontmatter["source_kind"] not in {"file", "text", "url"}
+            or not isinstance(frontmatter["source_ref"], str)
+            or not frontmatter["source_ref"]
+            or frontmatter["source_ref"] != frontmatter["source_ref"].strip()
+            or not isinstance(frontmatter["locator"], str)
+            or not frontmatter["locator"]
+            or frontmatter["locator"] != frontmatter["locator"].strip()
+            or not isinstance(frontmatter["media_type"], str)
+            or frontmatter["media_type"] not in _IMPORT_MEDIA_EXTENSIONS
+            or not isinstance(frontmatter["byte_size"], int)
+            or isinstance(frontmatter["byte_size"], bool)
+            or frontmatter["byte_size"] < 1
+            or not isinstance(frontmatter["content_hash"], str)
+            or not _SHA256.fullmatch(frontmatter["content_hash"])
+            or not isinstance(frontmatter["attachment_path"], str)
+        ):
+            return None
+        try:
+            validate_memory_attachment_path(
+                frontmatter["attachment_path"],
+                memory_id=memory_id,
+            )
+        except ValueError:
+            return None
+        return frontmatter
+
+    def _find_import_note_path(
+        self,
+        memory_id: str,
+        import_path: str,
+    ) -> str | None:
+        notes = self._memory_directory(memory_id, "notes")
+        import_target = import_path[:-3]
+        import_id = PurePosixPath(import_path).stem
+        expected_note_id = f"Note-import-{import_id.removeprefix('Import-')}"
+        matches: list[str] = []
+        for candidate in sorted(notes.glob("*.md"), key=lambda path: path.name):
+            relative_path = (
+                f"{memory_relative_path(memory_id)}notes/{candidate.name}"
+            )
+            try:
+                resolved = self._resolve_memory_markdown(memory_id, relative_path)
+                markdown = resolved.read_text(encoding="utf-8")
+                _, _, frontmatter = _frontmatter_parts(
+                    markdown,
+                    label="Memory import note",
+                )
+                if (
+                    set(frontmatter) != _IMPORT_NOTE_FRONTMATTER_FIELDS
+                    or not isinstance(frontmatter["id"], str)
+                    or not _IMPORT_NOTE_ID.fullmatch(frontmatter["id"])
+                    or frontmatter["id"] != expected_note_id
+                    or candidate.stem != frontmatter["id"]
+                    or frontmatter["type"] != "note"
+                    or frontmatter["memory_id"] != memory_id
+                    or frontmatter["origin"] != "import"
+                    or frontmatter["status"] != "confirmed"
+                    or frontmatter["tags"] != ["paperpilot"]
+                    or frontmatter["created_at"] != frontmatter["updated_at"]
+                ):
+                    continue
+                targets = {
+                    _parse_wikilink(match.group(0))[0]
+                    for match in _WIKILINK.finditer(markdown)
+                }
+            except (OSError, UnicodeError, TypeError, ValueError):
+                continue
+            if import_target in targets:
+                matches.append(relative_path)
+        if len(matches) > 1:
+            raise MemoryWriteConflictError(
+                "multiple import notes refer to the same Memory import"
+            )
+        return matches[0] if matches else None
+
+    def _home_marks_completed_import(
+        self,
+        memory_id: str,
+        import_path: str,
+    ) -> bool:
+        home_path = f"{memory_relative_path(memory_id)}Home.md"
+        try:
+            home = self._resolve_memory_markdown(memory_id, home_path)
+            markdown = home.read_text(encoding="utf-8")
+            lines, closing, frontmatter = _frontmatter_parts(
+                markdown,
+                label="Memory Home.md",
+            )
+        except (OSError, UnicodeError, TypeError, ValueError):
+            return False
+        if frontmatter["type"] != "home" or frontmatter["memory_id"] != memory_id:
+            return False
+        canonical_link = build_wikilink(import_path)
+        if tuple(match.group(0) for match in _WIKILINK.finditer(markdown)).count(
+            canonical_link
+        ) != 1:
+            return False
+        headings = [
+            index
+            for index, line in enumerate(lines[closing + 1 :], start=closing + 1)
+            if _HOME_IMPORTS_HEADING.fullmatch(line.rstrip("\r\n"))
+        ]
+        if len(headings) != 1:
+            return False
+        section_end = len(lines)
+        for index in range(headings[0] + 1, len(lines)):
+            if _HOME_SECTION_HEADING.match(lines[index].rstrip("\r\n")):
+                section_end = index
+                break
+        section = "".join(lines[headings[0] + 1 : section_end])
+        return canonical_link in tuple(
+            match.group(0) for match in _WIKILINK.finditer(section)
+        )
+
+    def find_memory_import(
+        self,
+        memory_id: str,
+        source_ref: str,
+        locator: str,
+        content_hash: str,
+    ) -> MemoryImportDuplicate | None:
+        """Find one exact existing import without maintaining an index."""
+        validate_memory_id(memory_id)
+        if not isinstance(source_ref, str) or not source_ref.strip():
+            raise ValueError("source_ref must be a non-empty string")
+        if not isinstance(locator, str):
+            raise ValueError("locator must be a string")
+        if not isinstance(content_hash, str) or not _SHA256.fullmatch(content_hash):
+            raise ValueError("content_hash must be a lowercase SHA-256")
+
+        with self._lock:
+            imports = self._memory_directory(memory_id, "imports")
+            exact: list[tuple[str, dict[str, object]]] = []
+            for candidate in sorted(imports.glob("*.md"), key=lambda path: path.name):
+                relative_path = (
+                    f"{memory_relative_path(memory_id)}imports/{candidate.name}"
+                )
+                try:
+                    resolved = self._resolve_memory_markdown(memory_id, relative_path)
+                    markdown = resolved.read_text(encoding="utf-8")
+                except (OSError, UnicodeError, ValueError):
+                    continue
+                frontmatter = self._valid_import_frontmatter(
+                    markdown,
+                    memory_id=memory_id,
+                )
+                if frontmatter is None:
+                    continue
+                if (
+                    not isinstance(frontmatter["id"], str)
+                    or not _IMPORT_ID.fullmatch(frontmatter["id"])
+                    or candidate.stem != frontmatter["id"]
+                ):
+                    continue
+                expected_fingerprint = _import_fingerprint(
+                    str(frontmatter["source_ref"]),
+                    str(frontmatter["locator"]),
+                    str(frontmatter["content_hash"]),
+                )
+                if frontmatter["id"] != f"Import-{expected_fingerprint}":
+                    continue
+                expected_extension = _IMPORT_MEDIA_EXTENSIONS[
+                    str(frontmatter["media_type"])
+                ]
+                expected_attachment = (
+                    f"{memory_relative_path(memory_id)}attachments/"
+                    f"Asset-{frontmatter['content_hash']}.{expected_extension}"
+                )
+                if frontmatter["attachment_path"] != expected_attachment:
+                    continue
+                exact_key = (
+                    frontmatter["source_ref"] == source_ref
+                    and frontmatter["locator"] == locator
+                    and frontmatter["content_hash"] == content_hash
+                )
+                if exact_key:
+                    exact.append((relative_path, frontmatter))
+            if len(exact) > 1:
+                raise MemoryWriteConflictError(
+                    "multiple imports match the same source, locator, and content"
+                )
+            if not exact:
+                return None
+
+            import_path, frontmatter = exact[0]
+            attachment_path = str(frontmatter["attachment_path"])
+            attachment = resolve_memory_attachment_path(
+                self.root,
+                attachment_path,
+                memory_id=memory_id,
+            )
+            if not attachment.is_file():
+                raise MemoryWriteConflictError(
+                    "existing import attachment is missing"
+                )
+            attachment_bytes, attachment_hash = self._file_snapshot(attachment)
+            if (
+                attachment_hash != content_hash
+                or len(attachment_bytes) != frontmatter["byte_size"]
+            ):
+                raise MemoryWriteConflictError(
+                    "existing import attachment does not match its content metadata"
+                )
+            if not self._home_marks_completed_import(memory_id, import_path):
+                raise MemoryWriteConflictError(
+                    "existing import has not reached its Home linearization point"
+                )
+            note_path = self._find_import_note_path(memory_id, import_path)
+            wikilinks = [
+                build_wikilink(import_path),
+                build_attachment_wikilink(attachment_path),
+            ]
+            if note_path is not None:
+                wikilinks.append(build_wikilink(note_path))
+            return MemoryImportDuplicate(
+                memory_id=memory_id,
+                import_id=str(frontmatter["id"]),
+                source_kind=str(frontmatter["source_kind"]),
+                source_ref=source_ref,
+                locator=locator,
+                content_hash=content_hash,
+                attachment_path=attachment_path,
+                import_path=import_path,
+                note_path=note_path,
+                wikilinks=tuple(wikilinks),
+            )
 
     @staticmethod
     def _proposal_strings(proposal: MemoryNoteProposal) -> None:
@@ -482,7 +962,307 @@ class MarkdownMemoryStore:
                 )
 
     @staticmethod
-    def _write_commit_temp(parent: Path, name: str, content: str) -> Path:
+    def _import_proposal_strings(proposal: MemoryImportProposal) -> None:
+        for field_name in (
+            "proposal_id",
+            "import_id",
+            "note_id",
+            "memory_id",
+            "source_kind",
+            "source_ref",
+            "media_type",
+            "content_hash",
+            "attachment_path",
+            "import_path",
+            "import_markdown",
+            "import_wikilink",
+            "note_path",
+            "note_markdown",
+            "note_wikilink",
+            "home_path",
+            "home_content_hash",
+            "home_markdown",
+        ):
+            value = getattr(proposal, field_name, None)
+            if not isinstance(value, str) or not value.strip():
+                raise ValueError(f"proposal {field_name} must be a non-empty string")
+        if not isinstance(proposal.locator, str):
+            raise ValueError("proposal locator must be a string")
+
+    def _validate_import_proposal_structure(
+        self,
+        proposal: MemoryImportProposal,
+    ) -> tuple[Path, Path, Path, Path, str]:
+        if not isinstance(proposal, MemoryImportProposal):
+            raise TypeError("proposal must be a MemoryImportProposal")
+        self._import_proposal_strings(proposal)
+        validate_memory_id(proposal.memory_id)
+        self.get_memory(proposal.memory_id)
+        if proposal.source_kind not in {"file", "text", "url"}:
+            raise ValueError("proposal source_kind must be file, text, or url")
+        if proposal.source_ref != proposal.source_ref.strip():
+            raise ValueError("proposal source_ref must use canonical surrounding whitespace")
+        if not proposal.locator.strip() or proposal.locator != proposal.locator.strip():
+            raise ValueError("proposal locator must be a canonical non-empty string")
+        if not _IMPORT_ID.fullmatch(proposal.import_id):
+            raise ValueError("proposal import_id must be a canonical Import-* ID")
+        if not _IMPORT_NOTE_ID.fullmatch(proposal.note_id):
+            raise ValueError("proposal note_id must be a canonical Note-* ID")
+        if not _SHA256.fullmatch(proposal.content_hash):
+            raise ValueError("proposal content_hash must be a lowercase SHA-256")
+        if not _SHA256.fullmatch(proposal.home_content_hash):
+            raise ValueError("proposal home_content_hash must be a lowercase SHA-256")
+        if not isinstance(proposal.attachment_bytes, bytes):
+            raise ValueError("proposal attachment_bytes must be bytes")
+        if (
+            not isinstance(proposal.byte_size, int)
+            or isinstance(proposal.byte_size, bool)
+            or proposal.byte_size < 1
+            or proposal.byte_size != len(proposal.attachment_bytes)
+        ):
+            raise ValueError("proposal byte_size must equal attachment byte length")
+        if hashlib.sha256(proposal.attachment_bytes).hexdigest() != proposal.content_hash:
+            raise ValueError("proposal content_hash must match attachment bytes")
+        fingerprint = _import_fingerprint(
+            proposal.source_ref,
+            proposal.locator,
+            proposal.content_hash,
+        )
+        if proposal.import_id != f"Import-{fingerprint}":
+            raise ValueError(
+                "proposal import_id must be derived from source_ref, locator, and content_hash"
+            )
+        if proposal.note_id != f"Note-import-{fingerprint}":
+            raise ValueError(
+                "proposal note_id must be derived from source_ref, locator, and content_hash"
+            )
+        extension = _IMPORT_MEDIA_EXTENSIONS.get(proposal.media_type)
+        if extension is None:
+            raise ValueError("proposal media_type must be PDF, plain text, or HTML")
+
+        prefix = memory_relative_path(proposal.memory_id)
+        expected_attachment_path = (
+            f"{prefix}attachments/Asset-{proposal.content_hash}.{extension}"
+        )
+        expected_import_path = f"{prefix}imports/{proposal.import_id}.md"
+        expected_note_path = f"{prefix}notes/{proposal.note_id}.md"
+        expected_home_path = f"{prefix}Home.md"
+        expected_paths = {
+            "attachment_path": expected_attachment_path,
+            "import_path": expected_import_path,
+            "note_path": expected_note_path,
+            "home_path": expected_home_path,
+        }
+        for field_name, expected in expected_paths.items():
+            if getattr(proposal, field_name) != expected:
+                raise ValueError(f"proposal {field_name} must be {expected!r}")
+
+        attachment = resolve_memory_attachment_path(
+            self.root,
+            proposal.attachment_path,
+            memory_id=proposal.memory_id,
+        )
+        import_target = self._resolve_memory_markdown(
+            proposal.memory_id,
+            proposal.import_path,
+        )
+        note_target = self._resolve_memory_markdown(
+            proposal.memory_id,
+            proposal.note_path,
+        )
+        home = self._resolve_memory_markdown(
+            proposal.memory_id,
+            proposal.home_path,
+        )
+        for directory_name, target in (
+            ("attachments", attachment),
+            ("imports", import_target),
+            ("notes", note_target),
+        ):
+            expected_directory = self._memory_directory(
+                proposal.memory_id,
+                directory_name,
+            )
+            if target.parent != expected_directory:
+                raise ValueError(
+                    f"proposal {directory_name} target escapes its canonical directory"
+                )
+
+        _, _, import_frontmatter = _frontmatter_parts(
+            proposal.import_markdown,
+            label="Memory import proposal",
+        )
+        if set(import_frontmatter) != _IMPORT_FRONTMATTER_FIELDS:
+            raise ValueError(
+                "Memory import proposal frontmatter must contain only fixed fields"
+            )
+        expected_import_values: dict[str, object] = {
+            "id": proposal.import_id,
+            "type": "import",
+            "memory_id": proposal.memory_id,
+            "origin": "import",
+            "status": "confirmed",
+            "tags": ["paperpilot"],
+            "source_kind": proposal.source_kind,
+            "source_ref": proposal.source_ref,
+            "locator": proposal.locator,
+            "media_type": proposal.media_type,
+            "byte_size": proposal.byte_size,
+            "content_hash": proposal.content_hash,
+            "attachment_path": proposal.attachment_path,
+        }
+        for field_name, expected in expected_import_values.items():
+            if import_frontmatter[field_name] != expected:
+                raise ValueError(
+                    f"Memory import frontmatter {field_name} must match proposal"
+                )
+        if import_frontmatter["created_at"] != import_frontmatter["updated_at"]:
+            raise ValueError(
+                "Memory import created_at and updated_at must match"
+            )
+        import_link_target, _ = _parse_wikilink(proposal.import_wikilink)
+        if import_link_target != proposal.import_path[:-3]:
+            raise ValueError("proposal import_wikilink must target the import note")
+
+        import_without_links = _WIKILINK.sub("", proposal.import_markdown)
+        if "[[" in import_without_links or "]]" in import_without_links:
+            raise ValueError("Memory import contains malformed WikiLink syntax")
+        attachment_targets: set[str] = set()
+        for match in _WIKILINK.finditer(proposal.import_markdown):
+            target, _ = _parse_attachment_wikilink(match.group(0))
+            attachment_targets.add(target)
+        if attachment_targets != {proposal.attachment_path}:
+            raise ValueError(
+                "Memory import must link exactly its content-addressed attachment"
+            )
+
+        _, _, note_frontmatter = _frontmatter_parts(
+            proposal.note_markdown,
+            label="Memory import note proposal",
+        )
+        if set(note_frontmatter) != _IMPORT_NOTE_FRONTMATTER_FIELDS:
+            raise ValueError(
+                "Memory import note frontmatter must contain only fixed fields"
+            )
+        expected_note_values: dict[str, object] = {
+            "id": proposal.note_id,
+            "type": "note",
+            "memory_id": proposal.memory_id,
+            "origin": "import",
+            "status": "confirmed",
+            "tags": ["paperpilot"],
+        }
+        for field_name, expected in expected_note_values.items():
+            if note_frontmatter[field_name] != expected:
+                raise ValueError(
+                    f"Memory import note frontmatter {field_name} must match proposal"
+                )
+        if note_frontmatter["created_at"] != note_frontmatter["updated_at"]:
+            raise ValueError(
+                "Memory import note created_at and updated_at must match"
+            )
+        note_link_target, _ = _parse_wikilink(proposal.note_wikilink)
+        if note_link_target != proposal.note_path[:-3]:
+            raise ValueError("proposal note_wikilink must target the import note")
+
+        if not isinstance(proposal.note_source_paths, tuple):
+            raise ValueError("proposal note_source_paths must be a tuple")
+        if (
+            not proposal.note_source_paths
+            or proposal.import_path not in proposal.note_source_paths
+            or len(set(proposal.note_source_paths)) != len(proposal.note_source_paths)
+        ):
+            raise ValueError(
+                "proposal note_source_paths must be unique and include import_path"
+            )
+        source_targets: set[str] = set()
+        for source_path in proposal.note_source_paths:
+            if not isinstance(source_path, str) or not source_path.startswith(prefix):
+                raise ValueError("import note sources must stay inside the selected Memory")
+            source = self._resolve_memory_markdown(proposal.memory_id, source_path)
+            if source_path != proposal.import_path and not source.is_file():
+                raise ValueError(f"import note source does not exist: {source_path}")
+            source_targets.add(source_path[:-3])
+        note_without_links = _WIKILINK.sub("", proposal.note_markdown)
+        if "[[" in note_without_links or "]]" in note_without_links:
+            raise ValueError("Memory import note contains malformed WikiLink syntax")
+        note_targets: set[str] = set()
+        for match in _WIKILINK.finditer(proposal.note_markdown):
+            target, _ = _parse_wikilink(match.group(0))
+            if not target.startswith(prefix):
+                raise ValueError("Memory import note WikiLinks cannot cross Memories")
+            note_targets.add(target)
+        if note_targets != source_targets:
+            raise ValueError(
+                "Memory import note WikiLinks must equal note_source_paths"
+            )
+        return (
+            home,
+            attachment,
+            import_target,
+            note_target,
+            str(import_frontmatter["updated_at"]),
+        )
+
+    def _validate_import_proposal_state(
+        self,
+        proposal: MemoryImportProposal,
+        home: Path,
+        attachment: Path,
+        import_target: Path,
+        note_target: Path,
+        updated_at: str,
+    ) -> None:
+        current_home, current_home_hash = self._file_snapshot(home)
+        if current_home_hash != proposal.home_content_hash:
+            raise MemoryWriteConflictError(
+                "Memory Home.md changed after the import proposal was prepared"
+            )
+        for label, target in (("import", import_target), ("note", note_target)):
+            if target.exists():
+                raise MemoryWriteConflictError(
+                    f"Memory {label} target already exists or was concurrently created"
+                )
+        if attachment.exists():
+            if not attachment.is_file():
+                raise MemoryWriteConflictError(
+                    "Memory attachment target exists but is not a file"
+                )
+            _, existing_hash = self._file_snapshot(attachment)
+            if existing_hash != proposal.content_hash:
+                raise MemoryWriteConflictError(
+                    "Memory attachment path already contains different content"
+                )
+        try:
+            current_home_markdown = current_home.decode("utf-8")
+        except UnicodeDecodeError as exc:
+            raise ValueError("Memory Home.md must be UTF-8 Markdown") from exc
+        expected_home = update_memory_home_with_import(
+            current_home_markdown,
+            proposal.import_wikilink,
+            proposal.note_wikilink,
+            updated_at,
+        )
+        if proposal.home_markdown != expected_home:
+            raise ValueError(
+                "proposal home_markdown must be the deterministic import Home update"
+            )
+
+    def validate_memory_import_proposal(
+        self,
+        proposal: MemoryImportProposal,
+    ) -> None:
+        """Strictly validate an import proposal without writing any file."""
+        with self._lock:
+            parts = self._validate_import_proposal_structure(proposal)
+            self._validate_import_proposal_state(proposal, *parts)
+
+    @staticmethod
+    def _write_commit_temp(
+        parent: Path,
+        name: str,
+        content: str | bytes,
+    ) -> Path:
         temp_path: str | None = None
         try:
             with tempfile.NamedTemporaryFile(
@@ -492,7 +1272,7 @@ class MarkdownMemoryStore:
                 prefix=f".{name}.",
                 suffix=".tmp",
             ) as handle:
-                handle.write(content.encode("utf-8"))
+                handle.write(content.encode("utf-8") if isinstance(content, str) else content)
                 temp_path = handle.name
             return Path(temp_path)
         except Exception:
@@ -612,6 +1392,273 @@ class MarkdownMemoryStore:
             "home_path": proposal.home_path,
             "wikilink": proposal.wikilink,
         }
+
+    @staticmethod
+    def _created_file_identity(path: Path) -> tuple[int, int]:
+        stat = path.stat()
+        return stat.st_dev, stat.st_ino
+
+    @classmethod
+    def _rollback_created_file(
+        cls,
+        path: Path,
+        identity: tuple[int, int],
+    ) -> None:
+        try:
+            if path.exists() and cls._created_file_identity(path) == identity:
+                path.unlink()
+        except FileNotFoundError:
+            return
+
+    def _attachment_has_linearized_import(
+        self,
+        memory_id: str,
+        attachment_path: str,
+    ) -> bool:
+        """Return whether a completed managed import currently owns an attachment."""
+        imports = self._memory_directory(memory_id, "imports")
+        for candidate in sorted(imports.glob("*.md"), key=lambda path: path.name):
+            relative_path = f"{memory_relative_path(memory_id)}imports/{candidate.name}"
+            try:
+                resolved = self._resolve_memory_markdown(memory_id, relative_path)
+                frontmatter = self._valid_import_frontmatter(
+                    resolved.read_text(encoding="utf-8"),
+                    memory_id=memory_id,
+                )
+                if frontmatter is None:
+                    continue
+                fingerprint = _import_fingerprint(
+                    str(frontmatter["source_ref"]),
+                    str(frontmatter["locator"]),
+                    str(frontmatter["content_hash"]),
+                )
+                expected_id = f"Import-{fingerprint}"
+                if (
+                    candidate.stem != expected_id
+                    or frontmatter["id"] != expected_id
+                    or frontmatter["attachment_path"] != attachment_path
+                ):
+                    continue
+                extension = _IMPORT_MEDIA_EXTENSIONS[str(frontmatter["media_type"])]
+                expected_attachment = (
+                    f"{memory_relative_path(memory_id)}attachments/"
+                    f"Asset-{frontmatter['content_hash']}.{extension}"
+                )
+                if attachment_path != expected_attachment:
+                    continue
+                if self._home_marks_completed_import(memory_id, relative_path):
+                    return True
+            except (OSError, UnicodeError, TypeError, ValueError):
+                continue
+        return False
+
+    def _rollback_import_created_files(
+        self,
+        created: list[tuple[Path, tuple[int, int]]],
+        *,
+        memory_id: str,
+        attachment: Path,
+        attachment_path: str,
+    ) -> None:
+        preserve_attachment = False
+        if any(path == attachment for path, _ in created):
+            try:
+                preserve_attachment = self._attachment_has_linearized_import(
+                    memory_id,
+                    attachment_path,
+                )
+            except (OSError, RuntimeError, ValueError):
+                # Ambiguous concurrent external state must not be deleted. In the
+                # ordinary failure path the scan succeeds and unreferenced files
+                # are still removed, preserving the zero-half-file guarantee.
+                preserve_attachment = True
+        for path, identity in reversed(created):
+            if preserve_attachment and path == attachment:
+                continue
+            self._rollback_created_file(path, identity)
+
+    @staticmethod
+    def _import_result(
+        proposal: MemoryImportProposal,
+        *,
+        status: str,
+        duplicate: MemoryImportDuplicate | None = None,
+    ) -> dict[str, object]:
+        if duplicate is None:
+            attachment_path = proposal.attachment_path
+            import_path = proposal.import_path
+            note_path = proposal.note_path
+            wikilinks = (
+                proposal.import_wikilink,
+                build_attachment_wikilink(proposal.attachment_path),
+                proposal.note_wikilink,
+            )
+        else:
+            attachment_path = duplicate.attachment_path
+            import_path = duplicate.import_path
+            note_path = duplicate.note_path
+            wikilinks = duplicate.wikilinks
+        return {
+            "status": status,
+            "memory_id": proposal.memory_id,
+            "attachment_path": attachment_path,
+            "import_path": import_path,
+            "note_path": note_path,
+            "home_path": proposal.home_path,
+            "wikilinks": wikilinks,
+        }
+
+    def commit_memory_import(
+        self,
+        proposal: MemoryImportProposal,
+    ) -> dict[str, object]:
+        """Commit one attachment/import/note batch with Home as linearization point."""
+        with self._lock:
+            parts = self._validate_import_proposal_structure(proposal)
+            duplicate = self.find_memory_import(
+                proposal.memory_id,
+                proposal.source_ref,
+                proposal.locator,
+                proposal.content_hash,
+            )
+            if duplicate is not None:
+                return self._import_result(
+                    proposal,
+                    status="duplicate",
+                    duplicate=duplicate,
+                )
+            self._validate_import_proposal_state(proposal, *parts)
+            home, attachment, import_target, note_target, _ = parts
+
+            attachment_temp: Path | None = None
+            import_temp: Path | None = None
+            note_temp: Path | None = None
+            home_temp: Path | None = None
+            created: list[tuple[Path, tuple[int, int]]] = []
+            try:
+                attachment_temp = self._write_commit_temp(
+                    attachment.parent,
+                    attachment.name,
+                    proposal.attachment_bytes,
+                )
+                import_temp = self._write_commit_temp(
+                    import_target.parent,
+                    import_target.name,
+                    proposal.import_markdown,
+                )
+                note_temp = self._write_commit_temp(
+                    note_target.parent,
+                    note_target.name,
+                    proposal.note_markdown,
+                )
+                home_temp = self._write_commit_temp(
+                    home.parent,
+                    home.name,
+                    proposal.home_markdown,
+                )
+
+                try:
+                    os.link(attachment_temp, attachment)
+                except OSError as exc:
+                    if not (isinstance(exc, FileExistsError) or exc.errno == errno.EEXIST):
+                        raise
+                    if not attachment.is_file():
+                        raise MemoryWriteConflictError(
+                            "Memory attachment target was concurrently created"
+                        ) from None
+                    _, existing_hash = self._file_snapshot(attachment)
+                    if existing_hash != proposal.content_hash:
+                        raise MemoryWriteConflictError(
+                            "Memory attachment target was concurrently changed"
+                        ) from None
+                else:
+                    created.append(
+                        (attachment, self._created_file_identity(attachment))
+                    )
+                attachment_temp.unlink()
+                attachment_temp = None
+
+                try:
+                    os.link(import_temp, import_target)
+                except OSError as exc:
+                    if isinstance(exc, FileExistsError) or exc.errno == errno.EEXIST:
+                        duplicate = self.find_memory_import(
+                            proposal.memory_id,
+                            proposal.source_ref,
+                            proposal.locator,
+                            proposal.content_hash,
+                        )
+                        if duplicate is not None:
+                            self._rollback_import_created_files(
+                                created,
+                                memory_id=proposal.memory_id,
+                                attachment=attachment,
+                                attachment_path=proposal.attachment_path,
+                            )
+                            created.clear()
+                            return self._import_result(
+                                proposal,
+                                status="duplicate",
+                                duplicate=duplicate,
+                            )
+                        raise MemoryWriteConflictError(
+                            "Memory import target was concurrently created"
+                        ) from None
+                    raise
+                created.append(
+                    (import_target, self._created_file_identity(import_target))
+                )
+                import_temp.unlink()
+                import_temp = None
+
+                try:
+                    os.link(note_temp, note_target)
+                except OSError as exc:
+                    if isinstance(exc, FileExistsError) or exc.errno == errno.EEXIST:
+                        raise MemoryWriteConflictError(
+                            "Memory import note target was concurrently created"
+                        ) from None
+                    raise
+                created.append((note_target, self._created_file_identity(note_target)))
+                note_temp.unlink()
+                note_temp = None
+
+                _, current_home_hash = self._file_snapshot(home)
+                if current_home_hash != proposal.home_content_hash:
+                    raise MemoryWriteConflictError(
+                        "Memory Home.md changed during import commit"
+                    )
+                replacement_hash = hashlib.sha256(
+                    proposal.home_markdown.encode("utf-8")
+                ).hexdigest()
+                replacement = home_temp
+                home_temp = None
+                self._replace_home_if_snapshot_matches(
+                    home,
+                    replacement,
+                    proposal.home_content_hash,
+                    replacement_hash,
+                )
+                created.clear()
+            except Exception:
+                self._rollback_import_created_files(
+                    created,
+                    memory_id=proposal.memory_id,
+                    attachment=attachment,
+                    attachment_path=proposal.attachment_path,
+                )
+                raise
+            finally:
+                for temp_path in (
+                    attachment_temp,
+                    import_temp,
+                    note_temp,
+                    home_temp,
+                ):
+                    if temp_path is not None and temp_path.exists():
+                        temp_path.unlink()
+
+        return self._import_result(proposal, status="committed")
 
     def _descriptor_from_home(self, memory_id: str) -> MemoryDescriptor:
         validate_memory_id(memory_id)
@@ -841,5 +1888,6 @@ class MarkdownMemoryStore:
 __all__ = [
     "MarkdownMemoryStore",
     "MemoryWriteConflictError",
+    "update_memory_home_with_import",
     "update_memory_home_with_note",
 ]

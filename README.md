@@ -59,12 +59,21 @@ PaperPilot 先由根 Research Agent 与用户对齐研究目标。用户确认�
 
 ```text
 memory/
-├── reports/
+├── Memories/
+│   └── M-.../
+│       ├── Home.md
+│       ├── reports/
+│       ├── evidence/
+│       ├── sources/
+│       ├── notes/
+│       ├── imports/
+│       └── attachments/
+├── reports/       # 旧根目录只读兼容识别
 ├── evidence/
 └── sources/
 ```
 
-报告通过 `[[Evidence-...]]` 链接证据，证据通过 `[[Source-...]]` 链接论文、网页或文件来源。关系由 Markdown WikiLink 和 Obsidian backlinks 表达，不建设独立 Evidence Graph。
+每个长期 Memory 使用稳定 `memory_id` 定位。报告通过完整 Vault 相对 WikiLink 链接证据，证据链接论文、网页或文件来源；导入资料的原始内容、可定位提取和整理笔记分别进入 `attachments/`、`imports/` 和 `notes/`。关系只由 Markdown WikiLink 和 Obsidian backlinks 表达，不建设独立 Evidence Graph。
 
 ### 简单完成判断
 
@@ -86,6 +95,7 @@ N0–N6 已完成。CLI、Web 和评测统一通过 `src/research/runtime.py` �
 - N4 有界递归：根→子→孙、祖先去重、总线程/工具/时间/token/重试限制、共享 saver 下的取消与恢复；
 - N5 生产入口：CLI/Web 用户确认与恢复、SSE 事件回放、结构化评测结果和架构回归测试。
 - N6 可选报告审查：原报告持久化后的单次 Red/Blue、确定性动作重放、结构保护与失败降级，默认关闭。
+- W0–W5 LLM Wiki + Obsidian：长期多 Memory、Obsidian 打开、记忆辅助继续研究、当前 Memory 问答与受控笔记，以及 PDF/文本/显式 URL 的受控导入。
 
 N6 已完成验收：关键专项与回归为 `65 passed, 1 warning`，全量回归为 `160 passed, 1 warning`；全量中的 warning 是既有 `StarletteDeprecationWarning`。
 
@@ -101,7 +111,7 @@ N6 只处理已经成功持久化的最终 Markdown 报告，由 `research.repor
 
 该能力不是新的 Research Agent 角色、RCS 或评分引擎，也不引入 claim-evidence 新模型或第二套存储。详细边界见 [N6 实施记录](docs/N6_OPTIONAL_REPORT_REVIEW.md)。
 
-下一主线已确认为 LLM Wiki + Obsidian：Obsidian 负责 Markdown 阅读、编辑和双链，PaperPilot 负责多 Memory、检索对话、受控写入和继续研究。默认使用一个 Vault 和多个长期 Memory，不自建复杂阅读器。W0–W4 已完成；W5 资料导入与整理尚未开始。
+下一主线已确认为 LLM Wiki + Obsidian：Obsidian 负责 Markdown 阅读、编辑和双链，PaperPilot 负责多 Memory、检索对话、受控写入和继续研究。默认使用一个 Vault 和多个长期 Memory，不自建复杂阅读器。W0–W5 已完成；W6 稳定化、迁移与入口收口尚未开始。
 
 - [LLM Wiki + Obsidian 目标架构](docs/LLM_WIKI_OBSIDIAN_ARCHITECTURE.md)
 - [LLM Wiki + Obsidian 实施计划](docs/LLM_WIKI_OBSIDIAN_IMPLEMENTATION_PLAN.md)
@@ -110,6 +120,9 @@ N6 只处理已经成功持久化的最终 Markdown 报告，由 `research.repor
 - [W2 实施记录](docs/W2_OBSIDIAN_MINIMAL_INTEGRATION.md)
 - [W3 实施记录](docs/W3_CONTINUE_RESEARCH_FROM_MEMORY.md)
 - [W4 实施记录](docs/W4_MEMORY_QA_CONTROLLED_NOTES.md)
+- [W5 实施记录](docs/W5_CONTROLLED_IMPORTS.md)
+
+W5 专项为 `61 passed, 1 warning`，原 N1–N6 + W0–W4 前序回归为 `350 passed, 1 warning`，包含 W5 的仓库全量回归为 `411 passed, 1 warning`；warning 为既有 `StarletteDeprecationWarning`。
 
 ## 快速开始
 
@@ -145,6 +158,8 @@ python web/run.py
 3. Web 顶部可以选择或新建 Memory，再用“在 Obsidian 中打开”定位其 `Home.md`。PaperPilot 不安装或检测 Obsidian，也不写 `.obsidian/`；未安装 Obsidian 不影响研究和 Markdown 持久化。
 
 Web 还可以显式切换到“Memory 问答”，回答只使用当前 Memory 并提供可在 Obsidian 中打开的引用。选择“保存回答为笔记”后，PaperPilot 会先展示完整 Markdown 提案；只有用户确认后才新建笔记并受控更新对应 `Home.md`，外部编辑冲突不会被静默覆盖。
+
+Web 的“导入资料”支持用户明确选择的 PDF/UTF-8 文本、直接粘贴文本和显式 URL。PaperPilot 先生成 Import/Note 完整预览，用户确认后才把原始附件、可定位提取结果和整理笔记成组写入当前 Memory。URL 仅在生成预览时读取，且经过公网地址、重定向、大小、超时和内容类型校验。W5 只提供 Web 导入入口，CLI 收口与 legacy 迁移属于尚未开始的 W6。
 
 ### 单次研究
 
@@ -196,6 +211,7 @@ deepresearch-agent/
 - [W2 实施记录](docs/W2_OBSIDIAN_MINIMAL_INTEGRATION.md)
 - [W3 实施记录](docs/W3_CONTINUE_RESEARCH_FROM_MEMORY.md)
 - [W4 实施记录](docs/W4_MEMORY_QA_CONTROLLED_NOTES.md)
+- [W5 实施记录](docs/W5_CONTROLLED_IMPORTS.md)
 
 ## 明确不做
 
