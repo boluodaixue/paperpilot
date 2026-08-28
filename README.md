@@ -83,7 +83,7 @@ Research FileReader 默认不可用。每次运行只授权当前 managed Memory
 
 ## 当前仓库状态
 
-N0–N6、W0–W6 与生产化 S0–S2 已完成。CLI、Web 和评测统一通过 `src/research/runtime.py` 进入同一个 Research Workflow；所有产品级 managed Vault 写入由持久队列和单一 Writer 发布；旧 Orchestrator、Planner DAG、AgentPool、独立 Summarizer、Evidence Store/Graph 和旧实验体系已经退出代码库。
+N0–N6、W0–W6 与生产化 S0–S3 已完成。CLI、Web 和评测统一通过 `src/research/runtime.py` 进入同一个 Research Workflow；所有产品级 managed Vault 写入由持久队列和单一 Writer 发布；旧 Orchestrator、Planner DAG、AgentPool、独立 Summarizer、Evidence Store/Graph 和旧实验体系已经退出代码库。
 
 目前已经具备：
 
@@ -170,6 +170,8 @@ Web 还可以显式切换到“Memory 问答”，回答只使用当前 Memory �
 Web 的“导入资料”支持用户明确选择的 PDF/UTF-8 文本、直接粘贴文本和显式 URL。PaperPilot 先生成 Import/Note 完整预览，用户确认后才把原始附件、可定位提取结果和整理笔记成组写入当前 Memory。URL 仅在生成预览时读取，且经过公网地址、重定向、大小、超时和内容类型校验。
 
 W6 会把每个 Web 会话永久绑定到第一次显式使用的 `memory_id`，不从历史报告推断或自动切换。既有根目录 `reports/evidence/sources` 以只读 `M-legacy` 暴露，可问答但不能研究、保存或导入；“迁移既有 Memory”会先展示 Home 和每篇转换后 Markdown 的完整预览，确认后原子发布一个 managed 副本，根文件和旧 Chat 指针保持不变，当前会话也不会自动切换。
+
+S3 已将上述 W6 迁移语义升级为安全退役：产品运行必须显式配置位于 Vault 外且可恢复的 `research.legacy_archive_root`。预览会同时列出受影响会话、历史 manifest、完整旧→新路径映射和归档目标；确认后单一 Writer 发布 managed Memory、持久化旧指针映射、改绑所有当前版本 `M-legacy` 会话，并把根目录移出活动 Vault。旧 Chat 消息原文不改，当前版本读取时通过映射定位 managed Markdown。永久删除外部归档是另一个带完整删除清单和内容哈希令牌的明确动作，迁移确认本身不会删除归档。
 
 ### 单次研究
 

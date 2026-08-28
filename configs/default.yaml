@@ -26,6 +26,9 @@ model:
 
 research:
   vault_root: "memory"
+  # S3 requires an explicit recoverable archive outside the active Vault.
+  # Migration never permanently deletes this archive.
+  legacy_archive_root: "legacy-archives"
   # Optional exact Obsidian Vault name. Omit it to open notes by absolute path.
   # vault_name: "PaperPilotVault"
   report_review:

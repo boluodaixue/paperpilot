@@ -601,8 +601,9 @@ def build_legacy_copy_plan(
     *,
     origin_thread_id: str | None = None,
 ) -> MemoryWritePlan:
-    """Build the existing W6 copy-only publication; legacy bytes remain inputs."""
+    """Build W6 copy publication, optionally followed by the S3 retirement switch."""
     normalized = dict(proposal)
+    retirement = normalized.pop("retirement", None)
     files = normalized.get("files")
     if isinstance(files, list):
         normalized["files"] = tuple(dict(item) for item in files)
@@ -626,7 +627,46 @@ def build_legacy_copy_plan(
                 "content": str(item["markdown"]).encode("utf-8"),
             }
         )
+    retirement_payload: dict[str, object] | None = None
+    if retirement is not None:
+        if not isinstance(retirement, Mapping):
+            raise ValueError("legacy retirement preview is invalid")
+        if retirement.get("blocked_reason") is not None:
+            raise ValueError(str(retirement["blocked_reason"]))
+        required = {
+            "archive_target",
+            "archive_inventory",
+            "affected_sessions",
+            "affected_manifests",
+            "dependency_hash",
+            "path_mapping",
+        }
+        if set(retirement) != required:
+            raise ValueError("legacy retirement preview fields do not match the contract")
+        path_mapping = retirement.get("path_mapping")
+        expected_mapping = {
+            str(item["source_path"]): str(item["target_path"])
+            for item in normalized_files
+            if isinstance(item, Mapping)
+        }
+        if not isinstance(path_mapping, Mapping) or dict(path_mapping) != expected_mapping:
+            raise ValueError("legacy retirement path mapping differs from migration files")
+        retirement_payload = {
+            "archive_target": retirement["archive_target"],
+            "archive_inventory": retirement["archive_inventory"],
+            "dependency_hash": retirement["dependency_hash"],
+            "migration_id": normalized["proposal_id"],
+            "path_mapping": dict(path_mapping),
+        }
     idempotency_key = f"legacy-copy:{descriptor.memory_id}:{normalized['proposal_id']}"
+    result: dict[str, object] = {
+        "status": "committed",
+        "source_memory_id": LEGACY_MEMORY_ID,
+        "memory_id": descriptor.memory_id,
+        "home_path": str(normalized["home_path"]),
+    }
+    if retirement_payload is not None:
+        result["_legacy_retirement"] = retirement_payload
     command = build_directory_create_command(
         operation_type="legacy_copy",
         memory_id=descriptor.memory_id,
@@ -635,14 +675,9 @@ def build_legacy_copy_plan(
         files=directory_files,
         input_hashes={
             "legacy_source": str(normalized["source_content_hash"]),
-            "proposal": _value_hash(normalized),
+            "proposal": _value_hash(dict(proposal)),
         },
-        result={
-            "status": "committed",
-            "source_memory_id": LEGACY_MEMORY_ID,
-            "memory_id": descriptor.memory_id,
-            "home_path": str(normalized["home_path"]),
-        },
+        result=result,
     )
     return _plan(
         idempotency_key=idempotency_key,

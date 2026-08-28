@@ -1865,11 +1865,14 @@ async def confirm_legacy_memory_migration(
     if not isinstance(descriptor_value, Mapping):
         raise RuntimeError("legacy migration workflow 未返回 descriptor")
     descriptor = MemoryDescriptor(**dict(descriptor_value))
+    retired = isinstance(proposal, Mapping) and isinstance(
+        proposal.get("retirement"), Mapping
+    )
     return {
         **_memory_response(runtime, descriptor),
         "status": "committed",
         "source_memory_id": LEGACY_MEMORY_ID,
-        "switch_is_explicit": True,
+        "switch_is_explicit": not retired,
         "session_id": record.session_id,
         **_workflow_response_identity(record),
     }

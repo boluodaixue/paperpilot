@@ -24,7 +24,7 @@ from pathlib import Path, PurePosixPath
 from typing import Any, Literal
 
 from .memory import _atomic_exchange, _legacy_snapshot, _windows_replace_file
-from .vault import LEGACY_MEMORY_ID, validate_memory_id
+from .vault import LEGACY_MEMORY_ID, scan_legacy_memory_markdown, validate_memory_id
 from .vault_write_queue import (
     VAULT_WRITE_OPERATION_TYPES,
     VaultWriteJob,
@@ -47,7 +47,7 @@ _MAX_RESTORE_EXCHANGES = 16
 _SHA256 = re.compile(r"^[0-9a-f]{64}$")
 _SAFE_JOB_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,159}$")
 _WRITER_DIRECTORY = ".paperpilot-writer"
-_MARKER_NAMES = ("PREPARED", "TREE_READY", "LINEARIZED", "COMPLETED")
+_MARKER_NAMES = ("PREPARED", "TREE_READY", "LINEARIZED", "COMPLETED", "ARCHIVE_READY")
 _EXPECTED_MODES = frozenset({"absent", "hash", "reuse"})
 _MEMORY_DIRECTORIES = (
     "reports",
@@ -664,15 +664,80 @@ class VaultWriter:
         *,
         failpoint: Callable[[str], None] | None = None,
         job_lease_seconds: float = 30.0,
+        legacy_archive_root: str | os.PathLike[str] | None = None,
     ) -> None:
         self.root = Path(vault_root).resolve()
         self.queue = queue
         self.failpoint = failpoint
         self.job_lease_seconds = float(job_lease_seconds)
+        self.legacy_archive_root = (
+            None if legacy_archive_root is None else Path(legacy_archive_root).resolve(strict=False)
+        )
         if self.job_lease_seconds <= 0:
             raise ValueError("job_lease_seconds must be positive")
         self.memories_root = self.root / "Memories"
         self.private_root = self.memories_root / _WRITER_DIRECTORY
+
+    @staticmethod
+    def _legacy_retirement(command: _Command) -> dict[str, Any] | None:
+        raw = command.result.get("_legacy_retirement")
+        if raw is None:
+            return None
+        if command.operation_type != "legacy_copy" or not isinstance(raw, Mapping):
+            raise VaultWriteCommandError("legacy retirement is only valid for legacy_copy")
+        required = {
+            "archive_target",
+            "archive_inventory",
+            "dependency_hash",
+            "migration_id",
+            "path_mapping",
+        }
+        if set(raw) != required:
+            raise VaultWriteCommandError("legacy retirement fields do not match the contract")
+        archive_target = raw["archive_target"]
+        migration_id = raw["migration_id"]
+        dependency_hash = raw["dependency_hash"]
+        mapping = raw["path_mapping"]
+        inventory = raw["archive_inventory"]
+        if not isinstance(archive_target, str) or not archive_target:
+            raise VaultWriteCommandError("legacy archive target is invalid")
+        if not isinstance(migration_id, str) or not re.fullmatch(r"LegacyMigration-[0-9a-f]{32}", migration_id):
+            raise VaultWriteCommandError("legacy retirement migration_id is invalid")
+        if not isinstance(dependency_hash, str) or not _SHA256.fullmatch(dependency_hash):
+            raise VaultWriteCommandError("legacy dependency hash is invalid")
+        if not isinstance(mapping, Mapping) or not mapping:
+            raise VaultWriteCommandError("legacy retirement mapping is invalid")
+        normalized_mapping: dict[str, str] = {}
+        for source, target in mapping.items():
+            if not isinstance(source, str) or not isinstance(target, str):
+                raise VaultWriteCommandError("legacy retirement mapping paths are invalid")
+            if PurePosixPath(source).parts[0] not in {"reports", "evidence", "sources"}:
+                raise VaultWriteCommandError("legacy retirement source path is invalid")
+            if PurePosixPath(target).parts[:2] != ("Memories", command.memory_id):
+                raise VaultWriteCommandError("legacy retirement target path is invalid")
+            normalized_mapping[source] = target
+        if not isinstance(inventory, Mapping) or not inventory:
+            raise VaultWriteCommandError("legacy archive inventory is invalid")
+        normalized_inventory: dict[str, str | None] = {}
+        for path, digest in inventory.items():
+            if not isinstance(path, str) or not path:
+                raise VaultWriteCommandError("legacy archive inventory path is invalid")
+            pure = PurePosixPath(path.rstrip("/"))
+            if pure.parts[0] not in {"reports", "evidence", "sources"} or ".." in pure.parts:
+                raise VaultWriteCommandError("legacy archive inventory escapes its roots")
+            if path.endswith("/"):
+                if digest is not None:
+                    raise VaultWriteCommandError("legacy archive directory cannot have a digest")
+            elif not isinstance(digest, str) or not _SHA256.fullmatch(digest):
+                raise VaultWriteCommandError("legacy archive file digest is invalid")
+            normalized_inventory[path] = digest
+        return {
+            "archive_target": archive_target,
+            "archive_inventory": dict(sorted(normalized_inventory.items())),
+            "dependency_hash": dependency_hash,
+            "migration_id": migration_id,
+            "path_mapping": dict(sorted(normalized_mapping.items())),
+        }
 
     def _fail(self, name: str) -> None:
         if self.failpoint is not None:
@@ -1804,6 +1869,275 @@ class VaultWriter:
             action = "deleted" if current is None else "changed"
             raise VaultWriteConflict(f"published Vault target was externally {action}: " f"{target_item['path']}")
 
+    @staticmethod
+    def _tree_inventory(base: Path) -> dict[str, str | None]:
+        inventory: dict[str, str | None] = {}
+        if not base.is_dir() or base.is_symlink() or _is_reparse(base):
+            raise VaultWriteConflict("legacy archive tree is not a real directory")
+        for current_root, directories, files in os.walk(base, followlinks=False):
+            current = Path(current_root)
+            for name in sorted(directories):
+                path = current / name
+                if path.is_symlink() or _is_reparse(path):
+                    raise VaultWriteConflict("legacy archive contains a linked directory")
+                inventory[f"{path.relative_to(base).as_posix()}/"] = None
+            for name in sorted(files):
+                if name == ".paperpilot-archive.json" and current == base:
+                    continue
+                path = current / name
+                if path.is_symlink() or _is_reparse(path):
+                    raise VaultWriteConflict("legacy archive contains a linked file")
+                inventory[path.relative_to(base).as_posix()] = _hash_bytes(path.read_bytes())
+        return dict(sorted(inventory.items()))
+
+    def _archive_target(self, spec: Mapping[str, Any]) -> Path:
+        if self.legacy_archive_root is None:
+            raise VaultWriteConflict("legacy archive root is not configured")
+        try:
+            root = self.legacy_archive_root.resolve(strict=True)
+        except OSError as exc:
+            raise VaultWriteConflict("legacy archive root is unavailable") from exc
+        if not root.is_dir() or root.is_symlink() or _is_reparse(root):
+            raise VaultWriteConflict("legacy archive root is unsafe")
+        if root == self.root or root.is_relative_to(self.root):
+            raise VaultWriteConflict("legacy archive root must be outside the active Vault")
+        raw = Path(str(spec["archive_target"]))
+        target = raw.resolve(strict=False)
+        scope = (root / self.queue.vault_scope).resolve(strict=False)
+        if target.parent != scope or target.name != raw.name or not target.name:
+            raise VaultWriteConflict("legacy archive target is outside its configured scope")
+        return target
+
+    def _archive_metadata(self, job: VaultWriteJob, spec: Mapping[str, Any]) -> bytes:
+        return _canonical_json(
+            {
+                "archive_inventory": spec["archive_inventory"],
+                "job_id": job.job_id,
+                "memory_id": job.memory_id,
+                "migration_id": spec["migration_id"],
+                "vault_scope": self.queue.vault_scope,
+            }
+        )
+
+    def _archive_is_owned(self, target: Path, job: VaultWriteJob, spec: Mapping[str, Any]) -> bool:
+        try:
+            metadata = (target / ".paperpilot-archive.json").read_bytes()
+        except FileNotFoundError:
+            return False
+        return metadata == self._archive_metadata(job, spec) and self._tree_inventory(target) == spec["archive_inventory"]
+
+    def _prepare_legacy_archive(
+        self,
+        job: VaultWriteJob,
+        lease: VaultWriterLease,
+        job_root: Path,
+        spec: Mapping[str, Any],
+        manifest_hash: str,
+    ) -> Path:
+        target = self._archive_target(spec)
+        if target.exists():
+            if not self._archive_is_owned(target, job, spec):
+                raise VaultWriteConflict("legacy archive target already exists")
+            self._write_marker(lease, job.job_id, job_root, "ARCHIVE_READY", manifest_hash)
+            return target
+        target.parent.mkdir(parents=True, exist_ok=True)
+        if target.parent.is_symlink() or _is_reparse(target.parent):
+            raise VaultWriteConflict("legacy archive scope is unsafe")
+        temporary = target.parent / f".{target.name}.{job.job_id}.tmp"
+        if temporary.exists():
+            shutil.rmtree(temporary)
+        temporary.mkdir()
+        try:
+            roots = {PurePosixPath(path.rstrip("/")).parts[0] for path in spec["archive_inventory"]}
+            for name in sorted(roots):
+                source = self.root / name
+                if not source.is_dir() or source.is_symlink() or _is_reparse(source):
+                    raise VaultWriteConflict(f"legacy archive source is unavailable: {name}")
+                shutil.copytree(source, temporary / name, copy_function=shutil.copy2)
+            if self._tree_inventory(temporary) != spec["archive_inventory"]:
+                raise VaultWriteConflict("legacy source changed while creating its archive")
+            _write_durable(temporary / ".paperpilot-archive.json", self._archive_metadata(job, spec))
+            try:
+                _rename_no_replace(temporary, target)
+            except FileExistsError as exc:
+                raise VaultWriteConflict("legacy archive target was concurrently created") from exc
+            _fsync_directory(target.parent)
+        finally:
+            if temporary.exists():
+                shutil.rmtree(temporary)
+        if not self._archive_is_owned(target, job, spec):
+            raise VaultWriteConflict("legacy archive verification failed")
+        self._write_marker(lease, job.job_id, job_root, "ARCHIVE_READY", manifest_hash)
+        self._fail("after_archive_ready")
+        return target
+
+    def _hold_legacy_roots(
+        self,
+        job: VaultWriteJob,
+        lease: VaultWriterLease,
+        job_root: Path,
+        spec: Mapping[str, Any],
+    ) -> Path:
+        hold = job_root / "legacy"
+        self._assert_private_path(hold)
+        self._fenced(lease, job.job_id, lambda: hold.mkdir(exist_ok=True))
+        roots = {PurePosixPath(path.rstrip("/")).parts[0] for path in spec["archive_inventory"]}
+        for name in sorted(roots):
+            source = self.root / name
+            preserved = hold / name
+            self._assert_private_path(preserved)
+            if source.exists() and preserved.exists():
+                raise VaultWriteConflict("legacy root exists in active and held locations")
+            if source.exists():
+                self._assert_same_volume(preserved, source)
+                self._fenced(
+                    lease,
+                    job.job_id,
+                    lambda source=source, preserved=preserved: os.rename(source, preserved),
+                )
+                self._fail(f"after_legacy_hold:{name}")
+            elif not preserved.exists():
+                raise VaultWriteConflict(f"legacy root disappeared before retirement: {name}")
+        if self._tree_inventory(hold) != spec["archive_inventory"]:
+            raise VaultWriteConflict("held legacy roots differ from the confirmed inventory")
+        return hold
+
+    def _restore_held_legacy(
+        self,
+        job: VaultWriteJob,
+        lease: VaultWriterLease,
+        job_root: Path,
+    ) -> None:
+        hold = job_root / "legacy"
+        self._assert_private_path(hold)
+        if not hold.is_dir():
+            return
+        for preserved in sorted(hold.iterdir(), key=lambda path: path.name, reverse=True):
+            self._assert_private_path(preserved)
+            target = self.root / preserved.name
+            if target.exists():
+                raise VaultWriteConflict("cannot restore legacy root over an existing path")
+            self._fenced(
+                lease,
+                job.job_id,
+                lambda preserved=preserved, target=target: os.rename(preserved, target),
+            )
+        try:
+            hold.rmdir()
+        except OSError:
+            pass
+
+    def _prepare_retirement_tree(
+        self,
+        job: VaultWriteJob,
+        lease: VaultWriterLease,
+        job_root: Path,
+        manifest: Mapping[str, Any],
+        manifest_hash: str,
+    ) -> Path:
+        tree = job_root / "tree"
+        self._assert_private_path(tree)
+        if self._validate_marker(job_root, "TREE_READY", manifest_hash):
+            if not self._directory_matches(tree, manifest):
+                raise VaultWriteConflict("TREE_READY private tree differs from manifest")
+            return tree
+        if tree.exists():
+            self._fenced(lease, job.job_id, lambda: self._remove_private_tree(tree))
+        self._fenced(lease, job.job_id, lambda: tree.mkdir(parents=True, exist_ok=False))
+        for directory in manifest["directories"]:
+            relative = PurePosixPath(str(directory)).relative_to(PurePosixPath(str(manifest["anchor"])))
+            destination = tree.joinpath(*relative.parts)
+            self._fenced(
+                lease,
+                job.job_id,
+                lambda destination=destination: destination.mkdir(parents=True, exist_ok=True),
+            )
+        for target in manifest["targets"]:
+            relative = PurePosixPath(str(target["path"])).relative_to(PurePosixPath(str(manifest["anchor"])))
+            destination = tree.joinpath(*relative.parts)
+            stage = job_root / str(target["stage"])
+            content = stage.read_bytes()
+            if _hash_bytes(content) != target["content_hash"]:
+                raise VaultWriteConflict("directory stage differs from manifest")
+            self._fenced(
+                lease,
+                job.job_id,
+                lambda destination=destination, content=content: _write_durable(destination, content),
+            )
+        if not self._directory_matches(tree, manifest):
+            raise VaultWriteConflict("private retirement tree differs from manifest")
+        self._write_marker(lease, job.job_id, job_root, "TREE_READY", manifest_hash)
+        return tree
+
+    def _publish_legacy_retirement(
+        self,
+        job: VaultWriteJob,
+        lease: VaultWriterLease,
+        command: _Command,
+        job_root: Path,
+        manifest: Mapping[str, Any],
+        manifest_hash: str,
+        spec: Mapping[str, Any],
+    ) -> None:
+        anchor = self._canonical(str(manifest["anchor"]))
+        tree = job_root / "tree"
+        if not anchor.exists():
+            tree = self._prepare_retirement_tree(
+                job, lease, job_root, manifest, manifest_hash
+            )
+        archive = self._prepare_legacy_archive(job, lease, job_root, spec, manifest_hash)
+        if anchor.exists():
+            if not self._directory_matches(anchor, manifest):
+                raise VaultWriteConflict("legacy migration target already differs")
+        else:
+            try:
+                self._hold_legacy_roots(job, lease, job_root, spec)
+                if scan_legacy_memory_markdown(self.root):
+                    raise VaultWriteConflict("active Vault still contains legacy Markdown")
+            except Exception:
+                self._restore_held_legacy(job, lease, job_root)
+                if self._archive_is_owned(archive, job, spec):
+                    shutil.rmtree(archive)
+                raise
+
+        def publish() -> None:
+            if anchor.exists():
+                if not self._directory_matches(anchor, manifest):
+                    raise VaultWriteConflict("legacy migration target already differs")
+                return
+            if not self._directory_matches(tree, manifest):
+                raise VaultWriteConflict("private retirement tree changed before publication")
+            anchor.parent.mkdir(parents=True, exist_ok=True)
+            _rename_no_replace(tree, anchor)
+            _fsync_directory(anchor.parent)
+            if not self._directory_matches(anchor, manifest):
+                raise VaultWriteConflict("published legacy migration tree differs")
+
+        try:
+            self.queue.commit_legacy_switch(
+                job.job_id,
+                lease,
+                migration_id=str(spec["migration_id"]),
+                memory_id=command.memory_id,
+                archive_target=str(archive),
+                path_mapping=spec["path_mapping"],
+                expected_dependency_hash=str(spec["dependency_hash"]),
+                publish=publish,
+            )
+        except Exception:
+            if not anchor.exists():
+                self._restore_held_legacy(job, lease, job_root)
+                if self._archive_is_owned(archive, job, spec):
+                    shutil.rmtree(archive)
+            raise
+        self._write_marker(lease, job.job_id, job_root, "LINEARIZED", manifest_hash)
+        if scan_legacy_memory_markdown(self.root):
+            raise VaultWriteConflict("legacy Markdown reappeared after retirement")
+        if not self.queue.legacy_retirement_complete(
+            str(spec["migration_id"]), command.memory_id, spec["path_mapping"]
+        ):
+            raise VaultWriteConflict("legacy retirement metadata is incomplete")
+
     def _complete(
         self,
         job: VaultWriteJob,
@@ -1813,7 +2147,12 @@ class VaultWriter:
         manifest_hash: str,
     ) -> VaultWriteJob:
         self._write_marker(lease, job.job_id, job_root, "COMPLETED", manifest_hash)
-        completed = self.queue.complete(job.job_id, lease, command.result)
+        public_result = {
+            key: value
+            for key, value in command.result.items()
+            if key != "_legacy_retirement"
+        }
+        completed = self.queue.complete(job.job_id, lease, public_result)
         self._fail("after_db_success")
         self._cleanup_terminal(job_root, completed, lease)
         return completed
@@ -1852,6 +2191,22 @@ class VaultWriter:
         job_root, manifest, manifest_hash = self._prepare(job, lease, command)
         self._recover_remove_intents(job, lease, job_root, manifest)
         self._recover_replace_intents(job, lease, job_root, manifest)
+        retirement = self._legacy_retirement(command)
+        if retirement is not None:
+            state = self._anchor_state(manifest)
+            if state == "foreign":
+                raise VaultWriteConflict("legacy migration target contains third-party bytes")
+            self._publish_legacy_retirement(
+                job,
+                lease,
+                command,
+                job_root,
+                manifest,
+                manifest_hash,
+                retirement,
+            )
+            self._verify_directory_new(manifest)
+            return self._complete(job, lease, command, job_root, manifest_hash)
         state = self._anchor_state(manifest)
         linearized = self._validate_marker(job_root, "LINEARIZED", manifest_hash)
         if state == "foreign":
