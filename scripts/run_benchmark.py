@@ -72,10 +72,12 @@ def run_baseline(query: str, config: dict) -> dict:
 # ---------------------------------------------------------------------------
 async def run_agent(query: str, config: dict) -> dict:
     """Run one explicitly auto-confirmed production workflow."""
+    from langgraph.checkpoint.memory import InMemorySaver
+
     from scripts.run_eval import workflow_metrics
     from src.research.runtime import build_research_runtime
 
-    runtime = build_research_runtime(config=config)
+    runtime = build_research_runtime(config=config, checkpointer=InMemorySaver())
     try:
         result = await runtime.run_auto_confirmed(
             query, thread_id=runtime.new_thread_id()

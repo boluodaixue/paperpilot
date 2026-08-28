@@ -112,7 +112,9 @@ def test_production_code_has_no_old_architecture_imports_or_active_symbols() -> 
 
 def test_default_config_contains_only_active_runtime_sections() -> None:
     config = yaml.safe_load((ROOT / "configs/default.yaml").read_text(encoding="utf-8"))
-    assert set(config) == {"system", "model", "research", "chat", "tools"}
+    assert set(config) == {
+        "system", "model", "research", "chat", "tools", "runtime"
+    }
     assert set(config["model"]["backend_mapping"]) == {"research", "judge"}
     assert set(config["model"]["backend_sampling"]["modules"]) == {"research", "judge"}
     assert set(config["research"]["limits"]) == AGENT_LIMIT_FIELDS

@@ -9,15 +9,17 @@ from __future__ import annotations
 
 import logging
 import os
+import time
 import uuid
 from collections.abc import Mapping
-from contextlib import contextmanager
+from contextlib import asynccontextmanager, contextmanager
 from pathlib import Path
 from typing import Any, AsyncIterator, Iterable
 
 import yaml
 from langgraph.checkpoint.base import BaseCheckpointSaver
 from langgraph.checkpoint.memory import InMemorySaver
+from langgraph.checkpoint.sqlite.aio import AsyncSqliteSaver
 from langgraph.types import Command
 
 from ..models.model_router import ModelRouter
@@ -48,6 +50,18 @@ from .memory_import import (
     prepare_memory_file_import as prepare_file_import,
     prepare_memory_text_import as prepare_text_import,
     prepare_memory_url_import as prepare_url_import,
+)
+from .memory_workflows import (
+    build_legacy_migration_workflow,
+    build_memory_import_workflow,
+    build_memory_note_workflow,
+    continue_memory_workflow,
+    create_legacy_migration_workflow_state,
+    create_memory_file_import_workflow_state,
+    create_memory_note_workflow_state,
+    create_memory_text_import_workflow_state,
+    create_memory_url_import_workflow_state,
+    resume_memory_workflow,
 )
 from .models import (
     AgentLimits,
@@ -110,6 +124,7 @@ __all__ = [
     "build_research_tools",
     "limits_from_config",
     "load_config",
+    "open_research_runtime",
     "setup_logging",
     "vault_root_from_config",
 ]
@@ -228,6 +243,20 @@ def _report_review_enabled(config: dict[str, Any]) -> bool:
     return value
 
 
+def _runtime_setting(
+    config: dict[str, Any],
+    key: str,
+    default: float,
+) -> float:
+    section = config.get("runtime", {})
+    if not isinstance(section, Mapping):
+        raise ValueError("runtime configuration must be a mapping")
+    value = section.get(key, default)
+    if isinstance(value, bool) or not isinstance(value, (int, float)) or value <= 0:
+        raise ValueError(f"runtime.{key} must be a positive number")
+    return float(value)
+
+
 class ResearchRuntime:
     """Shared production facade for starting and resuming root research runs."""
 
@@ -249,6 +278,16 @@ class ResearchRuntime:
         self.checkpointer = checkpointer
         self.limits = limits
         self.report_review_enabled = report_review_enabled
+        self.proposal_ttl_seconds = _runtime_setting(
+            config, "proposal_ttl_seconds", 86400
+        )
+        self.terminal_retention_seconds = _runtime_setting(
+            config, "terminal_retention_seconds", 604800
+        )
+        self.lease_seconds = _runtime_setting(config, "lease_seconds", 60)
+        self.sweep_interval_seconds = _runtime_setting(
+            config, "sweep_interval_seconds", 5
+        )
         self.graph = build_research_workflow(
             policy,
             self.tools,
@@ -256,10 +295,23 @@ class ResearchRuntime:
             checkpointer=checkpointer,
             report_review_enabled=report_review_enabled,
         )
+        self.memory_note_graph = build_memory_note_workflow(
+            memory_store, policy, checkpointer=checkpointer
+        )
+        self.memory_import_graph = build_memory_import_workflow(
+            memory_store, policy, checkpointer=checkpointer
+        )
+        self.legacy_migration_graph = build_legacy_migration_workflow(
+            memory_store, checkpointer=checkpointer
+        )
 
     @staticmethod
     def new_thread_id() -> str:
         return f"research-{uuid.uuid4().hex}"
+
+    @staticmethod
+    def new_workflow_id(workflow_type: str) -> str:
+        return f"{workflow_type.replace('_', '-')}-{uuid.uuid4().hex}"
 
     @contextmanager
     def _research_file_scope(self, memory_id: str | None):
@@ -294,6 +346,8 @@ class ResearchRuntime:
         *,
         thread_id: str | None = None,
         memory_id: str | None = None,
+        session_id: str | None = None,
+        expires_at: float | None = None,
     ) -> dict[str, Any]:
         if memory_id == LEGACY_MEMORY_ID:
             raise ValueError(
@@ -315,6 +369,8 @@ class ResearchRuntime:
                         identity,
                         self.limits,
                         memory_id=memory_id,
+                        session_id=session_id,
+                        expires_at=expires_at,
                     ),
                     config={"configurable": {"thread_id": root_thread_id}},
                 )
@@ -333,11 +389,26 @@ class ResearchRuntime:
         thread_id: str,
         action: str,
         feedback: str | None = None,
+        *,
+        session_id: str | None = None,
+        memory_id: str | None = None,
     ) -> dict[str, Any]:
         state = await self.get_state(thread_id)
-        memory_id = state.get("memory_id")
-        with _memory_trace("paperpilot.research.review", memory_id) as observation:
-            with self._research_file_scope(memory_id):
+        state_session_id = state.get("session_id")
+        state_memory_id = state.get("memory_id")
+        if session_id is not None and state_session_id != session_id:
+            raise ValueError("research workflow does not belong to this session")
+        if memory_id is not None and state_memory_id != memory_id:
+            raise ValueError("research workflow does not belong to this Memory")
+        expires_at = state.get("expires_at")
+        if (
+            action != "expire"
+            and expires_at is not None
+            and time.time() >= float(expires_at)
+        ):
+            raise TimeoutError("research confirmation has expired")
+        with _memory_trace("paperpilot.research.review", state_memory_id) as observation:
+            with self._research_file_scope(state_memory_id):
                 result = await resume_research_workflow(
                     self.graph,
                     thread_id=thread_id,
@@ -360,6 +431,43 @@ class ResearchRuntime:
                         if manifest is not None
                         else []
                     ),
+                }
+            )
+            return result
+
+    async def confirm_research_start(
+        self,
+        thread_id: str,
+        *,
+        session_id: str | None = None,
+        memory_id: str | None = None,
+    ) -> dict[str, Any]:
+        """Persist only the confirmation super-step before background execution."""
+        state = await self.get_state(thread_id)
+        if session_id is not None and state.get("session_id") != session_id:
+            raise ValueError("research workflow does not belong to this session")
+        if memory_id is not None and state.get("memory_id") != memory_id:
+            raise ValueError("research workflow does not belong to this Memory")
+        expires_at = state.get("expires_at")
+        if expires_at is not None and time.time() >= float(expires_at):
+            raise TimeoutError("research confirmation has expired")
+        config = {"configurable": {"thread_id": thread_id}}
+        with _memory_trace(
+            "paperpilot.research.confirm", state.get("memory_id")
+        ) as observation:
+            with self._research_file_scope(state.get("memory_id")):
+                result = await self.graph.ainvoke(
+                    Command(resume={"action": "confirm"}),
+                    config=config,
+                    interrupt_after=["review_brief"],
+                )
+            if result.get("confirmed") is not True:
+                raise RuntimeError("research confirmation super-step was not persisted")
+            observation.add_output(
+                {
+                    "memory_id": state.get("memory_id"),
+                    "thread_id": thread_id,
+                    "action": "confirm",
                 }
             )
             return result
@@ -398,6 +506,17 @@ class ResearchRuntime:
                 }
             )
 
+    async def continue_research(self, thread_id: str) -> dict[str, Any]:
+        """Continue a non-interrupted checkpoint without replacing its State."""
+        state = await self.get_state(thread_id)
+        memory_id = state.get("memory_id")
+        with _memory_trace("paperpilot.research.continue", memory_id):
+            with self._research_file_scope(memory_id):
+                return await self.graph.ainvoke(
+                    None,
+                    config={"configurable": {"thread_id": thread_id}},
+                )
+
     async def run_auto_confirmed(
         self,
         question: str,
@@ -422,6 +541,217 @@ class ResearchRuntime:
             {"configurable": {"thread_id": thread_id}}
         )
         return dict(snapshot.values)
+
+    async def get_snapshot(self, thread_id: str) -> Any:
+        """Return the authoritative LangGraph snapshot for recovery/status views."""
+        return await self.graph.aget_state(
+            {"configurable": {"thread_id": thread_id}}
+        )
+
+    async def mark_research_failed(self, thread_id: str, code: str) -> None:
+        """Persist a bounded failure marker in State after an application failure."""
+        await self.graph.aupdate_state(
+            {"configurable": {"thread_id": thread_id}},
+            {"workflow_status": "failed", "failure_code": code},
+            as_node="postprocess_report",
+        )
+
+    async def mark_workflow_failed(
+        self, workflow_type: str, thread_id: str, code: str
+    ) -> None:
+        """Terminally mark a checkpointed product workflow after adapter failure."""
+        if workflow_type == "research":
+            await self.mark_research_failed(thread_id, code)
+            return
+        graph = self.workflow_graph(workflow_type)
+        snapshot = await graph.aget_state(
+            {"configurable": {"thread_id": thread_id}}
+        )
+        values = dict(snapshot.values)
+        await graph.aupdate_state(
+            {"configurable": {"thread_id": thread_id}},
+            {
+                "workflow_status": "failed",
+                "result": {
+                    "status": "failed",
+                    "workflow_type": workflow_type,
+                    "thread_id": thread_id,
+                    "session_id": values.get("session_id"),
+                    "memory_id": values.get("memory_id"),
+                    "error": code,
+                },
+            },
+            as_node="finish",
+        )
+
+    async def mark_workflow_cancelled(
+        self, workflow_type: str, thread_id: str
+    ) -> None:
+        """Terminally cancel a running workflow before adapter-owned deletion."""
+        if workflow_type == "research":
+            await self.graph.aupdate_state(
+                {"configurable": {"thread_id": thread_id}},
+                {"workflow_status": "cancelled"},
+                as_node="postprocess_report",
+            )
+            return
+        graph = self.workflow_graph(workflow_type)
+        snapshot = await graph.aget_state(
+            {"configurable": {"thread_id": thread_id}}
+        )
+        values = dict(snapshot.values)
+        await graph.aupdate_state(
+            {"configurable": {"thread_id": thread_id}},
+            {
+                "workflow_status": "cancelled",
+                "decision": "cancel",
+                "result": {
+                    "status": "cancelled",
+                    "workflow_type": workflow_type,
+                    "thread_id": thread_id,
+                    "session_id": values.get("session_id"),
+                    "memory_id": values.get("memory_id"),
+                },
+            },
+            as_node="finish",
+        )
+
+    async def delete_workflow(self, thread_id: str) -> None:
+        """Delete all checkpoints for one product workflow thread."""
+        delete = getattr(self.checkpointer, "adelete_thread", None)
+        if delete is None:
+            return
+        await delete(thread_id)
+
+    def workflow_graph(self, workflow_type: str) -> Any:
+        graphs = {
+            "research": self.graph,
+            "memory_note": self.memory_note_graph,
+            "memory_import": self.memory_import_graph,
+            "legacy_migration": self.legacy_migration_graph,
+        }
+        try:
+            return graphs[workflow_type]
+        except KeyError as exc:
+            raise ValueError(f"unsupported workflow_type: {workflow_type}") from exc
+
+    async def get_workflow_snapshot(self, workflow_type: str, thread_id: str) -> Any:
+        return await self.workflow_graph(workflow_type).aget_state(
+            {"configurable": {"thread_id": thread_id}}
+        )
+
+    async def resume_memory_operation(
+        self,
+        workflow_type: str,
+        thread_id: str,
+        decision: Mapping[str, Any],
+    ) -> dict[str, Any]:
+        if workflow_type not in {
+            "memory_note", "memory_import", "legacy_migration"
+        }:
+            raise ValueError("workflow is not a Memory confirmation operation")
+        return await resume_memory_workflow(
+            self.workflow_graph(workflow_type),
+            thread_id=thread_id,
+            decision=decision,
+        )
+
+    async def continue_workflow(
+        self,
+        workflow_type: str,
+        thread_id: str,
+    ) -> dict[str, Any]:
+        if workflow_type == "research":
+            return await self.continue_research(thread_id)
+        return await continue_memory_workflow(
+            self.workflow_graph(workflow_type), thread_id=thread_id
+        )
+
+    async def start_memory_note_workflow(
+        self,
+        *,
+        session_id: str,
+        memory_id: str,
+        question: str,
+        thread_id: str | None = None,
+        expires_at: float | None = None,
+    ) -> dict[str, Any]:
+        workflow_id = thread_id or self.new_workflow_id("memory_note")
+        return await self.memory_note_graph.ainvoke(
+            create_memory_note_workflow_state(
+                thread_id=workflow_id,
+                session_id=session_id,
+                memory_id=memory_id,
+                question=question,
+                expires_at=expires_at,
+                ttl_seconds=self.proposal_ttl_seconds,
+            ),
+            config={"configurable": {"thread_id": workflow_id}},
+        )
+
+    async def start_memory_import_workflow(
+        self,
+        *,
+        session_id: str,
+        memory_id: str,
+        source: Mapping[str, Any],
+        thread_id: str | None = None,
+        expires_at: float | None = None,
+    ) -> dict[str, Any]:
+        workflow_id = thread_id or self.new_workflow_id("memory_import")
+        common = {
+            "thread_id": workflow_id,
+            "session_id": session_id,
+            "memory_id": memory_id,
+            "expires_at": expires_at,
+            "ttl_seconds": self.proposal_ttl_seconds,
+        }
+        kind = source.get("kind")
+        if kind == "file":
+            state = create_memory_file_import_workflow_state(
+                **common,
+                file_name=str(source.get("file_name") or ""),
+                content=source.get("content", b""),
+            )
+        elif kind == "text":
+            state = create_memory_text_import_workflow_state(
+                **common,
+                title=str(source.get("title") or ""),
+                text=str(source.get("text") or ""),
+            )
+        elif kind == "url":
+            state = create_memory_url_import_workflow_state(
+                **common,
+                url=str(source.get("url") or ""),
+            )
+        else:
+            raise ValueError("unsupported Memory import source")
+        return await self.memory_import_graph.ainvoke(
+            state,
+            config={"configurable": {"thread_id": workflow_id}},
+        )
+
+    async def start_legacy_migration_workflow(
+        self,
+        *,
+        session_id: str,
+        title: str,
+        target_memory_id: str,
+        thread_id: str | None = None,
+        expires_at: float | None = None,
+    ) -> dict[str, Any]:
+        workflow_id = thread_id or self.new_workflow_id("legacy_migration")
+        return await self.legacy_migration_graph.ainvoke(
+            create_legacy_migration_workflow_state(
+                thread_id=workflow_id,
+                session_id=session_id,
+                title=title,
+                target_memory_id=target_memory_id,
+                expires_at=expires_at,
+                ttl_seconds=self.proposal_ttl_seconds,
+            ),
+            config={"configurable": {"thread_id": workflow_id}},
+        )
 
     def read_memory(self, relative_path: str) -> str:
         return self.memory_store.read_text(relative_path)
@@ -690,3 +1020,32 @@ def build_research_runtime(
         limits=limits_from_config(effective_config),
         report_review_enabled=_report_review_enabled(effective_config),
     )
+
+
+@asynccontextmanager
+async def open_research_runtime(
+    checkpoint_db_path: str | os.PathLike[str],
+    config: dict[str, Any] | None = None,
+    *,
+    config_path: str | os.PathLike[str] | None = None,
+    policy: Any | None = None,
+    tools: Iterable[Any] | None = None,
+    memory_store: MarkdownMemoryStore | None = None,
+) -> AsyncIterator[ResearchRuntime]:
+    """Own one persistent SQLite saver for a product process lifecycle."""
+    path = Path(checkpoint_db_path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    async with AsyncSqliteSaver.from_conn_string(os.fspath(path)) as saver:
+        await saver.setup()
+        runtime = build_research_runtime(
+            config,
+            config_path=config_path,
+            policy=policy,
+            tools=tools,
+            memory_store=memory_store,
+            checkpointer=saver,
+        )
+        try:
+            yield runtime
+        finally:
+            await runtime.close(shutdown=True)

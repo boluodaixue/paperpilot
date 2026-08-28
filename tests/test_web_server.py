@@ -1,6 +1,7 @@
 """Offline Web acceptance tests for the N5 Research Workflow migration."""
 from __future__ import annotations
 
+import asyncio
 import json
 import time
 from pathlib import Path
@@ -158,19 +159,39 @@ async def test_event_buffer_deduplicates_cumulative_events_and_replays_by_cursor
     assert all(item["root_thread_id"] == "root-events" for item in task.events)
 
 
-def test_sse_cursor_replays_only_unseen_events(web_client):
-    client, *_ = web_client
-    task = server.ResearchTask("root-replay", "s", "q")
-    task.status = "done"
-    task.events = [
-        {"type": "agent_started", "sequence": 1},
-        {"type": "done", "sequence": 2},
-    ]
-    server._TASKS[task.task_id] = task
-    response = client.get(f"/api/tasks/{task.task_id}/events?cursor=1")
+def test_sse_terminal_snapshot_is_followed_by_durable_outbox(web_client):
+    client, runtime, *_ = web_client
+    paused = client.post(
+        "/api/alignment",
+        json={
+            "session_id": "sse-replay",
+            "memory_id": _MEMORY_ID,
+            "message": "Checkpointed SSE replay",
+        },
+    )
+    assert paused.status_code == 200, paused.text
+    task_id = paused.json()["task_id"]
+    registry = server.get_runtime_registry()
+    record = registry.get(task_id)
+    assert record is not None
+    cancelled = asyncio.run(
+        runtime.review(
+            record.thread_id,
+            "cancel",
+            session_id=record.session_id,
+            memory_id=record.memory_id,
+        )
+    )
+    assert cancelled["workflow_status"] == "cancelled"
+    server._TASKS[task_id].status = "error"
+
+    response = client.get(f"/api/tasks/{task_id}/events?cursor=0")
     assert response.status_code == 200
-    assert '"sequence": 1' not in response.text
-    assert '"sequence": 2' in response.text
+    assert '"type": "snapshot", "status": "cancelled"' in response.text
+    assert '"type": "cancelled", "sequence": 1' in response.text
+    assert response.text.index('"type": "snapshot"') < response.text.index(
+        '"type": "cancelled"'
+    )
 
 
 def test_two_sessions_keep_threads_isolated(web_client):

@@ -404,11 +404,13 @@ async function openLegacyMigration() {
     method: 'POST', headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({
       title: title.trim(), target_memory_id: targetMemoryId.trim(),
+      session_id: currentSessionId,
     }),
   });
   const proposal = await response.json();
   if (!response.ok) { alert(proposal.detail || '迁移预览生成失败'); return; }
   currentLegacyMigrationProposal = proposal;
+  bindCurrentSession(proposal.session_id, proposal.source_memory_id);
   const sections = [
     `Source: ${proposal.source_memory_id}（保留只读）`,
     `Target: ${proposal.target_memory_id}`,
@@ -423,12 +425,12 @@ async function openLegacyMigration() {
   $('legacyMigrationCard').scrollIntoView({ behavior: 'smooth', block: 'nearest' });
 }
 
-async function cancelLegacyMigration() {
+async function cancelLegacyMigration(notifyServer = true) {
   const proposal = currentLegacyMigrationProposal;
   currentLegacyMigrationProposal = null;
   $('legacyMigrationCard').hidden = true;
   $('legacyMigrationPreview').textContent = '';
-  if (!proposal) return;
+  if (!proposal || notifyServer === false) return;
   await fetch(
     `/api/legacy-memory/migration-proposals/${encodeURIComponent(proposal.proposal_id)}`,
     { method: 'DELETE' },
@@ -443,7 +445,14 @@ async function confirmLegacyMigration() {
   try {
     const response = await fetch(
       `/api/legacy-memory/migration-proposals/${encodeURIComponent(proposal.proposal_id)}/confirm`,
-      { method: 'POST' },
+      {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          session_id: proposal.session_id || currentSessionId,
+          memory_id: proposal.source_memory_id,
+          proposal_id: proposal.proposal_id,
+        }),
+      },
     );
     const result = await response.json();
     if (!response.ok) { alert(result.detail || '迁移失败，请重新生成预览'); return; }
@@ -589,9 +598,14 @@ function fmtTime(ts) {
   const d = new Date(ts * 1000);
   return `${String(d.getMonth()+1).padStart(2,'0')}-${String(d.getDate()).padStart(2,'0')} ${String(d.getHours()).padStart(2,'0')}:${String(d.getMinutes()).padStart(2,'0')}`;
 }
+function hideMemoryWorkflowCards() {
+  void cancelMemoryNoteProposal(false);
+  void cancelMemoryImport(false);
+  void cancelLegacyMigration(false);
+}
+
 function newSession() {
-  void cancelMemoryImport();
-  void cancelLegacyMigration();
+  hideMemoryWorkflowCards();
   currentSessionId = null; currentProposal = null; currentReportData = null; runningTask = null;
   if (eventSource) { eventSource.close(); eventSource = null; }
   sessionMemoryBound = false; sessionMemoryId = null;
@@ -609,9 +623,67 @@ function newSession() {
 // ------------------------------------------------------------------
 // 会话选择（历史）
 // ------------------------------------------------------------------
+async function restoreMemoryWorkflows(sid) {
+  hideMemoryWorkflowCards();
+  try {
+    const response = await fetch(`/api/sessions/${encodeURIComponent(sid)}/workflows`);
+    if (!response.ok) return false;
+    const workflows = await response.json();
+    for (const workflow of workflows) {
+      const interrupt = workflow.interrupt || {};
+      if (interrupt.kind === 'memory_answer_decision' && interrupt.answer) {
+        renderMemoryAnswer({
+          ...interrupt.answer,
+          session_id: sid,
+          workflow_id: workflow.workflow_id,
+        });
+      } else if (interrupt.kind === 'memory_note_confirmation' && interrupt.proposal) {
+        currentMemoryNoteProposal = {
+          ...interrupt.proposal,
+          session_id: sid,
+          workflow_id: workflow.workflow_id,
+        };
+        $('noteProposalTarget').textContent = `目标：${interrupt.proposal.target_path}`;
+        $('noteProposalMarkdown').textContent = interrupt.proposal.markdown || '';
+        $('noteProposalCard').hidden = false;
+      } else if (interrupt.kind === 'memory_import_confirmation' && interrupt.proposal) {
+        currentMemoryImportMemoryId = workflow.memory_id;
+        $('memoryImportCard').hidden = false;
+        renderMemoryImportPreview({
+          ...interrupt.proposal,
+          status: 'proposed',
+          can_confirm: true,
+          session_id: sid,
+          workflow_id: workflow.workflow_id,
+        });
+      } else if (interrupt.kind === 'legacy_migration_confirmation' && interrupt.proposal) {
+        currentLegacyMigrationProposal = {
+          ...interrupt.proposal,
+          session_id: sid,
+          workflow_id: workflow.workflow_id,
+        };
+        const proposal = interrupt.proposal;
+        const sections = [
+          `Source: ${proposal.source_memory_id}（只读）`,
+          `Target: ${proposal.target_memory_id}`,
+          `Home: ${proposal.home_path}`,
+          '', proposal.home_markdown || '',
+        ];
+        for (const file of proposal.files || []) {
+          sections.push('', `${file.source_path} → ${file.target_path}`, file.markdown || '');
+        }
+        $('legacyMigrationPreview').textContent = sections.join('\n');
+        $('legacyMigrationCard').hidden = false;
+      }
+    }
+    return workflows.length > 0;
+  } catch (e) {
+    return false;
+  }
+}
+
 async function selectSession(sid, memoryBound = false, memoryId = null) {
-  void cancelMemoryImport();
-  void cancelLegacyMigration();
+  hideMemoryWorkflowCards();
   currentSessionId = sid; currentProposal = null; currentReportData = null;
   sessionMemoryBound = memoryBound; sessionMemoryId = memoryId;
   selectedMemoryId = memoryBound ? memoryId : null;
@@ -624,7 +696,12 @@ async function selectSession(sid, memoryBound = false, memoryId = null) {
   const r = await fetch(`/api/sessions/${encodeURIComponent(sid)}/messages`);
   const msgs = await r.json();
   $('messages').innerHTML = '';
-  if (!msgs.length) { setMemorySelection(selectedMemoryId, false); loadSessions(); return; }
+  const restoredMemoryWorkflow = await restoreMemoryWorkflows(sid);
+  if (!msgs.length) {
+    setMemorySelection(selectedMemoryId, restoredMemoryWorkflow);
+    loadSessions();
+    return;
+  }
   // 跳过 proposal/report（单独卡片渲染），其余当气泡显示
   for (const m of msgs) renderStoredMessage(m);
 
@@ -637,7 +714,7 @@ async function selectSession(sid, memoryBound = false, memoryId = null) {
       if (td.task_id) {
         task = {
           task_id: td.task_id, session_id: sid, status: td.status,
-          memory_id: td.memory_id || null,
+          memory_id: td.memory_id || null, brief: td.brief || null,
         };
         runningTask = task;
       }
@@ -654,7 +731,12 @@ async function selectSession(sid, memoryBound = false, memoryId = null) {
   if (task && task.status === 'waiting_confirmation') {
     $('interactionMode').value = 'research';
     setMemorySelection(task.memory_id, true);
-    showProposalFromHistory(msgs);
+    if (task.brief) {
+      currentProposal = { brief: task.brief, task_id: task.task_id };
+      showProposalCard(currentProposal);
+    } else {
+      showProposalFromHistory(msgs);
+    }
     loadSessions();
     return;
   }
@@ -700,6 +782,17 @@ async function sendMemoryQuestion() {
   if (!selectedMemoryId) {
     appendBubble('assistant', '请先选择一个 Memory。');
     return;
+  }
+  if (task && task.status === 'done') {
+    runningTask = null;
+    setMemorySelection(task.memory_id, false);
+    await fetchResult(task.task_id);
+    loadSessions();
+    return;
+  }
+  if (task && task.status === 'error') {
+    runningTask = null;
+    setMemorySelection(task.memory_id, false);
   }
   const memoryId = selectedMemoryId;
   input.value = '';
@@ -795,10 +888,19 @@ async function requestMemoryNoteProposal(answer) {
   }
 }
 
-function cancelMemoryNoteProposal() {
+async function cancelMemoryNoteProposal(notifyServer = true) {
+  const proposal = currentMemoryNoteProposal;
   currentMemoryNoteProposal = null;
   $('noteProposalCard').hidden = true;
   $('noteProposalMarkdown').textContent = '';
+  if (proposal && notifyServer !== false) {
+    await fetch(
+      `/api/memory-note-proposals/${encodeURIComponent(proposal.proposal_id)}` +
+      `?session_id=${encodeURIComponent(proposal.session_id || currentSessionId || '')}` +
+      `&memory_id=${encodeURIComponent(proposal.memory_id || '')}`,
+      { method: 'DELETE' },
+    );
+  }
 }
 
 async function confirmMemoryNoteProposal() {
@@ -809,11 +911,19 @@ async function confirmMemoryNoteProposal() {
   try {
     const r = await fetch(
       `/api/memory-note-proposals/${encodeURIComponent(proposal.proposal_id)}/confirm`,
-      { method: 'POST' },
+      {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          session_id: proposal.session_id || currentSessionId,
+          memory_id: proposal.memory_id,
+          answer_id: proposal.answer_id,
+          proposal_id: proposal.proposal_id,
+        }),
+      },
     );
     const result = await r.json();
     if (!r.ok) { alert(result.detail || '笔记写入失败'); return; }
-    cancelMemoryNoteProposal();
+    await cancelMemoryNoteProposal(false);
     appendBubble('assistant', `已写入 ${result.wikilink}（${result.target_path}）`);
   } catch (e) {
     alert('笔记写入请求失败，请重试');
@@ -878,18 +988,19 @@ function closeMemoryImport() {
   setMemorySelection(memoryId, false);
 }
 
-async function cancelMemoryImport() {
+async function cancelMemoryImport(notifyServer = true) {
   if (!currentMemoryImportMemoryId && $('memoryImportCard').hidden) return;
   const proposal = currentMemoryImportProposal;
   const memoryId = currentMemoryImportMemoryId;
   closeMemoryImport();
-  if (!proposal || !proposal.proposal_id || !memoryId) return;
+  if (!proposal || !proposal.proposal_id || !memoryId || notifyServer === false) return;
   try {
     await fetch(
-      `/api/memories/${encodeURIComponent(memoryId)}/import-proposals/${encodeURIComponent(proposal.proposal_id)}`,
+      `/api/memories/${encodeURIComponent(memoryId)}/import-proposals/${encodeURIComponent(proposal.proposal_id)}` +
+      `?session_id=${encodeURIComponent(proposal.session_id || currentSessionId || '')}`,
       { method: 'DELETE' },
     );
-  } catch (e) { /* 进程内 proposal 也会在服务重启时释放 */ }
+  } catch (e) { /* 稍后可从持久化 workflow 重新取消 */ }
 }
 
 function readFileAsBase64(file) {
@@ -1020,7 +1131,14 @@ async function confirmMemoryImport() {
   try {
     const r = await fetch(
       `/api/memories/${encodeURIComponent(memoryId)}/import-proposals/${encodeURIComponent(proposal.proposal_id)}/confirm`,
-      { method: 'POST' },
+      {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          session_id: proposal.session_id || currentSessionId,
+          memory_id: memoryId,
+          proposal_id: proposal.proposal_id,
+        }),
+      },
     );
     const payload = await r.json();
     if (!r.ok) { alert(payload.detail || '导入确认失败，请重新生成预览'); return; }
@@ -1150,6 +1268,7 @@ function showProposalFromHistory(msgs) {
   if (!propMsg) return;
   try {
     const p = JSON.parse(propMsg.content);
+    if (!p.brief) return;
     currentProposal = {brief: p.brief || {}, task_id: p.task_id};
     showProposalCard(currentProposal);
   } catch (e) { /* 解析失败不弹卡 */ }
@@ -1212,11 +1331,15 @@ function openEventStream(task_id) {
     const ev = JSON.parse(e.data);
     if (ev.sequence) eventCursors[task_id] = ev.sequence;
     appendProgress(ev);
-    if (ev.type === 'done') {
+    const completed = ev.type === 'done' || ev.type === 'completed' ||
+      (ev.type === 'snapshot' && ev.status === 'completed');
+    const failed = ['error', 'failed', 'cancelled', 'expired'].includes(ev.type) ||
+      (ev.type === 'snapshot' && ['failed', 'cancelled', 'expired'].includes(ev.status));
+    if (completed) {
       eventSource.close(); eventSource = null;
       runningTask = null;
       fetchResult(task_id);
-    } else if (ev.type === 'error') {
+    } else if (failed) {
       eventSource.close(); eventSource = null;
       runningTask = null;
       setMemorySelection(selectedMemoryId, false);
@@ -1243,6 +1366,11 @@ function appendProgress(ev) {
     case 'agent_finished': div.textContent = `[${t}] ✓ Agent 完成（${ev.status}）`; break;
     case 'agent_failed': div.textContent = `[${t}] ✗ Agent 失败：${ev.error||''}`; break;
     case 'done': div.textContent = `[${t}] ✅ 研究完成`; break;
+    case 'completed': div.textContent = `[${t}] ✅ 研究完成`; break;
+    case 'cancelled': div.textContent = `[${t}] 研究已取消`; break;
+    case 'expired': div.textContent = `[${t}] 研究确认已过期`; break;
+    case 'failed': div.textContent = `[${t}] ❌ 研究失败`; break;
+    case 'snapshot': div.textContent = `[${t}] 恢复状态：${ev.status}`; break;
     case 'error': div.textContent = `[${t}] ❌ ${ev.message}`; break;
     default: div.textContent = `[${t}] ${JSON.stringify(ev)}`;
   }
