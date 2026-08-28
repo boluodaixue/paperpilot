@@ -547,6 +547,37 @@ def test_research_brief_is_rebuilt_from_checkpoint_after_runtime_restart(
     assert payload["brief"]["objective"] == "Recover the research brief"
 
 
+def test_research_confirm_and_result_rebuild_on_worker_cache_miss(
+    recovery_client,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    client, _store, _rebuild = recovery_client
+    aligned = client.post(
+        "/api/alignment",
+        json={
+            "session_id": "session-cross-worker",
+            "memory_id": "M-web",
+            "message": "Recover independently on another API worker",
+        },
+    ).json()
+    monkeypatch.setattr(server, "_RUN_SEMAPHORE", asyncio.Semaphore(0))
+
+    server._TASKS.clear()
+    started = client.post(
+        "/api/research",
+        json={
+            "task_id": aligned["task_id"],
+            "session_id": "session-cross-worker",
+        },
+    )
+    assert started.status_code == 200, started.text
+
+    server._TASKS.clear()
+    pending = client.get(f'/api/tasks/{aligned["task_id"]}/result')
+    assert pending.status_code == 202
+    assert server._TASKS[aligned["task_id"]].status == "running"
+
+
 def test_research_http_confirmation_persists_before_background_slot(
     recovery_client, monkeypatch: pytest.MonkeyPatch
 ) -> None:

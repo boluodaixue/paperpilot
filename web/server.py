@@ -285,10 +285,69 @@ class SessionOrder(BaseModel):
     session_ids: list[str]
 
 
-def _get_task(task_id: str) -> ResearchTask:
-    if task_id not in _TASKS:
+def _research_task_from_snapshot(
+    record: Any,
+    snapshot: Any,
+    status: str | None = None,
+) -> ResearchTask:
+    """Rebuild the disposable Web adapter from its durable locator and State."""
+    if record.workflow_type != "research":
+        raise ValueError("workflow is not a research task")
+    resolved = status or derive_workflow_status(record, snapshot)
+    if resolved in {"missing", "orphan"}:
+        raise ValueError("research task has no recoverable checkpoint")
+    values = dict(snapshot.values)
+    task = ResearchTask(
+        record.task_id,
+        record.session_id,
+        str(values.get("question") or ""),
+        record.memory_id,
+        created_at=record.created_at,
+        expires_at=record.expires_at,
+    )
+    task.status = (
+        "waiting_confirmation"
+        if resolved == "waiting_confirmation"
+        else "running"
+        if resolved == "running"
+        else "done"
+        if resolved == "completed"
+        else "error"
+    )
+    if task.status == "error":
+        task.error = str(values.get("failure_code") or resolved)
+    workflow_result = values.get("workflow_result")
+    if task.status == "done" and isinstance(
+        workflow_result, ResearchWorkflowResult
+    ):
+        task.result = _research_task_result(task, workflow_result, elapsed=0)
+    return task
+
+
+async def _get_task(task_id: str) -> ResearchTask:
+    """Return a local adapter, rebuilding it on a cross-worker cache miss."""
+    task = _TASKS.get(task_id)
+    if task is not None:
+        return task
+    record = get_runtime_registry().get(task_id)
+    if record is None or record.workflow_type != "research":
         raise HTTPException(status_code=404, detail=f"任务不存在: {task_id}")
-    return _TASKS[task_id]
+    try:
+        snapshot = await get_research_runtime().get_workflow_snapshot(
+            "research", record.thread_id
+        )
+        status = derive_workflow_status(record, snapshot)
+        task = _research_task_from_snapshot(record, snapshot, status)
+        _reconcile_workflow_outbox(record, snapshot, status)
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise HTTPException(
+            status_code=503,
+            detail=f"任务状态暂时无法恢复: {task_id}",
+        ) from exc
+    _TASKS[task_id] = task
+    return task
 
 
 def _active_task(session_id: str) -> ResearchTask | None:
@@ -303,6 +362,29 @@ def _active_task(session_id: str) -> ResearchTask | None:
 def _latest_task(session_id: str) -> ResearchTask | None:
     matches = [task for task in _TASKS.values() if task.session_id == session_id]
     return max(matches, key=lambda item: item.created_at) if matches else None
+
+
+async def _session_research_task(
+    session_id: str,
+    *,
+    active_only: bool,
+) -> ResearchTask | None:
+    """Find a session task without treating this worker's cache as authority."""
+    records = [
+        record
+        for record in get_runtime_registry().list(session_id=session_id)
+        if record.workflow_type == "research"
+    ]
+    for record in reversed(records):
+        try:
+            task = await _get_task(record.task_id)
+            status = await _authoritative_research_status(task)
+        except (HTTPException, ValueError, RuntimeError):
+            continue
+        if not active_only or status in {"waiting_confirmation", "running"}:
+            task.status = status
+            return task
+    return None
 
 
 async def _authoritative_research_status(task: ResearchTask) -> str:
@@ -1147,33 +1229,15 @@ async def _restore_registered_workflows() -> None:
             print(f"[Runtime] outbox 对账暂缓: {exc}")
 
         if record.workflow_type == "research":
-            values = dict(snapshot.values)
-            task = ResearchTask(
-                record.task_id,
-                record.session_id,
-                str(values.get("question") or ""),
-                record.memory_id,
-                created_at=record.created_at,
-                expires_at=record.expires_at,
-            )
-            task.status = (
-                "waiting_confirmation"
-                if status == "waiting_confirmation"
-                else "running"
-                if status == "running"
-                else "done"
-                if status == "completed"
-                else "error"
-            )
-            if task.status == "error":
-                task.error = str(values.get("failure_code") or status)
-            workflow_result = values.get("workflow_result")
+            try:
+                task = _research_task_from_snapshot(record, snapshot, status)
+            except ValueError as exc:
+                print(f"[Runtime] research adapter 无法恢复: {exc}")
+                continue
+            workflow_result = snapshot.values.get("workflow_result")
             if task.status == "done" and isinstance(
                 workflow_result, ResearchWorkflowResult
             ):
-                task.result = _research_task_result(
-                    task, workflow_result, elapsed=0
-                )
                 try:
                     _ensure_report_pointer(task, workflow_result)
                 except Exception as exc:
@@ -1271,6 +1335,16 @@ async def _workflow_sweeper(stop: asyncio.Event) -> None:
                 ):
                     await _expire_registered_workflow(record, snapshot)
                 elif status == "running" and record.task_id not in _BACKGROUND_TASKS:
+                    task: ResearchTask | None = None
+                    if record.workflow_type == "research":
+                        # Construct the local executor before claiming.  A worker
+                        # with an empty cache must not strand a durable lease.
+                        task = _TASKS.get(record.task_id)
+                        if task is None:
+                            task = _research_task_from_snapshot(
+                                record, snapshot, status
+                            )
+                            _TASKS[record.task_id] = task
                     lease = registry.claim_lease(
                         record.task_id,
                         lease_seconds=runtime.lease_seconds,
@@ -1278,16 +1352,15 @@ async def _workflow_sweeper(stop: asyncio.Event) -> None:
                     )
                     if lease is not None:
                         if record.workflow_type == "research":
-                            task = _TASKS.get(record.task_id)
-                            if task is not None:
-                                _spawn_background(
-                                    record.task_id,
-                                    _run_research_task(
-                                        task,
-                                        resume_existing=True,
-                                        lease_token=lease,
-                                    ),
-                                )
+                            assert task is not None
+                            _spawn_background(
+                                record.task_id,
+                                _run_research_task(
+                                    task,
+                                    resume_existing=True,
+                                    lease_token=lease,
+                                ),
+                            )
                         else:
                             _spawn_background(
                                 record.task_id,
@@ -1324,7 +1397,7 @@ async def align_research(req: AlignmentRequest) -> dict[str, Any]:
         raise HTTPException(status_code=400, detail="消息不能为空")
     runtime, store = get_research_runtime(), get_chat_store()
     if req.task_id:
-        task = _get_task(req.task_id)
+        task = await _get_task(req.task_id)
         if req.session_id and req.session_id != task.session_id:
             raise HTTPException(status_code=409, detail="task 与 session 不匹配")
         if req.memory_id is not None and req.memory_id != task.memory_id:
@@ -1371,7 +1444,7 @@ async def align_research(req: AlignmentRequest) -> dict[str, Any]:
             raise HTTPException(status_code=410, detail="研究确认已过期")
     else:
         session_id = _session_id(req.session_id)
-        if _active_task(session_id):
+        if await _session_research_task(session_id, active_only=True):
             raise HTTPException(status_code=409, detail="该会话已有待确认或运行中的研究")
         memory_id = _session_memory(session_id, req.memory_id)
         if memory_id is not None:
@@ -1420,7 +1493,7 @@ async def align_research(req: AlignmentRequest) -> dict[str, Any]:
 
 @app.post("/api/research")
 async def start_research(req: ResearchRequest) -> dict[str, Any]:
-    task = _get_task(req.task_id)
+    task = await _get_task(req.task_id)
     if req.session_id and req.session_id != task.session_id:
         raise HTTPException(status_code=409, detail="task 与 session 不匹配")
     if await _authoritative_research_status(task) != "waiting_confirmation":
@@ -1495,7 +1568,10 @@ async def start_research(req: ResearchRequest) -> dict[str, Any]:
 @app.get("/api/tasks/{task_id}/events")
 async def task_events(task_id: str, cursor: int = 0,
                       last_event_id: str | None = Header(None, alias="Last-Event-ID")) -> StreamingResponse:
-    task = _get_task(task_id)
+    record = get_runtime_registry().get(task_id)
+    if record is None:
+        raise HTTPException(status_code=404, detail=f"任务不存在: {task_id}")
+    task = _TASKS.get(task_id) if record.workflow_type == "research" else None
     try:
         cursor = max(0, cursor, int(last_event_id or 0))
     except ValueError:
@@ -1504,10 +1580,6 @@ async def task_events(task_id: str, cursor: int = 0,
     async def stream():
         current = cursor
         live_cursor = 0
-        record = get_runtime_registry().get(task_id)
-        if record is None:
-            raise RuntimeError("research task has no Runtime Registry locator")
-        persistent = True
         snapshot = await get_research_runtime().get_workflow_snapshot(
             record.workflow_type, record.thread_id
         )
@@ -1519,51 +1591,55 @@ async def task_events(task_id: str, cursor: int = 0,
         yield (
             f"data: {json.dumps({'type': 'snapshot', 'status': checkpoint_status, 'thread_id': record.thread_id, 'memory_id': record.memory_id}, ensure_ascii=False)}\n\n"
         )
+        last_keepalive = time.monotonic()
         while True:
-            if record is not None:
-                for item in get_runtime_registry().list_events(
-                    record.thread_id, after_sequence=current
-                ):
-                    current = item.sequence
-                    event = {
-                        "type": item.event_type,
-                        "sequence": item.sequence,
-                        "thread_id": item.thread_id,
-                        **item.payload,
-                    }
-                    yield (
-                        f"id: {current}\n"
-                        f"data: {json.dumps(event, ensure_ascii=False)}\n\n"
-                    )
-                    if item.event_type in {
-                        "completed", "failed", "cancelled", "expired"
-                    }:
-                        return
+            for item in get_runtime_registry().list_events(
+                record.thread_id, after_sequence=current
+            ):
+                current = item.sequence
+                event = {
+                    "type": item.event_type,
+                    "sequence": item.sequence,
+                    "thread_id": item.thread_id,
+                    **item.payload,
+                }
+                yield (
+                    f"id: {current}\n"
+                    f"data: {json.dumps(event, ensure_ascii=False)}\n\n"
+                )
+                if item.event_type in {
+                    "completed", "failed", "cancelled", "expired"
+                }:
+                    return
             if checkpoint_status in {"completed", "failed", "cancelled", "expired"}:
                 return
-            events = await task.wait_after(live_cursor if persistent else current)
-            if not events:
-                if task.status in {"done", "error"}:
-                    return
-                yield ": keep-alive\n\n"
-                continue
-            for event in events:
-                if persistent:
+            if task is not None:
+                for event in tuple(task.events):
+                    sequence = int(event.get("sequence", 0))
+                    if sequence <= live_cursor:
+                        continue
+                    live_cursor = sequence
                     transient = dict(event)
-                    live_cursor = max(live_cursor, int(transient.get("sequence", 0)))
                     transient.pop("sequence", None)
                     yield f"data: {json.dumps(transient, ensure_ascii=False)}\n\n"
-                else:
-                    current = event["sequence"]
-                    yield f"id: {current}\ndata: {json.dumps(event, ensure_ascii=False)}\n\n"
-            if not persistent and task.status in {"done", "error"} and current >= len(task.events):
-                return
+            if time.monotonic() - last_keepalive >= 30:
+                yield ": keep-alive\n\n"
+                last_keepalive = time.monotonic()
+            await asyncio.sleep(0.25)
+            try:
+                snapshot = await get_research_runtime().get_workflow_snapshot(
+                    record.workflow_type, record.thread_id
+                )
+                checkpoint_status = derive_workflow_status(record, snapshot)
+                _reconcile_workflow_outbox(record, snapshot, checkpoint_status)
+            except Exception as exc:
+                print(f"[Runtime] SSE checkpoint 对账暂缓: {exc}")
     return StreamingResponse(stream(), media_type="text/event-stream")
 
 
 @app.get("/api/tasks/{task_id}/result")
 async def task_result(task_id: str) -> dict[str, Any]:
-    task = _get_task(task_id)
+    task = await _get_task(task_id)
     status = await _authoritative_research_status(task)
     if status in {"waiting_confirmation", "running"}:
         raise HTTPException(status_code=202, detail="任务尚未完成")
@@ -1596,7 +1672,9 @@ async def task_result(task_id: str) -> dict[str, Any]:
 
 @app.get("/api/sessions/{sid}/active-task")
 async def session_active_task(sid: str) -> dict[str, Any]:
-    task = _active_task(sid) or _latest_task(sid)
+    task = await _session_research_task(sid, active_only=True)
+    if task is None:
+        task = await _session_research_task(sid, active_only=False)
     memory_id = get_chat_store().get_memory_binding(sid)
     if task is None:
         return {"task_id": None, "memory_id": memory_id, "status": "idle"}
@@ -1683,7 +1761,7 @@ async def create_memory(req: MemoryCreateRequest) -> dict[str, Any]:
     _configured_vault_name()
     runtime = get_research_runtime()
     try:
-        descriptor = runtime.create_memory(title)
+        descriptor = await asyncio.to_thread(runtime.create_memory, title)
     except FileExistsError as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
     except ValueError as exc:

@@ -299,7 +299,7 @@ W0–W6 已完成。LLM Wiki 继续复用唯一 `ResearchRuntime`、`MarkdownMem
 - 不为了兼容旧代码复制领域模型、Repository 或服务；
 - 不恢复已删除的旧角色包装或建立长期兼容层。
 
-## 12. S0 已实现与后续 S 系列目标
+## 12. S0–S2 已实现与后续 S 系列目标
 
 W6 的当前行为保持有效，直至对应 S 阶段通过验收。下一主线只做生产化和检索升级，不改变 Research AgentGraph、fork、递归、N6 Red/Blue 或 Markdown 知识真相源：
 
@@ -309,4 +309,4 @@ W6 的当前行为保持有效，直至对应 S 阶段通过验收。下一主�
 - S3 在显式确认、安全归档和历史路径映射后退役活动 Vault 中的 legacy 根文件，不再长期保留活动双份；
 - S4/S5 构建可从 Markdown 删除重建的 FTS5 与可选混合索引；索引不是第二知识真相源，也不得反向覆盖 Markdown。
 
-完整顺序、明确不做和验收标准见 [S 系列实施计划](S_PRODUCTION_HARDENING_AND_RETRIEVAL_PLAN.md)。S0–S1 已完成，详见 [S0 实施记录](S0_FILE_READER_SANDBOX.md)与 [S1 实施记录](S1_PERSISTENT_WORKFLOW_STATE.md)；S2–S5 尚未开始。
+完整顺序、明确不做和验收标准见 [S 系列实施计划](S_PRODUCTION_HARDENING_AND_RETRIEVAL_PLAN.md)。S0–S2 已完成，详见 [S0 实施记录](S0_FILE_READER_SANDBOX.md)、[S1 实施记录](S1_PERSISTENT_WORKFLOW_STATE.md)与 [S2 实施记录](S2_SINGLE_VAULT_WRITER.md)；S3–S5 尚未开始。
