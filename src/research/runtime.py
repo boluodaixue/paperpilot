@@ -65,6 +65,7 @@ from .memory_workflows import (
     create_memory_url_import_workflow_state,
     resume_memory_workflow,
 )
+from .retrieval import configure_persistent_retrieval
 from .models import (
     AgentLimits,
     ExecutionIdentity,
@@ -296,6 +297,26 @@ def _chat_db_path(config: dict[str, Any]) -> Path:
     return path if path.is_absolute() else PROJECT_ROOT / path
 
 
+def _retrieval_settings(config: dict[str, Any]) -> tuple[Path, float]:
+    section = config.get("runtime", {})
+    if not isinstance(section, Mapping):
+        raise ValueError("runtime configuration must be a mapping")
+    configured = section.get("retrieval_db_path", "data/retrieval.db")
+    try:
+        raw_path = os.fspath(configured)
+    except TypeError as exc:
+        raise ValueError("runtime.retrieval_db_path must be a non-empty path-like string") from exc
+    if not isinstance(raw_path, str) or not raw_path.strip():
+        raise ValueError("runtime.retrieval_db_path must be a non-empty path-like string")
+    path = Path(raw_path)
+    if not path.is_absolute():
+        path = PROJECT_ROOT / path
+    interval = section.get("retrieval_reconciliation_seconds", 300)
+    if isinstance(interval, bool) or not isinstance(interval, (int, float)) or interval <= 0:
+        raise ValueError("runtime.retrieval_reconciliation_seconds must be a positive number")
+    return path, float(interval)
+
+
 def _vault_scope(root: Path) -> str:
     canonical = os.path.normcase(str(root.resolve()))
     digest = hashlib.sha256(canonical.encode("utf-8")).hexdigest()
@@ -366,6 +387,12 @@ class ResearchRuntime:
         self.checkpointer = checkpointer
         self.limits = limits
         self.report_review_enabled = report_review_enabled
+        retrieval_db, reconciliation_seconds = _retrieval_settings(config)
+        configure_persistent_retrieval(
+            memory_store,
+            retrieval_db,
+            reconciliation_seconds=reconciliation_seconds,
+        )
         self.vault_write_service = vault_write_service or _build_vault_write_service(
             config=config,
             memory_store=memory_store,
