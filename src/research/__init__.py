@@ -13,6 +13,7 @@ from .runtime import (
     limits_from_config,
     load_config,
     setup_logging,
+    vault_root_from_config,
 )
 from .workflow import (
     build_research_workflow,
@@ -25,6 +26,7 @@ from .models import (
     ExecutionIdentity,
     ForkCandidate,
     ForkReason,
+    MemoryDescriptor,
     MemoryManifest,
     ReportEdit,
     ReportIssue,
@@ -35,6 +37,19 @@ from .models import (
     ResearchTask,
     ResearchWorkflowResult,
 )
+from .vault import (
+    LEGACY_MEMORY_ID,
+    LEGACY_ROOT_DIRECTORIES,
+    build_wikilink,
+    detect_legacy_memory_layout,
+    ensure_unique_memory_ids,
+    memory_relative_path,
+    resolve_vault_markdown_path,
+    validate_frontmatter,
+    validate_memory_descriptor,
+    validate_memory_id,
+    validate_wikilink_target,
+)
 
 __all__ = [
     "AgentLimits",
@@ -42,6 +57,9 @@ __all__ = [
     "ExecutionIdentity",
     "ForkCandidate",
     "ForkReason",
+    "LEGACY_MEMORY_ID",
+    "LEGACY_ROOT_DIRECTORIES",
+    "MemoryDescriptor",
     "MemoryManifest",
     "MarkdownMemoryStore",
     "ReportEdit",
@@ -57,11 +75,21 @@ __all__ = [
     "build_research_runtime",
     "build_research_tools",
     "build_research_workflow",
+    "build_wikilink",
     "create_research_agent_state",
     "create_research_workflow_state",
+    "detect_legacy_memory_layout",
+    "ensure_unique_memory_ids",
     "limits_from_config",
     "load_config",
+    "memory_relative_path",
+    "resolve_vault_markdown_path",
     "resume_research_workflow",
     "run_research_agent",
     "setup_logging",
+    "validate_frontmatter",
+    "validate_memory_descriptor",
+    "validate_memory_id",
+    "validate_wikilink_target",
+    "vault_root_from_config",
 ]

@@ -4,7 +4,7 @@
 
 ## 当前判断
 
-N0–N6 已完成。CLI、Web 和评测统一进入同一个 Research Workflow；旧 Manager / Planner / DAG / AgentPool / Evidence Graph 链路已经删除。当前主线只保留同质 Research AgentGraph、工具、模型适配、tracing、checkpointer、Markdown Memory、可选报告审查与 UI 会话投影。
+N0–N6 与 LLM Wiki + Obsidian 的 W0 已完成。CLI、Web 和评测统一进入同一个 Research Workflow；旧 Manager / Planner / DAG / AgentPool / Evidence Graph 链路已经删除。W0 只增加长期 Memory/Vault 安全契约，没有改变研究执行链路或开始多 Memory 写入。
 
 ## 进度
 
@@ -17,7 +17,8 @@ N0–N6 已完成。CLI、Web 和评测统一进入同一个 Research Workflow�
 | N4 一层递归与硬停止 | ✅ | 根→子→孙可运行，孙不可再 fork，限制与恢复可靠 |
 | N5 入口迁移与旧实现清理 | ✅ | CLI/Web/评测只走新路径，旧架构及证据图退出代码库 |
 | N6 可选 Red/Blue | ✅ | 默认关闭的单次报告后处理，且不破坏 frontmatter、WikiLink、URL 或 manifest |
-| W0–W6 LLM Wiki + Obsidian | 📝 | 方案与实施计划已确认，编码尚未开始 |
+| W0 Memory/Vault 契约 | ✅ | 稳定 `memory_id`、Vault 路径、frontmatter/WikiLink 安全与 legacy 只读识别 |
+| W1–W6 LLM Wiki + Obsidian | 📝 | 尚未开始；按已确认计划逐阶段实施 |
 
 ## N0 已确定的架构决策
 
@@ -103,13 +104,18 @@ N6 只在最终 Markdown 报告成功持久化后增加默认关闭的单次审�
 
 N6 关键专项与回归为 `65 passed, 1 warning`；N1–N6 全量回归为 `160 passed, 1 warning`，其中 warning 为既有 `StarletteDeprecationWarning`。详见 [N6 实施记录](N6_OPTIONAL_REPORT_REVIEW.md)。
 
-## 下一阶段：W0 Memory/Vault 契约
+## W0 已完成
 
-LLM Wiki + Obsidian 的方案与 W0–W6 实施计划已确认，编码尚未开始。
+W0 在不改变 N1–N6 主链的前提下完成了长期 Memory/Vault 基础：
 
-- 目标架构：[LLM Wiki + Obsidian 目标架构](LLM_WIKI_OBSIDIAN_ARCHITECTURE.md)；
-- 执行计划：[LLM Wiki + Obsidian 实施计划](LLM_WIKI_OBSIDIAN_IMPLEMENTATION_PLAN.md)；
-- 下一步只执行 W0，不提前实现 W1 的多 Memory 写入或 W2 的 Obsidian 前端接入。
+- 最小 `MemoryDescriptor` 与稳定 `memory_id`；
+- `Memories/M-<id>/` 规范路径、重复 ID 和带时区时间校验；
+- 平面 frontmatter、完整 WikiLink 和 Windows/Vault 路径安全；
+- `research.vault_root` 与旧 `research.memory_root` 读取兼容；
+- 既有根目录 `reports/evidence/sources` 的无写入识别；
+- W0 专项 `80 passed`，原 N1–N6 回归 `160 passed, 1 warning`，仓库全量 `240 passed, 1 warning`。
+
+详见 [W0 实施记录](W0_MEMORY_VAULT_CONTRACT.md)。W1 多 Memory 持久化尚未开始。
 
 ## 历史基础
 
