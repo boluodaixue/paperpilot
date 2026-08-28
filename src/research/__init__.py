@@ -6,6 +6,7 @@ from .agent_graph import (
     run_research_agent,
 )
 from .memory import MarkdownMemoryStore
+from .obsidian import build_obsidian_open_uri
 from .runtime import (
     ResearchRuntime,
     build_research_runtime,
@@ -71,6 +72,7 @@ __all__ = [
     "ResearchStatus",
     "ResearchTask",
     "ResearchWorkflowResult",
+    "build_obsidian_open_uri",
     "build_research_agent_graph",
     "build_research_runtime",
     "build_research_tools",

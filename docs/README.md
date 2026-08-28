@@ -33,6 +33,7 @@
 - [N6_OPTIONAL_REPORT_REVIEW.md](N6_OPTIONAL_REPORT_REVIEW.md)：默认关闭的单次 Red/Blue 报告后处理实现与验收结果。
 - [W0_MEMORY_VAULT_CONTRACT.md](W0_MEMORY_VAULT_CONTRACT.md)：长期 Memory/Vault、frontmatter、WikiLink 与路径安全契约的实现与验收结果。
 - [W1_MULTI_MEMORY_PERSISTENCE.md](W1_MULTI_MEMORY_PERSISTENCE.md)：多 Memory 创建、选择、隔离持久化、并发与 legacy 兼容的实现与验收结果。
+- [W2_OBSIDIAN_MINIMAL_INTEGRATION.md](W2_OBSIDIAN_MINIMAL_INTEGRATION.md)：安全 Obsidian URI、Web Memory 控件与 CLI 位置输出的实现与验收结果。
 
 ## 已清理文档
 
