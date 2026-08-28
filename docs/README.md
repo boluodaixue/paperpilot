@@ -35,6 +35,9 @@
 - [W1_MULTI_MEMORY_PERSISTENCE.md](W1_MULTI_MEMORY_PERSISTENCE.md)：多 Memory 创建、选择、隔离持久化、并发与 legacy 兼容的实现与验收结果。
 - [W2_OBSIDIAN_MINIMAL_INTEGRATION.md](W2_OBSIDIAN_MINIMAL_INTEGRATION.md)：安全 Obsidian URI、Web Memory 控件与 CLI 位置输出的实现与验收结果。
 - [W3_CONTINUE_RESEARCH_FROM_MEMORY.md](W3_CONTINUE_RESEARCH_FROM_MEMORY.md)：可重建 Markdown 检索、Research Brief 记忆上下文与同 Memory 继续研究的实现和验收结果。
+- [W4_MEMORY_QA_CONTROLLED_NOTES.md](W4_MEMORY_QA_CONTROLLED_NOTES.md)：当前 Memory 问答、带 WikiLink 引用、受控笔记提案与并发冲突保护的实现和验收结果。
+
+LLM Wiki + Obsidian 主线当前已完成 W0–W4；W5 资料导入与整理尚未开始。
 
 ## 已清理文档
 

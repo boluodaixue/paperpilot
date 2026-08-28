@@ -193,6 +193,46 @@ class MemoryDescriptor:
 
 
 @dataclass(frozen=True)
+class MemoryCitation:
+    """One exact selected-Memory citation attached by PaperPilot."""
+
+    relative_path: str
+    title: str
+    wikilink: str
+
+
+@dataclass(frozen=True)
+class MemoryAnswer:
+    """Transient answer grounded only in cited notes from one Memory."""
+
+    answer_id: str
+    memory_id: str
+    question: str
+    markdown: str
+    citations: tuple[MemoryCitation, ...]
+    insufficient_evidence: tuple[str, ...]
+
+
+@dataclass(frozen=True)
+class MemoryNoteProposal:
+    """Transient, validated proposal for one note and its Home update."""
+
+    proposal_id: str
+    answer_id: str
+    memory_id: str
+    note_id: str
+    title: str
+    target_path: str
+    markdown: str
+    wikilink: str
+    source_paths: tuple[str, ...]
+    home_path: str
+    home_content_hash: str
+    target_content_hash: str | None
+    home_markdown: str
+
+
+@dataclass(frozen=True)
 class ReportIssue:
     """One structured Red review finding about the final report."""
 

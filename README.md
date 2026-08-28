@@ -101,7 +101,7 @@ N6 只处理已经成功持久化的最终 Markdown 报告，由 `research.repor
 
 该能力不是新的 Research Agent 角色、RCS 或评分引擎，也不引入 claim-evidence 新模型或第二套存储。详细边界见 [N6 实施记录](docs/N6_OPTIONAL_REPORT_REVIEW.md)。
 
-下一主线已确认为 LLM Wiki + Obsidian：Obsidian 负责 Markdown 阅读、编辑和双链，PaperPilot 负责多 Memory、检索对话、受控写入和继续研究。默认使用一个 Vault 和多个长期 Memory，不自建复杂阅读器。W0–W3 已完成；W4 Memory 问答与受控新建笔记尚未开始。
+下一主线已确认为 LLM Wiki + Obsidian：Obsidian 负责 Markdown 阅读、编辑和双链，PaperPilot 负责多 Memory、检索对话、受控写入和继续研究。默认使用一个 Vault 和多个长期 Memory，不自建复杂阅读器。W0–W4 已完成；W5 资料导入与整理尚未开始。
 
 - [LLM Wiki + Obsidian 目标架构](docs/LLM_WIKI_OBSIDIAN_ARCHITECTURE.md)
 - [LLM Wiki + Obsidian 实施计划](docs/LLM_WIKI_OBSIDIAN_IMPLEMENTATION_PLAN.md)
@@ -109,6 +109,7 @@ N6 只处理已经成功持久化的最终 Markdown 报告，由 `research.repor
 - [W1 实施记录](docs/W1_MULTI_MEMORY_PERSISTENCE.md)
 - [W2 实施记录](docs/W2_OBSIDIAN_MINIMAL_INTEGRATION.md)
 - [W3 实施记录](docs/W3_CONTINUE_RESEARCH_FROM_MEMORY.md)
+- [W4 实施记录](docs/W4_MEMORY_QA_CONTROLLED_NOTES.md)
 
 ## 快速开始
 
@@ -142,6 +143,8 @@ python web/run.py
 1. 在 Obsidian 中选择“打开本地文件夹作为仓库”，手工打开 `configs/default.yaml` 中 `research.vault_root` 指向的目录；默认是项目下的 `memory/`。
 2. 如需按 Vault 名称生成链接，可在 `research` 下显式配置 `vault_name`，其值必须与 Obsidian 显示的 Vault 名称一致；省略时 PaperPilot 使用绝对路径 URI。
 3. Web 顶部可以选择或新建 Memory，再用“在 Obsidian 中打开”定位其 `Home.md`。PaperPilot 不安装或检测 Obsidian，也不写 `.obsidian/`；未安装 Obsidian 不影响研究和 Markdown 持久化。
+
+Web 还可以显式切换到“Memory 问答”，回答只使用当前 Memory 并提供可在 Obsidian 中打开的引用。选择“保存回答为笔记”后，PaperPilot 会先展示完整 Markdown 提案；只有用户确认后才新建笔记并受控更新对应 `Home.md`，外部编辑冲突不会被静默覆盖。
 
 ### 单次研究
 
@@ -192,6 +195,7 @@ deepresearch-agent/
 - [W1 实施记录](docs/W1_MULTI_MEMORY_PERSISTENCE.md)
 - [W2 实施记录](docs/W2_OBSIDIAN_MINIMAL_INTEGRATION.md)
 - [W3 实施记录](docs/W3_CONTINUE_RESEARCH_FROM_MEMORY.md)
+- [W4 实施记录](docs/W4_MEMORY_QA_CONTROLLED_NOTES.md)
 
 ## 明确不做
 
