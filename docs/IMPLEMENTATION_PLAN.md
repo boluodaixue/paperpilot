@@ -333,7 +333,7 @@ src/research/
 
 ### 状态
 
-W0–W5 已完成，W6 尚未开始。实施与验收结果见 [W0_MEMORY_VAULT_CONTRACT.md](W0_MEMORY_VAULT_CONTRACT.md)、[W1_MULTI_MEMORY_PERSISTENCE.md](W1_MULTI_MEMORY_PERSISTENCE.md)、[W2_OBSIDIAN_MINIMAL_INTEGRATION.md](W2_OBSIDIAN_MINIMAL_INTEGRATION.md)、[W3_CONTINUE_RESEARCH_FROM_MEMORY.md](W3_CONTINUE_RESEARCH_FROM_MEMORY.md)、[W4_MEMORY_QA_CONTROLLED_NOTES.md](W4_MEMORY_QA_CONTROLLED_NOTES.md) 和 [W5_CONTROLLED_IMPORTS.md](W5_CONTROLLED_IMPORTS.md)。
+W0–W6 已完成。实施与验收结果见 [W0_MEMORY_VAULT_CONTRACT.md](W0_MEMORY_VAULT_CONTRACT.md)、[W1_MULTI_MEMORY_PERSISTENCE.md](W1_MULTI_MEMORY_PERSISTENCE.md)、[W2_OBSIDIAN_MINIMAL_INTEGRATION.md](W2_OBSIDIAN_MINIMAL_INTEGRATION.md)、[W3_CONTINUE_RESEARCH_FROM_MEMORY.md](W3_CONTINUE_RESEARCH_FROM_MEMORY.md)、[W4_MEMORY_QA_CONTROLLED_NOTES.md](W4_MEMORY_QA_CONTROLLED_NOTES.md)、[W5_CONTROLLED_IMPORTS.md](W5_CONTROLLED_IMPORTS.md) 和 [W6_STABILIZATION_MIGRATION_AND_ENTRY.md](W6_STABILIZATION_MIGRATION_AND_ENTRY.md)。
 
 具体执行以 [LLM Wiki + Obsidian 实施计划](LLM_WIKI_OBSIDIAN_IMPLEMENTATION_PLAN.md) 为唯一阶段顺序和验收边界：
 
@@ -347,7 +347,7 @@ W0–W5 已完成，W6 尚未开始。实施与验收结果见 [W0_MEMORY_VAULT_
 
 该主线不改变 Research AgentGraph，不新增第二套存储，不开发复杂 Markdown 阅读器。
 
-W5 已在该边界内完成 PDF/UTF-8 文本、粘贴文本和显式 URL 的 Web 导入：原始内容进入 `attachments/`，可定位提取进入 `imports/`，policy 只生成受控整理提案，用户确认后才在单 PaperPilot 进程的共享 Vault `RLock` 内成组提交。导入使用 `source_ref + locator + content_hash` 精确三元组去重，并保护路径、WikiLink、Markdown、SSRF、Home 并发修改和共享 attachment 回滚边界。W5 不引入 journal、bundle、cross-process lock、Repository、索引或新 Agent；CLI 导入收口、迁移、文件树、内置阅读器和监控均未实现。
+W6 已在该边界内完成入口与迁移收口：CLI/Web 的真实写入路径要求显式 managed Memory；Web session 只新增 nullable `memory_id` 并固定首次绑定；虚拟 `M-legacy` 只读；迁移用完整零写 preview、二次源快照、完整 staging 校验和单次同卷目录 rename 发布 managed 副本，legacy 根文件及旧 Chat manifest 保持不变。Memory trace 与固定五项离线评测也已补齐。W6 没有引入 journal、bundle、cross-process lock、Repository、持久化索引、新 Agent、第二套存储或内置阅读器。
 
 ## 12. 测试顺序
 
@@ -376,4 +376,4 @@ N0 文档收敛
 → W0–W6 LLM Wiki + Obsidian
 ```
 
-N6 与 W0–W5 已完成，W6 尚未开始。不得从该主线隐式扩展新的 Agent 角色、图/向量数据库、复杂阅读器、第二套存储或未经确认的自动写入行为。W6 也不自动承诺为同一 Vault 的多 PaperPilot 进程增加 cross-process lock、journal 或 bundle。
+N0–N6 与 W0–W6 已全部完成。该既定主线没有后续隐含阶段；不得据此扩展新的 Agent 角色、图/向量数据库、复杂阅读器、第二套存储、未经确认的自动写入、cross-process lock、journal 或 bundle。

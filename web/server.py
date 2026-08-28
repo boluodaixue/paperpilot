@@ -45,6 +45,7 @@ from src.research.models import (  # noqa: E402
 )
 from src.research.obsidian import build_obsidian_open_uri  # noqa: E402
 from src.research.runtime import ResearchRuntime, build_research_runtime, load_config  # noqa: E402
+from src.research.vault import LEGACY_MEMORY_ID  # noqa: E402
 
 STATIC_DIR = Path(__file__).resolve().parent / "static"
 _config = load_config()
@@ -134,9 +135,10 @@ class ResearchTask:
 
 _TASKS: dict[str, ResearchTask] = {}
 _RUN_SEMAPHORE = asyncio.Semaphore(1)
-_MEMORY_ANSWERS: dict[str, MemoryAnswer] = {}
-_MEMORY_NOTE_PROPOSALS: dict[str, MemoryNoteProposal] = {}
-_MEMORY_IMPORT_PROPOSALS: dict[str, MemoryImportProposal] = {}
+_MEMORY_ANSWERS: dict[str, tuple[str, MemoryAnswer]] = {}
+_MEMORY_NOTE_PROPOSALS: dict[str, tuple[str, MemoryNoteProposal]] = {}
+_MEMORY_IMPORT_PROPOSALS: dict[str, tuple[str, MemoryImportProposal]] = {}
+_LEGACY_MIGRATION_PROPOSALS: dict[str, Mapping[str, object]] = {}
 
 _MAX_MEMORY_IMPORT_BYTES = 10 * 1024 * 1024
 _MAX_MEMORY_IMPORT_BASE64_CHARS = ((_MAX_MEMORY_IMPORT_BYTES + 2) // 3) * 4
@@ -158,18 +160,28 @@ class MemoryCreateRequest(BaseModel):
     title: str
 
 
+class LegacyMigrationRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    title: str
+    target_memory_id: str
+
+
 class MemoryAnswerRequest(BaseModel):
     question: str
+    session_id: str | None = None
 
 
 class MemoryNoteProposalRequest(BaseModel):
     answer_id: str
+    session_id: str | None = None
 
 
 class MemoryImportProposalRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     kind: Literal["file", "text", "url"]
+    session_id: str | None = None
     file_name: str | None = None
     media_type: str | None = None
     size_bytes: int | None = None
@@ -204,6 +216,69 @@ def _active_task(session_id: str) -> ResearchTask | None:
         and task.status in {"waiting_confirmation", "running"}
     ]
     return max(matches, key=lambda item: item.created_at) if matches else None
+
+
+def _session_id(value: str | None) -> str:
+    return (value or "").strip() or f"web-{uuid.uuid4().hex[:8]}"
+
+
+def _session_memory(
+    session_id: str,
+    requested_memory_id: str | None,
+) -> str | None:
+    """Return one durable session binding and reject every later switch."""
+    store = get_chat_store()
+    existing = store.get_memory_binding(session_id)
+    if existing is not None:
+        if requested_memory_id is not None and requested_memory_id != existing:
+            raise HTTPException(
+                status_code=409,
+                detail="该会话已绑定到另一个 Memory",
+            )
+        _validate_memory_option(existing)
+        return existing
+
+    if requested_memory_id is None:
+        # A W6-capable production Runtime exposes Memory options and must never
+        # turn an omitted selection into a writable legacy-root session.  The
+        # fallback only keeps older Runtime adapters usable by pre-W6 callers.
+        if hasattr(get_research_runtime(), "get_memory_option"):
+            raise HTTPException(
+                status_code=400,
+                detail="请先明确选择一个 managed Memory",
+            )
+        return None
+    if requested_memory_id is not None:
+        _validate_memory_option(requested_memory_id)
+    try:
+        return store.bind_memory(session_id, requested_memory_id)
+    except ValueError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+
+def _validate_memory_option(memory_id: str) -> None:
+    runtime = get_research_runtime()
+    try:
+        if hasattr(runtime, "get_memory_option"):
+            runtime.get_memory_option(memory_id)
+        elif memory_id != LEGACY_MEMORY_ID:
+            runtime.get_memory(memory_id)
+    except (FileNotFoundError, ValueError) as exc:
+        raise HTTPException(
+            status_code=404,
+            detail=f"Memory 不存在或不可读取: {memory_id}",
+        ) from exc
+
+
+def _require_writable_memory(memory_id: str | None) -> str:
+    if memory_id is None:
+        raise HTTPException(status_code=400, detail="请先明确选择一个 Memory")
+    if memory_id == LEGACY_MEMORY_ID:
+        raise HTTPException(
+            status_code=409,
+            detail="M-legacy 为只读；请先显式迁移或选择 managed Memory",
+        )
+    return memory_id
 
 
 def _interrupt_brief(state: dict[str, Any]) -> dict[str, Any]:
@@ -271,6 +346,9 @@ def _memory_response(
     home_absolute_path = (vault_root / home_relative_path).resolve(strict=False)
     return {
         **asdict(descriptor),
+        "read_only": False,
+        "can_migrate": False,
+        "file_count": None,
         "home_relative_path": home_relative_path,
         "home_absolute_path": str(home_absolute_path),
         "obsidian_uri": build_obsidian_open_uri(
@@ -278,6 +356,20 @@ def _memory_response(
             home_relative_path,
             vault_name=_configured_vault_name(),
         ),
+    }
+
+
+def _memory_option_response(
+    runtime: ResearchRuntime,
+    option: Mapping[str, Any],
+) -> dict[str, Any]:
+    if option.get("memory_id") != LEGACY_MEMORY_ID:
+        return _memory_response(runtime, runtime.get_memory(str(option["memory_id"])))
+    return {
+        **dict(option),
+        "home_relative_path": None,
+        "home_absolute_path": None,
+        "obsidian_uri": None,
     }
 
 
@@ -509,24 +601,32 @@ async def align_research(req: AlignmentRequest) -> dict[str, Any]:
             raise HTTPException(status_code=409, detail="task 与 memory 不匹配")
         if task.status != "waiting_confirmation":
             raise HTTPException(status_code=409, detail="任务当前不等待方案修改")
+        if task.memory_id is not None:
+            _require_writable_memory(task.memory_id)
+        bound_memory_id = _session_memory(task.session_id, task.memory_id)
+        if bound_memory_id != task.memory_id:
+            raise HTTPException(status_code=409, detail="task 与 session Memory 不匹配")
         store.add(task.session_id, "user", "chat", message)
         try:
             state = await runtime.review(task.thread_id, "modify", feedback=message)
         except Exception as exc:
             raise HTTPException(status_code=500, detail=f"方案修改失败: {exc}") from exc
     else:
-        session_id = (req.session_id or "").strip() or f"web-{uuid.uuid4().hex[:8]}"
+        session_id = _session_id(req.session_id)
         if _active_task(session_id):
             raise HTTPException(status_code=409, detail="该会话已有待确认或运行中的研究")
+        memory_id = _session_memory(session_id, req.memory_id)
+        if memory_id is not None:
+            _require_writable_memory(memory_id)
         thread_id = runtime.new_thread_id()
-        task = ResearchTask(thread_id, session_id, message, req.memory_id)
+        task = ResearchTask(thread_id, session_id, message, memory_id)
         _TASKS[thread_id] = task
         store.add(session_id, "user", "chat", message)
         try:
             state = await runtime.start(
                 message,
                 thread_id=thread_id,
-                memory_id=req.memory_id,
+                memory_id=memory_id,
             )
         except Exception as exc:
             task.status, task.error = "error", str(exc)
@@ -548,6 +648,10 @@ async def start_research(req: ResearchRequest) -> dict[str, Any]:
         raise HTTPException(status_code=409, detail="task 与 session 不匹配")
     if task.status != "waiting_confirmation":
         raise HTTPException(status_code=409, detail="任务当前不能确认启动")
+    if task.memory_id is not None:
+        _require_writable_memory(task.memory_id)
+    if _session_memory(task.session_id, task.memory_id) != task.memory_id:
+        raise HTTPException(status_code=409, detail="task 与 session Memory 不匹配")
     task.status = "running"
     await task.publish({
         "type": "confirmed", "thread_id": task.thread_id,
@@ -604,9 +708,12 @@ async def task_result(task_id: str) -> dict[str, Any]:
 @app.get("/api/sessions/{sid}/active-task")
 async def session_active_task(sid: str) -> dict[str, Any]:
     task = _active_task(sid)
-    return ({"task_id": None, "memory_id": None, "status": "idle"} if task is None else
+    memory_id = get_chat_store().get_memory_binding(sid)
+    return ({"task_id": None, "memory_id": memory_id,
+             "status": "idle"} if task is None else
             {"task_id": task.task_id, "thread_id": task.thread_id,
-             "memory_id": task.memory_id, "status": task.status})
+             "memory_id": task.memory_id,
+             "status": task.status})
 
 
 @app.get("/api/sessions")
@@ -617,6 +724,11 @@ async def list_sessions() -> list[dict[str, Any]]:
 @app.get("/api/memories")
 async def list_memories() -> list[dict[str, Any]]:
     runtime = get_research_runtime()
+    if hasattr(runtime, "list_memory_options"):
+        return [
+            _memory_option_response(runtime, item)
+            for item in runtime.list_memory_options()
+        ]
     return [_memory_response(runtime, item) for item in runtime.list_memories()]
 
 
@@ -636,22 +748,104 @@ async def create_memory(req: MemoryCreateRequest) -> dict[str, Any]:
     return _memory_response(runtime, descriptor)
 
 
+@app.post("/api/legacy-memory/migration-proposals")
+async def prepare_legacy_memory_migration(
+    req: LegacyMigrationRequest,
+) -> dict[str, Any]:
+    title = (req.title or "").strip()
+    target_memory_id = (req.target_memory_id or "").strip()
+    if not title or not target_memory_id:
+        raise HTTPException(
+            status_code=400,
+            detail="迁移标题和目标 memory_id 不能为空",
+        )
+    runtime = get_research_runtime()
+    if not hasattr(runtime, "prepare_legacy_memory_migration"):
+        raise HTTPException(status_code=501, detail="当前 Runtime 不支持 legacy 迁移")
+    try:
+        proposal = runtime.prepare_legacy_memory_migration(
+            title,
+            target_memory_id,
+        )
+    except FileNotFoundError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except FileExistsError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    proposal_id = str(proposal.get("proposal_id") or "")
+    if not proposal_id:
+        raise RuntimeError("legacy migration proposal has no identity")
+    existing = _LEGACY_MIGRATION_PROPOSALS.get(proposal_id)
+    if existing is not None and dict(existing) != dict(proposal):
+        raise RuntimeError("legacy migration proposal id collision")
+    _LEGACY_MIGRATION_PROPOSALS[proposal_id] = proposal
+    return {
+        **dict(proposal),
+        "files": [dict(item) for item in proposal["files"]],
+        "status": "proposal",
+        "switch_is_explicit": True,
+    }
+
+
+@app.post("/api/legacy-memory/migration-proposals/{proposal_id}/confirm")
+async def confirm_legacy_memory_migration(proposal_id: str) -> dict[str, Any]:
+    proposal = _LEGACY_MIGRATION_PROPOSALS.get(proposal_id)
+    if proposal is None:
+        raise HTTPException(
+            status_code=404,
+            detail=f"legacy migration proposal 不存在: {proposal_id}",
+        )
+    runtime = get_research_runtime()
+    try:
+        descriptor = runtime.commit_legacy_memory_migration(proposal)
+    except MemoryWriteConflictError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    except FileExistsError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    _LEGACY_MIGRATION_PROPOSALS.pop(proposal_id, None)
+    return {
+        **_memory_response(runtime, descriptor),
+        "status": "committed",
+        "source_memory_id": LEGACY_MEMORY_ID,
+        "switch_is_explicit": True,
+    }
+
+
+@app.delete("/api/legacy-memory/migration-proposals/{proposal_id}")
+async def cancel_legacy_memory_migration(proposal_id: str) -> dict[str, Any]:
+    proposal = _LEGACY_MIGRATION_PROPOSALS.pop(proposal_id, None)
+    if proposal is None:
+        raise HTTPException(
+            status_code=404,
+            detail=f"legacy migration proposal 不存在: {proposal_id}",
+        )
+    return {
+        "status": "cancelled",
+        "proposal_id": proposal_id,
+        "source_memory_id": LEGACY_MEMORY_ID,
+    }
+
+
 @app.post("/api/memories/{memory_id}/import-proposals")
 async def prepare_memory_import(
     memory_id: str,
     req: MemoryImportProposalRequest,
 ) -> dict[str, Any]:
+    session_id = _session_id(req.session_id)
+    bound_memory_id = _session_memory(session_id, memory_id)
+    _require_writable_memory(bound_memory_id)
+    if bound_memory_id != memory_id:
+        raise HTTPException(status_code=409, detail="session 与 memory 不匹配")
     runtime = get_research_runtime()
-    try:
-        runtime.get_memory(memory_id)
-    except (FileNotFoundError, ValueError) as exc:
-        raise HTTPException(status_code=404, detail=f"Memory 不存在: {memory_id}") from exc
 
     provided = set(req.model_fields_set)
     allowed = {
-        "file": {"kind", "file_name", "media_type", "size_bytes", "content_base64"},
-        "text": {"kind", "title", "text"},
-        "url": {"kind", "url"},
+        "file": {"kind", "session_id", "file_name", "media_type", "size_bytes", "content_base64"},
+        "text": {"kind", "session_id", "title", "text"},
+        "url": {"kind", "session_id", "url"},
     }[req.kind]
     required = {
         "file": {"kind", "file_name", "size_bytes", "content_base64"},
@@ -707,14 +901,19 @@ async def prepare_memory_import(
     if isinstance(result, MemoryImportDuplicate):
         if result.memory_id != memory_id:
             raise RuntimeError("Memory import duplicate does not match the request")
-        return _import_preview_response(runtime, result)
+        payload = _import_preview_response(runtime, result)
+        payload["session_id"] = session_id
+        return payload
     if not isinstance(result, MemoryImportProposal) or result.memory_id != memory_id:
         raise RuntimeError("Memory import proposal does not match the request")
     existing = _MEMORY_IMPORT_PROPOSALS.get(result.proposal_id)
-    if existing is not None and existing != result:
+    entry = (session_id, result)
+    if existing is not None and existing != entry:
         raise RuntimeError("Memory import proposal id collision")
-    _MEMORY_IMPORT_PROPOSALS[result.proposal_id] = result
-    return _import_preview_response(runtime, result)
+    _MEMORY_IMPORT_PROPOSALS[result.proposal_id] = entry
+    payload = _import_preview_response(runtime, result)
+    payload["session_id"] = session_id
+    return payload
 
 
 @app.post("/api/memories/{memory_id}/import-proposals/{proposal_id}/confirm")
@@ -722,12 +921,16 @@ async def confirm_memory_import(
     memory_id: str,
     proposal_id: str,
 ) -> dict[str, Any]:
-    proposal = _MEMORY_IMPORT_PROPOSALS.get(proposal_id)
-    if proposal is None:
+    entry = _MEMORY_IMPORT_PROPOSALS.get(proposal_id)
+    if entry is None:
         raise HTTPException(
             status_code=404,
             detail=f"Memory import proposal 不存在: {proposal_id}",
         )
+    session_id, proposal = entry
+    _require_writable_memory(memory_id)
+    if _session_memory(session_id, memory_id) != memory_id:
+        raise HTTPException(status_code=409, detail="session 与 memory 不匹配")
     if proposal.memory_id != memory_id:
         raise HTTPException(status_code=409, detail="proposal 与 memory 不匹配")
     runtime = get_research_runtime()
@@ -739,6 +942,7 @@ async def confirm_memory_import(
     if payload["memory_id"] != memory_id:
         raise RuntimeError("Memory import commit does not match the proposal")
     _MEMORY_IMPORT_PROPOSALS.pop(proposal_id, None)
+    payload["session_id"] = session_id
     return payload
 
 
@@ -747,12 +951,16 @@ async def cancel_memory_import(
     memory_id: str,
     proposal_id: str,
 ) -> dict[str, Any]:
-    proposal = _MEMORY_IMPORT_PROPOSALS.get(proposal_id)
-    if proposal is None:
+    entry = _MEMORY_IMPORT_PROPOSALS.get(proposal_id)
+    if entry is None:
         raise HTTPException(
             status_code=404,
             detail=f"Memory import proposal 不存在: {proposal_id}",
         )
+    session_id, proposal = entry
+    _require_writable_memory(memory_id)
+    if _session_memory(session_id, memory_id) != memory_id:
+        raise HTTPException(status_code=409, detail="session 与 memory 不匹配")
     if proposal.memory_id != memory_id:
         raise HTTPException(status_code=409, detail="proposal 与 memory 不匹配")
     _MEMORY_IMPORT_PROPOSALS.pop(proposal_id, None)
@@ -771,11 +979,10 @@ async def answer_memory(
     question = (req.question or "").strip()
     if not question:
         raise HTTPException(status_code=400, detail="Memory 问题不能为空")
+    session_id = _session_id(req.session_id)
+    if _session_memory(session_id, memory_id) != memory_id:
+        raise HTTPException(status_code=409, detail="session 与 memory 不匹配")
     runtime = get_research_runtime()
-    try:
-        runtime.get_memory(memory_id)
-    except (FileNotFoundError, ValueError) as exc:
-        raise HTTPException(status_code=404, detail=f"Memory 不存在: {memory_id}") from exc
     answer = await runtime.answer_memory(memory_id, question)
     if (
         not isinstance(answer, MemoryAnswer)
@@ -784,7 +991,8 @@ async def answer_memory(
     ):
         raise RuntimeError("Memory answer does not match the request")
     payload = _answer_response(runtime, answer)
-    _MEMORY_ANSWERS[answer.answer_id] = answer
+    payload["session_id"] = session_id
+    _MEMORY_ANSWERS[answer.answer_id] = (session_id, answer)
     return payload
 
 
@@ -796,9 +1004,16 @@ async def propose_memory_note(
     answer_id = (req.answer_id or "").strip()
     if not answer_id:
         raise HTTPException(status_code=400, detail="answer_id 不能为空")
-    answer = _MEMORY_ANSWERS.get(answer_id)
-    if answer is None:
+    entry = _MEMORY_ANSWERS.get(answer_id)
+    if entry is None:
         raise HTTPException(status_code=404, detail=f"Memory answer 不存在: {answer_id}")
+    answer_session_id, answer = entry
+    requested_session_id = (req.session_id or "").strip()
+    if requested_session_id and requested_session_id != answer_session_id:
+        raise HTTPException(status_code=409, detail="answer 与 session 不匹配")
+    if _session_memory(answer_session_id, memory_id) != memory_id:
+        raise HTTPException(status_code=409, detail="session 与 memory 不匹配")
+    _require_writable_memory(memory_id)
     if answer.memory_id != memory_id:
         raise HTTPException(status_code=409, detail="answer 与 memory 不匹配")
     proposal = await get_research_runtime().propose_memory_note(answer)
@@ -808,21 +1023,30 @@ async def propose_memory_note(
         or proposal.memory_id != memory_id
     ):
         raise RuntimeError("Memory note proposal does not match the answer")
-    _MEMORY_NOTE_PROPOSALS[proposal.proposal_id] = proposal
-    return asdict(proposal)
+    _MEMORY_NOTE_PROPOSALS[proposal.proposal_id] = (answer_session_id, proposal)
+    payload = asdict(proposal)
+    payload["session_id"] = answer_session_id
+    return payload
 
 
 @app.post("/api/memory-note-proposals/{proposal_id}/confirm")
 async def confirm_memory_note(proposal_id: str) -> dict[str, Any]:
-    proposal = _MEMORY_NOTE_PROPOSALS.get(proposal_id)
-    if proposal is None:
+    entry = _MEMORY_NOTE_PROPOSALS.get(proposal_id)
+    if entry is None:
         raise HTTPException(
             status_code=404,
             detail=f"Memory note proposal 不存在: {proposal_id}",
         )
-    answer = _MEMORY_ANSWERS.get(proposal.answer_id)
-    if answer is None:
+    session_id, proposal = entry
+    _require_writable_memory(proposal.memory_id)
+    if _session_memory(session_id, proposal.memory_id) != proposal.memory_id:
+        raise HTTPException(status_code=409, detail="session 与 memory 不匹配")
+    answer_entry = _MEMORY_ANSWERS.get(proposal.answer_id)
+    if answer_entry is None:
         raise HTTPException(status_code=409, detail="proposal 的原始 answer 已不可用")
+    answer_session_id, answer = answer_entry
+    if answer_session_id != session_id:
+        raise HTTPException(status_code=409, detail="proposal 与 session 不匹配")
     if answer.answer_id != proposal.answer_id or answer.memory_id != proposal.memory_id:
         raise HTTPException(status_code=409, detail="proposal 与 answer 不匹配")
     try:

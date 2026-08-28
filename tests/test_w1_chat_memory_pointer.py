@@ -160,25 +160,14 @@ def test_modify_rejects_explicit_memory_switch_but_allows_omission(web_client):
     assert revised.json()["memory_id"] == first.memory_id
 
 
-def test_legacy_alignment_without_memory_id_remains_supported(web_client):
+def test_w6_web_entry_rejects_legacy_alignment_without_memory_id(web_client):
     client, _runtime = web_client
     aligned = client.post("/api/alignment", json={
         "session_id": "legacy-memory",
         "message": "Legacy research",
     })
-    assert aligned.status_code == 200
-    assert aligned.json()["memory_id"] is None
-
-    task_id = aligned.json()["task_id"]
-    started = client.post("/api/research", json={
-        "task_id": task_id,
-        "session_id": "legacy-memory",
-    })
-    assert started.status_code == 200
-    assert started.json()["memory_id"] is None
-    result = _wait_result(client, task_id)
-    assert result["memory_id"] is None
-    assert result["manifest"]["report_path"].startswith("reports/")
-
-    raw = server.get_chat_store().get_messages("legacy-memory")[-1]
-    assert json.loads(raw["content"])["memory_id"] is None
+    assert aligned.status_code == 400
+    assert "managed Memory" in aligned.json()["detail"]
+    assert server.get_chat_store().get_memory_binding("legacy-memory") is None
+    assert server.get_chat_store().get_messages("legacy-memory") == []
+    assert not server._TASKS

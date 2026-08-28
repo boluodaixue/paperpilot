@@ -17,6 +17,7 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 from evaluation.benchmarks.hotpotqa import HotpotQABenchmark
+from evaluation.benchmarks.memory_wiki import evaluate_memory_wiki
 from evaluation.benchmarks.research_bench import ResearchBench
 from evaluation.report import EvaluationReport
 from src.research.models import ResearchWorkflowResult
@@ -194,7 +195,11 @@ def evaluate_hotpotqa(
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="PaperPilot benchmark evaluation")
-    parser.add_argument("--benchmark", choices=["research_bench", "hotpotqa"], required=True)
+    parser.add_argument(
+        "--benchmark",
+        choices=["research_bench", "hotpotqa", "memory_wiki"],
+        required=True,
+    )
     parser.add_argument("--num-questions", "--num_questions", type=int, default=20)
     parser.add_argument("--domain", default=None)
     parser.add_argument("--use-mock", "--use_mock", action="store_true")
@@ -210,7 +215,9 @@ def main() -> None:
     setup_logging(args.log_level)
     config = load_config(args.config)
 
-    if args.benchmark == "research_bench":
+    if args.benchmark == "memory_wiki":
+        report = evaluate_memory_wiki()
+    elif args.benchmark == "research_bench":
         report = evaluate_research_bench(args.num_questions, args.domain, config)
     else:
         report = evaluate_hotpotqa(args.num_questions, config, use_mock=args.use_mock)

@@ -10,8 +10,15 @@ from typing import Mapping
 
 import yaml
 
+from ..utils.tracing import trace_block, trace_context
 from .memory import MarkdownMemoryStore
-from .vault import memory_relative_path, resolve_vault_markdown_path
+from .vault import (
+    LEGACY_MEMORY_ID,
+    LEGACY_ROOT_DIRECTORIES,
+    memory_relative_path,
+    resolve_vault_markdown_path,
+    scan_legacy_memory_markdown,
+)
 
 
 _H1 = re.compile(r"^#\s+(.+?)\s*$", re.MULTILINE)
@@ -196,6 +203,8 @@ class MarkdownMemoryIndex:
         self._notes: dict[str, tuple[_IndexedNote, ...]] = {}
 
     def _markdown_paths(self, memory_id: str) -> tuple[tuple[str, Path], ...]:
+        if memory_id == LEGACY_MEMORY_ID:
+            return scan_legacy_memory_markdown(self.memory_store.root)
         self.memory_store.get_memory(memory_id)
         relative_root = memory_relative_path(memory_id).rstrip("/")
         memory_root = (self.memory_store.root / relative_root).resolve(strict=False)
@@ -296,6 +305,21 @@ class MarkdownMemoryIndex:
                 markdown_target = target
             else:
                 markdown_target = f"{target}.md"
+            if memory_id == LEGACY_MEMORY_ID:
+                if "/" not in markdown_target:
+                    linked.update(
+                        notes_by_stem.get(PurePosixPath(target).stem.casefold(), ())
+                    )
+                    continue
+                parts = PurePosixPath(markdown_target).parts
+                if (
+                    ".." not in parts
+                    and parts
+                    and parts[0] in LEGACY_ROOT_DIRECTORIES
+                    and markdown_target in notes_by_path
+                ):
+                    linked.add(markdown_target)
+                continue
             if markdown_target.startswith("Memories/"):
                 candidate = markdown_target
             elif "/" in markdown_target:
@@ -323,55 +347,86 @@ class MarkdownMemoryIndex:
             or not 1 <= limit <= 10
         ):
             raise ValueError("limit must be an integer between 1 and 10")
-        self.rebuild(memory_id)
-        terms = _query_terms(query)
-        if not terms:
-            return ()
+        trace_metadata = {"memory_id": memory_id, "limit": limit}
+        with trace_context(
+            trace_name="paperpilot.memory.retrieval",
+            tags=["paperpilot", "memory", "retrieval"],
+            metadata=trace_metadata,
+        ):
+            with trace_block(
+                "memory.search",
+                run_type="retriever",
+                inputs=trace_metadata,
+                tags=["paperpilot", "memory", "retrieval"],
+            ) as observation:
+                self.rebuild(memory_id)
+                terms = _query_terms(query)
+                results: tuple[MemorySearchHit, ...] = ()
+                if terms:
+                    notes = self._notes[memory_id]
+                    notes_by_path = {note.hit.relative_path: note for note in notes}
+                    stems: dict[str, list[str]] = {}
+                    for note in notes:
+                        stems.setdefault(
+                            Path(note.hit.relative_path).stem.casefold(),
+                            [],
+                        ).append(note.hit.relative_path)
+                    notes_by_stem = {
+                        key: tuple(sorted(value)) for key, value in stems.items()
+                    }
+                    links = {
+                        note.hit.relative_path: self._linked_paths(
+                            note,
+                            notes_by_path,
+                            notes_by_stem,
+                            memory_id,
+                        )
+                        for note in notes
+                    }
+                    scores = {
+                        note.hit.relative_path: self._text_score(note, terms)
+                        for note in notes
+                    }
+                    seeds = {path for path, score in scores.items() if score > 0}
+                    for seed in seeds:
+                        neighbors = set(links[seed])
+                        neighbors.update(
+                            path for path, targets in links.items() if seed in targets
+                        )
+                        for neighbor in neighbors:
+                            scores[neighbor] = max(scores[neighbor], 3)
 
-        notes = self._notes[memory_id]
-        notes_by_path = {note.hit.relative_path: note for note in notes}
-        stems: dict[str, list[str]] = {}
-        for note in notes:
-            stems.setdefault(Path(note.hit.relative_path).stem.casefold(), []).append(
-                note.hit.relative_path
-            )
-        notes_by_stem = {key: tuple(sorted(value)) for key, value in stems.items()}
-        links = {
-            note.hit.relative_path: self._linked_paths(
-                note,
-                notes_by_path,
-                notes_by_stem,
-                memory_id,
-            )
-            for note in notes
-        }
-
-        scores = {
-            note.hit.relative_path: self._text_score(note, terms)
-            for note in notes
-        }
-        seeds = {path for path, score in scores.items() if score > 0}
-        if not seeds:
-            return ()
-        for seed in seeds:
-            neighbors = set(links[seed])
-            neighbors.update(path for path, targets in links.items() if seed in targets)
-            for neighbor in neighbors:
-                scores[neighbor] = max(scores[neighbor], 3)
-
-        results: list[MemorySearchHit] = []
-        for path, score in scores.items():
-            if score <= 0:
-                continue
-            note = notes_by_path[path]
-            summary = (
-                _matching_summary(note.body, note.hit.title, terms)
-                if path in seeds
-                else note.hit.summary
-            )
-            results.append(replace(note.hit, score=score, summary=summary))
-        results.sort(key=lambda hit: (-hit.score, hit.relative_path.casefold(), hit.relative_path))
-        return tuple(results[:limit])
+                    ranked: list[MemorySearchHit] = []
+                    for path, score in scores.items():
+                        if score <= 0:
+                            continue
+                        note = notes_by_path[path]
+                        summary = (
+                            _matching_summary(note.body, note.hit.title, terms)
+                            if path in seeds
+                            else note.hit.summary
+                        )
+                        ranked.append(replace(note.hit, score=score, summary=summary))
+                    ranked.sort(
+                        key=lambda hit: (
+                            -hit.score,
+                            hit.relative_path.casefold(),
+                            hit.relative_path,
+                        )
+                    )
+                    results = tuple(ranked[:limit])
+                observation.add_output(
+                    {
+                        "memory_id": memory_id,
+                        "query_term_count": len(terms),
+                        "hit_count": len(results),
+                        "retrieved_files": [
+                            {"path": hit.relative_path, "score": hit.score}
+                            for hit in results
+                        ],
+                    }
+                )
+                return results
 
 
 __all__ = ["MarkdownMemoryIndex", "MemorySearchHit"]

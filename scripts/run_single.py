@@ -15,6 +15,7 @@ if str(PROJECT_ROOT) not in sys.path:
 from scripts._workflow_cli import (
     UserCancelled,
     format_result_locations,
+    require_memory,
     run_reviewed_workflow,
     vault_name_from_config,
 )
@@ -27,11 +28,15 @@ async def _run(args: argparse.Namespace) -> str:
     runtime = build_research_runtime(config=config)
     thread_id = args.thread_id or runtime.new_thread_id()
     try:
+        memory_id = require_memory(
+            runtime,
+            getattr(args, "memory_id", None),
+        )
         result = await run_reviewed_workflow(
             runtime,
             args.query,
             thread_id=thread_id,
-            memory_id=getattr(args, "memory_id", None),
+            memory_id=memory_id,
             auto_confirm=args.yes,
         )
         return format_result_locations(
@@ -50,8 +55,8 @@ def main() -> None:
     parser.add_argument("--thread-id", default=None, help="Optional root thread identity")
     parser.add_argument(
         "--memory-id",
-        default=None,
-        help="Optional existing Memory ID for this research result",
+        required=True,
+        help="Required explicit managed Memory ID for this research result",
     )
     parser.add_argument(
         "--yes",

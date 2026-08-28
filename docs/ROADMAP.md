@@ -4,7 +4,7 @@
 
 ## 当前判断
 
-N0–N6 与 LLM Wiki + Obsidian 的 W0–W5 已完成。CLI、Web 和评测继续进入同一个 Research Workflow；旧 Manager / Planner / DAG / AgentPool / Evidence Graph 链路已经删除。W5 只在 Web 中增加当前 Memory 的 PDF/文本/显式 URL 导入、受控整理提案和确认后成组写入，没有改变 Research AgentGraph、Research Workflow、fork、递归、checkpointer、Chat Store 或 N6 Red/Blue。W6 尚未开始。
+N0–N6 与 LLM Wiki + Obsidian 的 W0–W6 已完成。CLI、Web 和评测继续进入同一个 Research Workflow；旧 Manager / Planner / DAG / AgentPool / Evidence Graph 链路已经删除。W6 只收口 Memory 入口、会话绑定、legacy 只读迁移、可观测性和固定离线评测，没有改变 Research AgentGraph、Research Workflow、fork、递归、checkpointer 或 N6 Red/Blue，也没有引入第二套知识存储。
 
 ## 进度
 
@@ -23,7 +23,7 @@ N0–N6 与 LLM Wiki + Obsidian 的 W0–W5 已完成。CLI、Web 和评测继�
 | W3 基于旧 Memory 继续研究 | ✅ | 旧笔记进入 Research Brief，新报告回写同一 Memory且保留历史 |
 | W4 Memory 问答与受控新建笔记 | ✅ | 带可打开引用的当前 Memory 回答，确认后才新建笔记并更新 Home |
 | W5 资料导入与整理 | ✅ | file/PDF/text/显式 URL 生成受控提案，确认后写入 attachment/import/note 并线性化 Home |
-| W6 稳定化、迁移与入口收口 | 📝 | 尚未开始；按已确认计划单独实施和验收 |
+| W6 稳定化、迁移与入口收口 | ✅ | CLI/Web 固定 Memory、legacy 显式原子发布、Memory trace 与固定离线评测完成 |
 
 ## N0 已确定的架构决策
 
@@ -189,7 +189,20 @@ W0 在不改变 N1–N6 主链的前提下完成了长期 Memory/Vault 基础：
 
 W5 没有实现 CLI 导入收口、legacy 迁移、文件树、内置阅读器、文件系统监控、Repository、持久化索引或新 Agent。W5 不引入 journal、bundle 或 cross-process lock，不保证多 PaperPilot 进程同时写同一 Vault；W6 也不因此自动承诺扩展该范围。
 
-详见 [W5 实施记录](W5_CONTROLLED_IMPORTS.md)。W6 尚未开始。
+详见 [W5 实施记录](W5_CONTROLLED_IMPORTS.md)。
+
+## W6 已完成
+
+- CLI/Web 的真实写入入口统一通过 `ResearchRuntime` 校验显式 managed Memory；单次 CLI、REPL 和 Web 不再把缺省选择写入 legacy 根目录；
+- Web session 只在 `session_meta` 增加 nullable `memory_id`，首次显式绑定后不可切换；历史报告不再被用来推断会话 Memory；
+- 根目录 `reports/evidence/sources` 作为虚拟 `M-legacy` 安全扫描和问答，研究、笔记、导入与 managed 写入均拒绝；
+- CLI/Web 的 legacy 迁移先显示 Home 和所有转换 Markdown 的完整零写 preview，再在二次源快照和完整 staging 校验后用一次目录 rename 发布；根文件、旧 manifest 和当前 session 绑定保持不变；
+- Langfuse 补齐 `memory_id`、检索文件/分数和写入路径/状态，且不记录问题、正文或附件字节；
+- 固定离线评测真实覆盖检索命中、引用完整、无依据拒答、受控写入和继续研究，`5/5 passed`；
+- W6 专项 `39 passed, 1 warning`，原 N1–N6 回归 `160 passed, 1 warning`，N1–N6 + W0–W5 前序集合 `411 passed, 1 warning`，仓库全量 `450 passed, 1 warning`；pytest warning 为既有 `StarletteDeprecationWarning`；
+- 没有新增领域模型、Service、Repository、持久索引、Agent、第二套存储、内置阅读器、cross-process lock、journal 或 bundle。
+
+详见 [W6 实施记录](W6_STABILIZATION_MIGRATION_AND_ENTRY.md)。W0–W6 既定主线至此完成，没有开始计划外阶段。
 
 ## 历史基础
 

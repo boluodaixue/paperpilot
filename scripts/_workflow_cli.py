@@ -6,13 +6,158 @@ from dataclasses import asdict
 from pathlib import Path
 from typing import Any
 
-from src.research.models import ResearchBrief, ResearchWorkflowResult
+from src.research.models import (
+    MemoryAnswer,
+    MemoryImportDuplicate,
+    MemoryImportProposal,
+    MemoryNoteProposal,
+    ResearchBrief,
+    ResearchWorkflowResult,
+)
 from src.research.obsidian import build_obsidian_open_uri
 from src.research.runtime import ResearchRuntime
 
 
 class UserCancelled(Exception):
     """Raised when a user declines to run a reviewed research brief."""
+
+
+def require_memory(
+    runtime: ResearchRuntime,
+    memory_id: str | None,
+    *,
+    writable: bool = True,
+) -> str:
+    """Validate one explicit Memory selection through the shared Runtime facade."""
+    value = (memory_id or "").strip()
+    if not value:
+        raise ValueError("Please select a Memory first.")
+    if hasattr(runtime, "get_memory_option"):
+        option = runtime.get_memory_option(value)
+        if writable and option.get("read_only"):
+            raise ValueError(
+                "M-legacy is read-only; migrate it or select a managed Memory first."
+            )
+    elif hasattr(runtime, "get_memory"):
+        runtime.get_memory(value)
+    return value
+
+
+def format_memory_answer(answer: MemoryAnswer) -> str:
+    lines = [f"\nMemory answer ({answer.memory_id})", answer.markdown]
+    if answer.citations:
+        lines.append("Citations:")
+        lines.extend(f"  - {item.wikilink}" for item in answer.citations)
+    if answer.insufficient_evidence:
+        lines.append("Insufficient evidence:")
+        lines.extend(f"  - {item}" for item in answer.insufficient_evidence)
+    return "\n".join(lines)
+
+
+async def run_memory_question(
+    runtime: ResearchRuntime,
+    memory_id: str,
+    question: str,
+    *,
+    input_fn: Callable[[str], str] = input,
+    output_fn: Callable[[str], Any] = print,
+) -> MemoryAnswer:
+    """Answer from one Memory and optionally preview/confirm a new note."""
+    selected = require_memory(runtime, memory_id, writable=False)
+    answer = await runtime.answer_memory(selected, question)
+    output_fn(format_memory_answer(answer))
+    if hasattr(runtime, "get_memory_option"):
+        option = runtime.get_memory_option(selected)
+        if option.get("read_only"):
+            output_fn("This Memory is read-only; migrate it before saving notes.")
+            return answer
+    action = input_fn("Save this answer as a note? [y/N]: ").strip().lower()
+    if action not in {"y", "yes"}:
+        return answer
+
+    proposal = await runtime.propose_memory_note(answer)
+    if not isinstance(proposal, MemoryNoteProposal):
+        raise RuntimeError("Memory note proposal is invalid")
+    output_fn(
+        "\nMemory note preview\n"
+        f"Target: {proposal.target_path}\n\n{proposal.markdown}"
+    )
+    confirm = input_fn("Confirm this exact note write? [y/N]: ").strip().lower()
+    if confirm in {"y", "yes"}:
+        result = runtime.commit_memory_note(proposal)
+        output_fn(f"Saved: {result['wikilink']} ({result['target_path']})")
+    else:
+        output_fn("Note proposal cancelled; Memory was not changed.")
+    return answer
+
+
+def confirm_memory_import(
+    runtime: ResearchRuntime,
+    value: MemoryImportProposal | MemoryImportDuplicate,
+    *,
+    input_fn: Callable[[str], str] = input,
+    output_fn: Callable[[str], Any] = print,
+) -> Any:
+    """Display one complete import preview and commit only after confirmation."""
+    if isinstance(value, MemoryImportDuplicate):
+        output_fn(f"Already imported: {value.import_path}")
+        return value
+    output_fn(
+        "\nMemory import preview\n"
+        f"Attachment: {value.attachment_path}\n"
+        f"Import: {value.import_path}\n"
+        f"Note: {value.note_path}\n\n"
+        f"{value.import_markdown}\n\n{value.note_markdown}"
+    )
+    confirm = input_fn("Confirm this exact import write? [y/N]: ").strip().lower()
+    if confirm not in {"y", "yes"}:
+        output_fn("Import proposal cancelled; Memory was not changed.")
+        return value
+    result = runtime.commit_memory_import(value)
+    output_fn(f"Imported: {result['import_path']}")
+    return result
+
+
+def confirm_legacy_memory_migration(
+    runtime: ResearchRuntime,
+    proposal: Mapping[str, object],
+    *,
+    input_fn: Callable[[str], str] = input,
+    output_fn: Callable[[str], Any] = print,
+) -> Any:
+    """Display the complete legacy conversion and publish only after confirmation."""
+    files = proposal.get("files")
+    if not isinstance(files, tuple):
+        raise ValueError("legacy migration proposal files are invalid")
+    sections = [
+        "\nLegacy Memory migration preview",
+        f"Source: {proposal.get('source_memory_id')} (kept read-only)",
+        f"Target: {proposal.get('target_memory_id')}",
+        f"Home: {proposal.get('home_path')}",
+        "",
+        str(proposal.get("home_markdown") or ""),
+    ]
+    for item in files:
+        if not isinstance(item, Mapping):
+            raise ValueError("legacy migration proposal file entry is invalid")
+        sections.extend(
+            (
+                "",
+                f"{item.get('source_path')} -> {item.get('target_path')}",
+                str(item.get("markdown") or ""),
+            )
+        )
+    output_fn("\n".join(sections))
+    confirm = input_fn("Publish this exact managed copy? [y/N]: ").strip().lower()
+    if confirm not in {"y", "yes"}:
+        output_fn("Migration proposal cancelled; the Vault was not changed.")
+        return proposal
+    descriptor = runtime.commit_legacy_memory_migration(proposal)
+    output_fn(
+        f"Migrated to {descriptor.memory_id}. The legacy root remains read-only; "
+        "switch explicitly when ready."
+    )
+    return descriptor
 
 
 def _brief_from_state(state: dict[str, Any]) -> ResearchBrief:
