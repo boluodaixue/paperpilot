@@ -4,7 +4,7 @@
 
 ## 当前判断
 
-N0–N6 与 LLM Wiki + Obsidian 的 W0 已完成。CLI、Web 和评测统一进入同一个 Research Workflow；旧 Manager / Planner / DAG / AgentPool / Evidence Graph 链路已经删除。W0 只增加长期 Memory/Vault 安全契约，没有改变研究执行链路或开始多 Memory 写入。
+N0–N6 与 LLM Wiki + Obsidian 的 W0–W1 已完成。CLI、Web 和评测继续进入同一个 Research Workflow；旧 Manager / Planner / DAG / AgentPool / Evidence Graph 链路已经删除。W1 在同一个 MarkdownMemoryStore 内实现多 Memory 持久化，没有改变 Research AgentGraph 或开始 Obsidian 前端接入。
 
 ## 进度
 
@@ -18,7 +18,8 @@ N0–N6 与 LLM Wiki + Obsidian 的 W0 已完成。CLI、Web 和评测统一进�
 | N5 入口迁移与旧实现清理 | ✅ | CLI/Web/评测只走新路径，旧架构及证据图退出代码库 |
 | N6 可选 Red/Blue | ✅ | 默认关闭的单次报告后处理，且不破坏 frontmatter、WikiLink、URL 或 manifest |
 | W0 Memory/Vault 契约 | ✅ | 稳定 `memory_id`、Vault 路径、frontmatter/WikiLink 安全与 legacy 只读识别 |
-| W1–W6 LLM Wiki + Obsidian | 📝 | 尚未开始；按已确认计划逐阶段实施 |
+| W1 多 Memory 持久化 | ✅ | 原子创建/列出/选择 Memory，研究隔离写入并保留历史 |
+| W2–W6 LLM Wiki + Obsidian | 📝 | 尚未开始；按已确认计划逐阶段实施 |
 
 ## N0 已确定的架构决策
 
@@ -115,7 +116,20 @@ W0 在不改变 N1–N6 主链的前提下完成了长期 Memory/Vault 基础：
 - 既有根目录 `reports/evidence/sources` 的无写入识别；
 - W0 专项 `80 passed`，原 N1–N6 回归 `160 passed, 1 warning`，仓库全量 `240 passed, 1 warning`。
 
-详见 [W0 实施记录](W0_MEMORY_VAULT_CONTRACT.md)。W1 多 Memory 持久化尚未开始。
+详见 [W0 实施记录](W0_MEMORY_VAULT_CONTRACT.md)。
+
+## W1 已完成
+
+- 一个 Vault 可原子创建、列出和选择多个 `Memories/M-<id>/`；
+- `Home.md` 与六个必要子目录完整生成，外部标题编辑会在下次读取时生效；
+- Workflow/checkpoint/Runtime 显式保持所选 `memory_id`，缺失 Memory 在研究调用前失败；
+- 报告、证据、来源按 Memory 隔离并使用完整 Vault 相对 WikiLink；
+- 同一 Memory 多次研究保留多份报告，legacy 根目录调用保持不变；
+- Chat 只保存 `memory_id` 和 manifest 指针，报告正文继续以 Markdown 为准；
+- 并发创建、并发写入和 symlink/junction 逃逸均有确定性测试；
+- W1 专项 `19 passed, 1 warning`，原 W0 + N1–N6 回归 `240 passed, 1 warning`，仓库全量 `259 passed, 1 warning`。
+
+详见 [W1 实施记录](W1_MULTI_MEMORY_PERSISTENCE.md)。W2 Obsidian 最小接入尚未开始。
 
 ## 历史基础
 

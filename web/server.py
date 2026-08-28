@@ -74,9 +74,16 @@ def get_research_runtime() -> ResearchRuntime:
 
 
 class ResearchTask:
-    def __init__(self, task_id: str, session_id: str, query: str) -> None:
+    def __init__(
+        self,
+        task_id: str,
+        session_id: str,
+        query: str,
+        memory_id: str | None = None,
+    ) -> None:
         self.task_id = self.thread_id = task_id
         self.session_id, self.query = session_id, query
+        self.memory_id = memory_id
         self.status = "waiting_confirmation"
         self.result: dict[str, Any] | None = None
         self.error: str | None = None
@@ -119,6 +126,7 @@ _RUN_SEMAPHORE = asyncio.Semaphore(1)
 class AlignmentRequest(BaseModel):
     session_id: str | None = None
     task_id: str | None = None
+    memory_id: str | None = None
     message: str
 
 
@@ -166,7 +174,12 @@ def _interrupt_brief(state: dict[str, Any]) -> dict[str, Any]:
 
 def _proposal_pointer(task: ResearchTask, brief: dict[str, Any]) -> str:
     return json.dumps(
-        {"task_id": task.task_id, "thread_id": task.thread_id, "brief": brief},
+        {
+            "task_id": task.task_id,
+            "thread_id": task.thread_id,
+            "memory_id": task.memory_id,
+            "brief": brief,
+        },
         ensure_ascii=False,
     )
 
@@ -175,6 +188,7 @@ def _report_pointer(task: ResearchTask, result: ResearchWorkflowResult) -> dict[
     return {
         "task_id": task.task_id,
         "thread_id": task.thread_id,
+        "memory_id": result.memory_id,
         "manifest": asdict(result.memory_manifest),
     }
 
@@ -204,6 +218,7 @@ def _expanded_messages(session_id: str) -> list[dict[str, Any]]:
             message["content"] = runtime.read_memory(manifest["report_path"])
             message["manifest"] = manifest
             message["thread_id"] = pointer.get("thread_id")
+            message["memory_id"] = pointer.get("memory_id")
         except (KeyError, TypeError, ValueError, OSError, json.JSONDecodeError):
             message["content"] = "报告文件暂时不可读取。"
     return messages
@@ -250,6 +265,7 @@ async def _run_research_task(task: ResearchTask) -> None:
                 "task_id": task.task_id,
                 "thread_id": task.thread_id,
                 "session_id": task.session_id,
+                "memory_id": workflow_result.memory_id,
                 "query": task.query,
                 "elapsed": round(time.time() - started, 1),
                 "research_status": research_result.status.value,
@@ -269,14 +285,14 @@ async def _run_research_task(task: ResearchTask) -> None:
             await task.publish({
                 "type": "done", "thread_id": task.thread_id,
                 "parent_thread_id": None, "root_thread_id": task.thread_id,
-                "session_id": task.session_id,
+                "session_id": task.session_id, "memory_id": workflow_result.memory_id,
             })
     except Exception as exc:
         task.status, task.error = "error", str(exc)
         await task.publish({
             "type": "error", "message": str(exc)[:500],
             "thread_id": task.thread_id, "parent_thread_id": None,
-            "root_thread_id": task.thread_id,
+            "root_thread_id": task.thread_id, "memory_id": task.memory_id,
         })
 
 
@@ -298,6 +314,8 @@ async def align_research(req: AlignmentRequest) -> dict[str, Any]:
         task = _get_task(req.task_id)
         if req.session_id and req.session_id != task.session_id:
             raise HTTPException(status_code=409, detail="task 与 session 不匹配")
+        if req.memory_id is not None and req.memory_id != task.memory_id:
+            raise HTTPException(status_code=409, detail="task 与 memory 不匹配")
         if task.status != "waiting_confirmation":
             raise HTTPException(status_code=409, detail="任务当前不等待方案修改")
         store.add(task.session_id, "user", "chat", message)
@@ -310,11 +328,15 @@ async def align_research(req: AlignmentRequest) -> dict[str, Any]:
         if _active_task(session_id):
             raise HTTPException(status_code=409, detail="该会话已有待确认或运行中的研究")
         thread_id = runtime.new_thread_id()
-        task = ResearchTask(thread_id, session_id, message)
+        task = ResearchTask(thread_id, session_id, message, req.memory_id)
         _TASKS[thread_id] = task
         store.add(session_id, "user", "chat", message)
         try:
-            state = await runtime.start(message, thread_id=thread_id)
+            state = await runtime.start(
+                message,
+                thread_id=thread_id,
+                memory_id=req.memory_id,
+            )
         except Exception as exc:
             task.status, task.error = "error", str(exc)
             raise HTTPException(status_code=500, detail=f"研究说明生成失败: {exc}") from exc
@@ -324,7 +346,7 @@ async def align_research(req: AlignmentRequest) -> dict[str, Any]:
     return {
         "session_id": task.session_id, "task_id": task.task_id,
         "thread_id": task.thread_id, "status": task.status,
-        "action": "confirm", "brief": brief,
+        "memory_id": task.memory_id, "action": "confirm", "brief": brief,
     }
 
 
@@ -339,10 +361,12 @@ async def start_research(req: ResearchRequest) -> dict[str, Any]:
     await task.publish({
         "type": "confirmed", "thread_id": task.thread_id,
         "parent_thread_id": None, "root_thread_id": task.thread_id,
+        "memory_id": task.memory_id,
     })
     asyncio.create_task(_run_research_task(task))
     return {"task_id": task.task_id, "thread_id": task.thread_id,
-            "session_id": task.session_id, "status": task.status}
+            "session_id": task.session_id, "memory_id": task.memory_id,
+            "status": task.status}
 
 
 @app.get("/api/tasks/{task_id}/events")
@@ -377,15 +401,21 @@ async def task_result(task_id: str) -> dict[str, Any]:
     if task.status in {"waiting_confirmation", "running"}:
         raise HTTPException(status_code=202, detail="任务尚未完成")
     if task.status == "error":
-        return {"task_id": task_id, "status": "error", "message": task.error or ""}
+        return {
+            "task_id": task_id,
+            "memory_id": task.memory_id,
+            "status": "error",
+            "message": task.error or "",
+        }
     return {"transport_status": "done", **(task.result or {})}
 
 
 @app.get("/api/sessions/{sid}/active-task")
 async def session_active_task(sid: str) -> dict[str, Any]:
     task = _active_task(sid)
-    return ({"task_id": None, "status": "idle"} if task is None else
-            {"task_id": task.task_id, "thread_id": task.thread_id, "status": task.status})
+    return ({"task_id": None, "memory_id": None, "status": "idle"} if task is None else
+            {"task_id": task.task_id, "thread_id": task.thread_id,
+             "memory_id": task.memory_id, "status": task.status})
 
 
 @app.get("/api/sessions")
@@ -402,7 +432,7 @@ async def session_messages(sid: str) -> list[dict[str, Any]]:
 async def session_evidence(sid: str) -> dict[str, Any]:
     pointer = _latest_report_pointer(sid)
     if pointer is None:
-        return {"session_id": sid, "evidence": [], "sources": []}
+        return {"session_id": sid, "memory_id": None, "evidence": [], "sources": []}
     manifest, runtime = pointer["manifest"], get_research_runtime()
 
     def read_many(paths: Iterable[str]) -> list[dict[str, str]]:
@@ -413,7 +443,7 @@ async def session_evidence(sid: str) -> dict[str, Any]:
             except (OSError, ValueError):
                 pass
         return result
-    return {"session_id": sid,
+    return {"session_id": sid, "memory_id": pointer.get("memory_id"),
             "evidence": read_many(manifest.get("evidence_paths", [])),
             "sources": read_many(manifest.get("source_paths", []))}
 
