@@ -189,7 +189,7 @@ pytest -q
 当前确定性测试结果：
 
 ```text
-702 passed, 2 skipped
+716 passed, 2 skipped
 ```
 
 测试覆盖递归与预算、checkpoint 恢复、用户确认、多 Memory 隔离、Writer 崩溃恢复、并发冲突、Markdown/WikiLink 契约、导入、FTS5、语义降级以及 Web/CLI 入口。

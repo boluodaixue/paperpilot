@@ -27,7 +27,7 @@ Web / CLI
 - SQLite FTS5 和可选本地多语言混合检索；
 - 默认关闭的单次 Red/Blue 报告复核。
 
-当前离线回归基线为 `702 passed, 2 skipped`。
+当前离线回归基线为 `716 passed, 2 skipped`。
 
 ## 2. 统一验收原则
 
