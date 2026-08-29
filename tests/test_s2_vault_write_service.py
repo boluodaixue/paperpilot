@@ -30,7 +30,7 @@ from src.research.vault_writer import VaultWriter
 def _service(
     tmp_path: Path,
     *,
-    lease_seconds: float = 1.0,
+    lease_seconds: float = 60.0,
 ) -> tuple[MarkdownMemoryStore, VaultWriteQueue, VaultWriteService]:
     vault = tmp_path / "vault"
     store = MarkdownMemoryStore(vault)
