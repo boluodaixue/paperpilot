@@ -5,12 +5,12 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "deep-research-agent"
 version = "0.1.0"
-description = "基于 LangGraph 的同质递归研究 Agent"
+description = "Recoverable recursive research agents with LangGraph and an Obsidian-native Markdown memory"
 readme = "README.md"
 license = {text = "MIT"}
 requires-python = ">=3.10"
 authors = [
-    {name = "PaperPilot Team"},
+    {name = "boluodaixue"},
 ]
 keywords = ["deep-research", "langgraph", "research-agent", "recursive-agent", "paperpilot"]
 classifiers = [
@@ -65,11 +65,12 @@ run-research = "scripts.run_single:main"
 run-eval = "scripts.run_eval:main"
 run-benchmark = "scripts.run_benchmark:main"
 run-judge = "scripts.run_judge:main"
+prepare-semantic-model = "scripts.prepare_semantic_model:main"
 
 [project.urls]
-Homepage = "https://github.com/your-org/deep-research-agent"
-Repository = "https://github.com/your-org/deep-research-agent"
-Issues = "https://github.com/your-org/deep-research-agent/issues"
+Homepage = "https://github.com/boluodaixue/paperpilot"
+Repository = "https://github.com/boluodaixue/paperpilot"
+Issues = "https://github.com/boluodaixue/paperpilot/issues"
 
 [tool.setuptools.packages.find]
 where = ["."]

@@ -76,6 +76,9 @@ def _result() -> ResearchResult:
 
 def _store(tmp_path: Path, memory_id: str = "M-plan") -> MarkdownMemoryStore:
     store = MarkdownMemoryStore(tmp_path / "Vault")
+    # Keep Home.md creation ordered with the fixed proposal timestamp. Without
+    # this clock seam the test becomes time-of-day dependent on 2026-08-29.
+    store._timestamp = lambda: STAMP  # type: ignore[method-assign]
     store.create_memory("Planning", memory_id)
     return store
 

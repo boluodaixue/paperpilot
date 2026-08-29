@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 import math
 import os
 import re
@@ -24,6 +25,9 @@ from .vault import (
     resolve_vault_markdown_path,
     scan_legacy_memory_markdown,
 )
+
+
+logger = logging.getLogger(__name__)
 
 
 _H1 = re.compile(r"^#\s+(.+?)\s*$", re.MULTILINE)
@@ -265,6 +269,15 @@ def configure_persistent_retrieval(
             semantic_model=semantic_model.strip(),
             semantic_local_files_only=semantic_local_files_only,
         )
+    if semantic_enabled:
+        logger.info(
+            "Memory retrieval configured: hybrid FTS5 + semantic + WikiLink "
+            "(model=%s, local_files_only=%s)",
+            semantic_model.strip(),
+            semantic_local_files_only,
+        )
+    else:
+        logger.info("Memory retrieval configured: SQLite FTS5 (semantic disabled)")
 
 
 class _SentenceTransformerProvider:
@@ -1119,6 +1132,12 @@ class MarkdownMemoryIndex:
                     except Exception as exc:
                         retrieval_mode = "fts5_fallback"
                         fallback_reason = type(exc).__name__
+                        logger.warning(
+                            "Semantic retrieval unavailable (%s); using SQLite FTS5 "
+                            "for memory_id=%s",
+                            fallback_reason,
+                            memory_id,
+                        )
                         results = self._rank(memory_id, terms, limit) if terms else ()
                 elif terms:
                     results = self._rank(memory_id, terms, limit)
@@ -1134,6 +1153,12 @@ class MarkdownMemoryIndex:
                         except Exception as exc:
                             retrieval_mode = "fts5_fallback"
                             fallback_reason = type(exc).__name__
+                            logger.warning(
+                                "Semantic rerank unavailable after reconciliation (%s); "
+                                "using SQLite FTS5 for memory_id=%s",
+                                fallback_reason,
+                                memory_id,
+                            )
                             reranked = self._rank(memory_id, terms, limit) if terms else ()
                         results = tuple(
                             hit for hit in reranked if self._valid_hit(memory_id, hit)
