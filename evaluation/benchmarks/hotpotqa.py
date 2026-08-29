@@ -540,6 +540,7 @@ class HotpotQABenchmark:
         pass1_sum = 0.0
         entity_cov_sum = 0.0
         sem_cov_sum = 0.0
+        has_depth_metrics = False
 
         for item in predictions:
             pred = item.get("prediction", "")
@@ -555,6 +556,7 @@ class HotpotQABenchmark:
             # 深度研究指标（如果提供了完整报告）
             report = item.get("report", "")
             if report:
+                has_depth_metrics = True
                 depth_metrics = item.get("depth_metrics") or self.evaluate_report(report, gold)
                 entity_cov_sum += depth_metrics["gold_entity_coverage"]
                 sem_cov_sum += depth_metrics["semantic_gold_coverage"]
@@ -566,9 +568,8 @@ class HotpotQABenchmark:
             results["f1"] = f1_sum / total
         if "pass@1" in metrics:
             results["pass@1"] = pass1_sum / total
-        if entity_cov_sum > 0:
+        if has_depth_metrics:
             results["gold_entity_coverage"] = entity_cov_sum / total
-        if sem_cov_sum > 0:
             results["semantic_gold_coverage"] = sem_cov_sum / total
 
         return results

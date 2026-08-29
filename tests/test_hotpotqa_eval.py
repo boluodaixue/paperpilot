@@ -167,6 +167,28 @@ def test_evaluate_reuses_precomputed_depth_metrics() -> None:
     assert result["semantic_gold_coverage"] == 0.5
 
 
+def test_depth_metrics_keep_explicit_zero_values() -> None:
+    benchmark = HotpotQABenchmark(use_mock=True)
+
+    result = benchmark.evaluate(
+        [
+            {
+                "prediction": "wrong",
+                "gold": "answer",
+                "report": "non-empty report",
+                "depth_metrics": {
+                    "gold_entity_coverage": 0.0,
+                    "semantic_gold_coverage": 0.0,
+                    "report_length": 16,
+                },
+            }
+        ]
+    )
+
+    assert result["gold_entity_coverage"] == 0.0
+    assert result["semantic_gold_coverage"] == 0.0
+
+
 def test_empty_report_returns_empty_answer() -> None:
     assert HotpotQABenchmark.extract_short_answer("") == ""
     assert HotpotQABenchmark.short_answer_extraction_method("   ") == "empty_report"
