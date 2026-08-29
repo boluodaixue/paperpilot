@@ -11,6 +11,7 @@ import logging
 import re
 import sys
 import time
+from collections import Counter
 from dataclasses import asdict
 from pathlib import Path
 from typing import Any
@@ -144,7 +145,15 @@ def workflow_metrics(result: ResearchWorkflowResult) -> dict[str, Any]:
     return {
         "research_brief": asdict(result.brief),
         "status": str(status),
+        "research_status": str(status),
+        "termination_reason": (
+            research.termination_reason.value
+            if research.termination_reason is not None
+            else None
+        ),
+        "output_status": research.output_status.value,
         "stop_reason": research.stop_reason,
+        "rcs": research_completion_score(result),
         "evidence_count": len(research.evidence),
         "source_count": len(source_refs),
         "thread_count": research.thread_count,
@@ -156,6 +165,109 @@ def workflow_metrics(result: ResearchWorkflowResult) -> dict[str, Any]:
         "report_manifest": result.memory_manifest.report_path,
         "evidence_manifests": list(result.memory_manifest.evidence_paths),
         "source_manifests": list(result.memory_manifest.source_paths),
+    }
+
+
+def research_completion_score(result: ResearchWorkflowResult) -> dict[str, float]:
+    """Return post-run RCS dimensions; this function is never used for routing."""
+    research = result.research_result
+    coverage = tuple(research.coverage)
+    total = len(coverage)
+    if total:
+        supported = sum(item.status.value == "supported" for item in coverage)
+        evidence_points = sum(
+            {
+                "supported": 1.0,
+                "weak": 0.5,
+                "conflicted": 0.25,
+                "unsupported": 0.0,
+            }[item.status.value]
+            for item in coverage
+        )
+        conflicted = sum(item.status.value == "conflicted" for item in coverage)
+        incomplete_ids = {
+            item.requirement_id
+            for item in coverage
+            if item.status.value != "supported"
+        }
+        disclosed_ids = {item.requirement_id for item in research.critical_gaps}
+        objective_coverage = supported / total
+        evidence_sufficiency = evidence_points / total
+        conflict_resolution = 1.0 - (conflicted / total)
+        uncertainty_calibration = (
+            1.0
+            if not incomplete_ids
+            else len(incomplete_ids & disclosed_ids) / len(incomplete_ids)
+        )
+    else:
+        objective_coverage = 0.0
+        evidence_sufficiency = 0.0
+        conflict_resolution = 0.0
+        uncertainty_calibration = 0.0
+    denominator = max(1, total * 4)
+    research_efficiency = objective_coverage / (
+        1.0 + research.tool_calls_used / denominator
+    )
+    return {
+        "objective_coverage": round(objective_coverage, 6),
+        "evidence_sufficiency": round(evidence_sufficiency, 6),
+        "conflict_resolution": round(conflict_resolution, 6),
+        "uncertainty_calibration": round(uncertainty_calibration, 6),
+        "research_efficiency": round(research_efficiency, 6),
+    }
+
+
+def researchbench_summary(
+    report: EvaluationReport,
+    *,
+    budget: int,
+    local_budget: int,
+    token_budget: int,
+) -> dict[str, Any]:
+    """Aggregate comparison-ready ResearchBench metrics without inventing data."""
+    details = report.details
+    scores = [detail["composite_score"] for detail in details if "composite_score" in detail]
+    successful = [detail for detail in details if "error" not in detail]
+    rcs_details = [detail["rcs"] for detail in successful if "rcs" in detail]
+
+    def counts(field: str, *, default: str = "unknown") -> dict[str, int]:
+        return dict(Counter(str(detail.get(field) or default) for detail in details))
+
+    return {
+        "budget": budget,
+        "local_tool_budget": local_budget,
+        "token_budget": token_budget,
+        "average_composite": sum(scores) / len(scores) if scores else 0.0,
+        "num_success": len(successful),
+        "num_failed": len(details) - len(successful),
+        "elapsed_seconds": sum(detail.get("elapsed_seconds", 0.0) for detail in details),
+        "evidence_count": sum(detail.get("evidence_count", 0) for detail in details),
+        "source_count": sum(detail.get("source_count", 0) for detail in details),
+        "thread_count": sum(detail.get("thread_count", 0) for detail in details),
+        "tool_calls_used": sum(detail.get("tool_calls_used", 0) for detail in details),
+        "estimated_tokens_used": sum(
+            detail.get("estimated_tokens_used", 0) for detail in details
+        ),
+        "iterations": sum(detail.get("iterations", 0) for detail in details),
+        "unresolved_count": sum(detail.get("unresolved_count", 0) for detail in details),
+        "retries_used": sum(detail.get("retries_used", 0) for detail in details),
+        "research_status_counts": counts("research_status"),
+        "termination_reason_counts": counts("termination_reason", default="not_available"),
+        "output_status_counts": counts("output_status", default="not_available"),
+        "average_rcs": {
+            dimension: (
+                sum(item.get(dimension, 0.0) for item in rcs_details) / len(rcs_details)
+                if rcs_details
+                else 0.0
+            )
+            for dimension in (
+                "objective_coverage",
+                "evidence_sufficiency",
+                "conflict_resolution",
+                "uncertainty_calibration",
+                "research_efficiency",
+            )
+        },
     }
 
 
@@ -210,21 +322,13 @@ async def _evaluate_research_bench(
     finally:
         await runtime.close()
 
-    scores = [detail["composite_score"] for detail in report.details if "composite_score" in detail]
     report.set_summary(
-        {
-            "budget": budget,
-            "local_tool_budget": local_budget,
-            "token_budget": token_budget,
-            "average_composite": sum(scores) / len(scores) if scores else 0.0,
-            "num_success": sum("error" not in detail for detail in report.details),
-            "num_failed": sum("error" in detail for detail in report.details),
-            "evidence_count": sum(detail.get("evidence_count", 0) for detail in report.details),
-            "thread_count": sum(detail.get("thread_count", 0) for detail in report.details),
-            "tool_calls_used": sum(detail.get("tool_calls_used", 0) for detail in report.details),
-            "estimated_tokens_used": sum(detail.get("estimated_tokens_used", 0) for detail in report.details),
-            "retries_used": sum(detail.get("retries_used", 0) for detail in report.details),
-        }
+        researchbench_summary(
+            report,
+            budget=budget,
+            local_budget=local_budget,
+            token_budget=token_budget,
+        )
     )
     return report
 

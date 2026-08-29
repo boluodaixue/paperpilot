@@ -7,7 +7,7 @@
 | 能力 | 状态 | 结果 |
 |---|---|---|
 | 同质 Research AgentGraph | ✅ | 根、子、孙复用同一图，fork 与全树预算可恢复 |
-| 研究充分性与终止机制 | 🚧 | 固定来源数完成门已否决；按目标覆盖、证据、继续研究价值和资源边界重构 |
+| 研究充分性与终止机制 | ✅ | 固定完成门已替换；真实三题确认不再第 4 轮强停，并暴露语义收敛成本 |
 | Research Workflow | ✅ | Brief 修改/确认、interrupt、SQLite checkpoint 和重启恢复 |
 | Markdown Memory | ✅ | 多 `memory_id`、报告/证据/来源/笔记/导入和 WikiLink |
 | Obsidian 接入 | ✅ | 安全打开 Memory、报告和引用，不写 `.obsidian/` |
@@ -16,18 +16,18 @@
 | 单一 Vault Writer | ✅ | 持久队列、lease、staging/journal、幂等和崩溃恢复 |
 | 持久化检索 | ✅ | FTS5 增量索引、最终哈希复核和可删除重建 |
 | 可选混合检索 | ✅ | 本地多语言语义 + FTS + WikiLink，失败降级 |
-| 离线自动化验收 | ✅ | `716 passed, 2 skipped` |
+| 离线自动化验收 | ✅ | `747 passed, 2 skipped`；N1–N6 `122 passed` |
 
 ## 当前优先级
 
 ### 0. 修正研究终止机制
 
 - [x] 保存研究充分性与终止机制设计；
-- [ ] 移除固定来源数和连续轮次强制停止；
-- [ ] 实现 Continue / Replan / Stop Research；
-- [ ] 分离 Completed、Saturated、Exhausted、Budget Forced 和 Failed；
-- [ ] 将 RCS 接入最终评测，而不是运行时停止阈值；
-- [ ] 运行专项、全量回归和相同三题真实验收。
+- [x] 移除固定来源数和连续轮次强制停止；
+- [x] 实现 Continue / Replan / Stop Research；
+- [x] 分离 research status、termination reason 和 output status；
+- [x] 将 RCS 接入最终评测，而不是运行时停止阈值；
+- [x] 运行专项、全量回归和相同三题真实验收；三题均按 `time_budget_exhausted → budget_forced` 诚实停止，后续需继续改善语义收敛和最终输出稳定性。
 
 ### 1. 作品集发布
 

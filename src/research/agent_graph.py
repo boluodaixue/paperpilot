@@ -6,7 +6,6 @@ import copy
 import hashlib
 import inspect
 import json
-import re
 import time
 from contextlib import contextmanager
 from dataclasses import asdict
@@ -30,14 +29,37 @@ from .fork_policy import (
 )
 from .models import (
     AgentLimits,
+    CriticalGap,
     EvidenceItem,
     ExecutionIdentity,
     ForkCandidate,
+    NextResearchAction,
+    OutputStatus,
+    RequirementCoverage,
+    RequirementStatus,
+    ResearchDecision,
+    ResearchRequirement,
     ResearchResult,
     ResearchStatus,
     ResearchTask,
+    StrategyAttempt,
+    TerminationReason,
 )
 from .policy import call_policy
+from .research_sufficiency import (
+    AssessmentValidationError,
+    ResearchAssessment,
+    assessment_schema_prompt,
+    build_research_requirements,
+    control_message,
+    finalization_prompt,
+    hard_termination_reason,
+    initial_coverage,
+    parse_json_object,
+    parse_research_assessment,
+    repair_assessment_prompt,
+    repair_final_prompt,
+)
 
 
 __all__ = [
@@ -77,21 +99,27 @@ class ResearchAgentState(TypedDict):
     execution_events: list[dict[str, Any]]
     lineage_objectives: list[str]
     draft: dict[str, Any] | None
+    draft_raw: str
     last_content: str
     last_assessed_evidence_count: int
-    last_assessed_source_count: int
-    stagnant_evidence_rounds: int
-    completion_ready_rounds: int
-    completion_requested: bool
-    completion_reason: str | None
+    research_requirements: list[ResearchRequirement]
+    coverage: list[RequirementCoverage]
+    critical_gaps: list[CriticalGap]
+    next_actions: list[NextResearchAction]
+    strategy_attempts: list[StrategyAttempt]
+    assessment_decision: ResearchDecision | None
+    assessment_output_status: OutputStatus
+    assessment_error: str | None
+    termination_reason: TerminationReason | None
+    finalization_requested: bool
+    output_status: OutputStatus
     stop_reason: str | None
     result: ResearchResult | None
 
 
-_JSON_FENCE = re.compile(r"```(?:json)?\s*(.*?)\s*```", re.IGNORECASE | re.DOTALL)
-_COMPLETION_MIN_RESEARCH_ITERATIONS = 2
-_COMPLETION_READY_ROUNDS = 2
-_COMPLETION_STAGNANT_ROUNDS = 2
+_FINALIZATION_OUTPUT_TOKEN_RESERVE = 1024
+_ASSESSMENT_OUTPUT_TOKEN_RESERVE = 2048
+_MAX_FINALIZATION_TIME_RESERVE_SECONDS = 30.0
 
 
 def _event(
@@ -108,6 +136,16 @@ def _event(
 
 def _remaining_seconds(state: ResearchAgentState) -> float:
     return state["deadline_at"] - time.time()
+
+
+def _remaining_research_seconds(state: ResearchAgentState) -> float:
+    """Leave each recursive level time to synthesize and return upstream."""
+    per_level_reserve = min(
+        _MAX_FINALIZATION_TIME_RESERVE_SECONDS,
+        state["limits"].max_elapsed_seconds * 0.1,
+    )
+    reserve = per_level_reserve * (state["identity"].depth + 1)
+    return _remaining_seconds(state) - reserve
 
 
 def _estimate_tokens(messages: list[dict[str, Any]], response: dict[str, Any]) -> int:
@@ -200,10 +238,9 @@ When the task is complete, stop calling tools and return one JSON object:
   "findings": ["atomic finding"],
   "unresolved": ["remaining uncertainty"]
 }}
-After tool or child results, a checkpointed completion assessment may report
-the evidence floor, remaining requirements, or information saturation. Treat
-that assessment as a control instruction: do not collect redundant sources,
-and finalize without tools when it requests finalization.
+After tool or child results, the same policy performs a checkpointed structured
+research-state assessment. Continue and Replan instructions keep tools available
+and identify requirement-scoped gaps. Stop Research alone enters final synthesis.
 Do not wrap the final JSON in commentary. There is no separate Planner,
 Manager, or Summarizer Agent.
 """
@@ -278,29 +315,141 @@ def _normalize_tool_calls(raw_calls: Any) -> list[dict[str, Any]]:
     return calls
 
 
-def _parse_draft(content: str) -> dict[str, Any]:
-    stripped = (content or "").strip()
-    candidate = stripped
-    fenced = _JSON_FENCE.search(stripped)
-    if fenced:
-        candidate = fenced.group(1).strip()
-    try:
-        payload = json.loads(candidate)
-    except (json.JSONDecodeError, TypeError):
-        return {
-            "status": "partial" if stripped else "failed",
-            "summary": stripped,
-            "findings": [stripped] if stripped else [],
-            "unresolved": ["Model returned an unstructured final response."],
-        }
-    if not isinstance(payload, dict):
-        return {
-            "status": "failed",
-            "summary": "",
-            "findings": [],
-            "unresolved": ["Model final response was not a JSON object."],
-        }
+def _action_for_tool_call(
+    tool_name: str,
+    arguments: dict[str, Any],
+    actions: Iterable[NextResearchAction],
+) -> NextResearchAction | None:
+    """Match a proposed action only after a real research-tool call is issued."""
+    if tool_name in {"", "notepad", FORK_TOOL_NAME}:
+        return None
+    candidates = tuple(actions)
+    if not candidates:
+        return None
+    argument_text = " ".join(
+        str(value).strip().lower()
+        for value in arguments.values()
+        if isinstance(value, (str, int, float)) and str(value).strip()
+    )
+    exact = [
+        action
+        for action in candidates
+        if action.query.strip().lower()
+        and (
+            action.query.strip().lower() in argument_text
+            or argument_text in action.query.strip().lower()
+        )
+    ]
+    if len(exact) == 1:
+        return exact[0]
+    # The control message instructs the next loop to work only on its pending
+    # actions. A single pending action can therefore be attributed to a real
+    # research-tool call even when the policy rewrites the concrete query.
+    if len(candidates) == 1 and argument_text:
+        return candidates[0]
+    return None
+
+
+def _parse_final_draft(content: str) -> dict[str, Any]:
+    payload = parse_json_object(content)
+    status = str(payload.get("status") or "").strip().lower()
+    if status not in {item.value for item in ResearchStatus}:
+        raise AssessmentValidationError("final status is invalid")
+    summary = payload.get("summary")
+    if not isinstance(summary, str):
+        raise AssessmentValidationError("final summary must be a string")
+    for field in ("findings", "unresolved"):
+        value = payload.get(field)
+        if not isinstance(value, list) or any(not isinstance(item, str) for item in value):
+            raise AssessmentValidationError(f"final {field} must be an array of strings")
     return payload
+
+
+def _try_parse_final_draft(content: str) -> dict[str, Any] | None:
+    try:
+        return _parse_final_draft(content)
+    except AssessmentValidationError:
+        return None
+
+
+def _bounded_finalization_messages(
+    state: ResearchAgentState,
+) -> list[dict[str, Any]]:
+    """Build a compact same-policy snapshot instead of replaying long history."""
+    evidence = _deduplicate_evidence(state["observed_evidence"])
+    if len(evidence) > 32:
+        evidence = [*evidence[:16], *evidence[-16:]]
+    payload = {
+        "objective": state["task"].objective,
+        "expected_output": state["task"].expected_output,
+        "constraints": list(state["task"].constraints),
+        "termination_reason": (
+            state["termination_reason"].value
+            if state.get("termination_reason") is not None
+            else hard_termination_reason(state.get("stop_reason")).value
+            if hard_termination_reason(state.get("stop_reason")) is not None
+            else None
+        ),
+        "stop_detail": state.get("stop_reason"),
+        "requirements": [asdict(item) for item in state["research_requirements"]],
+        "coverage": [
+            {
+                **asdict(item),
+                "status": item.status.value,
+            }
+            for item in state["coverage"]
+        ],
+        "critical_gaps": [asdict(item) for item in state["critical_gaps"]],
+        "evidence": [
+            {
+                "evidence_id": item.evidence_id,
+                "finding": item.finding[:500],
+                "title": item.title[:300],
+                "source_ref": item.source_ref,
+                "limitations": item.limitations[:300],
+            }
+            for item in evidence
+        ],
+        "child_results": [
+            {
+                "task_id": item.task_id,
+                "status": item.status.value,
+                "summary": item.summary[:1000],
+                "unresolved": list(item.unresolved[:8]),
+            }
+            for item in state["child_results"]
+        ],
+        "tool_outcomes": [
+            {
+                "name": message.get("name"),
+                "content": str(message.get("content") or "")[:1000],
+            }
+            for message in state["messages"]
+            if message.get("role") == "tool"
+        ][-12:],
+        "candidate_summary": state.get("last_content", "")[:4000],
+    }
+    identity_messages = [
+        {
+            "role": "system",
+            "content": _system_prompt(state["identity"], state["limits"]),
+        },
+        {"role": "user", "content": _task_prompt(state["task"])},
+    ]
+    return [
+        *identity_messages,
+        {
+            "role": "user",
+            "content": (
+                "FINAL_SYNTHESIS_SNAPSHOT\nReturn one JSON object with status "
+                "(completed|partial|failed), summary, findings (array of strings), "
+                "and unresolved (array of strings). Preserve uncertainty and do not "
+                "invent evidence. The runtime will independently enforce research "
+                "status and termination reason.\n\nSTATE:\n"
+                + json.dumps(payload, ensure_ascii=False, default=str)
+            ),
+        },
+    ]
 
 
 def _stable_evidence_id(source_ref: str, excerpt: str) -> str:
@@ -454,72 +603,6 @@ def _coerce_strings(value: Any) -> list[str]:
     return [str(item).strip() for item in value if str(item).strip()]
 
 
-def _completion_requirements(task: ResearchTask) -> list[str]:
-    """Return user-confirmed research directions used by the lightweight gate."""
-    context = task.context if isinstance(task.context, dict) else {}
-    values: list[str] = []
-    for field in ("research_gaps", "directions", "scope"):
-        raw = context.get(field, [])
-        if isinstance(raw, str):
-            raw = [raw]
-        if isinstance(raw, (list, tuple)):
-            values.extend(str(item).strip() for item in raw if str(item).strip())
-    return list(dict.fromkeys(values))
-
-
-def _completion_source_target(
-    task: ResearchTask,
-    identity: ExecutionIdentity,
-) -> int:
-    """Bound the evidence eligibility target without pretending to score quality."""
-    baseline = 4 if identity.depth == 0 else 3
-    requirement_count = len(_completion_requirements(task))
-    if requirement_count <= 0:
-        return baseline
-    return min(12, max(baseline, requirement_count * 2))
-
-
-def _completion_message(
-    state: ResearchAgentState,
-    *,
-    source_count: int,
-    new_evidence: int,
-    new_sources: int,
-    force_finalize: bool,
-    saturated: bool = False,
-) -> str:
-    requirements = _completion_requirements(state["task"])
-    requirement_text = (
-        "\n".join(f"- {item}" for item in requirements)
-        if requirements
-        else f"- {state['task'].objective}"
-    )
-    if saturated:
-        decision = (
-            "The research has produced no new source-locatable evidence for two "
-            "consecutive assessed rounds. Return a partial final JSON now."
-        )
-    elif force_finalize:
-        decision = (
-            "The lightweight completion gate has been eligible for two consecutive "
-            "rounds. Return the final JSON now without calling tools. Mark status "
-            "partial and list concrete unresolved items if any requirement is not "
-            "actually supported."
-        )
-    else:
-        decision = (
-            "The evidence floor is now eligible. Before using another tool, identify "
-            "one concrete unsupported requirement. If none exists, return the final "
-            "JSON without tool calls; avoid collecting redundant sources."
-        )
-    return (
-        "COMPLETION ASSESSMENT\n"
-        f"Distinct source-locatable sources: {source_count}. "
-        f"This round added {new_evidence} evidence items and {new_sources} sources.\n"
-        f"Requirements to verify:\n{requirement_text}\n\n{decision}"
-    )
-
-
 def _fork_policy_instance(policy: Any) -> Any:
     fork = getattr(policy, "fork", None)
     if callable(fork):
@@ -603,6 +686,7 @@ def create_research_agent_state(
     lineage_objectives: list[str] | None = None,
 ) -> ResearchAgentState:
     limits.validate()
+    requirements = build_research_requirements(task)
     return ResearchAgentState(
         task=task,
         identity=identity,
@@ -654,15 +738,138 @@ def create_research_agent_state(
             else [task.objective]
         ),
         draft=None,
+        draft_raw="",
         last_content="",
         last_assessed_evidence_count=0,
-        last_assessed_source_count=0,
-        stagnant_evidence_rounds=0,
-        completion_ready_rounds=0,
-        completion_requested=False,
-        completion_reason=None,
+        research_requirements=list(requirements),
+        coverage=list(initial_coverage(requirements)),
+        critical_gaps=[],
+        next_actions=[],
+        strategy_attempts=[],
+        assessment_decision=None,
+        assessment_output_status=OutputStatus.VALID,
+        assessment_error=None,
+        termination_reason=None,
+        finalization_requested=False,
+        output_status=OutputStatus.VALID,
         stop_reason=None,
         result=None,
+    )
+
+
+def _fallback_assessment(
+    state: ResearchAgentState,
+    *,
+    attempts: tuple[StrategyAttempt, ...],
+    hard_reason: TerminationReason | None = None,
+    has_research_tools: bool,
+) -> ResearchAssessment:
+    """Conservative deterministic routing after one failed structure repair."""
+    requirements = tuple(state["research_requirements"])
+    evidence = _deduplicate_evidence(state["observed_evidence"])
+    existing = tuple(state["coverage"])
+    if hard_reason is not None:
+        return ResearchAssessment(
+            decision=ResearchDecision.STOP_RESEARCH,
+            coverage=existing,
+            critical_gaps=tuple(state["critical_gaps"]),
+            termination_reason=hard_reason,
+            output_status=OutputStatus.FALLBACK,
+        )
+    if not evidence and any(
+        event.get("kind") == "tool_finished" and not event.get("ok", False)
+        for event in state.get("execution_events", [])
+    ):
+        return ResearchAssessment(
+            decision=ResearchDecision.STOP_RESEARCH,
+            coverage=existing,
+            critical_gaps=tuple(
+                CriticalGap(
+                    item.requirement_id,
+                    item.remaining_gap or "The evidence tool path failed.",
+                )
+                for item in existing
+                if item.status != RequirementStatus.SUPPORTED
+            ),
+            termination_reason=TerminationReason.TOOL_FAILURE,
+            output_status=OutputStatus.FALLBACK,
+        )
+    if state.get("draft_raw") and not state["task"].require_evidence:
+        coverage = tuple(
+            RequirementCoverage(
+                requirement.requirement_id,
+                RequirementStatus.SUPPORTED,
+                rationale="The scoped task did not require external evidence.",
+            )
+            for requirement in requirements
+        )
+        return ResearchAssessment(
+            decision=ResearchDecision.STOP_RESEARCH,
+            coverage=coverage,
+            termination_reason=TerminationReason.COVERAGE_COMPLETE,
+            output_status=OutputStatus.FALLBACK,
+        )
+    all_required_supported = bool(existing) and all(
+        item.status == RequirementStatus.SUPPORTED for item in existing
+    )
+    if all_required_supported and (evidence or not state["task"].require_evidence):
+        # A structure failure cannot erase coverage that was already validated in
+        # an earlier checkpoint. It also cannot manufacture new support.
+        return ResearchAssessment(
+            decision=ResearchDecision.STOP_RESEARCH,
+            coverage=existing,
+            termination_reason=TerminationReason.COVERAGE_COMPLETE,
+            output_status=OutputStatus.FALLBACK,
+        )
+    if not has_research_tools:
+        return ResearchAssessment(
+            decision=ResearchDecision.STOP_RESEARCH,
+            coverage=existing,
+            critical_gaps=tuple(
+                CriticalGap(item.requirement_id, item.remaining_gap or "Evidence is unavailable.")
+                for item in existing
+                if item.status != RequirementStatus.SUPPORTED
+            ),
+            termination_reason=TerminationReason.TOOL_FAILURE,
+            output_status=OutputStatus.FALLBACK,
+        )
+    preserved_gaps = tuple(
+        gap
+        for gap in state.get("critical_gaps", [])
+        if any(
+            item.requirement_id == gap.requirement_id
+            and item.status != RequirementStatus.SUPPORTED
+            for item in existing
+        )
+    )
+    gaps = preserved_gaps or tuple(
+        CriticalGap(
+            item.requirement_id,
+            item.remaining_gap or "The necessary requirement remains unsupported.",
+        )
+        for item in existing
+        if item.status != RequirementStatus.SUPPORTED
+    )
+    actions = tuple(
+        NextResearchAction(
+            gap.requirement_id,
+            "query_rewrite",
+            next(
+                requirement.description
+                for requirement in requirements
+                if requirement.requirement_id == gap.requirement_id
+            ),
+            "high",
+            "Obtain source-locatable evidence for the unresolved necessary requirement.",
+        )
+        for gap in gaps
+    )
+    return ResearchAssessment(
+        decision=ResearchDecision.CONTINUE,
+        coverage=existing,
+        critical_gaps=gaps,
+        next_actions=actions,
+        output_status=OutputStatus.FALLBACK,
     )
 
 
@@ -697,8 +904,35 @@ def build_research_agent_graph(
         _validate_invocation(state, config)
         with _node_trace("prepare", state) as observation:
             if state["messages"]:
-                observation.add_output({"resumed": True})
-                return {}
+                requirements = tuple(
+                    state.get("research_requirements")
+                    or build_research_requirements(state["task"])
+                )
+                migration: dict[str, Any] = {
+                    "research_requirements": list(requirements),
+                    "coverage": list(
+                        state.get("coverage") or initial_coverage(requirements)
+                    ),
+                    "critical_gaps": list(state.get("critical_gaps", [])),
+                    "next_actions": list(state.get("next_actions", [])),
+                    "strategy_attempts": list(state.get("strategy_attempts", [])),
+                    "assessment_decision": state.get("assessment_decision"),
+                    "assessment_output_status": state.get(
+                        "assessment_output_status", OutputStatus.VALID
+                    ),
+                    "assessment_error": state.get("assessment_error"),
+                    "termination_reason": state.get("termination_reason"),
+                    "finalization_requested": bool(
+                        state.get("finalization_requested", False)
+                    ),
+                    "output_status": state.get("output_status", OutputStatus.VALID),
+                    "draft_raw": state.get("draft_raw", ""),
+                    "last_assessed_evidence_count": int(
+                        state.get("last_assessed_evidence_count", 0)
+                    ),
+                }
+                observation.add_output({"resumed": True, "state_migrated": True})
+                return migration
             messages = [
                 {
                     "role": "system",
@@ -720,64 +954,94 @@ def build_research_agent_graph(
         config: RunnableConfig,
     ) -> dict[str, Any]:
         _validate_invocation(state, config)
-        completion_requested = bool(state.get("completion_requested", False))
-        completion_reason = state.get("completion_reason")
-        if state["stop_reason"]:
-            return {"pending_tool_calls": [], "pending_fork_calls": []}
-        if state["iteration"] >= state["limits"].max_iterations:
+        finalization_requested = bool(state.get("finalization_requested", False))
+        if state["stop_reason"] and not finalization_requested:
+            return {
+                "pending_tool_calls": [],
+                "pending_fork_calls": [],
+                "termination_reason": hard_termination_reason(state["stop_reason"]),
+            }
+        if not finalization_requested and state["iteration"] >= state["limits"].max_iterations:
             return {
                 "pending_tool_calls": [],
                 "pending_fork_calls": [],
                 "stop_reason": "max_iterations_exhausted",
+                "termination_reason": TerminationReason.BUDGET_FORCED,
             }
-        if _remaining_seconds(state) <= 0:
-            return {
+        available_seconds = (
+            _remaining_seconds(state)
+            if finalization_requested
+            else _remaining_research_seconds(state)
+        )
+        if available_seconds <= 0:
+            update: dict[str, Any] = {
                 "pending_tool_calls": [],
                 "pending_fork_calls": [],
                 "stop_reason": "time_budget_exhausted",
+                "termination_reason": TerminationReason.BUDGET_FORCED,
             }
+            if finalization_requested:
+                update["finalization_requested"] = False
+            return update
         remaining_tokens = (
             state["subtree_token_budget"] - state["estimated_tokens_used"]
         )
+        policy_messages = (
+            _bounded_finalization_messages(state)
+            if finalization_requested
+            else state["messages"]
+        )
         estimated_prompt_tokens = max(
             1,
-            sum(len(str(item.get("content") or "")) for item in state["messages"])
+            sum(len(str(item.get("content") or "")) for item in policy_messages)
             // 4,
         )
-        if remaining_tokens <= 0 or estimated_prompt_tokens >= remaining_tokens:
-            return {
+        reserve = (
+            0
+            if finalization_requested
+            else estimated_prompt_tokens + _FINALIZATION_OUTPUT_TOKEN_RESERVE
+        )
+        if (
+            remaining_tokens <= reserve
+            or estimated_prompt_tokens >= max(1, remaining_tokens - reserve)
+        ):
+            update = {
                 "pending_tool_calls": [],
                 "pending_fork_calls": [],
                 "stop_reason": "token_budget_exhausted",
+                "termination_reason": TerminationReason.BUDGET_FORCED,
             }
+            if finalization_requested:
+                update["finalization_requested"] = False
+            return update
 
         with _node_trace("think_and_plan", state) as observation:
             # Tool availability can be bound per async research run, so resolve
             # schemas here instead of freezing a deny-all scope at graph compile.
-            schemas = (
-                []
-                if completion_requested
-                else [*_tool_schemas(tool_list), fork_tool_schema()]
-            )
+            schemas = [] if finalization_requested else [*_tool_schemas(tool_list), fork_tool_schema()]
             action_retries = 0
             while True:
                 try:
                     response = await asyncio.wait_for(
-                        call_policy(policy, state["messages"], schemas),
-                        timeout=max(0.001, _remaining_seconds(state)),
+                        call_policy(policy, policy_messages, schemas),
+                        timeout=max(0.001, available_seconds),
                     )
                     break
                 except asyncio.CancelledError:
                     raise
                 except asyncio.TimeoutError:
                     observation.set_error("time budget exhausted")
-                    return {
+                    update = {
                         "pending_tool_calls": [],
                         "pending_fork_calls": [],
                         "stop_reason": "time_budget_exhausted",
+                        "termination_reason": TerminationReason.BUDGET_FORCED,
                         "iteration": state["iteration"] + 1,
                         "retries_used": state["retries_used"] + action_retries,
                     }
+                    if finalization_requested:
+                        update["finalization_requested"] = False
+                    return update
                 except Exception as exc:
                     retry_available = min(
                         state["limits"].max_retries_per_action - action_retries,
@@ -785,27 +1049,27 @@ def build_research_agent_graph(
                     )
                     if retry_available <= 0:
                         observation.set_error(str(exc))
-                        return {
+                        update = {
                             "pending_tool_calls": [],
                             "pending_fork_calls": [],
                             "stop_reason": f"policy_error: {exc}",
+                            "termination_reason": TerminationReason.TOOL_FAILURE,
                             "iteration": state["iteration"] + 1,
                             "retries_used": state["retries_used"] + action_retries,
                         }
+                        if finalization_requested:
+                            update["finalization_requested"] = False
+                        return update
                     action_retries += 1
 
             token_charge = min(
-                _estimate_tokens(state["messages"], response),
+                _estimate_tokens(policy_messages, response),
                 remaining_tokens,
             )
             token_exhausted = token_charge >= remaining_tokens
 
             content = str(response.get("content") or "")
-            calls = (
-                []
-                if completion_requested
-                else _normalize_tool_calls(response.get("tool_calls"))
-            )
+            calls = [] if finalization_requested else _normalize_tool_calls(response.get("tool_calls"))
             assistant_message: dict[str, Any] = {
                 "role": "assistant",
                 "content": content,
@@ -820,38 +1084,32 @@ def build_research_agent_graph(
                 "iteration": state["iteration"] + 1,
                 "last_content": content,
                 "pending_stop_reason": None,
-                "completion_requested": False,
-                "completion_reason": None,
+                "finalization_requested": False,
                 "estimated_tokens_used": state["estimated_tokens_used"] + token_charge,
                 "retries_used": state["retries_used"] + action_retries,
             }
             if token_exhausted:
                 update["pending_tool_calls"] = []
                 update["pending_fork_calls"] = []
-                update["draft"] = _parse_draft(content)
+                update["draft_raw"] = content
+                update["draft"] = _try_parse_final_draft(content)
                 update["stop_reason"] = "token_budget_exhausted"
+                update["termination_reason"] = TerminationReason.BUDGET_FORCED
                 observation.add_output({"action": "stop", "reason": "token_budget"})
                 return update
-            if completion_requested:
+            if finalization_requested:
                 update["pending_tool_calls"] = []
                 update["pending_fork_calls"] = []
-                update["draft"] = _parse_draft(content)
-                if completion_reason == "evidence_saturated":
-                    update["stop_reason"] = "evidence_saturated"
-                elif not content.strip():
-                    update["stop_reason"] = "completion_finalize_failed"
-                observation.add_output(
-                    {
-                        "action": "synthesize",
-                        "completion_reason": completion_reason,
-                    }
-                )
+                update["draft_raw"] = content
+                update["draft"] = _try_parse_final_draft(content)
+                observation.add_output({"action": "finalize_output"})
                 return update
             if not calls:
                 update["pending_tool_calls"] = []
                 update["pending_fork_calls"] = []
-                update["draft"] = _parse_draft(content)
-                observation.add_output({"action": "synthesize"})
+                update["draft_raw"] = content
+                update["draft"] = _try_parse_final_draft(content)
+                observation.add_output({"action": "assess_candidate"})
                 return update
 
             fork_calls = [
@@ -877,6 +1135,7 @@ def build_research_agent_graph(
             if remaining <= 0:
                 update["pending_tool_calls"] = []
                 update["stop_reason"] = "max_tool_calls_exhausted"
+                update["termination_reason"] = TerminationReason.BUDGET_FORCED
                 observation.add_output({"action": "stop", "reason": "tool_budget"})
                 return update
             if len(calls) > remaining:
@@ -889,122 +1148,198 @@ def build_research_agent_graph(
             )
             return update
 
-    def assess_completion(
+    async def assess_research_state(
         state: ResearchAgentState,
         config: RunnableConfig,
     ) -> dict[str, Any]:
-        """Apply a checkpointed, explainable completion gate without a new Agent."""
+        """Use the same policy for a validated Continue/Replan/Stop decision."""
         _validate_invocation(state, config)
         evidence = _deduplicate_evidence(state["observed_evidence"])
-        sources = {item.source_ref for item in evidence if item.source_ref}
         evidence_count = len(evidence)
-        source_count = len(sources)
-        new_evidence = max(
-            0,
-            evidence_count - int(state.get("last_assessed_evidence_count", 0)),
+        previous_count = int(state.get("last_assessed_evidence_count", 0))
+        new_evidence_ids = tuple(
+            item.evidence_id for item in evidence[previous_count:]
         )
-        new_sources = max(
-            0,
-            source_count - int(state.get("last_assessed_source_count", 0)),
+        attempts = tuple(state.get("strategy_attempts", []))
+        hard_reason = hard_termination_reason(state.get("stop_reason"))
+        forced_stop_reason: str | None = None
+        if hard_reason is None and state.get("termination_reason") in {
+            TerminationReason.BUDGET_FORCED,
+            TerminationReason.TOOL_FAILURE,
+            TerminationReason.USER_CANCELLED,
+        }:
+            hard_reason = state["termination_reason"]
+        recent_tool_failures = tuple(
+            str(event.get("error") or event.get("tool") or "tool failure")
+            for event in state["execution_events"][-12:]
+            if event.get("kind") == "tool_finished" and not event.get("ok", False)
         )
-        stagnant_rounds = (
-            int(state.get("stagnant_evidence_rounds", 0)) + 1
-            if new_evidence == 0 and new_sources == 0
-            else 0
-        )
-        source_target = _completion_source_target(state["task"], state["identity"])
-        eligible = (
-            state["task"].require_evidence
-            and state["iteration"] >= _COMPLETION_MIN_RESEARCH_ITERATIONS
-            and source_count >= source_target
-        )
-        ready_rounds = (
-            int(state.get("completion_ready_rounds", 0)) + 1
-            if eligible
-            else 0
-        )
-        update: dict[str, Any] = {
-            "last_assessed_evidence_count": evidence_count,
-            "last_assessed_source_count": source_count,
-            "stagnant_evidence_rounds": stagnant_rounds,
-            "completion_ready_rounds": ready_rounds,
-            "completion_requested": False,
-            "completion_reason": None,
-        }
-
-        if state["stop_reason"] or state["draft"] is not None:
-            outcome = "synthesize"
-        elif ready_rounds >= _COMPLETION_READY_ROUNDS:
-            update["messages"] = [
-                *state["messages"],
-                {
-                    "role": "user",
-                    "content": _completion_message(
-                        state,
-                        source_count=source_count,
-                        new_evidence=new_evidence,
-                        new_sources=new_sources,
-                        force_finalize=True,
-                    ),
-                },
-            ]
-            update["completion_requested"] = True
-            update["completion_reason"] = "evidence_sufficient"
-            outcome = "finalize"
-        elif (
-            evidence
-            and stagnant_rounds >= _COMPLETION_STAGNANT_ROUNDS
-        ):
-            update["messages"] = [
-                *state["messages"],
-                {
-                    "role": "user",
-                    "content": _completion_message(
-                        state,
-                        source_count=source_count,
-                        new_evidence=new_evidence,
-                        new_sources=new_sources,
-                        force_finalize=True,
-                        saturated=True,
-                    ),
-                },
-            ]
-            update["completion_requested"] = True
-            update["completion_reason"] = "evidence_saturated"
-            outcome = "finalize_partial"
-        elif ready_rounds == 1:
-            update["messages"] = [
-                *state["messages"],
-                {
-                    "role": "user",
-                    "content": _completion_message(
-                        state,
-                        source_count=source_count,
-                        new_evidence=new_evidence,
-                        new_sources=new_sources,
-                        force_finalize=False,
-                    ),
-                },
-            ]
-            outcome = "verify_gaps"
+        assessment_error: str | None = None
+        token_charge = 0
+        if hard_reason is not None:
+            assessment = _fallback_assessment(
+                state,
+                attempts=attempts,
+                hard_reason=hard_reason,
+                has_research_tools=bool(tool_list),
+            )
         else:
-            outcome = "continue"
+            prompt = assessment_schema_prompt(
+                task=state["task"],
+                requirements=tuple(state["research_requirements"]),
+                coverage=tuple(state["coverage"]),
+                evidence=evidence,
+                critical_gaps=tuple(state["critical_gaps"]),
+                attempts=attempts,
+                candidate_final=state.get("draft_raw", ""),
+                recent_tool_failures=recent_tool_failures,
+            )
+            assessment_messages = [
+                {
+                    "role": "system",
+                    "content": (
+                        "You are the sufficiency-assessment step inside the same "
+                        "PaperPilot Research AgentGraph. Return structured JSON only."
+                    ),
+                },
+                {"role": "user", "content": prompt},
+            ]
+            remaining_tokens = (
+                state["subtree_token_budget"] - state["estimated_tokens_used"]
+            )
+            assessment_input_tokens = max(
+                1,
+                sum(len(str(item.get("content") or "")) for item in assessment_messages)
+                // 4,
+            )
+            finalization_reserve = max(
+                _FINALIZATION_OUTPUT_TOKEN_RESERVE,
+                sum(
+                    len(str(item.get("content") or ""))
+                    for item in state["messages"]
+                )
+                // 4
+                + _FINALIZATION_OUTPUT_TOKEN_RESERVE,
+            )
+            if remaining_tokens <= (
+                assessment_input_tokens
+                + _ASSESSMENT_OUTPUT_TOKEN_RESERVE
+                + finalization_reserve
+            ):
+                forced_stop_reason = "token_budget_exhausted"
+                hard_reason = TerminationReason.BUDGET_FORCED
+                assessment = _fallback_assessment(
+                    state,
+                    attempts=attempts,
+                    hard_reason=hard_reason,
+                    has_research_tools=bool(tool_list),
+                )
+            else:
+                try:
+                    if _remaining_research_seconds(state) <= 0:
+                        raise asyncio.TimeoutError
+                    response = await asyncio.wait_for(
+                        call_policy(policy, assessment_messages, []),
+                        timeout=max(0.001, _remaining_research_seconds(state)),
+                    )
+                    token_charge += _estimate_tokens(assessment_messages, response)
+                    raw_assessment = str(response.get("content") or "")
+                    try:
+                        assessment = parse_research_assessment(
+                            raw_assessment,
+                            requirements=tuple(state["research_requirements"]),
+                            evidence=evidence,
+                            attempts=attempts,
+                            require_evidence=state["task"].require_evidence,
+                        )
+                    except AssessmentValidationError as exc:
+                        assessment_error = str(exc)
+                        repair_messages = [
+                            assessment_messages[0],
+                            assessment_messages[1],
+                            {"role": "assistant", "content": raw_assessment},
+                            {
+                                "role": "user",
+                                "content": repair_assessment_prompt(raw_assessment, str(exc)),
+                            },
+                        ]
+                        repaired = await asyncio.wait_for(
+                            call_policy(policy, repair_messages, []),
+                            timeout=max(0.001, _remaining_research_seconds(state)),
+                        )
+                        token_charge += _estimate_tokens(repair_messages, repaired)
+                        assessment = parse_research_assessment(
+                            str(repaired.get("content") or ""),
+                            requirements=tuple(state["research_requirements"]),
+                            evidence=evidence,
+                            attempts=attempts,
+                            require_evidence=state["task"].require_evidence,
+                            output_status=OutputStatus.REPAIRED,
+                        )
+                except asyncio.CancelledError:
+                    raise
+                except Exception as exc:
+                    assessment_error = f"{type(exc).__name__}: {exc}"
+                    assessment = _fallback_assessment(
+                        state,
+                        attempts=attempts,
+                        has_research_tools=bool(tool_list),
+                    )
 
-        update["execution_events"] = [
+        messages = list(state["messages"])
+        draft = state.get("draft")
+        draft_raw = state.get("draft_raw", "")
+        finalization_requested = False
+        if assessment.decision in {ResearchDecision.CONTINUE, ResearchDecision.REPLAN}:
+            messages.append({"role": "user", "content": control_message(assessment)})
+            draft = None
+            draft_raw = ""
+        elif draft is None:
+            messages.append({"role": "user", "content": finalization_prompt(assessment)})
+            finalization_requested = True
+            draft_raw = ""
+
+        update: dict[str, Any] = {
+            "messages": messages,
+            "draft": draft,
+            "draft_raw": draft_raw,
+            "last_assessed_evidence_count": evidence_count,
+            "research_requirements": list(state["research_requirements"]),
+            "coverage": list(assessment.coverage),
+            "critical_gaps": list(assessment.critical_gaps),
+            "next_actions": list(assessment.next_actions),
+            "strategy_attempts": list(attempts),
+            "assessment_decision": assessment.decision,
+            "assessment_output_status": assessment.output_status,
+            "assessment_error": assessment_error,
+            "termination_reason": assessment.termination_reason,
+            "finalization_requested": finalization_requested,
+            "estimated_tokens_used": min(
+                state["subtree_token_budget"],
+                state["estimated_tokens_used"] + token_charge,
+            ),
+            "execution_events": [
             *state["execution_events"],
             _event(
-                "completion_assessed",
+                "research_state_assessed",
                 state["identity"],
-                outcome=outcome,
+                decision=assessment.decision.value,
+                termination_reason=(
+                    assessment.termination_reason.value
+                    if assessment.termination_reason is not None
+                    else None
+                ),
                 evidence_count=evidence_count,
-                source_count=source_count,
-                new_evidence=new_evidence,
-                new_sources=new_sources,
-                source_target=source_target,
-                stagnant_rounds=stagnant_rounds,
-                ready_rounds=ready_rounds,
+                new_evidence_count=len(new_evidence_ids),
+                critical_gap_count=len(assessment.critical_gaps),
+                next_action_count=len(assessment.next_actions),
+                assessment_output_status=assessment.output_status.value,
+                assessment_error=assessment_error,
             ),
-        ]
+            ],
+        }
+        if forced_stop_reason is not None:
+            update["stop_reason"] = forced_stop_reason
         return update
 
     async def _execute_pending_tools(
@@ -1015,6 +1350,7 @@ def build_research_agent_graph(
         local_tool_calls = state["tool_calls_used"]
         total_tool_calls = state["total_tool_calls_used"]
         retries_used = state["retries_used"]
+        strategy_attempts = list(state.get("strategy_attempts", []))
         events = list(state["execution_events"])
         stop_reason = state["pending_stop_reason"]
 
@@ -1054,6 +1390,11 @@ def build_research_agent_graph(
                     arguments = {}
 
                 tool = tool_map.get(tool_name)
+                matched_action = _action_for_tool_call(
+                    tool_name,
+                    arguments,
+                    state.get("next_actions", []),
+                )
                 result: Any
                 error: str | None = None
                 action_retries = 0
@@ -1065,7 +1406,7 @@ def build_research_agent_graph(
                     tags=["paperpilot", "research-agent", "tool"],
                 ) as observation:
                     while True:
-                        if _remaining_seconds(state) <= 0:
+                        if _remaining_research_seconds(state) <= 0:
                             error = "time budget exhausted"
                             result = {"error": error}
                             stop_reason = "time_budget_exhausted"
@@ -1081,7 +1422,10 @@ def build_research_agent_graph(
                                 if inspect.isawaitable(execution):
                                     result = await asyncio.wait_for(
                                         execution,
-                                        timeout=max(0.001, _remaining_seconds(state)),
+                                        timeout=max(
+                                            0.001,
+                                            _remaining_research_seconds(state),
+                                        ),
                                     )
                                 else:
                                     result = execution
@@ -1124,8 +1468,28 @@ def build_research_agent_graph(
                     else:
                         observation.add_output({"ok": True, "retries": action_retries})
 
+                extracted: list[EvidenceItem] = []
                 if error is None:
-                    collected.extend(_extract_evidence(tool_name, arguments, result))
+                    extracted = _extract_evidence(tool_name, arguments, result)
+                    known_ids = {item.evidence_id for item in collected}
+                    new_ids = tuple(
+                        item.evidence_id
+                        for item in extracted
+                        if item.evidence_id not in known_ids
+                    )
+                    collected.extend(extracted)
+                else:
+                    new_ids = ()
+                if matched_action is not None:
+                    strategy_attempts.append(
+                        StrategyAttempt(
+                            requirement_id=matched_action.requirement_id,
+                            strategy=matched_action.strategy,
+                            query=str(arguments.get("query") or matched_action.query),
+                            outcome="evidence_found" if new_ids else "no_progress",
+                            evidence_ids=new_ids,
+                        )
+                    )
                 events.append(
                     _event(
                         "tool_finished",
@@ -1133,6 +1497,7 @@ def build_research_agent_graph(
                         tool=tool_name,
                         ok=error is None,
                         retries=action_retries,
+                        error=error,
                     )
                 )
                 new_messages.append(
@@ -1162,6 +1527,7 @@ def build_research_agent_graph(
             "execution_events": events,
             "pending_tool_calls": [],
             "observed_evidence": _deduplicate_evidence(collected),
+            "strategy_attempts": strategy_attempts,
             "stop_reason": stop_reason,
             "pending_stop_reason": None,
         }
@@ -1370,6 +1736,20 @@ def build_research_agent_graph(
             "child_thread_ids": [*state["child_thread_ids"], *child_thread_ids],
             "child_results": all_results,
             "observed_evidence": evidence,
+            "strategy_attempts": [
+                *state.get("strategy_attempts", []),
+                *(
+                    StrategyAttempt(
+                        requirement_id=f"{result.task_id}:{attempt.requirement_id}",
+                        strategy=attempt.strategy,
+                        query=attempt.query,
+                        outcome=attempt.outcome,
+                        evidence_ids=attempt.evidence_ids,
+                    )
+                    for result in new_results
+                    for attempt in result.strategy_attempts
+                ),
+            ],
             "total_threads_used": (
                 state["total_threads_used"]
                 + sum(result.thread_count for result in new_results)
@@ -1398,6 +1778,89 @@ def build_research_agent_graph(
             ],
         }
 
+    async def finalize_output(
+        state: ResearchAgentState,
+        config: RunnableConfig,
+    ) -> dict[str, Any]:
+        """Validate the final JSON, repair once without tools, then fall back safely."""
+        _validate_invocation(state, config)
+        raw = state.get("draft_raw", "")
+        draft = state.get("draft")
+        output_status = OutputStatus.VALID
+        error: str | None = None
+        token_charge = 0
+        if draft is None:
+            try:
+                if not raw.strip():
+                    raise AssessmentValidationError("final response is empty")
+                draft = _parse_final_draft(raw)
+            except AssessmentValidationError as exc:
+                error = str(exc)
+                if raw.strip() and _remaining_seconds(state) > 0 and (
+                    state["subtree_token_budget"] - state["estimated_tokens_used"] > 0
+                ):
+                    repair_messages = [
+                        {
+                            "role": "system",
+                            "content": (
+                                "Repair final Research Agent output structure only. "
+                                "Return JSON and never call tools."
+                            ),
+                        },
+                        {"role": "user", "content": repair_final_prompt(raw, error)},
+                    ]
+                    try:
+                        response = await asyncio.wait_for(
+                            call_policy(policy, repair_messages, []),
+                            timeout=max(0.001, _remaining_seconds(state)),
+                        )
+                        token_charge = _estimate_tokens(repair_messages, response)
+                        draft = _parse_final_draft(str(response.get("content") or ""))
+                        output_status = OutputStatus.REPAIRED
+                    except asyncio.CancelledError:
+                        raise
+                    except Exception as repair_exc:
+                        error = f"{error}; repair failed: {type(repair_exc).__name__}: {repair_exc}"
+            if draft is None:
+                evidence = _deduplicate_evidence(state["observed_evidence"])
+                plain = raw.strip()
+                draft = {
+                    "status": "partial" if plain or evidence else "failed",
+                    "summary": plain or (
+                        "Research stopped before a structured synthesis was available."
+                    ),
+                    "findings": [item.finding for item in evidence[:12]],
+                    "unresolved": [
+                        "Final output used a deterministic fallback after one structure repair."
+                    ],
+                }
+                output_status = OutputStatus.FALLBACK
+
+        with _node_trace("finalize_output", state) as observation:
+            observation.add_output(
+                {
+                    "output_status": output_status.value,
+                    "repair_error": error,
+                }
+            )
+        return {
+            "draft": draft,
+            "output_status": output_status,
+            "estimated_tokens_used": min(
+                state["subtree_token_budget"],
+                state["estimated_tokens_used"] + token_charge,
+            ),
+            "execution_events": [
+                *state["execution_events"],
+                _event(
+                    "final_output_validated",
+                    state["identity"],
+                    output_status=output_status.value,
+                    repair_error=error,
+                ),
+            ],
+        }
+
     def synthesize(
         state: ResearchAgentState,
         config: RunnableConfig,
@@ -1415,17 +1878,23 @@ def build_research_agent_graph(
                 for child in state["child_results"]
                 if child.status != ResearchStatus.COMPLETED
             ]
-            for child in incomplete_children:
-                unresolved.append(
-                    f"Child task {child.task_id} returned {child.status.value}."
-                )
+            for child in state["child_results"]:
+                if child.status != ResearchStatus.COMPLETED:
+                    unresolved.append(
+                        f"Child task {child.task_id} returned {child.status.value}."
+                    )
                 unresolved.extend(child.unresolved)
 
             requested_status = str(draft.get("status") or "completed").lower()
+            termination_reason = state.get("termination_reason")
+            coverage = tuple(state.get("coverage", []))
+            all_required_supported = bool(coverage) and all(
+                item.status == RequirementStatus.SUPPORTED for item in coverage
+            )
+            usable = bool(state.get("draft_raw", "").strip() or findings or evidence)
             if stop_reason:
-                status = ResearchStatus.PARTIAL if summary or evidence else ResearchStatus.FAILED
                 unresolved.append(stop_reason)
-            elif not summary and not findings:
+            if not summary and not findings:
                 status = ResearchStatus.FAILED
                 unresolved.append("Agent returned no usable summary or findings.")
             elif state["task"].require_evidence and not evidence:
@@ -1437,8 +1906,24 @@ def build_research_agent_graph(
                 status = ResearchStatus.PARTIAL
             else:
                 status = ResearchStatus.COMPLETED
-            if status == ResearchStatus.COMPLETED and incomplete_children:
-                status = ResearchStatus.PARTIAL
+            if termination_reason == TerminationReason.COVERAGE_COMPLETE:
+                status = (
+                    ResearchStatus.COMPLETED
+                    if all_required_supported and (evidence or not state["task"].require_evidence)
+                    else ResearchStatus.PARTIAL
+                )
+            elif termination_reason == TerminationReason.SATURATED:
+                status = ResearchStatus.COMPLETED if all_required_supported else ResearchStatus.PARTIAL
+            elif termination_reason in {
+                TerminationReason.EVIDENCE_EXHAUSTED,
+                TerminationReason.BUDGET_FORCED,
+            }:
+                status = ResearchStatus.PARTIAL if usable else ResearchStatus.FAILED
+            elif termination_reason in {
+                TerminationReason.TOOL_FAILURE,
+                TerminationReason.USER_CANCELLED,
+            }:
+                status = ResearchStatus.PARTIAL if usable else ResearchStatus.FAILED
 
             result = ResearchResult(
                 task_id=state["task"].task_id,
@@ -1451,6 +1936,12 @@ def build_research_agent_graph(
                     child.task_id for child in state["child_results"]
                 ),
                 stop_reason=stop_reason,
+                termination_reason=termination_reason,
+                output_status=state.get("output_status", OutputStatus.FALLBACK),
+                coverage=coverage,
+                critical_gaps=tuple(state.get("critical_gaps", [])),
+                next_actions=tuple(state.get("next_actions", [])),
+                strategy_attempts=tuple(state.get("strategy_attempts", [])),
                 iterations=state["iteration"],
                 tool_calls_used=state["total_tool_calls_used"],
                 thread_count=state["total_threads_used"],
@@ -1472,6 +1963,12 @@ def build_research_agent_graph(
                         "agent_finished",
                         state["identity"],
                         status=result.status.value,
+                        termination_reason=(
+                            result.termination_reason.value
+                            if result.termination_reason is not None
+                            else None
+                        ),
+                        output_status=result.output_status.value,
                     ),
                 ],
             }
@@ -1481,19 +1978,30 @@ def build_research_agent_graph(
             return "fork_children"
         if state["pending_tool_calls"]:
             return "use_tools"
-        return "assess_completion"
+        if (
+            state.get("assessment_decision") == ResearchDecision.STOP_RESEARCH
+            and not state.get("finalization_requested")
+        ):
+            return "finalize_output"
+        return "assess_research_state"
 
     def route_after_assessment(state: ResearchAgentState) -> str:
-        if state["stop_reason"] or state["draft"] is not None:
-            return "synthesize"
-        return "think_and_plan"
+        if state.get("assessment_decision") in {
+            ResearchDecision.CONTINUE,
+            ResearchDecision.REPLAN,
+        }:
+            return "think_and_plan"
+        if state.get("finalization_requested"):
+            return "think_and_plan"
+        return "finalize_output"
 
     builder = StateGraph(ResearchAgentState)
     builder.add_node("prepare", prepare)
     builder.add_node("think_and_plan", think_and_plan)
     builder.add_node("use_tools", use_tools)
     builder.add_node("fork_children", fork_children)
-    builder.add_node("assess_completion", assess_completion)
+    builder.add_node("assess_research_state", assess_research_state)
+    builder.add_node("finalize_output", finalize_output)
     builder.add_node("synthesize", synthesize)
     builder.add_edge(START, "prepare")
     builder.add_edge("prepare", "think_and_plan")
@@ -1503,19 +2011,21 @@ def build_research_agent_graph(
         {
             "fork_children": "fork_children",
             "use_tools": "use_tools",
-            "assess_completion": "assess_completion",
+            "assess_research_state": "assess_research_state",
+            "finalize_output": "finalize_output",
         },
     )
-    builder.add_edge("use_tools", "assess_completion")
-    builder.add_edge("fork_children", "assess_completion")
+    builder.add_edge("use_tools", "assess_research_state")
+    builder.add_edge("fork_children", "assess_research_state")
     builder.add_conditional_edges(
-        "assess_completion",
+        "assess_research_state",
         route_after_assessment,
         {
             "think_and_plan": "think_and_plan",
-            "synthesize": "synthesize",
+            "finalize_output": "finalize_output",
         },
     )
+    builder.add_edge("finalize_output", "synthesize")
     builder.add_edge("synthesize", END)
     return builder.compile(checkpointer=effective_checkpointer)
 

@@ -26,6 +26,7 @@ from src.research import (
     create_research_agent_state,
     run_research_agent,
 )
+from tests._research_assessment import assessment_response
 
 
 def _config(thread_id: str) -> dict[str, dict[str, str]]:
@@ -77,6 +78,52 @@ def _final(objective: str, *, status: str = "completed") -> dict[str, Any]:
                 "summary": f"Completed {objective}",
                 "findings": [f"Finding for {objective}"],
                 "unresolved": [],
+            }
+        ),
+        "tool_calls": [],
+    }
+
+
+def _continue_assessment(messages, *, query: str = "repeat") -> dict[str, Any] | None:
+    content = str(messages[-1].get("content") or "")
+    if not content.startswith("ASSESS_RESEARCH_STATE"):
+        return None
+    state = json.loads(content.split("STATE:\n", 1)[1])
+    coverage = [
+        {
+            "requirement_id": item["requirement_id"],
+            "status": "unsupported",
+            "evidence_ids": [],
+            "rationale": "More evidence is required.",
+            "remaining_gap": "A material requirement remains open.",
+        }
+        for item in state["requirements"]
+    ]
+    requirement_id = state["requirements"][0]["requirement_id"]
+    return {
+        "content": json.dumps(
+            {
+                "decision": "continue",
+                "coverage": coverage,
+                "critical_gaps": [
+                    {
+                        "requirement_id": requirement_id,
+                        "reason": "A material requirement remains open.",
+                        "impact": "high",
+                    }
+                ],
+                "next_actions": [
+                    {
+                        "requirement_id": requirement_id,
+                        "strategy": "query_rewrite",
+                        "query": query,
+                        "expected_value": "high",
+                        "expected_improvement": "Collect the missing direct evidence.",
+                    }
+                ],
+                "termination_reason": None,
+                "replan_reason": None,
+                "exhaustion_reason": None,
             }
         ),
         "tool_calls": [],
@@ -148,6 +195,9 @@ class _HierarchyPolicy:
         )
 
     def __call__(self, messages, *, tools=None):
+        assessment = assessment_response(messages)
+        if assessment is not None:
+            return assessment
         task_payload = json.loads(messages[1]["content"])
         objective = task_payload["objective"]
         depth_match = re.search(r"depth (\d+)", messages[0]["content"])
@@ -160,6 +210,20 @@ class _HierarchyPolicy:
 
         if objective in self.failing_objectives:
             raise RuntimeError(f"fixed failure for {objective}")
+        if tools == [] and str(messages[-1].get("content") or "").startswith(
+            "FINAL_SYNTHESIS_SNAPSHOT"
+        ):
+            snapshot = json.loads(
+                str(messages[-1]["content"]).split("STATE:\n", 1)[1]
+            )
+            fork_outcomes = [
+                item["content"]
+                for item in snapshot.get("tool_outcomes", [])
+                if item.get("name") == "fork_research"
+            ]
+            if fork_outcomes:
+                self.tracker.fork_responses[objective] = fork_outcomes[-1]
+            return _final(objective)
 
         fork_messages = [
             message
@@ -296,6 +360,9 @@ async def test_child_cannot_fork_an_ancestor_objective() -> None:
 
 class _AlwaysToolPolicy:
     def __call__(self, messages, *, tools=None):
+        assessment = _continue_assessment(messages)
+        if assessment is not None:
+            return assessment
         return {"content": "", "tool_calls": [_search_call("repeat")]}
 
 
@@ -319,6 +386,7 @@ async def test_total_tool_call_limit_has_a_clear_stop_reason() -> None:
     assert tracker.tool_calls["repeat"] == 1
     assert result.tool_calls_used <= limits.max_total_tool_calls
     assert result.stop_reason == "max_tool_calls_exhausted"
+    assert result.termination_reason.value == "budget_forced"
     assert result.status in {ResearchStatus.PARTIAL, ResearchStatus.FAILED}
 
 
@@ -340,6 +408,7 @@ async def test_elapsed_time_limit_has_a_clear_stop_reason() -> None:
     )
 
     assert result.stop_reason == "time_budget_exhausted"
+    assert result.termination_reason.value == "budget_forced"
     assert result.status == ResearchStatus.FAILED
 
 
@@ -348,6 +417,9 @@ class _TokenPolicy:
         self.calls = 0
 
     def __call__(self, messages, *, tools=None):
+        assessment = assessment_response(messages)
+        if assessment is not None:
+            return assessment
         self.calls += 1
         return {
             **_final("token objective"),
@@ -369,12 +441,16 @@ async def test_total_token_limit_is_reported_in_result_metrics() -> None:
 
     assert result.estimated_tokens_used <= limits.max_total_tokens
     assert result.stop_reason == "token_budget_exhausted"
+    assert result.termination_reason.value == "budget_forced"
     assert result.status == ResearchStatus.FAILED
     assert policy.calls == 0
 
 
 class _FinalAfterToolPolicy:
     def __call__(self, messages, *, tools=None):
+        assessment = assessment_response(messages)
+        if assessment is not None:
+            return assessment
         if any(message.get("role") == "tool" for message in messages):
             return _final("retry objective")
         return {"content": "", "tool_calls": [_search_call("retry")]}
@@ -455,6 +531,12 @@ class _RecoveryTracker:
 
 class _RecoveryPolicy:
     def __call__(self, messages, *, tools=None):
+        content = str(messages[-1].get("content") or "")
+        if content.startswith("ASSESS_RESEARCH_STATE"):
+            state = json.loads(content.split("STATE:\n", 1)[1])
+            if len(state["evidence"]) < 2:
+                return _continue_assessment(messages, query="slow")
+            return assessment_response(messages)
         completed_tools = [
             message for message in messages if message.get("role") == "tool"
         ]
@@ -540,7 +622,16 @@ class _ChildRecoveryPolicy:
         return type(self)(self.tracker)
 
     def __call__(self, messages, *, tools=None):
+        assessment = assessment_response(messages)
+        if assessment is not None:
+            return assessment
         objective = json.loads(messages[1]["content"])["objective"]
+        if tools == [] and str(messages[-1].get("content") or "").startswith(
+            "FINAL_SYNTHESIS_SNAPSHOT"
+        ):
+            if objective == "fast child":
+                self.tracker.fast_final_response.set()
+            return _final(objective)
         fork_messages = [
             message
             for message in messages
@@ -661,7 +752,7 @@ async def test_failed_grandchild_keeps_successful_sibling_evidence() -> None:
         limits=AgentLimits(),
     )
 
-    assert result.status == ResearchStatus.PARTIAL
+    assert result.status == ResearchStatus.COMPLETED
     assert result.thread_count == 4
     assert len(result.evidence) == 1
     assert result.evidence[0].source_ref.endswith("/successful grandchild")

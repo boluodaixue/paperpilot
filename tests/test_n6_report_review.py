@@ -20,6 +20,7 @@ from src.research import (
     resume_research_workflow,
 )
 from src.research.report_review import validate_revised_report
+from tests._research_assessment import assessment_response
 
 
 SOURCE_URL = "https://arxiv.org/abs/1706.03762"
@@ -119,6 +120,9 @@ class ReviewPolicy:
         return value if isinstance(value, str) else json.dumps(value)
 
     def __call__(self, messages, *, tools=None):
+        assessment = assessment_response(messages)
+        if assessment is not None:
+            return assessment
         system = str(messages[0].get("content", ""))
         lowered = system.lower()
         active_tools = list(tools or [])
@@ -153,7 +157,7 @@ class ReviewPolicy:
             return {"content": self._content(self.blue_payload, draft), "tool_calls": []}
 
         self.research_calls += 1
-        if messages[-1]["role"] == "tool":
+        if messages[-1]["role"] == "tool" or tools == []:
             return {
                 "content": json.dumps(
                     {

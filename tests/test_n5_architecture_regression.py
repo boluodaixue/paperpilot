@@ -142,3 +142,12 @@ def test_web_ui_has_no_old_graph_or_export_surface() -> None:
     ):
         assert removed not in html
     assert "setTimeout(() => openEventStream(task_id)" in html
+
+
+def test_rcs_stays_out_of_runtime_research_routing() -> None:
+    violations = []
+    for path in sorted((ROOT / "src/research").rglob("*.py")):
+        text = path.read_text(encoding="utf-8").lower()
+        if "research_completion_score" in text or re.search(r"\brcs\b", text):
+            violations.append(str(path.relative_to(ROOT)))
+    assert violations == []

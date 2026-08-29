@@ -54,11 +54,23 @@ root depth=0
 
 fork 必须同时满足可并行、需要上下文隔离和预计存在足够工具链深度。全树共享最大线程、工具调用、时间、token 和重试预算；达到限制后返回明确 `stop_reason`。
 
-### 研究充分性与终止机制（待实施）
+### 研究充分性与终止机制
 
-提交 `bdf310a` 加入的来源数量完成门经真实三题验收后被否决：来源数量和连续轮次不能证明关键问题已经充分覆盖，也不应在存在可行动缺口时禁止工具调用。当前代码将在下一实施任务中替换，不作为目标架构。
+提交 `bdf310a` 加入的固定来源数量、方向数乘二、连续 ready 轮次和全局零增量完成门已经移除。来源数和循环数只作为观察量，不能证明关键问题已经覆盖，也不会在存在可行动关键缺口时禁用研究工具。
 
-目标机制在同一张图中以 `assess_research_state` 评估 Research Brief 目标覆盖、证据充分性、继续研究价值和硬资源边界，产生 `Continue`、`Replan` 或 `Stop Research`。只有必要问题获得支持且不存在会改变答案的关键缺口时才正常完成；有可行动缺口时继续或重新规划；低价值细节饱和、重要证据路径穷尽、预算强制和工具失败分别记录不同停止原因。RCS 仅作为最终评测参考，不作为运行时单一停止阈值。
+用户确认后的 Research Brief 在 `prepare_research` 中形成稳定必要要求。相同 Research Agent policy 在同一张图的 `assess_research_state` 节点中根据目标覆盖、Evidence ID 对应关系、关键缺口、下一轮价值和硬资源边界产生 `Continue`、`Replan` 或 `Stop Research`：
+
+```text
+think_and_plan
+  → use_tools / fork_children
+  → assess_research_state
+      ├─ Continue / Replan → think_and_plan（工具保持可用）
+      └─ Stop Research → finalize_output → synthesize
+```
+
+requirements、coverage、critical gaps、next actions、真实 strategy attempts 和 decision 都进入 checkpoint。程序确定性拒绝缺失 requirement、未知 Evidence ID、矛盾的覆盖/缺口/动作组合、没有新策略的 Replan、没有多种真实 `no_progress` 策略的 Exhausted，以及模型伪造的预算或取消原因。评估 JSON 和最终 JSON 各允许一次无工具结构修复；失败后使用保守 fallback，不覆盖此前已验证的研究状态。
+
+结果分别保存 `research_status`、`termination_reason` 和 `output_status`。停止原因区分 `coverage_complete`、`saturated`、`evidence_exhausted`、`budget_forced`、`tool_failure` 和 `user_cancelled`；子任务 `partial` 继续披露，但根状态只按根 Brief 的最终覆盖重新判断。RCS 只在最终评测输出中计算五个维度，不进入运行时停止路由。
 
 完整契约、状态、路由和验收标准见 `docs/RESEARCH_SUFFICIENCY_TERMINATION_DESIGN.md`。
 

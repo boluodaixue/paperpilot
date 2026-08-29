@@ -14,6 +14,42 @@ class ResearchStatus(str, Enum):
     FAILED = "failed"
 
 
+class ResearchDecision(str, Enum):
+    """The three decisions emitted by the in-graph sufficiency assessment."""
+
+    CONTINUE = "continue"
+    REPLAN = "replan"
+    STOP_RESEARCH = "stop_research"
+
+
+class RequirementStatus(str, Enum):
+    """Evidence support state for one confirmed Research Brief requirement."""
+
+    UNSUPPORTED = "unsupported"
+    WEAK = "weak"
+    SUPPORTED = "supported"
+    CONFLICTED = "conflicted"
+
+
+class TerminationReason(str, Enum):
+    """Why research stopped, kept separate from the result status."""
+
+    COVERAGE_COMPLETE = "coverage_complete"
+    SATURATED = "saturated"
+    EVIDENCE_EXHAUSTED = "evidence_exhausted"
+    BUDGET_FORCED = "budget_forced"
+    TOOL_FAILURE = "tool_failure"
+    USER_CANCELLED = "user_cancelled"
+
+
+class OutputStatus(str, Enum):
+    """Whether the final structured output was direct, repaired, or synthesized."""
+
+    VALID = "valid"
+    REPAIRED = "repaired"
+    FALLBACK = "fallback"
+
+
 class ForkReason(str, Enum):
     """The three product-approved reasons for isolating work in a child Agent."""
 
@@ -137,6 +173,57 @@ class EvidenceItem:
 
 
 @dataclass(frozen=True)
+class ResearchRequirement:
+    """Stable necessary requirement derived from the confirmed Research Brief."""
+
+    requirement_id: str
+    description: str
+    required: bool = True
+
+
+@dataclass(frozen=True)
+class RequirementCoverage:
+    """Current support assessment for one necessary requirement."""
+
+    requirement_id: str
+    status: RequirementStatus
+    evidence_ids: tuple[str, ...] = ()
+    rationale: str = ""
+    remaining_gap: str | None = None
+
+
+@dataclass(frozen=True)
+class CriticalGap:
+    """An unresolved gap and its expected impact on the final answer."""
+
+    requirement_id: str
+    reason: str
+    impact: str = "high"
+
+
+@dataclass(frozen=True)
+class NextResearchAction:
+    """A concrete, requirement-scoped action proposed by the assessment."""
+
+    requirement_id: str
+    strategy: str
+    query: str
+    expected_value: str
+    expected_improvement: str
+
+
+@dataclass(frozen=True)
+class StrategyAttempt:
+    """Checkpointed history of distinct strategies tried for one gap."""
+
+    requirement_id: str
+    strategy: str
+    query: str
+    outcome: str
+    evidence_ids: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True)
 class ResearchResult:
     """The only result shape exchanged between homogeneous Agents."""
 
@@ -148,6 +235,12 @@ class ResearchResult:
     unresolved: tuple[str, ...] = ()
     child_result_refs: tuple[str, ...] = ()
     stop_reason: str | None = None
+    termination_reason: TerminationReason | None = None
+    output_status: OutputStatus = OutputStatus.VALID
+    coverage: tuple[RequirementCoverage, ...] = ()
+    critical_gaps: tuple[CriticalGap, ...] = ()
+    next_actions: tuple[NextResearchAction, ...] = ()
+    strategy_attempts: tuple[StrategyAttempt, ...] = ()
     iterations: int = 0
     tool_calls_used: int = 0
     thread_count: int = 1

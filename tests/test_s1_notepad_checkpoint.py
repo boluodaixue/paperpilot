@@ -212,7 +212,7 @@ async def test_sqlite_rebuilt_graph_restores_notes_without_repeating_write(
         await stream.aclose()
 
         paused = await first_graph.aget_state(_config(thread_id))
-        assert paused.next == ("assess_completion",)
+        assert paused.next == ("assess_research_state",)
         assert [item["content"] for item in paused.values["notepad_entries"]] == [
             "survives-restart"
         ]

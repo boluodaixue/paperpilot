@@ -9,17 +9,27 @@ import pytest
 
 from evaluation.benchmarks.hotpotqa import HotpotQABenchmark
 from evaluation.metrics.rule_based import RuleBasedMetrics
+from evaluation.report import EvaluationReport
 from scripts._workflow_cli import report_path, run_reviewed_workflow
-from scripts.run_eval import workflow_metrics
+from scripts.run_eval import (
+    research_completion_score,
+    researchbench_summary,
+    workflow_metrics,
+)
 from scripts.run_judge import _judge_backend
 from scripts.run_repl import _new_root_thread
 from src.research.models import (
     EvidenceItem,
+    CriticalGap,
     MemoryManifest,
+    OutputStatus,
+    RequirementCoverage,
+    RequirementStatus,
     ResearchBrief,
     ResearchResult,
     ResearchStatus,
     ResearchWorkflowResult,
+    TerminationReason,
 )
 
 
@@ -46,6 +56,16 @@ def _workflow_result(report: str = "# Report") -> ResearchWorkflowResult:
         evidence=(evidence,),
         unresolved=("open",),
         stop_reason="tool_budget_exhausted",
+        termination_reason=TerminationReason.BUDGET_FORCED,
+        output_status=OutputStatus.VALID,
+        coverage=(
+            RequirementCoverage(
+                requirement_id="R1",
+                status=RequirementStatus.WEAK,
+                evidence_ids=("E-1",),
+                remaining_gap="A stronger source remains useful.",
+            ),
+        ),
         iterations=3,
         tool_calls_used=4,
         thread_count=2,
@@ -126,6 +146,7 @@ def test_workflow_metrics_are_structured_and_do_not_invent_confidence() -> None:
     metrics = workflow_metrics(_workflow_result())
 
     assert metrics["status"] == "partial"
+    assert metrics["research_status"] == "partial"
     assert metrics["research_brief"]["question"] == "question"
     assert metrics["evidence_count"] == 1
     assert metrics["source_count"] == 1
@@ -133,7 +154,112 @@ def test_workflow_metrics_are_structured_and_do_not_invent_confidence() -> None:
     assert metrics["tool_calls_used"] == 4
     assert metrics["estimated_tokens_used"] == 500
     assert metrics["retries_used"] == 1
+    assert metrics["termination_reason"] == "budget_forced"
+    assert metrics["output_status"] == "valid"
+    assert set(metrics["rcs"]) == {
+        "objective_coverage",
+        "evidence_sufficiency",
+        "conflict_resolution",
+        "uncertainty_calibration",
+        "research_efficiency",
+    }
+    assert "overall" not in metrics["rcs"]
     assert "confidence" not in metrics
+    assert metrics["rcs"] == {
+        "objective_coverage": 0.0,
+        "evidence_sufficiency": 0.5,
+        "conflict_resolution": 1.0,
+        "uncertainty_calibration": 0.0,
+        "research_efficiency": 0.0,
+    }
+
+
+def test_rcs_scores_mixed_coverage_and_empty_coverage_without_false_credit() -> None:
+    mixed_research = replace(
+        _workflow_result().research_result,
+        coverage=(
+            RequirementCoverage("R1", RequirementStatus.SUPPORTED, ("E-1",)),
+            RequirementCoverage("R2", RequirementStatus.WEAK, remaining_gap="weak"),
+            RequirementCoverage("R3", RequirementStatus.CONFLICTED, remaining_gap="conflict"),
+            RequirementCoverage("R4", RequirementStatus.UNSUPPORTED, remaining_gap="missing"),
+        ),
+        critical_gaps=(
+            CriticalGap("R2", "weak"),
+            CriticalGap("R3", "conflict"),
+            CriticalGap("R4", "missing"),
+        ),
+        tool_calls_used=4,
+    )
+    mixed = research_completion_score(
+        replace(_workflow_result(), research_result=mixed_research)
+    )
+    assert mixed == {
+        "objective_coverage": 0.25,
+        "evidence_sufficiency": 0.4375,
+        "conflict_resolution": 0.75,
+        "uncertainty_calibration": 1.0,
+        "research_efficiency": 0.2,
+    }
+
+    empty = research_completion_score(
+        replace(
+            _workflow_result(),
+            research_result=replace(_workflow_result().research_result, coverage=()),
+        )
+    )
+    assert empty == {
+        "objective_coverage": 0.0,
+        "evidence_sufficiency": 0.0,
+        "conflict_resolution": 0.0,
+        "uncertainty_calibration": 0.0,
+        "research_efficiency": 0.0,
+    }
+
+
+def test_researchbench_summary_is_comparison_ready_and_excludes_failed_rcs() -> None:
+    report = EvaluationReport("summary", num_questions=2)
+    report.add_detail(
+        {
+            "composite_score": 0.6,
+            "research_status": "partial",
+            "termination_reason": "budget_forced",
+            "output_status": "valid",
+            "elapsed_seconds": 12.5,
+            "evidence_count": 3,
+            "source_count": 2,
+            "thread_count": 1,
+            "tool_calls_used": 4,
+            "estimated_tokens_used": 500,
+            "iterations": 3,
+            "unresolved_count": 1,
+            "retries_used": 0,
+            "rcs": {"objective_coverage": 0.5},
+        }
+    )
+    report.add_detail(
+        {
+            "status": "failed",
+            "error": "offline",
+            "composite_score": 0.0,
+            "elapsed_seconds": 1.5,
+        }
+    )
+
+    summary = researchbench_summary(
+        report,
+        budget=36,
+        local_budget=12,
+        token_budget=120000,
+    )
+    assert summary["elapsed_seconds"] == 14.0
+    assert summary["source_count"] == 2
+    assert summary["iterations"] == 3
+    assert summary["research_status_counts"] == {"partial": 1, "unknown": 1}
+    assert summary["termination_reason_counts"] == {
+        "budget_forced": 1,
+        "not_available": 1,
+    }
+    assert summary["average_rcs"]["objective_coverage"] == 0.5
 
 
 def test_judge_backend_uses_config_unless_explicitly_overridden() -> None:

@@ -2,7 +2,7 @@
 
 ## 1. 文档状态
 
-- 状态：设计已确认，代码尚未实施；
+- 状态：已实施并完成确定性回归与相同三题真实验收；真实结果显示语义收敛仍有后续优化空间；
 - 目标：替换提交 `bdf310a` 中基于来源数量和连续轮次的轻量完成门；
 - 实施边界：继续使用同质 Research AgentGraph，不新增 Supervisor、Judge Agent、服务或第二条研究主链；
 - 结论：来源数量、循环次数和单一总分都不能直接证明研究完成。
@@ -167,7 +167,7 @@ use_tools / fork_children
 assess_research_state
       ├─ Continue → think_and_plan
       ├─ Replan   → 更新局部研究策略 → think_and_plan
-      └─ Stop     → synthesize
+      └─ Stop     → finalize_output → synthesize
 ```
 
 `assess_research_state` 使用相同的 Research Agent policy 和当前 checkpoint 上下文，要求结构化输出：
@@ -243,6 +243,8 @@ overall: optional
 
 `overall` 权重必须通过 ResearchBench、HotpotQA 和人工/LLM Judge 结果校准后再确定。即使 RCS 总分很高，只要存在未覆盖的关键必要要求，运行时也不能判定 `coverage_complete`。
 
+当前实现位于 `scripts/run_eval.py`：从最终 `ResearchResult` 的 coverage、critical gaps 和工具调用量生成上述五个维度；空 coverage 不获得冲突解决满分；ResearchBench 同时保存逐题 RCS 和成功题目的维度均值。`src/research/` 不读取 RCS，也不存在 RCS 停止阈值。
+
 RCS 可以用于：
 
 - 最终评测报告；
@@ -251,18 +253,39 @@ RCS 可以用于：
 - 检查 `Completed`、`Saturated`、`Exhausted` 判定是否合理；
 - 后续 Web UI 的研究进度与质量解释。
 
-## 10. 实施顺序
+## 10. 实施状态
 
-1. 移除 `bdf310a` 的固定来源数、连续 ready 轮次和全局零增量强制停止；
-2. 从已确认 Research Brief 建立稳定 requirement 清单；
-3. 增加 checkpointed coverage、critical gaps、next actions 和 strategy attempts；
-4. 将 `assess_completion` 重构为 `assess_research_state`，返回 Continue/Replan/Stop；
-5. 实现第 7 节的确定性路由校验和一次结构化修复；
-6. 修正子任务 `partial` 的无条件传播；
-7. 分离 research status、termination reason 和 output status；
-8. 增加 RCS 评测输出，但不接入运行时停止路由；
-9. 运行专项测试、N1–N6 全量回归和相同三题真实 ResearchBench 验收；
-10. 比较修改前后的调用数、token、耗时、规则分、RCS、LLM-as-Judge 和停止原因。
+- [x] 移除 `bdf310a` 的固定来源数、方向数乘二、连续 ready 轮次和全局零增量强制停止；
+- [x] 从已确认 Research Brief 建立稳定 requirement 清单；
+- [x] 增加 checkpointed coverage、critical gaps、next actions 和真实 strategy attempts；
+- [x] 将 `assess_completion` 重构为同图节点 `assess_research_state`，返回 Continue/Replan/Stop；
+- [x] 实现第 7 节的确定性路由校验和一次无工具结构化修复；
+- [x] 修正子任务 `partial` 的无条件传播；
+- [x] 分离 research status、termination reason 和 output status；
+- [x] 在 `scripts/run_eval.py` 增加五维 RCS 最终评测输出，不提供未经校准的 `overall`，不接入运行时路由；
+- [x] 运行专项测试、N1–N6 和仓库全量回归；
+- [x] 重新完整运行相同三题真实 ResearchBench，并比较前后指标与停止原因。
+
+当前确定性验收结果：充分性/N1/评测专项、递归分层收尾与长历史最终快照均通过；N1–N6 `122 passed`，仓库全量 `747 passed, 2 skipped`。
+
+真实 ResearchBench 使用相同 `tech_001`、`med_001`、`fin_001` 和宽松预算（每 Agent 84、全树 588 次工具调用，1,000,000 token）。最终报告保存在本地 `outputs/evaluation/researchbench-sufficiency-termination-final-v6/`，不提交仓库。
+
+| 指标 | 被否决完成门 | 最终实现 | 变化 |
+|---|---:|---:|---:|
+| 工具调用 | 86 | 104 | +18 |
+| 估算 token | 157,142 | 578,771 | +421,629 |
+| 耗时（秒） | 364.985 | 981.094 | +616.109 |
+| 平均规则分 | 0.581436 | 0.591106 | +0.009670 |
+| 证据数 | 347 | 418 | +71 |
+| RCS | N/A | coverage 0、sufficiency 0、conflict 1、calibration 1、efficiency 0 | 新增 |
+
+| 题目 | 根轮次（旧 → 新） | 规则分（旧 → 新） | 调用（旧 → 新） | token（旧 → 新） | 新停止/输出 |
+|---|---:|---:|---:|---:|---|
+| `tech_001` | 4 → 1 | 0.586136 → 0.585711 | 45 → 47 | 78,146 → 256,746 | `budget_forced` / `fallback` |
+| `med_001` | 4 → 7 | 0.578829 → 0.559184 | 33 → 15 | 68,913 → 105,530 | `budget_forced` / `valid` |
+| `fin_001` | 4 → 2 | 0.579341 → 0.628423 | 8 → 42 | 10,083 → 216,495 | `budget_forced` / `fallback` |
+
+三题均没有因来源数或固定 ready 轮次在第 4 轮强制结束；新状态契约正确披露了 `time_budget_exhausted → budget_forced`。同时，全部任务仍为 `partial`，RCS 未显示必要要求覆盖，两题最终输出使用 fallback，说明移除机械早停后继续研究价值的语义收敛仍需后续模型/提示优化。这些限制不得被解释为正常完成。
 
 ## 11. 验收标准
 

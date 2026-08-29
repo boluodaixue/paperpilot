@@ -8,7 +8,7 @@
 
 [![Python](https://img.shields.io/badge/Python-3.10%2B-blue.svg)](https://python.org)
 [![LangGraph](https://img.shields.io/badge/Orchestration-LangGraph-1f6feb.svg)](https://www.langchain.com/langgraph)
-[![Tests](https://img.shields.io/badge/tests-702%20passed-brightgreen.svg)](#测试)
+[![Tests](https://img.shields.io/badge/tests-747%20passed-brightgreen.svg)](#测试)
 [![License](https://img.shields.io/badge/license-MIT-green.svg)](LICENSE)
 
 </div>
@@ -189,7 +189,7 @@ pytest -q
 当前确定性测试结果：
 
 ```text
-716 passed, 2 skipped
+747 passed, 2 skipped
 ```
 
 测试覆盖递归与预算、checkpoint 恢复、用户确认、多 Memory 隔离、Writer 崩溃恢复、并发冲突、Markdown/WikiLink 契约、导入、FTS5、语义降级以及 Web/CLI 入口。
@@ -224,6 +224,7 @@ paperpilot/
 ## 🗺️ Roadmap
 
 - [x] 同质递归 Research AgentGraph
+- [x] 基于必要要求、证据和下一步价值的研究充分性与终止机制
 - [x] Research Brief 确认与 SQLite checkpoint 恢复
 - [x] 多 Memory Markdown Vault 与 Obsidian 工作流
 - [x] LLM Wiki 问答、受控笔记、导入与继续研究
