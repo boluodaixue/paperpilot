@@ -7,7 +7,7 @@
 | 能力 | 状态 | 结果 |
 |---|---|---|
 | 同质 Research AgentGraph | ✅ | 根、子、孙复用同一图，fork 与全树预算可恢复 |
-| 轻量完成门 | ✅ | 来源底线、缺口复核、信息饱和与硬停止可解释 |
+| 研究充分性与终止机制 | 🚧 | 固定来源数完成门已否决；按目标覆盖、证据、继续研究价值和资源边界重构 |
 | Research Workflow | ✅ | Brief 修改/确认、interrupt、SQLite checkpoint 和重启恢复 |
 | Markdown Memory | ✅ | 多 `memory_id`、报告/证据/来源/笔记/导入和 WikiLink |
 | Obsidian 接入 | ✅ | 安全打开 Memory、报告和引用，不写 `.obsidian/` |
@@ -19,6 +19,15 @@
 | 离线自动化验收 | ✅ | `716 passed, 2 skipped` |
 
 ## 当前优先级
+
+### 0. 修正研究终止机制
+
+- [x] 保存研究充分性与终止机制设计；
+- [ ] 移除固定来源数和连续轮次强制停止；
+- [ ] 实现 Continue / Replan / Stop Research；
+- [ ] 分离 Completed、Saturated、Exhausted、Budget Forced 和 Failed；
+- [ ] 将 RCS 接入最终评测，而不是运行时停止阈值；
+- [ ] 运行专项、全量回归和相同三题真实验收。
 
 ### 1. 作品集发布
 
