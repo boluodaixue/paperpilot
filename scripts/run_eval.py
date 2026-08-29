@@ -102,13 +102,15 @@ def smoke_evaluation_config(config: dict[str, Any]) -> dict[str, Any]:
 def evaluation_config_with_tool_budget(
     config: dict[str, Any],
     max_total_tool_calls: int | None,
+    max_tool_calls: int | None = None,
 ) -> dict[str, Any]:
-    """Return a copy with an optional evaluation-only global tool budget."""
+    """Return a copy with optional evaluation-only local/global tool budgets."""
     result = copy.deepcopy(config)
+    limits = result.setdefault("research", {}).setdefault("limits", {})
+    if max_tool_calls is not None:
+        limits["max_tool_calls"] = max_tool_calls
     if max_total_tool_calls is not None:
-        result.setdefault("research", {}).setdefault("limits", {})[
-            "max_total_tool_calls"
-        ] = max_total_tool_calls
+        limits["max_total_tool_calls"] = max_total_tool_calls
     return result
 
 
@@ -119,6 +121,11 @@ def configured_tool_budget(config: dict[str, Any]) -> int:
         .get("limits", {})
         .get("max_total_tool_calls", 36)
     )
+
+
+def configured_local_tool_budget(config: dict[str, Any]) -> int:
+    """Resolve the per-Agent tool budget recorded in evaluation output."""
+    return int(config.get("research", {}).get("limits", {}).get("max_tool_calls", 12))
 
 
 def workflow_metrics(result: ResearchWorkflowResult) -> dict[str, Any]:
@@ -161,6 +168,7 @@ async def _evaluate_research_bench(
     )
     report = EvaluationReport(name="ResearchBench_Evaluation", num_questions=len(questions))
     budget = configured_tool_budget(config)
+    local_budget = configured_local_tool_budget(config)
     runtime = build_research_runtime(config=config, checkpointer=InMemorySaver())
     try:
         for index, question in enumerate(questions, 1):
@@ -172,6 +180,7 @@ async def _evaluate_research_bench(
                 detail = bench.evaluate_report(workflow.report_markdown, question_id)
                 detail.update(workflow_metrics(workflow))
                 detail["budget"] = budget
+                detail["local_tool_budget"] = local_budget
                 detail["elapsed_seconds"] = time.monotonic() - started
                 report.add_detail(detail)
             except Exception as exc:
@@ -183,6 +192,7 @@ async def _evaluate_research_bench(
                         "error": str(exc),
                         "composite_score": 0.0,
                         "budget": budget,
+                        "local_tool_budget": local_budget,
                         "elapsed_seconds": time.monotonic() - started,
                     }
                 )
@@ -193,6 +203,7 @@ async def _evaluate_research_bench(
     report.set_summary(
         {
             "budget": budget,
+            "local_tool_budget": local_budget,
             "average_composite": sum(scores) / len(scores) if scores else 0.0,
             "num_success": sum("error" not in detail for detail in report.details),
             "num_failed": sum("error" in detail for detail in report.details),
@@ -235,6 +246,7 @@ async def _evaluate_hotpotqa(
     questions = bench.get_samples(n=num_questions, shuffle=True, seed=seed)
     report = EvaluationReport(name="HotpotQA_PaperPilot_Evaluation", num_questions=len(questions))
     budget = configured_tool_budget(config)
+    local_budget = configured_local_tool_budget(config)
     predictions: list[dict[str, Any]] = []
     runtime = build_research_runtime(config=config, checkpointer=InMemorySaver())
     try:
@@ -296,6 +308,7 @@ async def _evaluate_hotpotqa(
                     "answer_extraction_error": answer_extraction_error,
                     "depth_metrics": depth,
                     "budget": budget,
+                    "local_tool_budget": local_budget,
                     "elapsed_seconds": time.monotonic() - started,
                     **structured,
                 }
@@ -307,6 +320,7 @@ async def _evaluate_hotpotqa(
     summary.update(
         {
             "budget": budget,
+            "local_tool_budget": local_budget,
             "num_success": sum(detail.get("status") != "failed" for detail in report.details),
             "num_failed": sum(detail.get("status") == "failed" for detail in report.details),
             "evidence_count": sum(detail.get("evidence_count", 0) for detail in report.details),
@@ -362,6 +376,12 @@ def main() -> None:
         help="Use explicit low-cost limits for a real end-to-end chain check",
     )
     parser.add_argument(
+        "--max-tool-calls",
+        type=int,
+        default=None,
+        help="Evaluation-only per-Agent tool-call budget override",
+    )
+    parser.add_argument(
         "--max-total-tool-calls",
         type=int,
         default=None,
@@ -376,10 +396,14 @@ def main() -> None:
         choices=["DEBUG", "INFO", "WARNING", "ERROR"],
     )
     args = parser.parse_args()
+    if args.max_tool_calls is not None and args.max_tool_calls < 1:
+        parser.error("--max-tool-calls must be at least 1")
     if args.max_total_tool_calls is not None and args.max_total_tool_calls < 1:
         parser.error("--max-total-tool-calls must be at least 1")
-    if args.smoke and args.max_total_tool_calls is not None:
-        parser.error("--smoke cannot be combined with --max-total-tool-calls")
+    if args.smoke and (
+        args.max_tool_calls is not None or args.max_total_tool_calls is not None
+    ):
+        parser.error("--smoke cannot be combined with tool-budget overrides")
     if args.benchmark != "research_bench" and (args.question_ids or args.stratified or args.domain):
         parser.error("--question-ids, --stratified and --domain apply only to research_bench")
     if args.question_ids and (args.stratified or args.domain):
@@ -389,7 +413,11 @@ def main() -> None:
     if args.smoke:
         config = smoke_evaluation_config(config)
     else:
-        config = evaluation_config_with_tool_budget(config, args.max_total_tool_calls)
+        config = evaluation_config_with_tool_budget(
+            config,
+            args.max_total_tool_calls,
+            max_tool_calls=args.max_tool_calls,
+        )
 
     if args.benchmark == "memory_wiki":
         report = evaluate_memory_wiki()
