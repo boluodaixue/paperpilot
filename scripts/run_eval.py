@@ -103,14 +103,17 @@ def evaluation_config_with_tool_budget(
     config: dict[str, Any],
     max_total_tool_calls: int | None,
     max_tool_calls: int | None = None,
+    max_total_tokens: int | None = None,
 ) -> dict[str, Any]:
-    """Return a copy with optional evaluation-only local/global tool budgets."""
+    """Return a copy with optional evaluation-only resource budgets."""
     result = copy.deepcopy(config)
     limits = result.setdefault("research", {}).setdefault("limits", {})
     if max_tool_calls is not None:
         limits["max_tool_calls"] = max_tool_calls
     if max_total_tool_calls is not None:
         limits["max_total_tool_calls"] = max_total_tool_calls
+    if max_total_tokens is not None:
+        limits["max_total_tokens"] = max_total_tokens
     return result
 
 
@@ -126,6 +129,11 @@ def configured_tool_budget(config: dict[str, Any]) -> int:
 def configured_local_tool_budget(config: dict[str, Any]) -> int:
     """Resolve the per-Agent tool budget recorded in evaluation output."""
     return int(config.get("research", {}).get("limits", {}).get("max_tool_calls", 12))
+
+
+def configured_token_budget(config: dict[str, Any]) -> int:
+    """Resolve the global token budget recorded in evaluation output."""
+    return int(config.get("research", {}).get("limits", {}).get("max_total_tokens", 120000))
 
 
 def workflow_metrics(result: ResearchWorkflowResult) -> dict[str, Any]:
@@ -169,6 +177,7 @@ async def _evaluate_research_bench(
     report = EvaluationReport(name="ResearchBench_Evaluation", num_questions=len(questions))
     budget = configured_tool_budget(config)
     local_budget = configured_local_tool_budget(config)
+    token_budget = configured_token_budget(config)
     runtime = build_research_runtime(config=config, checkpointer=InMemorySaver())
     try:
         for index, question in enumerate(questions, 1):
@@ -181,6 +190,7 @@ async def _evaluate_research_bench(
                 detail.update(workflow_metrics(workflow))
                 detail["budget"] = budget
                 detail["local_tool_budget"] = local_budget
+                detail["token_budget"] = token_budget
                 detail["elapsed_seconds"] = time.monotonic() - started
                 report.add_detail(detail)
             except Exception as exc:
@@ -193,6 +203,7 @@ async def _evaluate_research_bench(
                         "composite_score": 0.0,
                         "budget": budget,
                         "local_tool_budget": local_budget,
+                        "token_budget": token_budget,
                         "elapsed_seconds": time.monotonic() - started,
                     }
                 )
@@ -204,6 +215,7 @@ async def _evaluate_research_bench(
         {
             "budget": budget,
             "local_tool_budget": local_budget,
+            "token_budget": token_budget,
             "average_composite": sum(scores) / len(scores) if scores else 0.0,
             "num_success": sum("error" not in detail for detail in report.details),
             "num_failed": sum("error" in detail for detail in report.details),
@@ -247,6 +259,7 @@ async def _evaluate_hotpotqa(
     report = EvaluationReport(name="HotpotQA_PaperPilot_Evaluation", num_questions=len(questions))
     budget = configured_tool_budget(config)
     local_budget = configured_local_tool_budget(config)
+    token_budget = configured_token_budget(config)
     predictions: list[dict[str, Any]] = []
     runtime = build_research_runtime(config=config, checkpointer=InMemorySaver())
     try:
@@ -309,6 +322,7 @@ async def _evaluate_hotpotqa(
                     "depth_metrics": depth,
                     "budget": budget,
                     "local_tool_budget": local_budget,
+                    "token_budget": token_budget,
                     "elapsed_seconds": time.monotonic() - started,
                     **structured,
                 }
@@ -321,6 +335,7 @@ async def _evaluate_hotpotqa(
         {
             "budget": budget,
             "local_tool_budget": local_budget,
+            "token_budget": token_budget,
             "num_success": sum(detail.get("status") != "failed" for detail in report.details),
             "num_failed": sum(detail.get("status") == "failed" for detail in report.details),
             "evidence_count": sum(detail.get("evidence_count", 0) for detail in report.details),
@@ -387,6 +402,12 @@ def main() -> None:
         default=None,
         help="Evaluation-only global tool-call budget override",
     )
+    parser.add_argument(
+        "--max-total-tokens",
+        type=int,
+        default=None,
+        help="Evaluation-only global token budget override",
+    )
     parser.add_argument("--config", default=None)
     parser.add_argument("--output-dir", "--output_dir", default="outputs/evaluation")
     parser.add_argument(
@@ -400,8 +421,12 @@ def main() -> None:
         parser.error("--max-tool-calls must be at least 1")
     if args.max_total_tool_calls is not None and args.max_total_tool_calls < 1:
         parser.error("--max-total-tool-calls must be at least 1")
+    if args.max_total_tokens is not None and args.max_total_tokens < 1:
+        parser.error("--max-total-tokens must be at least 1")
     if args.smoke and (
-        args.max_tool_calls is not None or args.max_total_tool_calls is not None
+        args.max_tool_calls is not None
+        or args.max_total_tool_calls is not None
+        or args.max_total_tokens is not None
     ):
         parser.error("--smoke cannot be combined with tool-budget overrides")
     if args.benchmark != "research_bench" and (args.question_ids or args.stratified or args.domain):
@@ -417,6 +442,7 @@ def main() -> None:
             config,
             args.max_total_tool_calls,
             max_tool_calls=args.max_tool_calls,
+            max_total_tokens=args.max_total_tokens,
         )
 
     if args.benchmark == "memory_wiki":
