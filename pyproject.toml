@@ -1,0 +1,94 @@
+[build-system]
+requires = ["setuptools>=61.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "deep-research-agent"
+version = "0.1.0"
+description = "Recoverable recursive research agents with LangGraph and an Obsidian-native Markdown memory"
+readme = "README.md"
+license = {text = "MIT"}
+requires-python = ">=3.10"
+authors = [
+    {name = "boluodaixue"},
+]
+keywords = ["deep-research", "langgraph", "research-agent", "recursive-agent", "paperpilot"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Science/Research",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
+
+dependencies = [
+    "openai>=1.0",
+    "numpy",
+    "aiohttp",
+    "pyyaml",
+    "python-dotenv>=1.0",
+    "langfuse>=4.0.0,<5.0.0",
+    "langgraph>=1.0.0,<2.0.0",
+    "langgraph-checkpoint-sqlite>=3.1.1,<4.0.0",
+    "fastapi>=0.110",
+    "uvicorn>=0.27",
+    "beautifulsoup4>=4.12",
+    "pypdf>=5.0,<7.0",
+    "sentence-transformers",
+    "datasets",
+    "pandas",
+]
+
+[project.optional-dependencies]
+# vLLM 推理服务依赖
+serve = [
+    "vllm>=0.4.0",
+]
+# 开发依赖
+dev = [
+    "pytest>=7.0",
+    "pytest-asyncio",
+    "black",
+    "isort",
+    "mypy",
+    "flake8",
+]
+# 全部可选依赖
+all = ["deep-research-agent[serve,dev]"]
+
+[project.scripts]
+# 命令行快捷入口
+run-research = "scripts.run_single:main"
+run-eval = "scripts.run_eval:main"
+run-benchmark = "scripts.run_benchmark:main"
+run-judge = "scripts.run_judge:main"
+prepare-semantic-model = "scripts.prepare_semantic_model:main"
+
+[project.urls]
+Homepage = "https://github.com/boluodaixue/paperpilot"
+Repository = "https://github.com/boluodaixue/paperpilot"
+Issues = "https://github.com/boluodaixue/paperpilot/issues"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["src*", "evaluation*", "scripts*", "web*", "configs*"]
+
+[tool.setuptools.package-data]
+configs = ["*.yaml", "**/*.yaml"]
+
+[tool.black]
+line-length = 120
+target-version = ["py310", "py311", "py312"]
+
+[tool.isort]
+profile = "black"
+line_length = 120
+
+[tool.mypy]
+python_version = "3.10"
+warn_return_any = true
+warn_unused_configs = true
+disallow_untyped_defs = false

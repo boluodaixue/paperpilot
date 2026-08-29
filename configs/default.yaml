@@ -1,0 +1,79 @@
+system:
+  name: "PaperPilot"
+  version: "0.2.0"
+  log_level: "INFO"
+  work_dir: "outputs"
+
+# One policy drives alignment, research, tool use, fork decisions, and summary.
+# The evaluation judge is external to the Research AgentGraph.
+model:
+  backend: "deepseek"
+  backend_sampling:
+    deepseek:
+      temperature: 0.7
+      max_tokens: 4096
+      top_p: 1.0
+    modules:
+      research:
+        temperature: 0.7
+        max_tokens: 4096
+      judge:
+        temperature: 0.1
+        max_tokens: 2048
+  backend_mapping:
+    research: "deepseek"
+    judge: "deepseek"
+
+research:
+  vault_root: "memory"
+  # S3 requires an explicit recoverable archive outside the active Vault.
+  # Migration never permanently deletes this archive.
+  legacy_archive_root: "legacy-archives"
+  # Optional exact Obsidian Vault name. Omit it to open notes by absolute path.
+  # vault_name: "PaperPilotVault"
+  report_review:
+    enabled: false
+  limits:
+    max_iterations: 8
+    max_tool_calls: 12
+    max_tool_output_chars: 12000
+    max_children: 4
+    max_fork_depth: 2
+    max_total_threads: 7
+    max_total_tool_calls: 36
+    max_elapsed_seconds: 300.0
+    max_total_tokens: 120000
+    max_retries_per_action: 1
+    max_total_retries: 6
+
+chat:
+  db_path: "data/chat.db"
+
+runtime:
+  # Workflow state/checkpoints and the thin registry share chat.db but use
+  # independent tables. These values control confirmation lifecycle only.
+  proposal_ttl_seconds: 86400
+  terminal_retention_seconds: 604800
+  lease_seconds: 60
+  sweep_interval_seconds: 5
+  # Polling interval used only while a caller waits for the durable Vault Writer.
+  writer_coordination_interval_seconds: 0.1
+  # Disposable FTS5 derivative data; Markdown in the Vault remains authoritative.
+  retrieval_db_path: "data/retrieval.db"
+  retrieval_reconciliation_seconds: 300
+  # Optional local multilingual embeddings. Disabled by default: when enabled,
+  # a missing or incompatible model safely falls back to the FTS5 index above.
+  semantic_retrieval_enabled: false
+  semantic_embedding_model: "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2"
+  semantic_local_files_only: true
+
+tools:
+  enabled:
+    - web_search
+    - browser
+    - arxiv_reader
+    - file_reader
+    - calculator
+    - notepad
+  web_search:
+    mock_mode: false

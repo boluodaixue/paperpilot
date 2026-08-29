@@ -1,0 +1,111 @@
+from __future__ import annotations
+
+from unittest.mock import patch
+
+from evaluation.benchmarks.hotpotqa import HotpotQABenchmark
+from scripts.run_eval import evaluate_hotpotqa
+from src.research.models import (
+    MemoryManifest,
+    ResearchBrief,
+    ResearchResult,
+    ResearchStatus,
+    ResearchWorkflowResult,
+)
+
+
+class _Runtime:
+    def __init__(self, report: str) -> None:
+        self.report = report
+
+    @staticmethod
+    def new_thread_id() -> str:
+        return "eval-root"
+
+    async def run_auto_confirmed(self, query: str, *, thread_id: str) -> ResearchWorkflowResult:
+        brief = ResearchBrief(query, query, (), (), (), "report")
+        result = ResearchResult("task", ResearchStatus.COMPLETED, "done")
+        return ResearchWorkflowResult(
+            brief,
+            result,
+            self.report,
+            MemoryManifest("reports/eval-root.md"),
+        )
+
+    async def close(self) -> None:
+        return None
+
+
+def test_extracts_chinese_answer_field_after_title() -> None:
+    report = "# 曹雪芹所处朝代\n\n答案：清朝\n\n## 分析\n曹雪芹生活于清代。"
+
+    assert HotpotQABenchmark.extract_short_answer(report) == "清朝"
+    assert HotpotQABenchmark.short_answer_extraction_method(report) == "explicit_答案"
+
+
+def test_extracts_english_short_answer_and_conclusion_labels() -> None:
+    short_answer_report = "# Research Report\n\nShort Answer: Paris\n\n## Evidence\nE-1: source"
+    conclusion_report = "# Result\n\n## Conclusion\nVaswani et al., 2017."
+    heading_inline_report = "# Result\n\n## Answer: Geoffrey Hinton"
+
+    assert HotpotQABenchmark.extract_short_answer(short_answer_report) == "Paris"
+    assert HotpotQABenchmark.extract_short_answer(conclusion_report) == "Vaswani et al., 2017."
+    assert HotpotQABenchmark.extract_short_answer(heading_inline_report) == "Geoffrey Hinton"
+
+
+def test_falls_back_to_first_body_statement_not_markdown_title() -> None:
+    report = "# Transformer 架构研究\n\nTransformer 由 Vaswani 等人在 2017 年提出。\n\n更多分析。"
+
+    assert HotpotQABenchmark.extract_short_answer(report) == "Transformer 由 Vaswani 等人在 2017 年提出。"
+    assert HotpotQABenchmark.short_answer_extraction_method(report) == "first_body_statement"
+
+
+def test_empty_report_returns_empty_answer() -> None:
+    assert HotpotQABenchmark.extract_short_answer("") == ""
+    assert HotpotQABenchmark.short_answer_extraction_method("   ") == "empty_report"
+
+
+def test_sources_and_evidence_are_never_selected() -> None:
+    report = """# Report
+
+## Sources
+- https://example.com/paper
+Evidence ID: E-1
+[E-2] supporting excerpt
+"""
+
+    assert HotpotQABenchmark.extract_short_answer(report) == ""
+    assert HotpotQABenchmark.short_answer_extraction_method(report) == "no_valid_candidate"
+
+    plain_sources = "Sources:\n- A Paper That Is Not An Answer\nEvidence ID: E-3"
+    assert HotpotQABenchmark.extract_short_answer(plain_sources) == ""
+
+
+def test_fallback_ignores_sources_section_before_body_section() -> None:
+    report = """# Report
+
+## 参考文献
+- https://example.com/paper
+
+## 分析
+正确答案是清朝。
+"""
+
+    assert HotpotQABenchmark.extract_short_answer(report) == "正确答案是清朝。"
+
+
+def test_evaluate_hotpotqa_uses_extractor_and_keeps_full_report() -> None:
+    full_report = "# A misleading title\n\n答案：清朝\n\n完整的报告正文。"
+    sample = {"query": "曹雪芹生活在哪个朝代？", "expected_answer": "清朝"}
+
+    with (
+        patch("scripts.run_eval.HotpotQABenchmark.get_samples", return_value=[sample]),
+        patch("scripts.run_eval.build_research_runtime", return_value=_Runtime(full_report)),
+        patch.object(HotpotQABenchmark, "extract_short_answer", wraps=HotpotQABenchmark.extract_short_answer) as extractor,
+        patch.object(HotpotQABenchmark, "evaluate_report", return_value={"gold_entity_coverage": 1.0, "semantic_gold_coverage": 1.0, "report_length": len(full_report)}),
+    ):
+        result = evaluate_hotpotqa(1, {}, use_mock=True)
+
+    extractor.assert_called_once_with(full_report, question=sample["query"])
+    assert result.details[0]["prediction"] == "清朝"
+    assert result.details[0]["prediction"] != "# A misleading title"
+    assert result.details[0]["extraction_method"] == "explicit_答案"
