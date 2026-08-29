@@ -99,6 +99,28 @@ def smoke_evaluation_config(config: dict[str, Any]) -> dict[str, Any]:
     return result
 
 
+def evaluation_config_with_tool_budget(
+    config: dict[str, Any],
+    max_total_tool_calls: int | None,
+) -> dict[str, Any]:
+    """Return a copy with an optional evaluation-only global tool budget."""
+    result = copy.deepcopy(config)
+    if max_total_tool_calls is not None:
+        result.setdefault("research", {}).setdefault("limits", {})[
+            "max_total_tool_calls"
+        ] = max_total_tool_calls
+    return result
+
+
+def configured_tool_budget(config: dict[str, Any]) -> int:
+    """Resolve the effective global tool budget recorded in evaluation output."""
+    return int(
+        config.get("research", {})
+        .get("limits", {})
+        .get("max_total_tool_calls", 36)
+    )
+
+
 def workflow_metrics(result: ResearchWorkflowResult) -> dict[str, Any]:
     """Expose measured workflow counters; never infer a confidence score."""
     research = result.research_result
@@ -126,11 +148,19 @@ async def _evaluate_research_bench(
     num_questions: int,
     domain: str | None,
     config: dict[str, Any],
+    question_ids: list[str] | None = None,
+    stratified: bool = False,
 ) -> EvaluationReport:
     logger = logging.getLogger("run_eval")
     bench = ResearchBench()
-    questions = bench.get_questions(domain=domain, n=num_questions)
+    questions = bench.get_questions(
+        domain=domain,
+        n=None if question_ids else num_questions,
+        question_ids=question_ids,
+        stratified=stratified,
+    )
     report = EvaluationReport(name="ResearchBench_Evaluation", num_questions=len(questions))
+    budget = configured_tool_budget(config)
     runtime = build_research_runtime(config=config, checkpointer=InMemorySaver())
     try:
         for index, question in enumerate(questions, 1):
@@ -141,6 +171,7 @@ async def _evaluate_research_bench(
                 workflow = await runtime.run_auto_confirmed(question["query"], thread_id=runtime.new_thread_id())
                 detail = bench.evaluate_report(workflow.report_markdown, question_id)
                 detail.update(workflow_metrics(workflow))
+                detail["budget"] = budget
                 detail["elapsed_seconds"] = time.monotonic() - started
                 report.add_detail(detail)
             except Exception as exc:
@@ -151,6 +182,7 @@ async def _evaluate_research_bench(
                         "status": "failed",
                         "error": str(exc),
                         "composite_score": 0.0,
+                        "budget": budget,
                         "elapsed_seconds": time.monotonic() - started,
                     }
                 )
@@ -160,6 +192,7 @@ async def _evaluate_research_bench(
     scores = [detail["composite_score"] for detail in report.details if "composite_score" in detail]
     report.set_summary(
         {
+            "budget": budget,
             "average_composite": sum(scores) / len(scores) if scores else 0.0,
             "num_success": sum("error" not in detail for detail in report.details),
             "num_failed": sum("error" in detail for detail in report.details),
@@ -177,8 +210,18 @@ def evaluate_research_bench(
     num_questions: int,
     domain: str | None,
     config: dict[str, Any],
+    question_ids: list[str] | None = None,
+    stratified: bool = False,
 ) -> EvaluationReport:
-    return asyncio.run(_evaluate_research_bench(num_questions, domain, config))
+    return asyncio.run(
+        _evaluate_research_bench(
+            num_questions,
+            domain,
+            config,
+            question_ids=question_ids,
+            stratified=stratified,
+        )
+    )
 
 
 async def _evaluate_hotpotqa(
@@ -191,6 +234,7 @@ async def _evaluate_hotpotqa(
     bench = HotpotQABenchmark(use_mock=use_mock)
     questions = bench.get_samples(n=num_questions, shuffle=True, seed=seed)
     report = EvaluationReport(name="HotpotQA_PaperPilot_Evaluation", num_questions=len(questions))
+    budget = configured_tool_budget(config)
     predictions: list[dict[str, Any]] = []
     runtime = build_research_runtime(config=config, checkpointer=InMemorySaver())
     try:
@@ -251,6 +295,7 @@ async def _evaluate_hotpotqa(
                     "extraction_method": extraction_method,
                     "answer_extraction_error": answer_extraction_error,
                     "depth_metrics": depth,
+                    "budget": budget,
                     "elapsed_seconds": time.monotonic() - started,
                     **structured,
                 }
@@ -261,6 +306,7 @@ async def _evaluate_hotpotqa(
     summary = bench.evaluate(predictions, metrics=["em", "f1", "pass@1"])
     summary.update(
         {
+            "budget": budget,
             "num_success": sum(detail.get("status") != "failed" for detail in report.details),
             "num_failed": sum(detail.get("status") == "failed" for detail in report.details),
             "evidence_count": sum(detail.get("evidence_count", 0) for detail in report.details),
@@ -292,6 +338,17 @@ def main() -> None:
     )
     parser.add_argument("--num-questions", "--num_questions", type=int, default=20)
     parser.add_argument("--domain", default=None)
+    parser.add_argument(
+        "--question-ids",
+        nargs="+",
+        default=None,
+        help="Fixed ResearchBench question IDs in evaluation order",
+    )
+    parser.add_argument(
+        "--stratified",
+        action="store_true",
+        help="Select ResearchBench questions by deterministic domain round-robin",
+    )
     parser.add_argument("--use-mock", "--use_mock", action="store_true")
     parser.add_argument(
         "--seed",
@@ -304,6 +361,12 @@ def main() -> None:
         action="store_true",
         help="Use explicit low-cost limits for a real end-to-end chain check",
     )
+    parser.add_argument(
+        "--max-total-tool-calls",
+        type=int,
+        default=None,
+        help="Evaluation-only global tool-call budget override",
+    )
     parser.add_argument("--config", default=None)
     parser.add_argument("--output-dir", "--output_dir", default="outputs/evaluation")
     parser.add_argument(
@@ -313,15 +376,31 @@ def main() -> None:
         choices=["DEBUG", "INFO", "WARNING", "ERROR"],
     )
     args = parser.parse_args()
+    if args.max_total_tool_calls is not None and args.max_total_tool_calls < 1:
+        parser.error("--max-total-tool-calls must be at least 1")
+    if args.smoke and args.max_total_tool_calls is not None:
+        parser.error("--smoke cannot be combined with --max-total-tool-calls")
+    if args.benchmark != "research_bench" and (args.question_ids or args.stratified or args.domain):
+        parser.error("--question-ids, --stratified and --domain apply only to research_bench")
+    if args.question_ids and (args.stratified or args.domain):
+        parser.error("--question-ids cannot be combined with --stratified or --domain")
     setup_logging(args.log_level)
     config = load_config(args.config)
     if args.smoke:
         config = smoke_evaluation_config(config)
+    else:
+        config = evaluation_config_with_tool_budget(config, args.max_total_tool_calls)
 
     if args.benchmark == "memory_wiki":
         report = evaluate_memory_wiki()
     elif args.benchmark == "research_bench":
-        report = evaluate_research_bench(args.num_questions, args.domain, config)
+        report = evaluate_research_bench(
+            args.num_questions,
+            args.domain,
+            config,
+            question_ids=args.question_ids,
+            stratified=args.stratified,
+        )
     else:
         report = evaluate_hotpotqa(
             args.num_questions,

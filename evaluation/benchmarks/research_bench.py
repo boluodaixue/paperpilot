@@ -433,20 +433,47 @@ class ResearchBench:
         self,
         domain: str | None = None,
         n: int | None = None,
+        *,
+        question_ids: list[str] | None = None,
+        stratified: bool = False,
     ) -> list[dict[str, Any]]:
         """
         获取评测题目。
 
         Args:
-            domain: 按领域过滤（科技/医疗/金融）。
+            domain: 按领域过滤。
             n: 返回前 n 道题。
+            question_ids: 按给定顺序返回固定题目，不再应用 n。
+            stratified: 按领域确定性轮询抽样，避免前 n 题集中在早期领域。
 
         Returns:
             题目列表。
         """
-        result = self.questions
+        if question_ids:
+            by_id = {question["id"]: question for question in self.questions}
+            missing = [question_id for question_id in question_ids if question_id not in by_id]
+            if missing:
+                raise ValueError(f"未找到题目 ID: {', '.join(missing)}")
+            return [by_id[question_id] for question_id in question_ids]
+
+        result = list(self.questions)
         if domain:
             result = [q for q in result if q.get("domain") == domain]
+        if stratified:
+            by_domain: dict[str, list[dict[str, Any]]] = {}
+            for question in result:
+                by_domain.setdefault(str(question.get("domain", "")), []).append(question)
+            result = []
+            offset = 0
+            while True:
+                added = False
+                for questions in by_domain.values():
+                    if offset < len(questions):
+                        result.append(questions[offset])
+                        added = True
+                if not added:
+                    break
+                offset += 1
         if n is not None:
             result = result[:n]
         return result
