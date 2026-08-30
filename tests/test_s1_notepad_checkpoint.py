@@ -54,6 +54,70 @@ class _WriteThenReadPolicy:
     """Write one task-specific note, read it, and finish without external evidence."""
 
     def __call__(self, messages, *, tools=None):
+        content = str(messages[-1].get("content") or "")
+        if content.startswith("FINAL_SYNTHESIS_SNAPSHOT"):
+            state = json.loads(content.split("STATE:\n", 1)[1])
+            return _final(state["tool_outcomes"][-1]["content"])
+        if content.startswith("ASSESS_RESEARCH_STATE"):
+            state = json.loads(content.split("STATE:\n", 1)[1])
+            requirement = state["requirements"][0]
+            read_completed = len(state["recent_tool_outcomes"]) >= 2
+            return {
+                "content": json.dumps(
+                    {
+                        "decision": (
+                            "stop_research" if read_completed else "continue"
+                        ),
+                        "coverage": [
+                            {
+                                "requirement_id": requirement["requirement_id"],
+                                "status": (
+                                    "supported" if read_completed else "unsupported"
+                                ),
+                                "evidence_ids": [],
+                                "rationale": (
+                                    "The scoped note workflow completed."
+                                    if read_completed
+                                    else "The note must still be read from checkpoint state."
+                                ),
+                                "remaining_gap": (
+                                    None if read_completed else "Read the saved note."
+                                ),
+                            }
+                        ],
+                        "critical_gaps": (
+                            []
+                            if read_completed
+                            else [
+                                {
+                                    "requirement_id": requirement["requirement_id"],
+                                    "reason": "The saved note has not been read yet.",
+                                    "impact": "high",
+                                }
+                            ]
+                        ),
+                        "next_actions": (
+                            []
+                            if read_completed
+                            else [
+                                {
+                                    "requirement_id": requirement["requirement_id"],
+                                    "strategy": "other",
+                                    "query": "read the checkpointed notepad",
+                                    "expected_value": "high",
+                                    "expected_improvement": "Recover the saved note without repeating the write.",
+                                }
+                            ]
+                        ),
+                        "termination_reason": (
+                            "coverage_complete" if read_completed else None
+                        ),
+                        "replan_reason": None,
+                        "exhaustion_reason": None,
+                    }
+                ),
+                "tool_calls": [],
+            }
         tool_messages = [message for message in messages if message["role"] == "tool"]
         if not tool_messages:
             task = json.loads(messages[1]["content"])

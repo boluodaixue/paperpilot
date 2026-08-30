@@ -47,6 +47,7 @@ from .models import (
 )
 from .policy import call_policy
 from .research_sufficiency import (
+    active_next_actions,
     AssessmentValidationError,
     ResearchAssessment,
     assessment_schema_prompt,
@@ -55,10 +56,14 @@ from .research_sufficiency import (
     finalization_prompt,
     hard_termination_reason,
     initial_coverage,
+    merge_child_coverage_evidence,
+    merge_next_action_queue,
     parse_json_object,
     parse_research_assessment,
+    reconcile_strategy_attempt_outcomes,
     repair_assessment_prompt,
     repair_final_prompt,
+    unattempted_actions,
 )
 
 
@@ -102,6 +107,7 @@ class ResearchAgentState(TypedDict):
     draft_raw: str
     last_content: str
     last_assessed_evidence_count: int
+    last_assessed_strategy_attempt_count: int
     research_requirements: list[ResearchRequirement]
     coverage: list[RequirementCoverage]
     critical_gaps: list[CriticalGap]
@@ -119,7 +125,8 @@ class ResearchAgentState(TypedDict):
 
 _FINALIZATION_OUTPUT_TOKEN_RESERVE = 1024
 _ASSESSMENT_OUTPUT_TOKEN_RESERVE = 2048
-_MAX_FINALIZATION_TIME_RESERVE_SECONDS = 30.0
+_ASSESSMENT_INPUT_TOKEN_RESERVE = 10000
+_FINALIZATION_TIME_RESERVE_FRACTION = 0.1
 
 
 def _event(
@@ -140,12 +147,41 @@ def _remaining_seconds(state: ResearchAgentState) -> float:
 
 def _remaining_research_seconds(state: ResearchAgentState) -> float:
     """Leave each recursive level time to synthesize and return upstream."""
-    per_level_reserve = min(
-        _MAX_FINALIZATION_TIME_RESERVE_SECONDS,
-        state["limits"].max_elapsed_seconds * 0.1,
+    per_level_reserve = (
+        state["limits"].max_elapsed_seconds
+        * _FINALIZATION_TIME_RESERVE_FRACTION
     )
     reserve = per_level_reserve * (state["identity"].depth + 1)
     return _remaining_seconds(state) - reserve
+
+
+def _delegable_token_budget(state: ResearchAgentState) -> int:
+    """Retain enough subtree tokens for parent assessment and final synthesis."""
+    remaining = max(
+        0,
+        state["subtree_token_budget"] - state["estimated_tokens_used"],
+    )
+    desired_reserve = (
+        _ASSESSMENT_INPUT_TOKEN_RESERVE
+        + _ASSESSMENT_OUTPUT_TOKEN_RESERVE
+        + _FINALIZATION_OUTPUT_TOKEN_RESERVE
+    )
+    parent_reserve = min(desired_reserve, remaining // 2)
+    return remaining - parent_reserve
+
+
+def _delegable_tool_budget(
+    state: ResearchAgentState,
+    child_count: int,
+) -> int:
+    """Give the parent one fair budget share for post-fork gap resolution."""
+    remaining = max(
+        0,
+        state["subtree_tool_budget"] - state["total_tool_calls_used"],
+    )
+    if child_count <= 0:
+        return 0
+    return (remaining * child_count) // (child_count + 1)
 
 
 def _estimate_tokens(messages: list[dict[str, Any]], response: dict[str, Any]) -> int:
@@ -633,16 +669,58 @@ def _fork_tool_instances(tools: Iterable[Any]) -> list[Any]:
 def _child_task(
     parent: ResearchTask,
     candidate: ForkCandidate,
+    parent_requirements: Iterable[ResearchRequirement] = (),
 ) -> ResearchTask:
     fingerprint = candidate_fingerprint(candidate)
+    # Root Brief planning fields describe the root deliverable. Inheriting them
+    # made every homogeneous child assess itself against the entire root Brief,
+    # so parallel forks repeated the whole research problem recursively.
+    planning_keys = {"research_requirements", "directions", "research_gaps"}
+    child_context = {
+        key: value
+        for key, value in parent.context.items()
+        if key not in planning_keys
+    }
+    child_context.update(
+        {
+            key: value
+            for key, value in candidate.context.items()
+            if key not in planning_keys
+        }
+    )
+    requirements_by_id = {
+        item.requirement_id: item for item in parent_requirements
+    }
+    selected_requirements = [
+        requirements_by_id[requirement_id]
+        for requirement_id in candidate.requirement_ids
+        if requirement_id in requirements_by_id
+    ]
+    if selected_requirements:
+        child_context["research_requirements"] = [
+            {
+                "requirement_id": item.requirement_id,
+                "description": item.description,
+                "required": item.required,
+            }
+            for item in selected_requirements
+        ]
+        child_context["parent_requirement_ids"] = [
+            item.requirement_id for item in selected_requirements
+        ]
+    else:
+        child_context["research_requirements"] = [
+            {
+                "requirement_id": "R1",
+                "description": candidate.objective,
+                "required": True,
+            }
+        ]
+    child_context["parent_objective"] = parent.objective
     return ResearchTask(
         task_id=f"child-{fingerprint[:12]}",
         objective=candidate.objective,
-        context={
-            **parent.context,
-            **candidate.context,
-            "parent_objective": parent.objective,
-        },
+        context=child_context,
         expected_output=candidate.expected_output,
         constraints=parent.constraints,
         require_evidence=parent.require_evidence,
@@ -741,6 +819,7 @@ def create_research_agent_state(
         draft_raw="",
         last_content="",
         last_assessed_evidence_count=0,
+        last_assessed_strategy_attempt_count=0,
         research_requirements=list(requirements),
         coverage=list(initial_coverage(requirements)),
         critical_gaps=[],
@@ -850,25 +929,29 @@ def _fallback_assessment(
         for item in existing
         if item.status != RequirementStatus.SUPPORTED
     )
-    actions = tuple(
-        NextResearchAction(
-            gap.requirement_id,
-            "query_rewrite",
-            next(
-                requirement.description
-                for requirement in requirements
-                if requirement.requirement_id == gap.requirement_id
-            ),
-            "high",
-            "Obtain source-locatable evidence for the unresolved necessary requirement.",
+    gap_ids = {item.requirement_id for item in gaps}
+    pending_actions = tuple(
+        action
+        for action in unattempted_actions(
+            state.get("next_actions", []),
+            attempts,
         )
-        for gap in gaps
+        if action.requirement_id in gap_ids
+        and action.expected_value in {"high", "medium"}
     )
+    if pending_actions:
+        return ResearchAssessment(
+            decision=ResearchDecision.CONTINUE,
+            coverage=existing,
+            critical_gaps=gaps,
+            next_actions=pending_actions,
+            output_status=OutputStatus.FALLBACK,
+        )
     return ResearchAssessment(
-        decision=ResearchDecision.CONTINUE,
+        decision=ResearchDecision.STOP_RESEARCH,
         coverage=existing,
         critical_gaps=gaps,
-        next_actions=actions,
+        termination_reason=TerminationReason.TOOL_FAILURE,
         output_status=OutputStatus.FALLBACK,
     )
 
@@ -916,6 +999,10 @@ def build_research_agent_graph(
                     "critical_gaps": list(state.get("critical_gaps", [])),
                     "next_actions": list(state.get("next_actions", [])),
                     "strategy_attempts": list(state.get("strategy_attempts", [])),
+                    "last_assessed_strategy_attempt_count": state.get(
+                        "last_assessed_strategy_attempt_count",
+                        len(state.get("strategy_attempts", [])),
+                    ),
                     "assessment_decision": state.get("assessment_decision"),
                     "assessment_output_status": state.get(
                         "assessment_output_status", OutputStatus.VALID
@@ -1174,6 +1261,14 @@ def build_research_agent_graph(
             for event in state["execution_events"][-12:]
             if event.get("kind") == "tool_finished" and not event.get("ok", False)
         )
+        recent_tool_outcomes = tuple(
+            {
+                "name": str(message.get("name") or "tool"),
+                "content": str(message.get("content") or "")[:1000],
+            }
+            for message in state["messages"]
+            if message.get("role") == "tool"
+        )[-8:]
         assessment_error: str | None = None
         token_charge = 0
         if hard_reason is not None:
@@ -1191,8 +1286,10 @@ def build_research_agent_graph(
                 evidence=evidence,
                 critical_gaps=tuple(state["critical_gaps"]),
                 attempts=attempts,
+                child_results=tuple(state["child_results"]),
                 candidate_final=state.get("draft_raw", ""),
                 recent_tool_failures=recent_tool_failures,
+                recent_tool_outcomes=recent_tool_outcomes,
             )
             assessment_messages = [
                 {
@@ -1286,12 +1383,33 @@ def build_research_agent_graph(
                         has_research_tools=bool(tool_list),
                     )
 
+        reconciled_attempts = (
+            reconcile_strategy_attempt_outcomes(attempts, assessment.coverage)
+            if assessment.output_status != OutputStatus.FALLBACK
+            else attempts
+        )
+        scheduled_actions = merge_next_action_queue(
+            state.get("next_actions", []),
+            assessment,
+            active_consumed=(
+                len(attempts)
+                > state.get("last_assessed_strategy_attempt_count", 0)
+            ),
+        )
         messages = list(state["messages"])
         draft = state.get("draft")
         draft_raw = state.get("draft_raw", "")
         finalization_requested = False
         if assessment.decision in {ResearchDecision.CONTINUE, ResearchDecision.REPLAN}:
-            messages.append({"role": "user", "content": control_message(assessment)})
+            messages.append(
+                {
+                    "role": "user",
+                    "content": control_message(
+                        assessment,
+                        scheduled_actions=scheduled_actions,
+                    ),
+                }
+            )
             draft = None
             draft_raw = ""
         elif draft is None:
@@ -1307,8 +1425,9 @@ def build_research_agent_graph(
             "research_requirements": list(state["research_requirements"]),
             "coverage": list(assessment.coverage),
             "critical_gaps": list(assessment.critical_gaps),
-            "next_actions": list(assessment.next_actions),
-            "strategy_attempts": list(attempts),
+            "next_actions": list(scheduled_actions),
+            "strategy_attempts": list(reconciled_attempts),
+            "last_assessed_strategy_attempt_count": len(reconciled_attempts),
             "assessment_decision": assessment.decision,
             "assessment_output_status": assessment.output_status,
             "assessment_error": assessment_error,
@@ -1332,7 +1451,7 @@ def build_research_agent_graph(
                 evidence_count=evidence_count,
                 new_evidence_count=len(new_evidence_ids),
                 critical_gap_count=len(assessment.critical_gaps),
-                next_action_count=len(assessment.next_actions),
+                next_action_count=len(scheduled_actions),
                 assessment_output_status=assessment.output_status.value,
                 assessment_error=assessment_error,
             ),
@@ -1393,7 +1512,7 @@ def build_research_agent_graph(
                 matched_action = _action_for_tool_call(
                     tool_name,
                     arguments,
-                    state.get("next_actions", []),
+                    active_next_actions(state.get("next_actions", [])),
                 )
                 result: Any
                 error: str | None = None
@@ -1556,7 +1675,11 @@ def build_research_agent_graph(
         token_budget: int,
         retry_budget: int,
     ) -> tuple[str, str, ResearchResult, list[dict[str, Any]]]:
-        child_task = _child_task(state["task"], candidate)
+        child_task = _child_task(
+            state["task"],
+            candidate,
+            state["research_requirements"],
+        )
         child_identity = _child_identity(state["identity"], candidate)
         try:
             child_state = await _run_research_agent_state(
@@ -1628,6 +1751,9 @@ def build_research_agent_graph(
             identity=state["identity"],
             max_fork_depth=state["limits"].max_fork_depth,
             max_children=remaining_children,
+            parent_requirement_ids=(
+                item.requirement_id for item in state["research_requirements"]
+            ),
             completed_fingerprints=state["completed_fork_fingerprints"],
             ancestor_objectives=state["lineage_objectives"],
         )
@@ -1646,11 +1772,11 @@ def build_research_agent_graph(
             minimum=1,
         )
         tool_budgets = _split_budget(
-            max(0, state["subtree_tool_budget"] - state["total_tool_calls_used"]),
+            _delegable_tool_budget(state, len(accepted)),
             len(accepted),
         )
         token_budgets = _split_budget(
-            max(0, state["subtree_token_budget"] - state["estimated_tokens_used"]),
+            _delegable_token_budget(state),
             len(accepted),
         )
         retry_budgets = _split_budget(
@@ -1736,11 +1862,14 @@ def build_research_agent_graph(
             "child_thread_ids": [*state["child_thread_ids"], *child_thread_ids],
             "child_results": all_results,
             "observed_evidence": evidence,
+            "coverage": list(
+                merge_child_coverage_evidence(state["coverage"], new_results)
+            ),
             "strategy_attempts": [
                 *state.get("strategy_attempts", []),
                 *(
                     StrategyAttempt(
-                        requirement_id=f"{result.task_id}:{attempt.requirement_id}",
+                        requirement_id=attempt.requirement_id,
                         strategy=attempt.strategy,
                         query=attempt.query,
                         outcome=attempt.outcome,

@@ -68,9 +68,9 @@ think_and_plan
       └─ Stop Research → finalize_output → synthesize
 ```
 
-requirements、coverage、critical gaps、next actions、真实 strategy attempts 和 decision 都进入 checkpoint。程序确定性拒绝缺失 requirement、未知 Evidence ID、矛盾的覆盖/缺口/动作组合、没有新策略的 Replan、没有多种真实 `no_progress` 策略的 Exhausted，以及模型伪造的预算或取消原因。评估 JSON 和最终 JSON 各允许一次无工具结构修复；失败后使用保守 fallback，不覆盖此前已验证的研究状态。
+requirements、coverage、critical gaps、next actions、真实 strategy attempts 和 decision 都进入 checkpoint。程序确定性拒绝缺失 requirement、未知 Evidence ID、矛盾的覆盖/缺口/动作组合、没有新策略的 Replan、没有多种真实 `no_progress` 策略的 Exhausted，以及模型伪造的预算或取消原因。工具返回唯一页面并不自动等于研究进展：只有被合法 coverage 引用的 Evidence ID 才把对应 strategy attempt 记为 `evidence_found`，否则记为 `no_progress`。评估 JSON 和最终 JSON 各允许一次无工具结构修复；失败后使用保守 fallback，不覆盖此前已验证的研究状态，也不因格式错误禁用工具。
 
-结果分别保存 `research_status`、`termination_reason` 和 `output_status`。停止原因区分 `coverage_complete`、`saturated`、`evidence_exhausted`、`budget_forced`、`tool_failure` 和 `user_cancelled`；子任务 `partial` 继续披露，但根状态只按根 Brief 的最终覆盖重新判断。RCS 只在最终评测输出中计算五个维度，不进入运行时停止路由。
+结果分别保存 `research_status`、`termination_reason` 和 `output_status`。停止原因区分 `coverage_complete`、`saturated`、`evidence_exhausted`、`budget_forced`、`tool_failure` 和 `user_cancelled`；子任务 `partial` 继续披露，但根状态只按根 Brief 的最终覆盖重新判断。RCS 只在最终评测输出中计算五个维度，不进入运行时停止路由。ResearchBench 可选使用持久 SQLite checkpoint 逐题恢复，并把规则分、完整报告分块 LLM Judge 和二者组合分分开保存；Judge 使用独立的 `modules.judge` 采样参数，不参与运行时终止，也不改变 Research policy。
 
 完整契约、状态、路由和验收标准见 `docs/RESEARCH_SUFFICIENCY_TERMINATION_DESIGN.md`。
 

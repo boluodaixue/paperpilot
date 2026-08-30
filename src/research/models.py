@@ -151,6 +151,7 @@ class ForkCandidate:
 
     objective: str
     expected_output: str
+    requirement_ids: tuple[str, ...] = ()
     context: dict[str, Any] = field(default_factory=dict)
     reasons: tuple[ForkReason, ...] = ()
     estimated_tool_calls: int = 0

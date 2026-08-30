@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+from dataclasses import replace
 from typing import Any, Iterable
 
 from .models import ExecutionIdentity, ForkCandidate, ForkReason, ResearchTask
@@ -31,6 +32,15 @@ def fork_tool_schema() -> dict[str, Any]:
                             "properties": {
                                 "objective": {"type": "string"},
                                 "expected_output": {"type": "string"},
+                                "requirement_ids": {
+                                    "type": "array",
+                                    "items": {"type": "string"},
+                                    "minItems": 1,
+                                    "description": (
+                                        "Necessary requirement IDs from the current task "
+                                        "that this child is delegated to investigate."
+                                    ),
+                                },
                                 "context": {"type": "object"},
                                 "reasons": {
                                     "type": "array",
@@ -45,7 +55,12 @@ def fork_tool_schema() -> dict[str, Any]:
                                 },
                                 "independent": {"type": "boolean"},
                             },
-                            "required": ["objective", "expected_output", "reasons"],
+                            "required": [
+                                "objective",
+                                "expected_output",
+                                "requirement_ids",
+                                "reasons",
+                            ],
                         },
                         "minItems": 1,
                     }
@@ -82,6 +97,13 @@ def parse_fork_candidates(arguments: Any) -> list[ForkCandidate]:
             if reason not in reasons:
                 reasons.append(reason)
         context = raw.get("context", {})
+        requirement_ids = tuple(
+            dict.fromkeys(
+                str(value).strip()
+                for value in raw.get("requirement_ids", [])
+                if str(value).strip()
+            )
+        )
         try:
             estimated_tool_calls = max(0, int(raw.get("estimated_tool_calls") or 0))
         except (TypeError, ValueError):
@@ -90,6 +112,7 @@ def parse_fork_candidates(arguments: Any) -> list[ForkCandidate]:
             ForkCandidate(
                 objective=str(raw.get("objective") or "").strip(),
                 expected_output=str(raw.get("expected_output") or "").strip(),
+                requirement_ids=requirement_ids,
                 context=context if isinstance(context, dict) else {},
                 reasons=tuple(reasons),
                 estimated_tool_calls=estimated_tool_calls,
@@ -103,6 +126,7 @@ def candidate_fingerprint(candidate: ForkCandidate) -> str:
     normalized = {
         "objective": " ".join(candidate.objective.lower().split()),
         "expected_output": " ".join(candidate.expected_output.lower().split()),
+        "requirement_ids": candidate.requirement_ids,
         "context": candidate.context,
     }
     encoded = json.dumps(normalized, ensure_ascii=False, sort_keys=True, default=str)
@@ -116,6 +140,7 @@ def evaluate_fork_candidates(
     identity: ExecutionIdentity,
     max_fork_depth: int,
     max_children: int,
+    parent_requirement_ids: Iterable[str] = (),
     completed_fingerprints: Iterable[str] = (),
     ancestor_objectives: Iterable[str] = (),
 ) -> tuple[list[ForkCandidate], list[str]]:
@@ -126,6 +151,39 @@ def evaluate_fork_candidates(
         return [], ["fork depth limit reached"]
     if max_children <= 0:
         return [], ["child budget exhausted"]
+
+    valid_requirement_ids = tuple(
+        dict.fromkeys(
+            str(requirement_id).strip()
+            for requirement_id in parent_requirement_ids
+            if str(requirement_id).strip()
+        )
+    )
+    valid_requirement_id_set = set(valid_requirement_ids)
+    bound_proposals: list[ForkCandidate] = []
+    for candidate in proposals:
+        requirement_ids = candidate.requirement_ids
+        if valid_requirement_ids and not requirement_ids:
+            if len(valid_requirement_ids) == 1:
+                candidate = replace(
+                    candidate,
+                    requirement_ids=(valid_requirement_ids[0],),
+                )
+            else:
+                rejected.append(
+                    f"{candidate.objective or '<empty objective>'}: "
+                    "missing parent requirement mapping"
+                )
+                continue
+        unknown_requirement_ids = set(requirement_ids) - valid_requirement_id_set
+        if valid_requirement_ids and unknown_requirement_ids:
+            rejected.append(
+                f"{candidate.objective or '<empty objective>'}: unknown parent "
+                "requirements " + ", ".join(sorted(unknown_requirement_ids))
+            )
+            continue
+        bound_proposals.append(candidate)
+    proposals = bound_proposals
 
     seen = set(completed_fingerprints)
     parent_objective = " ".join(parent_task.objective.lower().split())

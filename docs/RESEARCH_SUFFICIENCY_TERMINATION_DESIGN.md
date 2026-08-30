@@ -2,7 +2,7 @@
 
 ## 1. 文档状态
 
-- 状态：已实施并完成确定性回归与相同三题真实验收；真实结果显示语义收敛仍有后续优化空间；
+- 状态：已实施并完成确定性回归、相同三题真实研究以及完整 LLM Judge 验收；真实结果显示语义收敛仍有后续优化空间；
 - 目标：替换提交 `bdf310a` 中基于来源数量和连续轮次的轻量完成门；
 - 实施边界：继续使用同质 Research AgentGraph，不新增 Supervisor、Judge Agent、服务或第二条研究主链；
 - 结论：来源数量、循环次数和单一总分都不能直接证明研究完成。
@@ -266,26 +266,32 @@ RCS 可以用于：
 - [x] 运行专项测试、N1–N6 和仓库全量回归；
 - [x] 重新完整运行相同三题真实 ResearchBench，并比较前后指标与停止原因。
 
-当前确定性验收结果：充分性/N1/评测专项、递归分层收尾与长历史最终快照均通过；N1–N6 `122 passed`，仓库全量 `747 passed, 2 skipped`。
+当前确定性验收结果：充分性、AgentGraph、fork、评测与 checkpoint 专项 `90 passed`；N1–N6 `138 passed`；仓库全量 `772 passed, 2 skipped`。全量第一次运行曾出现一个与本次改动无关且不可复现的 Windows Memory Store 并发路径抖动，单测复跑与全量复跑均通过。
 
-真实 ResearchBench 使用相同 `tech_001`、`med_001`、`fin_001` 和宽松预算（每 Agent 84、全树 588 次工具调用，1,000,000 token）。最终报告保存在本地 `outputs/evaluation/researchbench-sufficiency-termination-final-v6/`，不提交仓库。
+真实 ResearchBench 使用相同 `tech_001`、`med_001`、`fin_001` 和宽松预算（每 Agent 84、全树 588 次工具调用，1,000,000 token，单题 1,800 秒）。最终报告和 checkpoint 保存在本地 `outputs/evaluation/researchbench-state-model-final/`，不提交仓库。研究阶段累计 3,791.735 秒；按成功的规则评测和 Judge 调用折算，完整链路累计 4,202.346 秒。
 
-| 指标 | 被否决完成门 | 最终实现 | 变化 |
+| 指标 | 被否决完成门 | 最终状态模型 | 变化 |
 |---|---:|---:|---:|
-| 工具调用 | 86 | 104 | +18 |
-| 估算 token | 157,142 | 578,771 | +421,629 |
-| 耗时（秒） | 364.985 | 981.094 | +616.109 |
-| 平均规则分 | 0.581436 | 0.591106 | +0.009670 |
-| 证据数 | 347 | 418 | +71 |
-| RCS | N/A | coverage 0、sufficiency 0、conflict 1、calibration 1、efficiency 0 | 新增 |
+| 工具调用 | 86 | 160 | +74 |
+| 估算 token | 157,142 | 1,731,327 | +1,574,185 |
+| 研究耗时（秒） | 364.985 | 3,791.735 | +3,426.750 |
+| 平均规则分 | 0.581436 | 0.580055 | -0.001381 |
+| 平均 LLM Judge（0–10） | N/A | 4.400000 | 新增 |
+| 平均规则/Judge 综合分 | N/A | 0.524033 | 新增 |
+| 证据数 | 347 | 165 | -182 |
+| RCS | N/A | coverage 0、sufficiency 0.344444、conflict 1、calibration 1、efficiency 0 | 新增 |
 
-| 题目 | 根轮次（旧 → 新） | 规则分（旧 → 新） | 调用（旧 → 新） | token（旧 → 新） | 新停止/输出 |
-|---|---:|---:|---:|---:|---|
-| `tech_001` | 4 → 1 | 0.586136 → 0.585711 | 45 → 47 | 78,146 → 256,746 | `budget_forced` / `fallback` |
-| `med_001` | 4 → 7 | 0.578829 → 0.559184 | 33 → 15 | 68,913 → 105,530 | `budget_forced` / `valid` |
-| `fin_001` | 4 → 2 | 0.579341 → 0.628423 | 8 → 42 | 10,083 → 216,495 | `budget_forced` / `fallback` |
+| 题目 | 根轮次（旧 → 新） | 规则分（旧 → 新） | 调用（旧 → 新） | token（旧 → 新） | Judge | 新停止/输出 |
+|---|---:|---:|---:|---:|---:|---|
+| `tech_001` | 4 → 9 | 0.586136 → 0.590288 | 45 → 26 | 78,146 → 216,030 | 5.0 | `max_iterations_exhausted → budget_forced` / `valid` |
+| `med_001` | 4 → 5 | 0.578829 → 0.575370 | 33 → 86 | 68,913 → 1,000,000 | 3.4 | `token_budget_exhausted → budget_forced` / `valid` |
+| `fin_001` | 4 → 6 | 0.579341 → 0.574508 | 8 → 48 | 10,083 → 515,297 | 4.8 | `time_budget_exhausted → budget_forced` / `valid` |
 
-三题均没有因来源数或固定 ready 轮次在第 4 轮强制结束；新状态契约正确披露了 `time_budget_exhausted → budget_forced`。同时，全部任务仍为 `partial`，RCS 未显示必要要求覆盖，两题最终输出使用 fallback，说明移除机械早停后继续研究价值的语义收敛仍需后续模型/提示优化。这些限制不得被解释为正常完成。
+三题均没有因来源数或固定 ready 轮次在第 4 轮强制结束；真实递归还验证了子任务 `tool_failure` 不会无条件传播，父任务可在吸收子证据后合法判定 `evidence_exhausted`。根任务最终均为诚实的 `partial / budget_forced / valid`，没有伪装成完成；RCS 必要要求覆盖仍为 0，说明新增成本没有转化为稳定的根 Brief 充分覆盖，继续研究价值的语义判断通常晚于最优停止点。
+
+验收期间还发现并修复了评测层配置遗漏：LLM Judge 过去没有读取 `modules.judge` 的采样配置，实际回退到 1,024 输出 token，长报告分块 JSON 会被截断。现在 Judge 显式使用配置的 `temperature=0.1`、`max_tokens=2048`，相同 `med_001` checkpoint 的六个报告分块和最终评分全部成功。该修复不改变 Research AgentGraph 或运行时终止路由。
+
+仍需后续单独处理的观察项包括：提高检索证据与必要 requirement 的匹配质量、校准模型对 `saturated/evidence_exhausted` 的语义判断，以及让通用消息截断在极端情况下严格满足声明的字符上界。这些限制不得被解释为正常完成，也不应通过恢复固定轮次或来源阈值掩盖。
 
 ## 11. 验收标准
 

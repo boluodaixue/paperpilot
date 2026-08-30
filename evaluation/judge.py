@@ -20,23 +20,96 @@ from typing import Any
 
 logger = logging.getLogger("judge")
 
+_JUDGE_CHUNK_CHARS = 22_000
+_JUDGE_CHUNK_OVERLAP = 500
+_SCORE_KEYS = (
+    "factual_accuracy",
+    "logical_consistency",
+    "citation_quality",
+    "comprehensiveness",
+    "overall",
+)
+_CHUNK_KEYS = (
+    "factual_observations",
+    "logical_observations",
+    "citation_observations",
+    "coverage_observations",
+    "missing_or_uncertain",
+)
+
+
+def _report_chunks(report: str) -> list[str]:
+    """Cover the complete report with bounded overlapping Judge inputs."""
+    if len(report) <= _JUDGE_CHUNK_CHARS:
+        return [report]
+    chunks: list[str] = []
+    start = 0
+    while start < len(report):
+        end = min(len(report), start + _JUDGE_CHUNK_CHARS)
+        chunks.append(report[start:end])
+        if end == len(report):
+            break
+        start = end - _JUDGE_CHUNK_OVERLAP
+    return chunks
+
+
+def _validated_score_payload(value: dict[str, Any] | None) -> dict[str, Any] | None:
+    if not isinstance(value, dict) or any(key not in value for key in _SCORE_KEYS):
+        return None
+    for key in _SCORE_KEYS:
+        entry = value.get(key)
+        if not isinstance(entry, dict) or not isinstance(entry.get("reason"), str):
+            return None
+        score = entry.get("score")
+        if not isinstance(score, (int, float)) or not 0 <= float(score) <= 10:
+            return None
+    return value
+
+
+def _validated_chunk_payload(value: dict[str, Any] | None) -> dict[str, Any] | None:
+    """Accept only complete structured observations for a report chunk."""
+    if not isinstance(value, dict) or set(value) != set(_CHUNK_KEYS):
+        return None
+    for key in _CHUNK_KEYS:
+        entries = value.get(key)
+        if (
+            not isinstance(entries, list)
+            or len(entries) > 6
+            or any(not isinstance(entry, str) for entry in entries)
+        ):
+            return None
+    return value
+
+
+def _judge_input(report: str, chunks: list[str], *, complete: bool) -> dict[str, Any]:
+    return {
+        "report_chars": len(report),
+        "chunks": len(chunks),
+        "complete_report_covered": complete,
+    }
+
 
 class LLMJudge:
     """使用配置后端的 LLM-as-Judge 评审器。"""
 
-    def __init__(self, backend: str = "deepseek") -> None:
+    def __init__(self, backend: str = "deepseek", **policy_kwargs: Any) -> None:
         """
         Args:
             backend: Judge 后端名称，对应 ModelRouter 注册的后端。
+            policy_kwargs: Judge 专用采样参数，例如 temperature 和 max_tokens。
         """
         self.backend = backend
+        self.policy_kwargs = dict(policy_kwargs)
         self._policy = None
 
     def _get_policy(self):
         """惰性初始化 policy，避免在导入时触发网络请求。"""
         if self._policy is None:
             from src.models.model_router import ModelRouter
-            self._policy = ModelRouter.create_backend(self.backend)
+            self._policy = ModelRouter.create_backend(
+                self.backend,
+                **self.policy_kwargs,
+            )
         return self._policy
 
     # -----------------------------------------------------------------------
@@ -69,13 +142,104 @@ class LLMJudge:
             gt_lines = "\n".join(f"- {k}: {v}" for k, v in ground_truth.items())
             gt_section = f"期望包含的关键事实：\n{gt_lines}\n"
 
-        prompt = f"""你是一位严谨的研究报告评审专家。请对以下研究报告进行评分。
+        chunks = _report_chunks(report)
+        policy = self._get_policy()
+        if len(chunks) == 1:
+            report_context = f"--- Complete research report ---\n{report}"
+        else:
+            chunk_reviews: list[dict[str, Any]] = []
+            for index, chunk in enumerate(chunks, 1):
+                chunk_prompt = f"""Review chunk {index}/{len(chunks)} of a research report. Do not assign final scores.
 
-研究问题：{query}
+Research question: {query}
 
 {gt_section}
---- 研究报告 ---
-{report[:4000]}
+--- Report chunk {index}/{len(chunks)} ---
+{chunk}
+
+Return strict JSON with exactly these five arrays, each containing at most six strings:
+{{
+  "factual_observations": ["..."],
+  "logical_observations": ["..."],
+  "citation_observations": ["..."],
+  "coverage_observations": ["..."],
+  "missing_or_uncertain": ["..."]
+}}"""
+                try:
+                    chunk_messages = [
+                        {
+                            "role": "system",
+                            "content": (
+                                "You are a research-report chunk reviewer. "
+                                "Return valid JSON only."
+                            ),
+                        },
+                        {"role": "user", "content": chunk_prompt},
+                    ]
+                    chunk_response = policy(chunk_messages)
+                    chunk_raw = str(chunk_response.get("content", ""))
+                    parsed_chunk = _validated_chunk_payload(
+                        self._extract_json(chunk_raw)
+                    )
+                    if parsed_chunk is None:
+                        repaired_chunk = policy(
+                            [
+                                *chunk_messages,
+                                {"role": "assistant", "content": chunk_raw[:8000]},
+                                {
+                                    "role": "user",
+                                    "content": (
+                                        "REPAIR_CHUNK_OBSERVATION_JSON\n"
+                                        "Repair structure only and preserve the review. "
+                                        "Return exactly five arrays named "
+                                        "factual_observations, logical_observations, "
+                                        "citation_observations, coverage_observations, "
+                                        "and missing_or_uncertain. Each array may contain "
+                                        "at most six strings. Return JSON only."
+                                    ),
+                                },
+                            ]
+                        )
+                        parsed_chunk = _validated_chunk_payload(
+                            self._extract_json(
+                                str(repaired_chunk.get("content", ""))
+                            )
+                        )
+                    if parsed_chunk is None:
+                        return {
+                            "error": f"invalid Judge observation schema for chunk {index}",
+                            "judge_backend": self.backend,
+                            "judge_input": _judge_input(
+                                report,
+                                chunks,
+                                complete=False,
+                            ),
+                        }
+                    chunk_reviews.append(parsed_chunk)
+                except Exception as exc:
+                    return {
+                        "error": (
+                            f"Judge chunk {index} failed: "
+                            f"{type(exc).__name__}: {exc}"
+                        ),
+                        "judge_backend": self.backend,
+                        "judge_input": _judge_input(
+                            report,
+                            chunks,
+                            complete=False,
+                        ),
+                    }
+            report_context = (
+                "--- Structured observations covering every report chunk ---\n"
+                + json.dumps(chunk_reviews, ensure_ascii=False)
+            )
+
+        prompt = f"""You are a rigorous research-report evaluator. Score the complete report evidence below.
+
+Research question: {query}
+
+{gt_section}
+{report_context}
 
 请从以下维度评分（每项 0-10 分，10 分为最高）：
 1. factual_accuracy: 事实准确性（数字、日期、人名、机构名是否正确）
@@ -94,7 +258,6 @@ class LLMJudge:
 }}"""
 
         try:
-            policy = self._get_policy()
             messages = [
                 {"role": "system", "content": "你是研究报告评审专家。必须输出合法 JSON，不要输出任何其他内容。"},
                 {"role": "user", "content": prompt},
@@ -102,13 +265,29 @@ class LLMJudge:
             resp = policy(messages)
             content = resp.get("content", "")
 
-            result = self._extract_json(content)
-            if result:
-                scores = [
-                    v["score"]
-                    for v in result.values()
-                    if isinstance(v, dict) and "score" in v
-                ]
+            result = _validated_score_payload(self._extract_json(content))
+            if result is None:
+                repair = policy(
+                    [
+                        messages[0],
+                        messages[1],
+                        {"role": "assistant", "content": str(content)[:8000]},
+                        {
+                            "role": "user",
+                            "content": (
+                                "你的输出不符合评分 JSON 契约。只修复结构，不改变判断。"
+                                "必须且只能包含 factual_accuracy、logical_consistency、"
+                                "citation_quality、comprehensiveness、overall 五个键；"
+                                "每个值必须是 {score: 0到10数字, reason: 字符串}。"
+                            ),
+                        },
+                    ]
+                )
+                result = _validated_score_payload(
+                    self._extract_json(str(repair.get("content", "")))
+                )
+            if result is not None:
+                scores = [float(result[key]["score"]) for key in _SCORE_KEYS]
                 avg = sum(scores) / len(scores) if scores else 0.0
                 dimensions = {k: v for k, v in result.items() if k != "overall"}
                 overall = result.get("overall", {"score": avg, "reason": ""})
@@ -117,12 +296,21 @@ class LLMJudge:
                     "dimensions": dimensions,
                     "average": avg,
                     "judge_backend": self.backend,
+                    "judge_input": _judge_input(report, chunks, complete=True),
                 }
         except Exception as e:
             logger.warning(f"LLM Judge 单篇评分失败: {e}")
-            return {"error": str(e), "judge_backend": self.backend}
+            return {
+                "error": str(e),
+                "judge_backend": self.backend,
+                "judge_input": _judge_input(report, chunks, complete=True),
+            }
 
-        return {"error": "无法解析 LLM Judge 输出", "judge_backend": self.backend}
+        return {
+            "error": "无法解析 LLM Judge 输出",
+            "judge_backend": self.backend,
+            "judge_input": _judge_input(report, chunks, complete=True),
+        }
 
     # -----------------------------------------------------------------------
     # 两篇报告 head-to-head 对比
