@@ -6,6 +6,7 @@ from pathlib import Path
 from typing import Any
 
 import pytest
+from tests._research_assessment import assessment_response
 
 import src.research.workflow as workflow_module
 from src.research import (
@@ -103,6 +104,9 @@ class _Policy:
         self.research_messages: list[list[dict[str, Any]]] = []
 
     def __call__(self, messages, *, tools=None):
+        assessment = assessment_response(messages)
+        if assessment is not None:
+            return assessment
         if "before research begins" in str(messages[0].get("content", "")):
             self.alignment_messages.append(messages)
             revised = "Revise the research brief" in str(messages[-1].get("content", ""))
@@ -123,7 +127,7 @@ class _Policy:
             return {"content": json.dumps(payload), "tool_calls": []}
 
         self.research_messages.append(messages)
-        if messages[-1]["role"] == "tool":
+        if messages[-1]["role"] == "tool" or tools == []:
             return {
                 "content": json.dumps(
                     {

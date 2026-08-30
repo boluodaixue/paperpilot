@@ -15,10 +15,14 @@ from src.research import (
     create_research_workflow_state,
     resume_research_workflow,
 )
+from tests._research_assessment import assessment_response
 
 
 class _Policy:
     def __call__(self, messages, *, tools=None):
+        assessment = assessment_response(messages)
+        if assessment is not None:
+            return assessment
         if "before research begins" in str(messages[0].get("content", "")):
             return {
                 "content": json.dumps(
@@ -32,7 +36,7 @@ class _Policy:
                 ),
                 "tool_calls": [],
             }
-        if messages[-1]["role"] == "tool":
+        if messages[-1]["role"] == "tool" or tools == []:
             return {
                 "content": json.dumps(
                     {

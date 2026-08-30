@@ -293,8 +293,11 @@ def render_report(
         f"## Evidence-backed Details\n\n{evidence_text}\n\n"
         f"## Unresolved\n\n{unresolved}\n\n"
         f"## Execution\n\n"
-        f"- Status: {result.status.value}\n"
-        f"- Stop reason: {result.stop_reason or 'normal completion'}\n"
+        f"- Research status: {result.status.value}\n"
+        f"- Termination reason: "
+        f"{result.termination_reason.value if result.termination_reason else 'unspecified'}\n"
+        f"- Output status: {result.output_status.value}\n"
+        f"- Resource/error detail: {result.stop_reason or 'none'}\n"
         f"- Iterations: {result.iterations}\n"
         f"- Tool calls: {result.tool_calls_used}\n"
     )

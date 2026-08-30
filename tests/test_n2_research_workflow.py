@@ -21,6 +21,7 @@ from src.research import (
     resume_research_workflow,
 )
 from src.research.models import EvidenceItem
+from tests._research_assessment import assessment_response
 
 
 def _tool_call() -> dict[str, Any]:
@@ -71,6 +72,9 @@ class WorkflowPolicy:
         self.research_calls = 0
 
     def __call__(self, messages, *, tools=None):
+        assessment = assessment_response(messages)
+        if assessment is not None:
+            return assessment
         system = str(messages[0].get("content", ""))
         if "before research begins" in system:
             self.alignment_calls += 1
@@ -94,7 +98,7 @@ class WorkflowPolicy:
             return {"content": json.dumps(payload), "tool_calls": []}
 
         self.research_calls += 1
-        if messages[-1]["role"] == "tool":
+        if messages[-1]["role"] == "tool" or tools == []:
             return {
                 "content": json.dumps(
                     {

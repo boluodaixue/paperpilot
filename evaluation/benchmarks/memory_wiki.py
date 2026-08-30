@@ -103,6 +103,35 @@ class _OfflinePolicy:
         self.calls += 1
         system = str(messages[0].get("content") or "")
 
+        if "sufficiency-assessment step" in system:
+            state = json.loads(
+                str(messages[-1]["content"]).split("STATE:\n", 1)[1]
+            )
+            evidence_ids = [item["evidence_id"] for item in state["evidence"]]
+            return {
+                "content": json.dumps(
+                    {
+                        "decision": "stop_research",
+                        "coverage": [
+                            {
+                                "requirement_id": requirement["requirement_id"],
+                                "status": "supported",
+                                "evidence_ids": evidence_ids,
+                                "rationale": "The fixed source fills the scoped gap.",
+                                "remaining_gap": None,
+                            }
+                            for requirement in state["requirements"]
+                        ],
+                        "critical_gaps": [],
+                        "next_actions": [],
+                        "termination_reason": "coverage_complete",
+                        "replan_reason": None,
+                        "exhaustion_reason": None,
+                    }
+                ),
+                "tool_calls": [],
+            }
+
         if "Answer only from the supplied selected-Memory notes" in system:
             self.answer_calls += 1
             context = json.loads(
@@ -190,7 +219,7 @@ class _OfflinePolicy:
 
         if "You are a PaperPilot Research Agent" in system:
             self.research_calls += 1
-            if messages[-1].get("role") == "tool":
+            if messages[-1].get("role") == "tool" or tools == []:
                 return {
                     "content": json.dumps(
                         {

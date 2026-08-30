@@ -14,6 +14,7 @@ from langgraph.checkpoint.memory import InMemorySaver
 import web.server as server
 from src.research.memory import MarkdownMemoryStore
 from src.research.runtime import build_research_runtime
+from tests._research_assessment import assessment_response
 
 
 _MEMORY_ID = "M-web"
@@ -45,6 +46,9 @@ class FixedPolicy:
         self.research_calls = 0
 
     def __call__(self, messages, *, tools=None):
+        assessment = assessment_response(messages)
+        if assessment is not None:
+            return assessment
         system = str(messages[0].get("content", ""))
         if "before research begins" in system:
             self.alignment_calls += 1
@@ -57,7 +61,7 @@ class FixedPolicy:
                 "expected_output": "Evidence-backed Markdown report",
             }), "tool_calls": []}
         self.research_calls += 1
-        if messages[-1]["role"] == "tool":
+        if messages[-1]["role"] == "tool" or tools == []:
             return {"content": json.dumps({
                 "status": "completed", "summary": "Fixed summary.",
                 "findings": ["A source-locatable fixed finding."],

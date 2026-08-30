@@ -21,14 +21,22 @@ from .agent_graph import build_research_agent_graph, create_research_agent_state
 from .memory import MarkdownMemoryStore, MemoryWriteConflictError
 from .models import (
     AgentLimits,
+    CriticalGap,
     EvidenceItem,
     ExecutionIdentity,
     MemoryManifest,
+    NextResearchAction,
+    OutputStatus,
     ReportReviewOutcome,
+    RequirementCoverage,
+    ResearchDecision,
     ResearchBrief,
+    ResearchRequirement,
     ResearchResult,
     ResearchTask,
     ResearchWorkflowResult,
+    StrategyAttempt,
+    TerminationReason,
 )
 from .policy import call_policy
 from .rendering import (
@@ -96,7 +104,20 @@ class ResearchWorkflowState(TypedDict, total=False):
     execution_events: list[dict[str, Any]]
     lineage_objectives: list[str]
     draft: dict[str, Any] | None
+    draft_raw: str
     last_content: str
+    last_assessed_evidence_count: int
+    research_requirements: list[ResearchRequirement]
+    coverage: list[RequirementCoverage]
+    critical_gaps: list[CriticalGap]
+    next_actions: list[NextResearchAction]
+    strategy_attempts: list[StrategyAttempt]
+    assessment_decision: ResearchDecision | None
+    assessment_output_status: OutputStatus
+    assessment_error: str | None
+    termination_reason: TerminationReason | None
+    finalization_requested: bool
+    output_status: OutputStatus
     stop_reason: str | None
     result: ResearchResult | None
     report_markdown: str | None
@@ -713,6 +734,20 @@ def build_research_workflow(
                     "research_gaps": list(brief.research_gaps),
                 }
             )
+        requirement_descriptions = list(
+            dict.fromkeys([*brief.directions, *brief.research_gaps])
+        )
+        task_context["research_requirements"] = [
+            {
+                "requirement_id": f"R{index}",
+                "description": description,
+                "required": True,
+            }
+            for index, description in enumerate(
+                requirement_descriptions or [brief.objective],
+                1,
+            )
+        ]
         task = ResearchTask(
             task_id=f"root-task-{state['identity'].root_thread_id}",
             objective=brief.objective,

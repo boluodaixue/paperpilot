@@ -7,6 +7,7 @@ from dataclasses import dataclass, field
 from typing import Any
 
 import pytest
+from tests._research_assessment import assessment_response
 
 from src.research import (
     AgentLimits,
@@ -113,13 +114,16 @@ class ChildPolicy:
         self.tracker.child_policy_ids.append(id(self))
 
     def __call__(self, messages, *, tools=None):
+        assessment = assessment_response(messages)
+        if assessment is not None:
+            return assessment
         task_payload = json.loads(messages[1]["content"])
         objective = task_payload["objective"]
         if len(messages) == 2:
             self.tracker.child_user_prompts.append(messages[1]["content"])
         if self.fail_objective and self.fail_objective in objective:
             raise RuntimeError("child model failure")
-        if messages[-1]["role"] == "tool":
+        if messages[-1]["role"] == "tool" or tools == []:
             return _final(
                 f"Completed {objective}",
                 f"Evidence-backed finding for {objective}",
@@ -145,6 +149,16 @@ class ForkingPolicy:
         return ChildPolicy(self.tracker, self.fail_objective)
 
     def __call__(self, messages, *, tools=None):
+        assessment = assessment_response(messages)
+        if assessment is not None:
+            return assessment
+        if tools == [] and str(messages[-1].get("content") or "").startswith(
+            "FINAL_SYNTHESIS_SNAPSHOT"
+        ):
+            return _final(
+                "The parent gathered and synthesized child research.",
+                "The child directions produced evidence-backed findings.",
+            )
         fork_responses = [
             message
             for message in messages
@@ -350,7 +364,7 @@ async def test_partial_child_failure_keeps_successful_evidence_and_is_reported()
         identity=_root_identity("root-partial-child"),
     )
 
-    assert result.status == ResearchStatus.PARTIAL
+    assert result.status == ResearchStatus.COMPLETED
     assert len(result.child_result_refs) == 2
     assert len(result.evidence) == 1
     assert any("returned failed" in item for item in result.unresolved)

@@ -1031,6 +1031,12 @@ def _research_task_result(
         "query": task.query,
         "elapsed": round(elapsed, 1),
         "research_status": research_result.status.value,
+        "termination_reason": (
+            research_result.termination_reason.value
+            if research_result.termination_reason is not None
+            else None
+        ),
+        "output_status": research_result.output_status.value,
         "stop_reason": research_result.stop_reason,
         "report_md": workflow_result.report_markdown,
         "evidence": [asdict(item) for item in research_result.evidence],

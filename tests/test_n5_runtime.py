@@ -9,6 +9,7 @@ import pytest
 
 from src.research import MarkdownMemoryStore, ResearchStatus
 from src.research.runtime import build_research_runtime, limits_from_config
+from tests._research_assessment import assessment_response
 
 
 class RuntimeTool:
@@ -42,6 +43,9 @@ class RuntimeTool:
 
 class RuntimePolicy:
     def __call__(self, messages, *, tools=None):
+        assessment = assessment_response(messages)
+        if assessment is not None:
+            return assessment
         if "before research begins" in str(messages[0].get("content", "")):
             revised = "narrow" in str(messages[-1].get("content", "")).lower()
             return {
@@ -56,7 +60,7 @@ class RuntimePolicy:
                 ),
                 "tool_calls": [],
             }
-        if messages[-1]["role"] == "tool":
+        if messages[-1]["role"] == "tool" or tools == []:
             return {
                 "content": json.dumps(
                     {
