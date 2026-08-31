@@ -31,6 +31,7 @@ from ..tools import (
     CalculatorTool,
     CodeSandboxTool,
     FileReaderTool,
+    EvidenceAcquisitionTool,
     MockBrowserTool,
     MockWebSearchTool,
     NotepadTool,
@@ -83,6 +84,12 @@ from .workflow import (
     resume_research_workflow,
 )
 from .vault import LEGACY_MEMORY_ID, scan_legacy_memory_markdown
+from .v2_contracts import (
+    ResearchArchitecture,
+    ResearchArchitectureSettings,
+    SupervisorV2Config,
+)
+from ..tools.content_extraction import content_extraction_config_from_config
 
 from .vault_write_queue import VaultWriteQueue
 from .vault_write_service import VaultWriteService
@@ -131,6 +138,7 @@ __all__ = [
     "limits_from_config",
     "load_config",
     "open_research_runtime",
+    "research_architecture_settings_from_config",
     "setup_logging",
     "vault_root_from_config",
 ]
@@ -177,24 +185,78 @@ def build_research_tools(config: dict[str, Any]) -> list[Any]:
     tools_config = config.get("tools", {})
     mock_mode = bool(tools_config.get("web_search", {}).get("mock_mode", False))
     enabled = tools_config.get("enabled")
+    extraction_config = content_extraction_config_from_config(config)
 
+    search_tool = MockWebSearchTool() if mock_mode else WebSearchTool()
+    browser_tool = (
+        MockBrowserTool()
+        if mock_mode
+        else BrowserTool(extraction_config=extraction_config)
+    )
+    acquisition_raw = tools_config.get("evidence_acquisition", {})
+    if not isinstance(acquisition_raw, Mapping):
+        raise ValueError("tools.evidence_acquisition must be a mapping")
+    acquisition_allowed = {
+        "default_candidates",
+        "default_sources",
+        "max_sources",
+        "max_chars_per_source",
+    }
+    acquisition_unknown = sorted(
+        str(key) for key in acquisition_raw if key not in acquisition_allowed
+    )
+    if acquisition_unknown:
+        raise ValueError(
+            "unknown tools.evidence_acquisition settings: "
+            + ", ".join(acquisition_unknown)
+        )
+    acquisition_tool = EvidenceAcquisitionTool(
+        search_tool,
+        browser_tool,
+        **{
+            key: acquisition_raw[key]
+            for key in acquisition_allowed
+            if key in acquisition_raw
+        },
+    )
     available: dict[str, Any] = {
-        "web_search": MockWebSearchTool() if mock_mode else WebSearchTool(),
-        "browser": MockBrowserTool() if mock_mode else BrowserTool(),
+        "web_search": search_tool,
+        "browser": browser_tool,
+        "acquire_evidence": acquisition_tool,
         "arxiv_reader": ArxivReaderTool(use_mock=mock_mode),
         "file_reader": FileReaderTool(),
         "code_sandbox": CodeSandboxTool(use_mock=mock_mode),
         "calculator": CalculatorTool(),
         "notepad": NotepadTool(),
     }
-    if enabled is None:
-        return list(available.values())
+    base_names = tuple(name for name in available if name != "acquire_evidence")
+    selected_names = list(base_names if enabled is None else enabled)
     if not isinstance(enabled, list):
-        raise ValueError("tools.enabled must be a list of tool names")
-    unknown = [name for name in enabled if name not in available]
+        if enabled is not None:
+            raise ValueError("tools.enabled must be a list of tool names")
+    unknown = [name for name in selected_names if name not in available]
     if unknown:
         raise ValueError(f"unknown research tools: {', '.join(unknown)}")
-    return [available[name] for name in enabled]
+    research = config.get("research", {})
+    supervisor = research.get("supervisor_v2", {}) if isinstance(research, Mapping) else {}
+    use_v2_acquisition = (
+        isinstance(research, Mapping)
+        and research.get("architecture") == ResearchArchitecture.SUPERVISOR_V2.value
+        and isinstance(supervisor, Mapping)
+        and bool(supervisor.get("enabled", False))
+        and "web_search" in selected_names
+        and "browser" in selected_names
+    )
+    if use_v2_acquisition:
+        first_low_level = min(
+            selected_names.index("web_search"),
+            selected_names.index("browser"),
+        )
+        selected_names = [
+            name for name in selected_names if name not in {"web_search", "browser"}
+        ]
+        selected_names.insert(first_low_level, "acquire_evidence")
+    return [available[name] for name in selected_names]
 
 
 def _research_config(config: dict[str, Any]) -> Mapping[str, Any]:
@@ -202,6 +264,42 @@ def _research_config(config: dict[str, Any]) -> Mapping[str, Any]:
     if not isinstance(research, Mapping):
         raise ValueError("research configuration must be a mapping")
     return research
+
+
+def research_architecture_settings_from_config(
+    config: dict[str, Any],
+) -> ResearchArchitectureSettings:
+    """Strictly parse the V1/V2 rollout switch and bounded V2 settings."""
+    research = _research_config(config)
+    architecture_value = research.get("architecture", ResearchArchitecture.LEGACY.value)
+    if not isinstance(architecture_value, str):
+        raise ValueError(
+            "research.architecture must be 'legacy' or 'supervisor_v2'"
+        )
+    try:
+        architecture = ResearchArchitecture(architecture_value)
+    except ValueError as exc:
+        raise ValueError(
+            "research.architecture must be 'legacy' or 'supervisor_v2'"
+        ) from exc
+
+    raw_supervisor = research.get("supervisor_v2", {})
+    if not isinstance(raw_supervisor, Mapping):
+        raise ValueError("research.supervisor_v2 must be a mapping")
+    allowed = SupervisorV2Config.__dataclass_fields__.keys()
+    unknown = sorted(str(key) for key in raw_supervisor if key not in allowed)
+    if unknown:
+        raise ValueError(
+            "unknown research.supervisor_v2 settings: " + ", ".join(unknown)
+        )
+    supervisor = SupervisorV2Config(
+        **{key: raw_supervisor[key] for key in allowed if key in raw_supervisor}
+    )
+    supervisor.validate()
+    return ResearchArchitectureSettings(
+        architecture=architecture,
+        supervisor_v2=supervisor,
+    )
 
 
 def limits_from_config(config: dict[str, Any]) -> AgentLimits:
@@ -388,6 +486,8 @@ class ResearchRuntime:
         checkpointer: BaseCheckpointSaver,
         limits: AgentLimits,
         report_review_enabled: bool = False,
+        research_architecture: ResearchArchitecture = ResearchArchitecture.LEGACY,
+        supervisor_v2_config: SupervisorV2Config | None = None,
         vault_write_service: VaultWriteService | None = None,
         write_db_path: str | os.PathLike[str] | None = None,
         write_queue: VaultWriteQueue | None = None,
@@ -399,6 +499,8 @@ class ResearchRuntime:
         self.checkpointer = checkpointer
         self.limits = limits
         self.report_review_enabled = report_review_enabled
+        self.research_architecture = research_architecture
+        self.supervisor_v2_config = supervisor_v2_config or SupervisorV2Config()
         (
             retrieval_db,
             reconciliation_seconds,
@@ -438,6 +540,8 @@ class ResearchRuntime:
             memory_store,
             checkpointer=checkpointer,
             report_review_enabled=report_review_enabled,
+            research_architecture=research_architecture,
+            supervisor_v2_config=self.supervisor_v2_config,
             vault_write_service=self.vault_write_service,
         )
         self.memory_note_graph = build_memory_note_workflow(
@@ -1203,6 +1307,15 @@ def build_research_runtime(
 ) -> ResearchRuntime:
     """Construct the single production Research Workflow dependency graph."""
     effective_config = config if config is not None else load_config(config_path)
+    architecture_settings = research_architecture_settings_from_config(effective_config)
+    if (
+        architecture_settings.architecture is ResearchArchitecture.SUPERVISOR_V2
+        and not architecture_settings.supervisor_v2.enabled
+    ):
+        raise ValueError(
+            "research.architecture=supervisor_v2 requires "
+            "research.supervisor_v2.enabled=true"
+        )
     effective_store = (
         memory_store
         if memory_store is not None
@@ -1216,6 +1329,8 @@ def build_research_runtime(
         checkpointer=checkpointer if checkpointer is not None else InMemorySaver(),
         limits=limits_from_config(effective_config),
         report_review_enabled=_report_review_enabled(effective_config),
+        research_architecture=architecture_settings.architecture,
+        supervisor_v2_config=architecture_settings.supervisor_v2,
         vault_write_service=vault_write_service,
         write_db_path=write_db_path,
         write_queue=write_queue,

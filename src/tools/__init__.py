@@ -5,6 +5,17 @@ from .web_search import WebSearchTool, MockWebSearchTool, BaseWebSearchTool
 from .arxiv_reader import ArxivReaderTool
 from .code_sandbox import CodeSandboxTool
 from .browser import BrowserTool, MockBrowserTool, BaseBrowserTool, get_browser_tool
+from .content_extraction import (
+    ContentExtractionConfig,
+    ExtractedBlock,
+    ExtractedDocument,
+    content_extraction_config_from_config,
+)
+from .evidence_acquisition import (
+    AcquisitionRegistry,
+    EvidenceAcquisitionTool,
+    canonicalize_source_url,
+)
 from .file_reader import FileReaderError, FileReaderTool, file_reader_scope
 from .calculator import CalculatorTool
 from .notepad import NotepadTool, NotepadEntry
@@ -19,6 +30,13 @@ __all__ = [
     "MockBrowserTool",
     "BaseBrowserTool",
     "get_browser_tool",
+    "ContentExtractionConfig",
+    "ExtractedBlock",
+    "ExtractedDocument",
+    "content_extraction_config_from_config",
+    "AcquisitionRegistry",
+    "EvidenceAcquisitionTool",
+    "canonicalize_source_url",
     "FileReaderTool",
     "FileReaderError",
     "file_reader_scope",

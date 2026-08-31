@@ -1,4 +1,5 @@
 """Root workflow: align, confirm, run the homogeneous graph, and persist."""
+
 from __future__ import annotations
 
 import asyncio
@@ -6,7 +7,7 @@ import json
 import re
 import time
 from contextlib import contextmanager
-from dataclasses import asdict
+from dataclasses import asdict, replace
 from typing import Any, Iterable, TypedDict
 
 import yaml
@@ -18,6 +19,12 @@ from langgraph.types import Command, interrupt
 
 from ..utils.tracing import trace_block, trace_context
 from .agent_graph import build_research_agent_graph, create_research_agent_state
+from .citation_audit import (
+    audit_citations,
+    citation_followup_directives,
+    deterministic_citation_issues,
+    repair_citations,
+)
 from .memory import MarkdownMemoryStore, MemoryWriteConflictError
 from .models import (
     AgentLimits,
@@ -29,10 +36,11 @@ from .models import (
     OutputStatus,
     ReportReviewOutcome,
     RequirementCoverage,
-    ResearchDecision,
     ResearchBrief,
+    ResearchDecision,
     ResearchRequirement,
     ResearchResult,
+    ResearchStatus,
     ResearchTask,
     ResearchWorkflowResult,
     StrategyAttempt,
@@ -47,12 +55,35 @@ from .rendering import (
     report_note_id,
     safe_note_id,
     source_note_id,
+    render_v2_report,
 )
+from .report_composer import EVIDENCE_MARKER, compose_report, drop_unsafe_markdown_lines
 from .report_review import review_final_report
+from .research_sufficiency import atomic_requirement_descriptions
+from .research_challenge import (
+    execute_supplemental_work_packets,
+    merge_supervisor_outcome,
+    run_research_challenge_loop,
+)
+from .research_planner import plan_research
+from .research_worker import run_research_worker
+from .research_supervisor import (
+    SupervisorBudget,
+    plan_supplemental_work_packets,
+    run_research_supervisor,
+)
 from .retrieval import MarkdownMemoryIndex, MemorySearchHit
 from .vault import validate_frontmatter, validate_memory_id
 from .vault_write_service import VaultWriteService
-
+from .v2_contracts import (
+    CitationAuditOutcome,
+    ReportDraft,
+    ResearchArchitecture,
+    ResearchChallengeLoopOutcome,
+    ResearchPlan,
+    SupervisorOutcome,
+    SupervisorV2Config,
+)
 
 __all__ = [
     "ResearchWorkflowState",
@@ -125,6 +156,17 @@ class ResearchWorkflowState(TypedDict, total=False):
     workflow_result: ResearchWorkflowResult | None
     report_review: ReportReviewOutcome | None
     failure_code: str | None
+    research_architecture: ResearchArchitecture
+    supervisor_v2_config: SupervisorV2Config
+    v2_plan: ResearchPlan | None
+    v2_supervisor_outcome: SupervisorOutcome | None
+    v2_challenge_outcome: ResearchChallengeLoopOutcome | None
+    v2_report_draft: ReportDraft | None
+    v2_citation_audit: CitationAuditOutcome | None
+    v2_report_body: str | None
+    v2_citation_followup_used: bool
+    v2_citation_followup_question_ids: list[str]
+    v2_citation_followup_guidance: dict[str, list[str]]
 
 
 _JSON_FENCE = re.compile(r"```(?:json)?\s*(.*?)\s*```", re.IGNORECASE | re.DOTALL)
@@ -139,21 +181,13 @@ def _managed_research_timestamp(
     """Recover the one timestamp used by an already-published managed bundle."""
     lines = report_markdown.splitlines(keepends=True)
     if not lines or lines[0].rstrip("\r\n") != "---":
-        raise MemoryWriteConflictError(
-            "research persist replay conflict: existing report has no frontmatter"
-        )
+        raise MemoryWriteConflictError("research persist replay conflict: existing report has no frontmatter")
     closing = next(
-        (
-            index
-            for index, line in enumerate(lines[1:], start=1)
-            if line.rstrip("\r\n") == "---"
-        ),
+        (index for index, line in enumerate(lines[1:], start=1) if line.rstrip("\r\n") == "---"),
         None,
     )
     if closing is None:
-        raise MemoryWriteConflictError(
-            "research persist replay conflict: existing report frontmatter is not closed"
-        )
+        raise MemoryWriteConflictError("research persist replay conflict: existing report frontmatter is not closed")
     try:
         raw_frontmatter = yaml.safe_load("".join(lines[1:closing]))
         if not isinstance(raw_frontmatter, dict):
@@ -174,9 +208,7 @@ def _managed_research_timestamp(
     created_at = frontmatter.get("created_at")
     updated_at = frontmatter.get("updated_at")
     if not isinstance(created_at, str) or updated_at != created_at:
-        raise MemoryWriteConflictError(
-            "research persist replay conflict: existing report timestamp is not stable"
-        )
+        raise MemoryWriteConflictError("research persist replay conflict: existing report timestamp is not stable")
     return created_at
 
 
@@ -187,6 +219,7 @@ def _reuse_existing_research_commit(
     identity: ExecutionIdentity,
     *,
     memory_id: str | None,
+    report_body_markdown: str | None = None,
 ) -> tuple[str, MemoryManifest] | None:
     """Return an exact prior commit, or reject an unsafe persist-node replay."""
     report_note = report_note_id(identity.root_thread_id)
@@ -206,9 +239,7 @@ def _reuse_existing_research_commit(
         if memory_id is not None
         else None
     )
-    unique_evidence = list(
-        {item.evidence_id: item for item in result.evidence}.values()
-    )
+    unique_evidence = list({item.evidence_id: item for item in result.evidence}.values())
     evidence_note_by_id = {
         evidence.evidence_id: (
             managed_note_id("Evidence", evidence.evidence_id)
@@ -221,15 +252,19 @@ def _reuse_existing_research_commit(
     for evidence in unique_evidence:
         source_note_by_ref.setdefault(evidence.source_ref, source_note_id(evidence))
 
-    expected_report = render_report(
-        brief,
-        result,
+    renderer = render_v2_report if report_body_markdown is not None else render_report
+    renderer_kwargs = dict(
         report_note=report_note,
         evidence_notes=evidence_note_by_id,
         root_thread_id=identity.root_thread_id,
         memory_id=memory_id,
         created_at=timestamp,
         updated_at=timestamp,
+    )
+    expected_report = (
+        renderer(brief, result, report_body_markdown, **renderer_kwargs)
+        if report_body_markdown is not None
+        else renderer(brief, result, **renderer_kwargs)
     )
     expected_files: list[tuple[str, str]] = []
     source_paths: list[str] = []
@@ -281,9 +316,7 @@ def _reuse_existing_research_commit(
                 f"research persist replay conflict: committed bundle is missing {path}"
             ) from exc
         if existing_markdown != expected_markdown:
-            raise MemoryWriteConflictError(
-                f"research persist replay conflict: committed content changed at {path}"
-            )
+            raise MemoryWriteConflictError(f"research persist replay conflict: committed content changed at {path}")
     return existing_report, MemoryManifest(
         report_path=report_path,
         evidence_paths=tuple(evidence_paths),
@@ -305,9 +338,7 @@ def _validate_root_state(
     state["limits"].validate()
     checkpoint_thread_id = config.get("configurable", {}).get("thread_id")
     if checkpoint_thread_id != identity.thread_id:
-        raise ValueError(
-            "LangGraph configurable.thread_id must match identity.thread_id"
-        )
+        raise ValueError("LangGraph configurable.thread_id must match identity.thread_id")
     if state.get("thread_id", identity.thread_id) != identity.thread_id:
         raise ValueError("workflow thread_id must match identity.thread_id")
 
@@ -433,11 +464,7 @@ def _parse_brief(
     if not expected_output:
         raise ValueError("research brief expected_output cannot be empty")
     fixed_memory = tuple(retrieved_memory) if memory_id is not None else ()
-    memory_paths = tuple(
-        str(item["path"])
-        for item in fixed_memory
-        if str(item.get("path") or "").strip()
-    )
+    memory_paths = tuple(str(item["path"]) for item in fixed_memory if str(item.get("path") or "").strip())
     if memory_id is None:
         known_information: tuple[str, ...] = ()
         research_gaps: tuple[str, ...] = ()
@@ -448,15 +475,9 @@ def _parse_brief(
             known_information = _as_string_tuple(payload.get("known_information"))
         else:
             known_information = tuple(
-                str(item["summary"]).strip()
-                for item in fixed_memory
-                if str(item.get("summary") or "").strip()
+                str(item["summary"]).strip() for item in fixed_memory if str(item.get("summary") or "").strip()
             )
-        research_gaps = (
-            _as_string_tuple(payload.get("research_gaps"))
-            if "research_gaps" in payload
-            else directions
-        )
+        research_gaps = _as_string_tuple(payload.get("research_gaps")) if "research_gaps" in payload else directions
     return ResearchBrief(
         question=question,
         objective=objective,
@@ -561,7 +582,230 @@ def create_research_workflow_state(
         report_review=None,
         failure_code=None,
         result=None,
+        research_architecture=ResearchArchitecture.LEGACY,
+        supervisor_v2_config=SupervisorV2Config(),
+        v2_plan=None,
+        v2_supervisor_outcome=None,
+        v2_challenge_outcome=None,
+        v2_report_draft=None,
+        v2_citation_audit=None,
+        v2_report_body=None,
+        v2_citation_followup_used=False,
+        v2_citation_followup_question_ids=[],
+        v2_citation_followup_guidance={},
     )
+
+
+def _v2_event(kind: str, identity: ExecutionIdentity, **details: Any) -> dict[str, Any]:
+    return {
+        "kind": kind,
+        "thread_id": identity.thread_id,
+        "parent_thread_id": identity.parent_thread_id,
+        "root_thread_id": identity.root_thread_id,
+        "depth": identity.depth,
+        **details,
+    }
+
+
+def _v2_evidence(outcome: SupervisorOutcome) -> tuple[EvidenceItem, ...]:
+    return tuple({
+        item.evidence_id: item
+        for worker in outcome.worker_results
+        for item in worker.evidence
+    }.values())
+
+
+def _safe_partial_report(
+    outcome: SupervisorOutcome,
+    issues: tuple[Any, ...],
+    original_markdown: str = "",
+) -> str:
+    """Build a deterministic, cited fallback when model repair cannot be trusted."""
+    if original_markdown.strip():
+        unsafe = {
+            str(issue.claim_text).strip()
+            for issue in issues
+            if str(getattr(issue, "claim_text", "")).strip()
+        }
+        revised = drop_unsafe_markdown_lines(original_markdown, unsafe)
+        evidence = _v2_evidence(outcome)
+        if (
+            revised
+            and EVIDENCE_MARKER.search(revised)
+            and not deterministic_citation_issues(revised, evidence)
+        ):
+            return revised + "\n"
+    lines = ["# Partial research result", "", "## Supported findings", ""]
+    claims = [claim for worker in outcome.worker_results for claim in worker.claims]
+    selected: list[Any] = []
+    per_question: dict[str, int] = {}
+    for claim in claims:
+        if any(per_question.get(item, 0) >= 2 for item in claim.question_ids):
+            continue
+        selected.append(claim)
+        for item in claim.question_ids:
+            per_question[item] = per_question.get(item, 0) + 1
+        if len(selected) >= 18:
+            break
+    claims = selected
+    if claims:
+        for claim in claims:
+            markers = " ".join(f"[[EVIDENCE:{item}]]" for item in claim.evidence_ids)
+            lines.append(f"- {claim.claim[:1000]} {markers}".rstrip())
+    else:
+        lines.append("- No source-locatable supported finding remained after citation audit.")
+    lines.extend(("", "## Unresolved", ""))
+    for issue in issues:
+        lines.append(f"- Citation audit removed or downgraded: {issue.claim_text}")
+    return "\n".join(lines).rstrip() + "\n"
+
+
+def _safe_citation_outcome(
+    outcome: SupervisorOutcome,
+    markdown: str,
+    evidence: tuple[EvidenceItem, ...],
+    issues: tuple[Any, ...],
+    unresolved: tuple[str, ...],
+) -> tuple[str, CitationAuditOutcome]:
+    body = _safe_partial_report(outcome, issues, markdown)
+    remaining = deterministic_citation_issues(body, evidence)
+    return body, CitationAuditOutcome(
+        status="repaired" if not remaining else "partial",
+        issues=remaining,
+        repaired_markdown=body,
+        unresolved=tuple(dict.fromkeys(unresolved)),
+    )
+
+
+def _v2_research_result(
+    challenge: ResearchChallengeLoopOutcome,
+    draft: ReportDraft,
+    audit: CitationAuditOutcome,
+) -> ResearchResult:
+    supervisor = challenge.supervisor_outcome
+    evidence = _v2_evidence(supervisor)
+    claims = tuple(
+        claim for worker in supervisor.worker_results for claim in worker.claims
+    )
+    unresolved = tuple(dict.fromkeys((
+        *supervisor.unresolved_question_ids,
+        *(text for worker in supervisor.worker_results for text in worker.unresolved),
+        *draft.unresolved,
+        *audit.unresolved,
+        *(item.reason for item in challenge.challenges if item.status != "resolved"),
+    )))
+    critical_incomplete = bool(
+        supervisor.unresolved_question_ids
+        or draft.output_status is OutputStatus.FALLBACK
+        or audit.status == "partial"
+    )
+    status = (
+        ResearchStatus.COMPLETED
+        if evidence and not critical_incomplete
+        else ResearchStatus.PARTIAL
+    )
+    repair_actions = tuple(dict.fromkeys((
+        *(("composer_safety_repair",)
+          if draft.output_status is OutputStatus.REPAIRED else ()),
+        *(("citation_repair",)
+          if audit.status == "repaired" else ()),
+    )))
+    output_status = (
+        OutputStatus.FALLBACK if draft.output_status is OutputStatus.FALLBACK
+        else OutputStatus.REPAIRED
+        if audit.status == "partial"
+        else OutputStatus.VALID
+    )
+    return ResearchResult(
+        task_id=f"v2-{supervisor.plan_id}",
+        status=status,
+        summary=(claims[0].claim if claims else "No supported finding was available."),
+        findings=tuple(item.claim for item in claims),
+        evidence=evidence,
+        unresolved=unresolved,
+        tool_alerts=tuple(dict.fromkeys((
+            *(alert for worker in supervisor.worker_results for alert in worker.alerts),
+            *challenge.quality_alerts,
+        ))),
+        termination_reason=supervisor.termination_reason,
+        output_status=output_status,
+        stop_reason=("citation_partial" if audit.status == "partial" else None),
+        iterations=sum(item.usage.iterations for item in supervisor.worker_results),
+        tool_calls_used=sum(item.usage.tool_calls for item in supervisor.worker_results),
+        thread_count=1 + len(supervisor.worker_results),
+        estimated_tokens_used=sum(item.usage.estimated_tokens for item in supervisor.worker_results),
+        retries_used=sum(item.usage.retries for item in supervisor.worker_results),
+        source_candidate_count=sum(
+            item.usage.source_candidates for item in supervisor.worker_results
+        ),
+        source_open_count=sum(
+            item.usage.sources_opened for item in supervisor.worker_results
+        ),
+        duplicate_source_count=sum(
+            item.usage.duplicate_sources for item in supervisor.worker_results
+        ),
+        acquisition_call_count=sum(
+            item.usage.acquisition_calls for item in supervisor.worker_results
+        ),
+        repair_applied=bool(repair_actions),
+        repair_actions=repair_actions,
+    )
+
+
+def _append_v2_disclosures(
+    markdown: str,
+    challenge: ResearchChallengeLoopOutcome,
+    audit: CitationAuditOutcome,
+) -> str:
+    lines = [markdown.rstrip(), "", "## 红方未解决问题 / Unresolved Red-team issues", ""]
+    open_items = tuple(
+        item
+        for item in challenge.challenges
+        if item.status in {"pending", "accepted", "deferred", "unresolved_disclosed"}
+    )
+    if open_items:
+        lines.extend((
+            "| 问题 | 重要程度 | 已采取行动 | 对正文影响 | 后续建议 |",
+            "|---|---|---|---|---|",
+        ))
+        for item in open_items:
+            reason = " ".join(item.reason.replace("|", "/").split())
+            action = (
+                "完成一次定向补研后仍未获得足够证据"
+                if item.severity == "high" and challenge.supervisor_outcome.wave_count > 1
+                else "记录并披露，未消耗额外补研波次"
+            )
+            impact = (
+                "相关目标结论已从事实正文排除或降级"
+                if item.target_claim_ids
+                else "报告保留该范围限制，不作确定性结论"
+            )
+            followup = " ".join(
+                (item.requested_evidence or item.suggested_query or "后续检查一手资料")
+                .replace("|", "/")
+                .split()
+            )
+            lines.append(
+                f"| {reason} | {item.severity} | {action} | {impact} | {followup} |"
+            )
+    else:
+        lines.append("- Red review has no unresolved issue requiring disclosure.")
+    resolved = sum(item.status == "resolved" for item in challenge.challenges)
+    rejected = sum(item.status == "rejected" for item in challenge.challenges)
+    lines.extend(("", f"- Red review summary: {resolved} resolved, {len(open_items)} disclosed unresolved, {rejected} rejected."))
+    if audit.issues:
+        lines.extend(
+            f"- Citation issue `{item.category}` ({item.severity}): {item.repair_action} — {item.claim_text}"
+            for item in audit.issues
+        )
+    else:
+        lines.append(f"- Citation audit status: {audit.status}.")
+    lines.append(
+        f"- Supplemental research waves: {max(0, challenge.supervisor_outcome.wave_count - 1)}."
+    )
+    if challenge.quality_alerts:
+        lines.extend(f"- Quality alert: {item.message}" for item in challenge.quality_alerts)
+    return "\n".join(lines).rstrip() + "\n"
 
 
 def build_research_workflow(
@@ -571,19 +815,33 @@ def build_research_workflow(
     *,
     checkpointer: BaseCheckpointSaver | None = None,
     report_review_enabled: bool = False,
+    research_architecture: ResearchArchitecture = ResearchArchitecture.LEGACY,
+    supervisor_v2_config: SupervisorV2Config | None = None,
     vault_write_service: VaultWriteService | None = None,
 ) -> Any:
     """Build the root workflow around the same homogeneous Research AgentGraph."""
     tool_list = list(tools)
-    effective_checkpointer = (
-        checkpointer if checkpointer is not None else InMemorySaver()
-    )
-    research_agent_graph = build_research_agent_graph(
-        policy,
-        tool_list,
-        inherit_checkpointer=True,
-        child_checkpointer=effective_checkpointer,
-    )
+    effective_checkpointer = checkpointer if checkpointer is not None else InMemorySaver()
+    v2_settings = supervisor_v2_config or SupervisorV2Config()
+    if not isinstance(research_architecture, ResearchArchitecture):
+        research_architecture = ResearchArchitecture(str(research_architecture))
+    if research_architecture is ResearchArchitecture.SUPERVISOR_V2:
+        v2_settings.validate()
+        if not v2_settings.enabled:
+            raise ValueError("supervisor_v2 workflow requires enabled=true")
+        if report_review_enabled:
+            raise ValueError(
+                "legacy report_review_enabled conflicts with supervisor_v2 Red/Citation gates"
+            )
+        research_agent_graph = None
+    else:
+        research_agent_graph = build_research_agent_graph(
+            policy,
+            tool_list,
+            inherit_checkpointer=True,
+            child_checkpointer=effective_checkpointer,
+            tool_artifact_store=vault_write_service,
+        )
     memory_index = MarkdownMemoryIndex(memory_store)
 
     def validate_workflow_state(
@@ -617,11 +875,7 @@ def build_research_workflow(
             retrieved_memory = _bounded_memory_hits(hits)
         messages = [
             {"role": "system", "content": _alignment_system_prompt()},
-            *(
-                [_memory_alignment_message(memory_id, retrieved_memory)]
-                if memory_id is not None
-                else []
-            ),
+            *([_memory_alignment_message(memory_id, retrieved_memory)] if memory_id is not None else []),
             {"role": "user", "content": state["question"]},
         ]
         with _workflow_trace("draft_brief", state) as observation:
@@ -663,11 +917,7 @@ def build_research_workflow(
             "workflow_status": (
                 "cancelled"
                 if action == "cancel"
-                else "expired"
-                if action == "expire"
-                else "running"
-                if action == "confirm"
-                else "revising"
+                else "expired" if action == "expire" else "running" if action == "confirm" else "revising"
             ),
         }
 
@@ -734,14 +984,19 @@ def build_research_workflow(
                     "research_gaps": list(brief.research_gaps),
                 }
             )
-        requirement_descriptions = list(
-            dict.fromkeys([*brief.directions, *brief.research_gaps])
+        evidence_work_items = (
+            brief.research_gaps if brief.memory_id is not None and brief.research_gaps else brief.directions
         )
+        requirement_descriptions = atomic_requirement_descriptions(evidence_work_items)
+        deliverable = f"Deliverable: {brief.expected_output.strip()}" if brief.expected_output.strip() else None
+        if deliverable:
+            requirement_descriptions.append(deliverable)
+        requirement_descriptions = list(dict.fromkeys(requirement_descriptions))
         task_context["research_requirements"] = [
             {
                 "requirement_id": f"R{index}",
                 "description": description,
-                "required": True,
+                "required": description != deliverable,
             }
             for index, description in enumerate(
                 requirement_descriptions or [brief.objective],
@@ -756,6 +1011,15 @@ def build_research_workflow(
             constraints=brief.constraints,
             require_evidence=True,
         )
+        if research_architecture is ResearchArchitecture.SUPERVISOR_V2:
+            return {
+                "task": task,
+                "research_architecture": research_architecture,
+                "supervisor_v2_config": v2_settings,
+                "deadline_at": time.time() + state["limits"].max_elapsed_seconds,
+                "execution_events": list(state.get("execution_events", [])),
+                "workflow_status": "running",
+            }
         prepared = dict(
             create_research_agent_state(
                 task,
@@ -765,6 +1029,306 @@ def build_research_workflow(
         )
         prepared["workflow_status"] = "running"
         return prepared
+
+    async def planning(state: ResearchWorkflowState, config: RunnableConfig) -> dict[str, Any]:
+        validate_workflow_state(state, config)
+        brief = state.get("brief")
+        if not isinstance(brief, ResearchBrief):
+            raise TypeError("V2 planning requires a ResearchBrief")
+        plan = await plan_research(brief, policy)
+        return {
+            "v2_plan": plan,
+            "execution_events": [
+                *state.get("execution_events", []),
+                _v2_event("planning", state["identity"], status="completed", plan_id=plan.plan_id),
+            ],
+        }
+
+    async def blue_research(state: ResearchWorkflowState, config: RunnableConfig) -> dict[str, Any]:
+        validate_workflow_state(state, config)
+        plan = state.get("v2_plan")
+        if not isinstance(plan, ResearchPlan):
+            raise TypeError("V2 blue research requires a ResearchPlan")
+        limits = state["limits"]
+        budget = SupervisorBudget(
+            total_tool_calls=limits.max_total_tool_calls,
+            total_tokens=limits.max_total_tokens,
+            deadline_at=float(state["deadline_at"]),
+        )
+        outcome = await run_research_supervisor(
+            plan,
+            policy=policy,
+            tools=tool_list,
+            identity=state["identity"],
+            limits=limits,
+            settings=v2_settings,
+            budget=budget,
+            checkpointer=effective_checkpointer,
+            tool_artifact_store=vault_write_service,
+            checkpoint_thread_id=f"{state['identity'].thread_id}.v2-supervisor",
+        )
+        return {
+            "v2_supervisor_outcome": outcome,
+            "execution_events": [
+                *state.get("execution_events", []),
+                _v2_event(
+                    "blue_research", state["identity"], status="completed",
+                    worker_count=len(outcome.worker_results), wave_count=outcome.wave_count,
+                ),
+            ],
+        }
+
+    async def red_review_v2(state: ResearchWorkflowState, config: RunnableConfig) -> dict[str, Any]:
+        validate_workflow_state(state, config)
+        plan = state.get("v2_plan")
+        supervisor = state.get("v2_supervisor_outcome")
+        if not isinstance(plan, ResearchPlan) or not isinstance(supervisor, SupervisorOutcome):
+            raise TypeError("V2 Red review requires plan and supervisor outcome")
+        limits = state["limits"]
+        outcome = await run_research_challenge_loop(
+            plan,
+            supervisor,
+            policy=policy,
+            tools=tool_list,
+            identity=state["identity"],
+            limits=limits,
+            settings=v2_settings,
+            budget=SupervisorBudget(
+                limits.max_total_tool_calls,
+                limits.max_total_tokens,
+                float(state["deadline_at"]),
+            ),
+            checkpointer=effective_checkpointer,
+            tool_artifact_store=vault_write_service,
+            checkpoint_thread_id=f"{state['identity'].thread_id}.v2-supervisor",
+        )
+        events = [
+            *state.get("execution_events", []),
+            _v2_event(
+                "red_review", state["identity"], status="completed",
+                challenge_count=len(outcome.challenges),
+                quality_alert_count=len(outcome.quality_alerts),
+            ),
+        ]
+        if outcome.supervisor_outcome.wave_count > supervisor.wave_count:
+            events.append(_v2_event(
+                "supplemental", state["identity"], status="completed",
+                wave_count=outcome.supervisor_outcome.wave_count,
+            ))
+        return {
+            "v2_challenge_outcome": outcome,
+            "v2_supervisor_outcome": outcome.supervisor_outcome,
+            "execution_events": events,
+        }
+
+    async def drafting_v2(state: ResearchWorkflowState, config: RunnableConfig) -> dict[str, Any]:
+        validate_workflow_state(state, config)
+        plan = state.get("v2_plan")
+        challenge = state.get("v2_challenge_outcome")
+        if not isinstance(plan, ResearchPlan) or not isinstance(challenge, ResearchChallengeLoopOutcome):
+            raise TypeError("V2 drafting requires reviewed research")
+        draft = await compose_report(policy, plan, challenge)
+        return {
+            "v2_report_draft": draft,
+            "execution_events": [
+                *state.get("execution_events", []),
+                _v2_event("drafting", state["identity"], status=draft.status),
+            ],
+        }
+
+    async def citation_audit_v2(state: ResearchWorkflowState, config: RunnableConfig) -> dict[str, Any]:
+        validate_workflow_state(state, config)
+        draft = state.get("v2_report_draft")
+        challenge = state.get("v2_challenge_outcome")
+        if not isinstance(draft, ReportDraft) or not isinstance(challenge, ResearchChallengeLoopOutcome):
+            raise TypeError("V2 citation audit requires a draft and reviewed research")
+        evidence = _v2_evidence(challenge.supervisor_outcome)
+        body = draft.markdown
+        followup_question_ids: tuple[str, ...] = ()
+        followup_guidance: dict[str, tuple[str, ...]] = {}
+        if draft.status == "abstained":
+            audit = CitationAuditOutcome(
+                status="partial",
+                unresolved=("Citation audit skipped because no valid evidence was available.",),
+            )
+        else:
+            try:
+                audit = await audit_citations(policy, body, evidence)
+            except Exception as exc:
+                deterministic = deterministic_citation_issues(body, evidence)
+                audit = CitationAuditOutcome(
+                    status="issues" if deterministic else "passed_deterministic",
+                    issues=deterministic,
+                    unresolved=(f"Semantic citation audit unavailable: {type(exc).__name__}: {exc}",),
+                )
+            if audit.issues:
+                followup_question_ids, followup_guidance = (
+                    citation_followup_directives(
+                        audit.issues,
+                        challenge.supervisor_outcome,
+                    )
+                )
+                can_research = (
+                    bool(followup_question_ids)
+                    and not state.get("v2_citation_followup_used", False)
+                    and challenge.supervisor_outcome.wave_count
+                    < v2_settings.max_research_waves
+                )
+                if can_research:
+                    audit = replace(audit, status="research_required")
+                elif v2_settings.max_citation_repair_rounds:
+                    try:
+                        repaired = await repair_citations(policy, body, evidence, audit.issues)
+                    except Exception as exc:
+                        body, audit = _safe_citation_outcome(
+                            challenge.supervisor_outcome,
+                            body,
+                            evidence,
+                            audit.issues,
+                            (f"Citation repair unavailable: {type(exc).__name__}: {exc}",),
+                        )
+                    else:
+                        if repaired.status == "repaired" and repaired.repaired_markdown:
+                            body = repaired.repaired_markdown
+                            audit = repaired
+                        else:
+                            body, audit = _safe_citation_outcome(
+                                challenge.supervisor_outcome,
+                                body,
+                                evidence,
+                                audit.issues,
+                                repaired.unresolved,
+                            )
+                else:
+                    body, audit = _safe_citation_outcome(
+                        challenge.supervisor_outcome,
+                        body,
+                        evidence,
+                        audit.issues,
+                        tuple(item.claim_text for item in audit.issues),
+                    )
+        body = _append_v2_disclosures(body, challenge, audit)
+        result = _v2_research_result(challenge, draft, audit)
+        return {
+            "v2_citation_audit": audit,
+            "v2_report_body": body,
+            "result": result,
+            "v2_citation_followup_question_ids": (
+                list(followup_question_ids)
+                if audit.status == "research_required"
+                else []
+            ),
+            "v2_citation_followup_guidance": (
+                {key: list(value) for key, value in followup_guidance.items()}
+                if audit.status == "research_required"
+                else {}
+            ),
+            "execution_events": [
+                *state.get("execution_events", []),
+                _v2_event(
+                    "citation_audit", state["identity"], status=audit.status,
+                    issue_count=len(audit.issues),
+                ),
+            ],
+        }
+
+    async def citation_followup_v2(
+        state: ResearchWorkflowState,
+        config: RunnableConfig,
+    ) -> dict[str, Any]:
+        validate_workflow_state(state, config)
+        plan = state.get("v2_plan")
+        challenge = state.get("v2_challenge_outcome")
+        if not isinstance(plan, ResearchPlan) or not isinstance(
+            challenge, ResearchChallengeLoopOutcome
+        ):
+            raise TypeError("Citation follow-up requires reviewed V2 research")
+        question_ids = tuple(state.get("v2_citation_followup_question_ids", []))
+        guidance = state.get("v2_citation_followup_guidance", {})
+        limits = state["limits"]
+        budget = SupervisorBudget(
+            limits.max_total_tool_calls,
+            limits.max_total_tokens,
+            float(state["deadline_at"]),
+        )
+        packets = plan_supplemental_work_packets(
+            plan,
+            v2_settings,
+            budget,
+            challenge.supervisor_outcome,
+            question_ids,
+            guidance_by_question=guidance,
+        )
+        packets = tuple(
+            item
+            for item in packets
+            if item.max_tool_calls > 0 and item.token_budget > 0
+        )
+        results = (
+            await execute_supplemental_work_packets(
+                packets,
+                plan=plan,
+                policy=policy,
+                tools=tool_list,
+                identity=state["identity"],
+                limits=limits,
+                worker_runner=run_research_worker,
+                checkpointer=effective_checkpointer,
+                tool_artifact_store=vault_write_service,
+            )
+            if packets
+            else ()
+        )
+        supervisor = (
+            merge_supervisor_outcome(
+                plan,
+                challenge.supervisor_outcome,
+                results,
+            )
+            if results
+            else challenge.supervisor_outcome
+        )
+        reviewed = replace(
+            challenge,
+            supervisor_outcome=supervisor,
+            supplemental_question_ids=tuple(dict.fromkeys((
+                *challenge.supplemental_question_ids,
+                *question_ids,
+            ))),
+            supplemental_packet_ids=tuple(dict.fromkeys((
+                *challenge.supplemental_packet_ids,
+                *(item.packet_id for item in packets),
+            ))),
+        )
+        return {
+            "v2_supervisor_outcome": supervisor,
+            "v2_challenge_outcome": reviewed,
+            "v2_report_draft": None,
+            "v2_citation_audit": None,
+            "v2_report_body": None,
+            "result": None,
+            "v2_citation_followup_used": True,
+            "v2_citation_followup_question_ids": [],
+            "v2_citation_followup_guidance": {},
+            "execution_events": [
+                *state.get("execution_events", []),
+                _v2_event(
+                    "supplemental",
+                    state["identity"],
+                    status="completed" if results else "unavailable",
+                    source="citation_audit",
+                    worker_count=len(results),
+                ),
+            ],
+        }
+
+    def route_after_citation_v2(state: ResearchWorkflowState) -> str:
+        if (
+            state.get("v2_citation_followup_question_ids")
+            and not state.get("v2_citation_followup_used", False)
+        ):
+            return "citation_followup"
+        return "persist_result"
 
     async def persist_result(
         state: ResearchWorkflowState,
@@ -777,8 +1341,15 @@ def build_research_workflow(
             raise TypeError("workflow completed research without a ResearchBrief")
         if not isinstance(result, ResearchResult):
             raise TypeError("Research AgentGraph completed without a ResearchResult")
+        is_v2 = research_architecture is ResearchArchitecture.SUPERVISOR_V2
+        report_body = state.get("v2_report_body") if is_v2 else None
+        if is_v2 and (not isinstance(report_body, str) or not report_body.strip()):
+            raise TypeError("V2 persistence requires a citation-approved report body")
         with _workflow_trace("persist", state) as observation:
             memory_id = state.get("memory_id")
+            v2_persist_kwargs = (
+                {"report_body_markdown": report_body} if is_v2 else {}
+            )
             replayed = await asyncio.to_thread(
                 _reuse_existing_research_commit,
                 memory_store,
@@ -786,6 +1357,7 @@ def build_research_workflow(
                 result,
                 state["identity"],
                 memory_id=memory_id,
+                report_body_markdown=report_body,
             )
             if replayed is not None:
                 report_markdown, manifest = replayed
@@ -795,6 +1367,7 @@ def build_research_workflow(
                     brief,
                     result,
                     state["identity"],
+                    **v2_persist_kwargs,
                 )
             elif vault_write_service is not None:
                 report_markdown, manifest = await asyncio.to_thread(
@@ -803,6 +1376,7 @@ def build_research_workflow(
                     result,
                     state["identity"],
                     memory_id=memory_id,
+                    **v2_persist_kwargs,
                 )
             else:
                 report_markdown, manifest = await asyncio.to_thread(
@@ -811,13 +1385,66 @@ def build_research_workflow(
                     result,
                     state["identity"],
                     memory_id=memory_id,
+                    **v2_persist_kwargs,
                 )
+            challenge = state.get("v2_challenge_outcome")
+            citation = state.get("v2_citation_audit")
             workflow_result = ResearchWorkflowResult(
                 brief=brief,
                 research_result=result,
                 report_markdown=report_markdown,
                 memory_manifest=manifest,
                 memory_id=memory_id,
+                research_architecture=research_architecture.value,
+                challenges=(
+                    tuple(asdict(item) for item in challenge.challenges)
+                    if isinstance(challenge, ResearchChallengeLoopOutcome) else ()
+                ),
+                citation_issues=(
+                    tuple(asdict(item) for item in citation.issues)
+                    if isinstance(citation, CitationAuditOutcome) else ()
+                ),
+                supplemental_wave_count=(
+                    max(0, challenge.supervisor_outcome.wave_count - 1)
+                    if isinstance(challenge, ResearchChallengeLoopOutcome) else 0
+                ),
+                finalization_token_reserve=(
+                    challenge.supervisor_outcome.finalization_token_reserve
+                    if isinstance(challenge, ResearchChallengeLoopOutcome) else 0
+                ),
+                core_question_count=(
+                    len(
+                        tuple(
+                            item
+                            for item in state["v2_plan"].core_questions
+                            if item.required
+                        )
+                        or state["v2_plan"].core_questions
+                    )
+                    if isinstance(state.get("v2_plan"), ResearchPlan) else 0
+                ),
+                assigned_core_question_count=(
+                    len(challenge.supervisor_outcome.assigned_question_ids)
+                    if isinstance(challenge, ResearchChallengeLoopOutcome) else 0
+                ),
+                worker_packet_count=(
+                    len(challenge.supervisor_outcome.worker_results)
+                    if isinstance(challenge, ResearchChallengeLoopOutcome) else 0
+                ),
+                unique_worker_packet_count=(
+                    len({item.packet_id for item in challenge.supervisor_outcome.worker_results})
+                    if isinstance(challenge, ResearchChallengeLoopOutcome) else 0
+                ),
+                source_open_count=(result.source_open_count if is_v2 else 0),
+                source_candidate_count=(result.source_candidate_count if is_v2 else 0),
+                duplicate_source_count=(
+                    result.duplicate_source_count if is_v2 else 0
+                ),
+                acquisition_call_count=(
+                    result.acquisition_call_count if is_v2 else 0
+                ),
+                repair_applied=(result.repair_applied if is_v2 else False),
+                repair_actions=(result.repair_actions if is_v2 else ()),
             )
             observation.add_output(
                 {
@@ -834,6 +1461,13 @@ def build_research_workflow(
             "memory_manifest": manifest,
             "workflow_result": workflow_result,
             "report_review": None,
+            "execution_events": [
+                *state.get("execution_events", []),
+                *(
+                    [_v2_event("persisting", state["identity"], status="completed")]
+                    if is_v2 else []
+                ),
+            ],
         }
 
     async def review_report(
@@ -841,6 +1475,8 @@ def build_research_workflow(
         config: RunnableConfig,
     ) -> dict[str, Any]:
         validate_workflow_state(state, config)
+        if research_architecture is ResearchArchitecture.SUPERVISOR_V2:
+            return {"report_review": None}
         if not report_review_enabled:
             return {"report_review": None}
 
@@ -902,6 +1538,15 @@ def build_research_workflow(
     ) -> dict[str, Any]:
         """Apply one checkpointed review result without re-running Red/Blue."""
         validate_workflow_state(state, config)
+        if research_architecture is ResearchArchitecture.SUPERVISOR_V2:
+            persisted = state.get("workflow_result")
+            if not isinstance(persisted, ResearchWorkflowResult):
+                raise TypeError("V2 postprocess requires the persisted workflow result")
+            return {
+                "workflow_result": persisted,
+                "workflow_status": "completed",
+                "report_review": None,
+            }
         brief = state.get("brief")
         result = state.get("result")
         reviewed_report = state.get("report_markdown")
@@ -979,9 +1624,7 @@ def build_research_workflow(
                     "issue_count": 0 if final_outcome is None else len(final_outcome.issues),
                     "edit_count": 0 if final_outcome is None else len(final_outcome.edits),
                     "fallback": bool(final_outcome and final_outcome.fallback_reason),
-                    "fallback_reason": (
-                        None if final_outcome is None else final_outcome.fallback_reason
-                    ),
+                    "fallback_reason": (None if final_outcome is None else final_outcome.fallback_reason),
                 }
             )
             return {
@@ -1001,7 +1644,6 @@ def build_research_workflow(
     builder.add_node("review_brief", review_brief)
     builder.add_node("revise_brief", revise_brief)
     builder.add_node("prepare_research", prepare_research)
-    builder.add_node("research_agent", research_agent_graph)
     builder.add_node("persist_result", persist_result)
     builder.add_node("review_report", review_report)
     builder.add_node("postprocess_report", postprocess_report)
@@ -1017,10 +1659,34 @@ def build_research_workflow(
         },
     )
     builder.add_edge("revise_brief", "review_brief")
-    builder.add_edge("prepare_research", "research_agent")
-    builder.add_edge("research_agent", "persist_result")
-    builder.add_edge("persist_result", "review_report")
-    builder.add_edge("review_report", "postprocess_report")
+    if research_architecture is ResearchArchitecture.SUPERVISOR_V2:
+        builder.add_node("planning", planning)
+        builder.add_node("blue_research", blue_research)
+        builder.add_node("red_review", red_review_v2)
+        builder.add_node("drafting", drafting_v2)
+        builder.add_node("citation_audit", citation_audit_v2)
+        builder.add_node("citation_followup", citation_followup_v2)
+        builder.add_edge("prepare_research", "planning")
+        builder.add_edge("planning", "blue_research")
+        builder.add_edge("blue_research", "red_review")
+        builder.add_edge("red_review", "drafting")
+        builder.add_edge("drafting", "citation_audit")
+        builder.add_conditional_edges(
+            "citation_audit",
+            route_after_citation_v2,
+            {
+                "citation_followup": "citation_followup",
+                "persist_result": "persist_result",
+            },
+        )
+        builder.add_edge("citation_followup", "drafting")
+        builder.add_edge("persist_result", "postprocess_report")
+    else:
+        builder.add_node("research_agent", research_agent_graph)
+        builder.add_edge("prepare_research", "research_agent")
+        builder.add_edge("research_agent", "persist_result")
+        builder.add_edge("persist_result", "review_report")
+        builder.add_edge("review_report", "postprocess_report")
     builder.add_edge("postprocess_report", END)
     return builder.compile(checkpointer=effective_checkpointer)
 

@@ -1,4 +1,5 @@
 """N3 acceptance tests for bounded homogeneous root-to-child fork."""
+
 from __future__ import annotations
 
 import asyncio
@@ -7,7 +8,6 @@ from dataclasses import dataclass, field
 from typing import Any
 
 import pytest
-from tests._research_assessment import assessment_response
 
 from src.research import (
     AgentLimits,
@@ -23,6 +23,7 @@ from src.research.agent_graph import _child_task
 from src.research.fork_policy import evaluate_fork_candidates, fork_tool_schema
 from src.research.models import ForkCandidate, ResearchRequirement
 from src.research.research_sufficiency import build_research_requirements
+from tests._research_assessment import assessment_response
 
 
 def _fork_call(candidates: list[dict[str, Any]]) -> dict[str, Any]:
@@ -85,9 +86,7 @@ def test_child_requirements_keep_the_parent_requirement_identity() -> None:
     child = _child_task(parent, candidate, parent_requirements)
     requirements = build_research_requirements(child)
 
-    assert requirements == (
-        ResearchRequirement("R2", "Compare long-context quality"),
-    )
+    assert requirements == (ResearchRequirement("R2", "Compare long-context quality"),)
     assert child.context["parent_requirement_ids"] == ["R2"]
     assert child.context["known_information"] == ["Reusable memory context"]
     assert child.context["parent_objective"] == parent.objective
@@ -121,10 +120,45 @@ def test_multi_requirement_fork_requires_a_valid_parent_mapping() -> None:
     assert accepted == []
     assert any("missing parent requirement mapping" in item for item in rejected)
     assert any("unknown parent requirements R9" in item for item in rejected)
-    candidate_schema = fork_tool_schema()["function"]["parameters"]["properties"][
-        "candidates"
-    ]["items"]
+    candidate_schema = fork_tool_schema()["function"]["parameters"]["properties"]["candidates"]["items"]
     assert "requirement_ids" in candidate_schema["required"]
+
+
+def test_fork_budget_prefers_requirement_breadth_before_finer_splits() -> None:
+    parent = ResearchTask("root", "Cover four requirements")
+    candidates = [
+        ForkCandidate(
+            objective=objective,
+            expected_output=f"Evidence for {objective}",
+            requirement_ids=(requirement_id,),
+            reasons=(ForkReason.CONTEXT_ISOLATION,),
+        )
+        for objective, requirement_id in (
+            ("R1 reasoning", "R1"),
+            ("R1 code", "R1"),
+            ("R1 context", "R1"),
+            ("R2 architecture", "R2"),
+            ("R3 causality", "R3"),
+            ("R4 cost", "R4"),
+        )
+    ]
+
+    accepted, rejected = evaluate_fork_candidates(
+        candidates,
+        parent_task=parent,
+        identity=_root_identity("root-breadth"),
+        max_fork_depth=2,
+        max_children=4,
+        parent_requirement_ids=("R1", "R2", "R3", "R4"),
+    )
+
+    assert [item.requirement_ids for item in accepted] == [
+        ("R1",),
+        ("R2",),
+        ("R3",),
+        ("R4",),
+    ]
+    assert sum("child budget exhausted" in item for item in rejected) == 2
 
 
 @dataclass
@@ -223,18 +257,13 @@ class ForkingPolicy:
         assessment = assessment_response(messages)
         if assessment is not None:
             return assessment
-        if tools == [] and str(messages[-1].get("content") or "").startswith(
-            "FINAL_SYNTHESIS_SNAPSHOT"
-        ):
+        if tools == [] and str(messages[-1].get("content") or "").startswith("FINAL_SYNTHESIS_SNAPSHOT"):
             return _final(
                 "The parent gathered and synthesized child research.",
                 "The child directions produced evidence-backed findings.",
             )
         fork_responses = [
-            message
-            for message in messages
-            if message.get("role") == "tool"
-            and message.get("name") == "fork_research"
+            message for message in messages if message.get("role") == "tool" and message.get("name") == "fork_research"
         ]
         if not fork_responses:
             return {
@@ -345,10 +374,7 @@ async def test_tree_results_preserve_root_requirement_lineage_through_aggregatio
     assert all(item.status.value == "supported" for item in result.coverage)
     assert all(item.evidence_ids for item in result.coverage)
     child_requirement_sets = {
-        tuple(
-            item["requirement_id"]
-            for item in json.loads(prompt)["context"]["research_requirements"]
-        )
+        tuple(item["requirement_id"] for item in json.loads(prompt)["context"]["research_requirements"])
         for prompt in tracker.child_user_prompts
     }
     assert child_requirement_sets == {("R1",), ("R2",)}

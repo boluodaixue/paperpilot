@@ -184,6 +184,40 @@ class RuleBasedMetrics:
 
         return cited_paragraphs / len(paragraphs)
 
+    @staticmethod
+    def material_claim_citation_coverage(report: str) -> float:
+        """Measure citations only on substantive result paragraphs."""
+        if not report:
+            return 0.0
+        cited = 0
+        material = 0
+        in_frontmatter = report.lstrip().startswith("---")
+        excluded = False
+        for index, raw in enumerate(report.splitlines()):
+            line = raw.strip()
+            if in_frontmatter:
+                if index > 0 and line == "---":
+                    in_frontmatter = False
+                continue
+            heading = re.match(r"^#{1,6}\s+(.+)$", line)
+            if heading:
+                title = heading.group(1).strip().lower()
+                excluded = any(key in title for key in ("unresolved", "references", "execution"))
+                continue
+            if excluded or not line or line.startswith(("|---", "<!--")):
+                continue
+            plain = re.sub(r"\[\[.*?\]\]|\[\d+\]|https?://\S+", "", line)
+            if len(re.findall(r"\w+", plain, flags=re.UNICODE)) < 6 and not re.search(r"\d", plain):
+                continue
+            material += 1
+            if re.search(
+                r"\[\d+\]|\[\[evidence/|https?://|\[来源[：:]|【来源[：:]",
+                line,
+                re.IGNORECASE,
+            ):
+                cited += 1
+        return cited / material if material else 0.0
+
     # -----------------------------------------------------------------------
     # 4. 逻辑一致性 (Logical Consistency)
     # -----------------------------------------------------------------------

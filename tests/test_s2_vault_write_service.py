@@ -151,12 +151,9 @@ class _ImportPolicy:
 
 def _write_legacy(vault: Path) -> None:
     values = {
-        "sources/Source-fixed.md": (
-            '---\nid: "Source-fixed"\ntype: "source"\n---\n\n# Source\n'
-        ),
+        "sources/Source-fixed.md": ('---\nid: "Source-fixed"\ntype: "source"\n---\n\n# Source\n'),
         "evidence/E-fixed.md": (
-            '---\nid: "E-fixed"\ntype: "evidence"\n---\n\n'
-            "# Evidence\n\n[[sources/Source-fixed|Source]]\n"
+            '---\nid: "E-fixed"\ntype: "evidence"\n---\n\n' "# Evidence\n\n[[sources/Source-fixed|Source]]\n"
         ),
         "reports/Report-fixed.md": (
             '---\nid: "Report-fixed"\ntype: "report"\n'
@@ -204,9 +201,7 @@ def test_create_memory_replay_reads_latest_descriptor_from_home(tmp_path: Path) 
     service.create_memory("Original", "M-home-truth")
     home = store.root / "Memories/M-home-truth/Home.md"
     home.write_text(
-        home.read_text(encoding="utf-8").replace(
-            'title: "Original"', 'title: "Obsidian title"'
-        ),
+        home.read_text(encoding="utf-8").replace('title: "Original"', 'title: "Obsidian title"'),
         encoding="utf-8",
     )
 
@@ -357,29 +352,21 @@ async def test_note_import_and_legacy_copy_return_store_compatible_results(
         "alpha\nbeta",
     )
     assert isinstance(proposal, MemoryImportProposal)
-    import_result = service.commit_memory_import(
-        proposal, origin_thread_id="import-thread"
-    )
+    import_result = service.commit_memory_import(proposal, origin_thread_id="import-thread")
     assert import_result["status"] == "committed"
     assert isinstance(import_result["wikilinks"], tuple)
     assert (store.root / proposal.attachment_path).read_bytes() == b"alpha\nbeta"
 
     _write_legacy(store.root)
     legacy = store.prepare_legacy_memory_migration("Migrated", "M-migrated")
-    descriptor = service.commit_legacy_memory_migration(
-        legacy, origin_thread_id="legacy-thread"
-    )
+    descriptor = service.commit_legacy_memory_migration(legacy, origin_thread_id="legacy-thread")
     assert descriptor == store.get_memory("M-migrated")
     migrated_home = store.root / "Memories/M-migrated/Home.md"
     migrated_home.write_text(
-        migrated_home.read_text(encoding="utf-8").replace(
-            'title: "Migrated"', 'title: "Obsidian migrated"'
-        ),
+        migrated_home.read_text(encoding="utf-8").replace('title: "Migrated"', 'title: "Obsidian migrated"'),
         encoding="utf-8",
     )
-    replayed = service.commit_legacy_memory_migration(
-        legacy, origin_thread_id="legacy-thread"
-    )
+    replayed = service.commit_legacy_memory_migration(legacy, origin_thread_id="legacy-thread")
     assert replayed.title == "Obsidian migrated"
     legacy_job = next(job for job in queue.list() if job.operation_type == "legacy_copy")
     assert legacy_job.result is not None
@@ -395,9 +382,7 @@ def test_legacy_root_research_compatibility_does_not_make_m_legacy_writable(
     tmp_path: Path,
 ) -> None:
     store, queue, service = _service(tmp_path)
-    report, manifest = service.persist_research(
-        _brief("M-unused"), _research_result(), _identity("legacy-thread")
-    )
+    report, manifest = service.persist_research(_brief("M-unused"), _research_result(), _identity("legacy-thread"))
 
     assert report == store.read_text(manifest.report_path)
     assert manifest.report_path.startswith("reports/")
@@ -604,9 +589,7 @@ def test_second_startup_waits_for_first_writer_to_finish_snapshot_job(
     queue.enqueue(**plan.enqueue_kwargs())
     lease = queue.claim_writer(owner="first-startup", lease_seconds=0.2)
     assert lease is not None
-    claimed = queue.claim_next(
-        lease, lease_seconds=0.2, job_id=plan.job_id
-    )
+    claimed = queue.claim_next(lease, lease_seconds=0.2, job_id=plan.job_id)
     assert claimed is not None
     outcome: list[tuple] = []
 
@@ -808,13 +791,7 @@ def test_drain_checks_timeout_between_jobs_and_retains_remaining_command(
 
 def test_startup_bounded_recovery_cleans_safe_orphan_staging(tmp_path: Path) -> None:
     store, _queue, service = _service(tmp_path, lease_seconds=0.2)
-    orphan = (
-        store.root
-        / "Memories"
-        / ".paperpilot-writer"
-        / "jobs"
-        / "VaultJob-orphan"
-    )
+    orphan = store.root / "Memories" / ".paperpilot-writer" / "jobs" / "VaultJob-orphan"
     staged = orphan / "stage" / "000000"
     staged.parent.mkdir(parents=True)
     staged.write_bytes(b"unpublished staging bytes")
@@ -852,3 +829,39 @@ def test_startup_timeout_and_unknown_writer_errors_are_explicit_and_retain_comma
     assert retained is not None
     assert retained.status == "queued"
     assert retained.command_blob is not None
+
+
+def test_tool_artifact_is_published_by_the_single_writer_and_reused_by_hash(
+    tmp_path: Path,
+) -> None:
+    store, queue, service = _service(tmp_path)
+    result = {
+        "query": "bounded context",
+        "results": [{"url": "https://example.test/a", "snippet": "x" * 8000}],
+    }
+
+    first = service.persist_tool_artifact(
+        "artifact-fixed",
+        tool_name="web_search",
+        arguments={"query": "bounded context"},
+        result=result,
+        origin_thread_id="root-artifact",
+    )
+    repeated = service.persist_tool_artifact(
+        "artifact-fixed",
+        tool_name="web_search",
+        arguments={"query": "bounded context"},
+        result=result,
+        origin_thread_id="root-artifact",
+    )
+
+    assert repeated == first
+    assert first["artifact_id"] == "artifact-fixed"
+    assert first["artifact_path"].startswith("Artifacts/")
+    artifact = store.root / first["artifact_path"]
+    assert artifact.exists()
+    payload = json.loads(artifact.read_text(encoding="utf-8"))
+    assert payload["result"] == result
+    jobs = queue.list(status="succeeded")
+    assert len(jobs) == 1
+    assert jobs[0].operation_type == "tool_artifact"

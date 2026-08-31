@@ -30,6 +30,7 @@ try:
 
     _SENTENCE_TRANSFORMERS_AVAILABLE = True
 except ImportError:
+    SentenceTransformer = None  # type: ignore[assignment]
     _SENTENCE_TRANSFORMERS_AVAILABLE = False
     logger.warning("sentence-transformers not installed. Embedder will use deterministic random fallback.")
 
@@ -58,7 +59,7 @@ class Embedder:
         self.model_name = model_name or self._model_name
         self.local_files_only = local_files_only
         self._model: Optional[object] = None
-        self._available = _SENTENCE_TRANSFORMERS_AVAILABLE
+        self._available = _SENTENCE_TRANSFORMERS_AVAILABLE or callable(SentenceTransformer)
 
     def _load_model(self) -> object:
         """懒加载模型，返回 SentenceTransformer 实例或 None（fallback 模式）。"""

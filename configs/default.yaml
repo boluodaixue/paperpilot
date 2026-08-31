@@ -25,6 +25,16 @@ model:
     judge: "deepseek"
 
 research:
+  # V2 remains opt-in: the isolated single-question gate improved after targeted
+  # fixes but still did not meet the publication-quality threshold.
+  architecture: "legacy"
+  supervisor_v2:
+    enabled: false
+    max_initial_workers: 4
+    max_research_waves: 3
+    red_review_enabled: true
+    max_red_review_rounds: 1
+    max_citation_repair_rounds: 1
   vault_root: "memory"
   # S3 requires an explicit recoverable archive outside the active Vault.
   # Migration never permanently deletes this archive.
@@ -34,17 +44,29 @@ research:
   report_review:
     enabled: false
   limits:
-    max_iterations: 8
-    max_tool_calls: 12
-    max_tool_output_chars: 12000
+    max_iterations: 18
+    max_tool_calls: 30
+    max_tool_output_chars: 24000
     max_children: 4
     max_fork_depth: 2
-    max_total_threads: 7
-    max_total_tool_calls: 36
-    max_elapsed_seconds: 300.0
-    max_total_tokens: 120000
-    max_retries_per_action: 1
-    max_total_retries: 6
+    max_total_threads: 10
+    max_total_tool_calls: 96
+    max_elapsed_seconds: 900.0
+    max_total_tokens: 500000
+    max_retries_per_action: 2
+    max_total_retries: 12
+
+# Full-content extraction is an independent opt-in rollout. Legacy behavior is
+# retained until the isolated canary demonstrates a measurable evidence gain.
+content_extraction:
+  mode: "legacy"
+  tavily_extract_fallback: false
+  docling_enabled: false
+  # Scanned-document OCR is intentionally out of scope for this personal project.
+  ocr_enabled: false
+  max_download_bytes: 12000000
+  max_blocks: 24
+  max_output_chars: 24000
 
 chat:
   db_path: "data/chat.db"
@@ -77,3 +99,8 @@ tools:
     - notepad
   web_search:
     mock_mode: false
+  evidence_acquisition:
+    default_candidates: 8
+    default_sources: 3
+    max_sources: 6
+    max_chars_per_source: 12000

@@ -1,20 +1,8 @@
-"""
-网页搜索工具 — 支持多后端：SerpAPI / Bing / 博查AI / 秘塔AI
+"""Tavily / 秘塔 / Exa / 博查 / SerpAPI 网页搜索与自动回退。"""
 
-设计理由：
-  通过 .env 中的 SEARCH_BACKEND 切换后端，零源码修改。
-
-后端对比：
-  - serpapi: 每月 100 次免费，结果最全（Google 数据），国内可访问
-  - bing:    微软搜索 API，国内稳定，需 Azure 订阅 Key
-  - bocha:   博查AI搜索，国内索引最全，面向 AI Agent 优化
-  - metaso:  秘塔AI搜索，中文语义强，有 research 多轮模式
-"""
 from __future__ import annotations
 
 import asyncio
-import json
-import os
 import random
 from abc import ABC, abstractmethod
 from typing import Any
@@ -22,6 +10,7 @@ from typing import Any
 import aiohttp
 
 from ..utils.env_config import get_env
+from .http_client import trusted_connector
 
 __all__ = ["WebSearchTool", "MockWebSearchTool", "BaseWebSearchTool"]
 
@@ -32,13 +21,13 @@ class BaseWebSearchTool(ABC):
     name: str = "web_search"
     description: str = (
         "Search the web for information. "
-        "Supports SerpAPI / Bing / 博查AI(bocha) / 秘塔AI(metaso) backends. "
-        "Input: {'query': str, 'top_n': int(optional, default=5)}. "
+        "Supports Tavily / 秘塔AI / Exa / 博查AI / SerpAPI backends with fallback. "
+        "Input: {'query': str, 'top_n': int(optional, default=3)}. "
         "Output: list of {'title': str, 'url': str, 'snippet': str}."
     )
 
     @abstractmethod
-    async def execute(self, query: str, top_n: int = 5) -> dict[str, Any]:
+    async def execute(self, query: str, top_n: int = 3) -> dict[str, Any]:
         """执行搜索并返回结果。"""
         pass
 
@@ -55,7 +44,7 @@ class BaseWebSearchTool(ABC):
                         "top_n": {
                             "type": "integer",
                             "description": "返回结果数量",
-                            "default": 5,
+                            "default": 3,
                         },
                     },
                     "required": ["query"],
@@ -70,7 +59,7 @@ class MockWebSearchTool(BaseWebSearchTool):
     def __init__(self, delay_ms: tuple[int, int] = (50, 200)) -> None:
         self.delay_ms = delay_ms
 
-    async def execute(self, query: str, top_n: int = 5) -> dict[str, Any]:
+    async def execute(self, query: str, top_n: int = 3) -> dict[str, Any]:
         await asyncio.sleep(random.randint(*self.delay_ms) / 1000.0)
 
         query_lower = query.lower()
@@ -134,40 +123,86 @@ class MockWebSearchTool(BaseWebSearchTool):
 
 
 class WebSearchTool(BaseWebSearchTool):
-    """真实网页搜索工具：支持 SerpAPI 和 Bing Search API 双后端。
+    """真实网页搜索工具：首选后端失败时按配置自动回退。
 
     配置优先从 .env / .env.local 读取：
-      - SEARCH_BACKEND: 后端选择，可选 "serpapi" | "bing"（默认 serpapi）
+      - SEARCH_BACKEND: 首选后端（默认 tavily）
+      - SEARCH_FALLBACK_BACKENDS: 逗号分隔的备用后端
+      - TAVILY_API_KEY / TAVILY_API_ENDPOINT: Tavily 配置
+      - EXA_API_KEY / EXA_API_ENDPOINT: Exa 配置
       - SERPAPI_KEY / SERPAPI_ENDPOINT: SerpAPI 配置
-      - BING_SEARCH_KEY / BING_SEARCH_ENDPOINT: Bing API 配置
     """
 
     _session: aiohttp.ClientSession | None = None
+    _supported_backends = (
+        "tavily",
+        "metaso",
+        "exa",
+        "bocha",
+        "serpapi",
+    )
 
-    def __init__(self, backend: str | None = None, api_key: str | None = None, api_endpoint: str | None = None) -> None:
-        self.backend = (backend or get_env("SEARCH_BACKEND", "serpapi")).lower().strip()
+    def __init__(
+        self,
+        backend: str | None = None,
+        api_key: str | None = None,
+        api_endpoint: str | None = None,
+    ) -> None:
+        self.backend = (backend or get_env("SEARCH_BACKEND", "tavily")).lower().strip()
+        fallback_config = get_env(
+            "SEARCH_FALLBACK_BACKENDS",
+            "tavily,metaso,exa,bocha,serpapi",
+        )
+        self.fallback_backends = tuple(
+            item.strip().lower()
+            for item in str(fallback_config or "").split(",")
+            if item.strip().lower() in self._supported_backends
+        )
+
+        def override_for(name: str, env_name: str) -> str | None:
+            return api_key if api_key and self.backend == name else get_env(env_name)
+
+        def endpoint_for(name: str, env_name: str, default: str) -> str:
+            if api_endpoint and self.backend == name:
+                return api_endpoint
+            return str(get_env(env_name, default) or default)
+
+        # Tavily / Exa 配置
+        self.tavily_key = override_for("tavily", "TAVILY_API_KEY")
+        self.tavily_endpoint = endpoint_for(
+            "tavily",
+            "TAVILY_API_ENDPOINT",
+            "https://api.tavily.com/search",
+        )
+        self.exa_key = override_for("exa", "EXA_API_KEY")
+        self.exa_endpoint = endpoint_for(
+            "exa",
+            "EXA_API_ENDPOINT",
+            "https://api.exa.ai/search",
+        )
 
         # SerpAPI 配置
-        self.serpapi_key = api_key or get_env("SERPAPI_KEY")
-        self.serpapi_endpoint = api_endpoint or get_env("SERPAPI_ENDPOINT", "https://serpapi.com/search")
-
-        # Bing API 配置
-        self.bing_key = api_key or get_env("BING_SEARCH_KEY")
-        self.bing_endpoint = api_endpoint or get_env("BING_SEARCH_ENDPOINT", "https://api.bing.microsoft.com/v7.0/search")
+        self.serpapi_key = override_for("serpapi", "SERPAPI_KEY")
+        self.serpapi_endpoint = endpoint_for("serpapi", "SERPAPI_ENDPOINT", "https://serpapi.com/search")
 
         # 博查AI 配置
-        self.bocha_key = api_key or get_env("BOCHA_API_KEY")
-        self.bocha_endpoint = api_endpoint or get_env("BOCHA_API_ENDPOINT", "https://api.bochaai.com/v1/web-search")
+        self.bocha_key = override_for("bocha", "BOCHA_API_KEY")
+        self.bocha_endpoint = endpoint_for("bocha", "BOCHA_API_ENDPOINT", "https://api.bochaai.com/v1/web-search")
 
         # 秘塔AI 配置
-        self.metaso_key = api_key or get_env("METASO_API_KEY")
-        self.metaso_endpoint = api_endpoint or get_env("METASO_API_ENDPOINT", "https://metaso.cn/api/open/search/v2")
+        self.metaso_key = override_for("metaso", "METASO_API_KEY")
+        self.metaso_endpoint = endpoint_for(
+            "metaso",
+            "METASO_API_ENDPOINT",
+            "https://metaso.cn/api/v1/search",
+        )
 
     def _get_session(self) -> aiohttp.ClientSession:
         """获取复用的 ClientSession，避免每次搜索新建连接。"""
         if WebSearchTool._session is None or WebSearchTool._session.closed:
             WebSearchTool._session = aiohttp.ClientSession(
-                headers={"Accept-Encoding": "gzip, deflate"}
+                headers={"Accept-Encoding": "gzip, deflate"},
+                connector=trusted_connector(),
             )
         return WebSearchTool._session
 
@@ -188,14 +223,200 @@ class WebSearchTool(BaseWebSearchTool):
                 # 无运行中的事件循环，忽略
                 pass
 
-    async def execute(self, query: str, top_n: int = 5) -> dict[str, Any]:
-        if self.backend == "bing":
-            return await self._bing_execute(query, top_n)
-        if self.backend == "bocha":
+    async def execute(self, query: str, top_n: int = 3) -> dict[str, Any]:
+        attempts: list[dict[str, str]] = []
+        for backend in self._backend_order():
+            try:
+                result = await self._execute_backend(backend, query, top_n)
+            except Exception as exc:
+                result = {
+                    "query": query,
+                    "results": [],
+                    "total": 0,
+                    "error": str(exc),
+                }
+            if result.get("results"):
+                return {
+                    **result,
+                    "backends_tried": [item["backend"] for item in attempts] + [backend],
+                    "fallback_used": bool(attempts),
+                    "backend_errors": attempts,
+                }
+            attempts.append(
+                {
+                    "backend": backend,
+                    "error": str(result.get("error") or "no results"),
+                }
+            )
+
+        all_failed = all(item["error"] != "no results" for item in attempts)
+        detail = " | ".join(f"{item['backend']}: {item['error']}" for item in attempts)
+        return {
+            "query": query,
+            "results": [],
+            "total": 0,
+            "source": "web_search_fallback",
+            "error": (
+                f"All web search backends unavailable: {detail}"
+                if all_failed
+                else f"No web search results found after fallback: {detail}"
+            ),
+            "backends_tried": [item["backend"] for item in attempts],
+            "fallback_used": len(attempts) > 1,
+            "backend_errors": attempts,
+        }
+
+    def _backend_order(self) -> tuple[str, ...]:
+        preferred = self.backend if self.backend in self._supported_backends else "tavily"
+        ordered = tuple(dict.fromkeys((preferred, *self.fallback_backends)))
+        # Always retain the preferred backend so a missing primary key is visible.
+        # Unconfigured optional fallbacks are skipped without making network calls.
+        return tuple(backend for backend in ordered if backend == preferred or self._backend_configured(backend))
+
+    def _backend_configured(self, backend: str) -> bool:
+        key = {
+            "tavily": self.tavily_key,
+            "metaso": self.metaso_key,
+            "exa": self.exa_key,
+            "bocha": self.bocha_key,
+            "serpapi": self.serpapi_key,
+        }.get(backend)
+        if not key:
+            return False
+        normalized = str(key).strip().lower()
+        return not (
+            normalized.startswith("your_")
+            or normalized.endswith("_here")
+            or normalized in {"changeme", "replace-me", "placeholder"}
+        )
+
+    async def _execute_backend(
+        self,
+        backend: str,
+        query: str,
+        top_n: int,
+    ) -> dict[str, Any]:
+        if backend == "tavily":
+            return await self._tavily_execute(query, top_n)
+        if backend == "exa":
+            return await self._exa_execute(query, top_n)
+        if backend == "bocha":
             return await self._bocha_execute(query, top_n)
-        if self.backend == "metaso":
+        if backend == "metaso":
             return await self._metaso_execute(query, top_n)
         return await self._serpapi_execute(query, top_n)
+
+    async def _tavily_execute(self, query: str, top_n: int) -> dict[str, Any]:
+        if not self.tavily_key:
+            raise RuntimeError("Tavily unavailable: TAVILY_API_KEY is not configured")
+
+        payload = {
+            "query": query,
+            "search_depth": "basic",
+            "max_results": min(max(1, top_n), 20),
+            "include_answer": False,
+            "include_raw_content": False,
+        }
+        headers = {
+            "Authorization": f"Bearer {self.tavily_key}",
+            "Content-Type": "application/json",
+        }
+        try:
+            session = self._get_session()
+            async with session.post(
+                self.tavily_endpoint,
+                json=payload,
+                headers=headers,
+                timeout=aiohttp.ClientTimeout(total=25),
+            ) as resp:
+                data = await resp.json(content_type=None)
+                if resp.status != 200:
+                    return {
+                        "query": query,
+                        "results": [],
+                        "total": 0,
+                        "error": f"Tavily error: {data.get('detail') or data.get('error') or resp.status}",
+                    }
+        except Exception as exc:
+            return {
+                "query": query,
+                "results": [],
+                "total": 0,
+                "error": f"Tavily network error: {exc}",
+            }
+
+        results = [
+            {
+                "title": item.get("title", ""),
+                "url": item.get("url", ""),
+                "snippet": item.get("content", "")[:1500],
+            }
+            for item in data.get("results", [])[:top_n]
+        ]
+        deduplicated = self._deduplicate_results(results)
+        return {
+            "query": query,
+            "results": deduplicated,
+            "total": len(deduplicated),
+            "source": "tavily",
+        }
+
+    async def _exa_execute(self, query: str, top_n: int) -> dict[str, Any]:
+        if not self.exa_key:
+            raise RuntimeError("Exa unavailable: EXA_API_KEY is not configured")
+
+        payload = {
+            "query": query,
+            "numResults": min(max(1, top_n), 10),
+            "type": "auto",
+            "contents": {"highlights": True},
+        }
+        headers = {
+            "x-api-key": self.exa_key,
+            "Content-Type": "application/json",
+        }
+        try:
+            session = self._get_session()
+            async with session.post(
+                self.exa_endpoint,
+                json=payload,
+                headers=headers,
+                timeout=aiohttp.ClientTimeout(total=25),
+            ) as resp:
+                data = await resp.json(content_type=None)
+                if resp.status != 200:
+                    return {
+                        "query": query,
+                        "results": [],
+                        "total": 0,
+                        "error": f"Exa error: {data.get('error') or data.get('message') or resp.status}",
+                    }
+        except Exception as exc:
+            return {
+                "query": query,
+                "results": [],
+                "total": 0,
+                "error": f"Exa network error: {exc}",
+            }
+
+        results = []
+        for item in data.get("results", [])[:top_n]:
+            highlights = item.get("highlights") or []
+            snippet = " ".join(str(value) for value in highlights if value)
+            results.append(
+                {
+                    "title": item.get("title", ""),
+                    "url": item.get("url", ""),
+                    "snippet": (snippet or item.get("text") or "")[:1500],
+                }
+            )
+        deduplicated = self._deduplicate_results(results)
+        return {
+            "query": query,
+            "results": deduplicated,
+            "total": len(deduplicated),
+            "source": "exa",
+        }
 
     async def _serpapi_execute(self, query: str, top_n: int) -> dict[str, Any]:
         if not self.serpapi_key:
@@ -222,15 +443,15 @@ class WebSearchTool(BaseWebSearchTool):
                 params=params,
                 timeout=aiohttp.ClientTimeout(total=20),
             ) as resp:
-                    data = await resp.json()
-                    if resp.status != 200:
-                        error_msg = data.get("error", f"HTTP {resp.status}")
-                        return {
-                            "query": query,
-                            "results": [],
-                            "total": 0,
-                            "error": f"SerpAPI 错误: {error_msg}",
-                        }
+                data = await resp.json()
+                if resp.status != 200:
+                    error_msg = data.get("error", f"HTTP {resp.status}")
+                    return {
+                        "query": query,
+                        "results": [],
+                        "total": 0,
+                        "error": f"SerpAPI 错误: {error_msg}",
+                    }
         except Exception as e:
             return {
                 "query": query,
@@ -243,70 +464,19 @@ class WebSearchTool(BaseWebSearchTool):
         organic = data.get("organic_results", [])
         results = []
         for item in organic[:top_n]:
-            results.append({
-                "title": item.get("title", ""),
-                "url": item.get("link", ""),
-                "snippet": item.get("snippet", ""),
-            })
+            results.append(
+                {
+                    "title": item.get("title", ""),
+                    "url": item.get("link", ""),
+                    "snippet": item.get("snippet", ""),
+                }
+            )
 
         return {
             "query": query,
             "results": results,
             "total": len(results),
             "source": "serpapi",
-        }
-
-    async def _bing_execute(self, query: str, top_n: int) -> dict[str, Any]:
-        if not self.bing_key:
-            raise RuntimeError(
-                "WebSearchTool (bing 后端) 需要 API Key。\n"
-                "请在 .env 或 .env.local 中设置 BING_SEARCH_KEY，\n"
-                "或在 Azure Portal 创建 Bing Search v7 资源获取 Key。\n"
-                "如需 Mock 模式，请显式使用 MockWebSearchTool()"
-            )
-
-        headers = {"Ocp-Apim-Subscription-Key": self.bing_key}
-        params = {"q": query, "count": top_n, "mkt": "en-US"}
-
-        try:
-            session = self._get_session()
-            async with session.get(
-                self.bing_endpoint,
-                params=params,
-                timeout=aiohttp.ClientTimeout(total=20),
-            ) as resp:
-                    data = await resp.json()
-                    if resp.status != 200:
-                        error_msg = data.get("message", f"HTTP {resp.status}")
-                        return {
-                            "query": query,
-                            "results": [],
-                            "total": 0,
-                            "error": f"Bing API 错误: {error_msg}",
-                        }
-        except Exception as e:
-            return {
-                "query": query,
-                "results": [],
-                "total": 0,
-                "error": f"Bing API 网络错误: {e}",
-            }
-
-        # 解析 Bing 响应
-        web_pages = data.get("webPages", {}).get("value", [])
-        results = []
-        for item in web_pages[:top_n]:
-            results.append({
-                "title": item.get("name", ""),
-                "url": item.get("url", ""),
-                "snippet": item.get("snippet", ""),
-            })
-
-        return {
-            "query": query,
-            "results": results,
-            "total": len(results),
-            "source": "bing",
         }
 
     async def _bocha_execute(self, query: str, top_n: int) -> dict[str, Any]:
@@ -365,11 +535,13 @@ class WebSearchTool(BaseWebSearchTool):
         # 结构 A: /v1/web-search → data.webPages.value[]
         web_pages = data.get("data", {}).get("webPages", {}).get("value", [])
         for item in web_pages[:top_n]:
-            results.append({
-                "title": item.get("name", ""),
-                "url": item.get("url", ""),
-                "snippet": item.get("snippet", ""),
-            })
+            results.append(
+                {
+                    "title": item.get("name", ""),
+                    "url": item.get("url", ""),
+                    "snippet": item.get("snippet", ""),
+                }
+            )
 
         # 结构 B: /v1/ai-search → data.messages[] content 里含引用
         if not results:
@@ -377,11 +549,13 @@ class WebSearchTool(BaseWebSearchTool):
             for msg in messages[:top_n]:
                 content = msg.get("content", "")
                 if content:
-                    results.append({
-                        "title": msg.get("role", "引用")[:30],
-                        "url": "",
-                        "snippet": content[:500],
-                    })
+                    results.append(
+                        {
+                            "title": msg.get("role", "引用")[:30],
+                            "url": "",
+                            "snippet": content[:500],
+                        }
+                    )
 
         # 去重：同一篇文章的不同 URL（移动端/PC端/转发）会被当作多条结果
         results = self._deduplicate_results(results)
@@ -395,8 +569,8 @@ class WebSearchTool(BaseWebSearchTool):
 
     def _deduplicate_results(self, results: list[dict]) -> list[dict]:
         """对搜索结果去重：基于规范化 URL 和清洗后的标题。"""
-        from urllib.parse import urlparse
         import re
+        from urllib.parse import urlparse
 
         seen_keys: set[str] = set()
         unique: list[dict] = []
@@ -414,7 +588,7 @@ class WebSearchTool(BaseWebSearchTool):
                 # 去掉移动端前缀
                 for prefix in ("m.", "wap.", "mobile.", "app."):
                     if netloc.startswith(prefix):
-                        netloc = netloc[len(prefix):]
+                        netloc = netloc[len(prefix) :]
                         break
                 # 去掉 www 前缀
                 if netloc.startswith("www."):
@@ -452,21 +626,23 @@ class WebSearchTool(BaseWebSearchTool):
     async def _metaso_execute(self, query: str, top_n: int) -> dict[str, Any]:
         """秘塔AI搜索后端。
 
-        文档: https://metaso.cn/open
-        特点: 中文语义搜索强，支持 detail / concise / research 模式。
+        文档: https://metaso.cn/search-api/playground
         """
         if not self.metaso_key:
             raise RuntimeError(
                 "WebSearchTool (metaso 后端) 需要 API Key。\n"
                 "请在 .env 或 .env.local 中设置 METASO_API_KEY，\n"
-                "或访问 https://metaso.cn/open 注册获取。\n"
+                "或访问 https://metaso.cn/search-api/api-keys 创建。\n"
                 "如需 Mock 模式，请显式使用 MockWebSearchTool()"
             )
 
         payload = {
-            "question": query,
-            "lang": "zh",
-            "stream": False,
+            "q": query,
+            "scope": "webpage",
+            "size": str(min(max(1, top_n), 20)),
+            "includeSummary": False,
+            "includeRawContent": False,
+            "conciseSnippet": True,
         }
         headers = {
             "Authorization": f"Bearer {self.metaso_key}",
@@ -498,34 +674,15 @@ class WebSearchTool(BaseWebSearchTool):
                 "error": f"秘塔AI 网络错误: {e}",
             }
 
-        # 解析秘塔响应
-        results: list[dict] = []
-        result_data = data.get("data", {})
-
-        # 1. 优先把 text 字段（秘塔 AI 整理的完整答案）作为高价值结果
-        text = result_data.get("text", "")
-        if text:
-            results.append({
-                "title": "秘塔AI搜索总结",
-                "url": "",
-                "snippet": text[:1500],  # 给足上下文，让 LLM 能直接总结
-            })
-
-        # 2. 附加参考文献列表（用于溯源）
-        refs = result_data.get("references", [])
-        for item in refs[:top_n]:
-            snippet_parts = []
-            if item.get("title"):
-                snippet_parts.append(item["title"])
-            if item.get("article_type"):
-                snippet_parts.append(f"类型: {item['article_type']}")
-            if item.get("date"):
-                snippet_parts.append(f"日期: {item['date']}")
-            results.append({
+        results = [
+            {
                 "title": item.get("title", ""),
                 "url": item.get("link", ""),
-                "snippet": " | ".join(snippet_parts)[:500],
-            })
+                "snippet": item.get("snippet", "")[:1500],
+            }
+            for item in data.get("webpages", [])[:top_n]
+        ]
+        results = self._deduplicate_results(results)
 
         return {
             "query": query,

@@ -6,12 +6,14 @@ import json
 import re
 from typing import Mapping
 
+from .evidence_selection import select_representative_evidence
 from .models import EvidenceItem, ResearchBrief, ResearchResult
 from .vault import build_wikilink
 
 
 _SAFE_NOTE_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,119}$")
 _MANAGED_NOTE_ID = re.compile(r"^[A-Za-z][A-Za-z0-9]*-[A-Za-z0-9]+(?:-[A-Za-z0-9]+)*$")
+_EVIDENCE_MARKER = re.compile(r"\[\[EVIDENCE:([A-Za-z0-9._-]+)\]\]")
 
 
 def safe_note_id(prefix: str, value: str) -> str:
@@ -39,6 +41,94 @@ def managed_note_id(prefix: str, value: str) -> str:
         return candidate
     digest = hashlib.sha256(str(value or "").strip().encode("utf-8")).hexdigest()[:16]
     return f"{prefix}-{digest}"
+
+
+def render_evidence_references(
+    markdown: str,
+    evidence: tuple[EvidenceItem, ...],
+    evidence_notes: Mapping[str, str],
+    *,
+    memory_id: str | None = None,
+) -> str:
+    """Resolve internal markers in stable first-source-appearance order."""
+    inventory = {item.evidence_id: item for item in evidence}
+    source_numbers: dict[str, int] = {}
+    source_first_ids: dict[str, str] = {}
+
+    def replace_marker(match: re.Match[str]) -> str:
+        evidence_id = match.group(1)
+        item = inventory.get(evidence_id)
+        if item is None or evidence_id not in evidence_notes:
+            raise ValueError(f"unknown or unpersisted Evidence ID: {evidence_id}")
+        source_key = item.source_ref
+        if source_key not in source_numbers:
+            source_numbers[source_key] = len(source_numbers) + 1
+            source_first_ids[source_key] = evidence_id
+        return f"[{source_numbers[source_key]}]"
+
+    rendered = _EVIDENCE_MARKER.sub(replace_marker, markdown)
+    if not source_numbers:
+        return rendered
+    references: list[str] = []
+    for source_ref, number in sorted(source_numbers.items(), key=lambda pair: pair[1]):
+        evidence_id = source_first_ids[source_ref]
+        item = inventory[evidence_id]
+        note = evidence_notes[evidence_id]
+        if memory_id is None:
+            link = f"[[evidence/{note}|[{number}]]]"
+        else:
+            path = f"Memories/{memory_id}/evidence/{note}.md"
+            link = build_wikilink(path, f"[{number}]")
+        references.append(
+            f"{number}. {link} — {item.title or item.source_ref}; {item.locator or item.source_ref}"
+        )
+    return rendered.rstrip() + "\n\n## References\n\n" + "\n".join(references) + "\n"
+
+
+def render_v2_report(
+    brief: ResearchBrief,
+    result: ResearchResult,
+    report_body_markdown: str,
+    *,
+    report_note: str,
+    evidence_notes: Mapping[str, str],
+    root_thread_id: str,
+    memory_id: str | None = None,
+    created_at: str | None = None,
+    updated_at: str | None = None,
+) -> str:
+    """Render an already-audited V2 body into the normal report note envelope."""
+    body = str(report_body_markdown or "").strip()
+    if not body:
+        raise ValueError("V2 report body cannot be empty")
+    resolved = render_evidence_references(
+        body,
+        tuple(result.evidence),
+        evidence_notes,
+        memory_id=memory_id,
+    )
+    if memory_id is None:
+        frontmatter = _frontmatter(
+            id=report_note,
+            type="report",
+            root_thread_id=root_thread_id,
+            architecture="supervisor_v2",
+        )
+    else:
+        if created_at is None or updated_at is None:
+            raise ValueError("managed V2 report notes require created_at and updated_at")
+        frontmatter = _managed_frontmatter(
+            note_id=report_note,
+            note_type="report",
+            memory_id=memory_id,
+            title=brief.question,
+            created_at=created_at,
+            updated_at=updated_at,
+            origin="research",
+            root_thread_id=root_thread_id,
+            architecture="supervisor_v2",
+        )
+    return f"{frontmatter}\n\n{resolved.lstrip()}"
 
 
 def _yaml_string(value: object) -> str:
@@ -211,10 +301,15 @@ def render_report(
             "Evidence",
         )
 
+    report_evidence = select_representative_evidence(
+        result.evidence,
+        result.coverage,
+        limit=32,
+    )
     all_links = [
-        evidence_link(note)
-        for evidence_id, note in evidence_notes.items()
-        if any(item.evidence_id == evidence_id for item in result.evidence)
+        evidence_link(evidence_notes[item.evidence_id])
+        for item in report_evidence[:12]
+        if item.evidence_id in evidence_notes
     ]
     summary_suffix = f" {' '.join(all_links)}" if all_links else ""
 
@@ -248,15 +343,31 @@ def render_report(
         finding_lines = ["- No completed findings."]
 
     evidence_lines: list[str] = []
-    for evidence in result.evidence:
+    for evidence in report_evidence:
         note = evidence_notes[evidence.evidence_id]
         evidence_lines.append(
             f"- {evidence.finding} {evidence_link(note)}"
         )
     if not evidence_lines:
         evidence_lines = ["- No source-locatable evidence was collected."]
+    elif len(report_evidence) < len(result.evidence):
+        evidence_lines.append(
+            f"- Showing {len(report_evidence)} of {len(result.evidence)} collected evidence items; "
+            "the complete evidence inventory remains stored in the Vault."
+        )
 
     unresolved = "\n".join(f"- {item}" for item in result.unresolved) or "- None"
+    availability = ""
+    if result.tool_alerts:
+        availability_lines = "\n".join(
+            f"- **{item.category} / {item.tool} / {item.target or 'unknown'}:** "
+            f"{item.message} {item.action_required}"
+            for item in result.tool_alerts
+        )
+        availability = (
+            "## External Information Availability\n\n"
+            f"{availability_lines}\n\n"
+        )
     findings_text = "\n".join(finding_lines)
     evidence_text = "\n".join(evidence_lines)
     if memory_id is None:
@@ -291,6 +402,7 @@ def render_report(
         f"## Summary\n\n{result.summary or 'No summary was produced.'}{summary_suffix}\n\n"
         f"## Findings\n\n{findings_text}\n\n"
         f"## Evidence-backed Details\n\n{evidence_text}\n\n"
+        f"{availability}"
         f"## Unresolved\n\n{unresolved}\n\n"
         f"## Execution\n\n"
         f"- Research status: {result.status.value}\n"

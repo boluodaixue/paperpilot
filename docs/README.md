@@ -12,4 +12,9 @@
 6. [S2_SINGLE_VAULT_WRITER.md](S2_SINGLE_VAULT_WRITER.md)：持久队列、单一 Writer、journal 和崩溃一致性；
 7. [S5_OPTIONAL_SEMANTIC_HYBRID_RETRIEVAL.md](S5_OPTIONAL_SEMANTIC_HYBRID_RETRIEVAL.md)：FTS、语义与 WikiLink 的可选混合检索。
 
+## 待实施架构
+
+1. [RESEARCH_AGENT_V2_DESIGN.md](RESEARCH_AGENT_V2_DESIGN.md)：已确认的 Supervisor、Blue Worker、Red Reviewer、Lead Draft 与 Citation Audit 整体设计；
+2. [RESEARCH_AGENT_V2_IMPLEMENTATION_PLAN.md](RESEARCH_AGENT_V2_IMPLEMENTATION_PLAN.md)：基于当前基础设施、LangChain Deep Research From Scratch 和 GPT Researcher 固定版本制定的分阶段实施计划。
+
 若代码、注释和文档冲突，以 [ARCHITECTURE.md](ARCHITECTURE.md) 描述的当前实现为准。

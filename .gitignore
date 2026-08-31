@@ -218,14 +218,20 @@ htmlcov/
 outputs/**/*.log
 outputs/reports/
 outputs/viz_smoke*
+outputs/evaluation/
 # Obsidian 导出的 Vault（生成的证据库，不入库）
 outputs/obsidian/
+
+# 本地研究 Memory 与评测临时 Vault（均可能包含用户资料）
+memory/
+paperpilot-memory-eval-*/
 
 # 本地快速 E2E 配置（可能调用真实外部服务，不作为默认基线）
 configs/e2e_fast.yaml
 
 # Windows / pytest 在工作区根目录生成的临时运行目录
 .tmp_test_runtime/
+.test-tmp/
 .pytest-*/
 .test-temp*/
 .uv-cache/

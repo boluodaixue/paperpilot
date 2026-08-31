@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 from typing import Any
 
 
@@ -478,6 +479,45 @@ class ResearchBench:
             result = result[:n]
         return result
 
+    @staticmethod
+    def final_report_body(report: str) -> str:
+        """Exclude prompt/brief/metadata sections from outcome coverage metrics."""
+        excluded = {
+            "research brief",
+            "memory context",
+            "execution",
+            "references",
+            "bibliography",
+        }
+        lines = str(report or "").splitlines()
+        body: list[str] = []
+        in_frontmatter = bool(lines and lines[0].strip() == "---")
+        excluded_depth: int | None = None
+        for index, line in enumerate(lines):
+            clean = line.strip()
+            if in_frontmatter:
+                if index > 0 and clean == "---":
+                    in_frontmatter = False
+                continue
+            heading = re.match(r"^(#{1,6})\s+(.+?)\s*$", clean)
+            if heading:
+                depth = len(heading.group(1))
+                title = heading.group(2).strip().lower()
+                if depth == 1:
+                    excluded_depth = None
+                    continue
+                if title in excluded:
+                    excluded_depth = depth
+                    continue
+                if excluded_depth is not None and depth <= excluded_depth:
+                    excluded_depth = None
+                if excluded_depth is None:
+                    body.append(line)
+                continue
+            if excluded_depth is None:
+                body.append(line)
+        return "\n".join(body).strip()
+
     def evaluate_report(
         self,
         report: str,
@@ -501,15 +541,16 @@ class ResearchBench:
         if q is None:
             raise ValueError(f"未找到题目 ID: {question_id}")
 
+        report_body = self.final_report_body(report)
         expected_topics = q.get("expected_topics", [])
         ground_truth = q.get("ground_truth", {})
 
-        factual_str = RuleBasedMetrics.fact_accuracy(report, ground_truth)
-        factual_sem = RuleBasedMetrics.semantic_fact_accuracy(report, ground_truth, threshold=0.65)
-        hallucination = RuleBasedMetrics.hallucination_rate(report)
-        citation = RuleBasedMetrics.citation_coverage(report)
-        logic = RuleBasedMetrics.logical_consistency(report)
-        comprehensive = RuleBasedMetrics.comprehensiveness(report, expected_topics)
+        factual_str = RuleBasedMetrics.fact_accuracy(report_body, ground_truth)
+        factual_sem = RuleBasedMetrics.semantic_fact_accuracy(report_body, ground_truth, threshold=0.65)
+        hallucination = RuleBasedMetrics.hallucination_rate(report_body)
+        citation = RuleBasedMetrics.citation_coverage(report_body)
+        logic = RuleBasedMetrics.logical_consistency(report_body)
+        comprehensive = RuleBasedMetrics.comprehensiveness(report_body, expected_topics)
 
         # bias 维度用 (1 - hallucination_rate) 作为代理
         bias_score = max(0.0, 1.0 - hallucination)

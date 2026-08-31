@@ -1,4 +1,5 @@
 """The checkpointed LangGraph implementation shared by every Agent level."""
+
 from __future__ import annotations
 
 import asyncio
@@ -6,6 +7,7 @@ import copy
 import hashlib
 import inspect
 import json
+import re
 import time
 from contextlib import contextmanager
 from dataclasses import asdict
@@ -20,6 +22,15 @@ from langgraph.graph import END, START, StateGraph
 from ..tools.file_reader import FileReaderError
 from ..tools.notepad import NotepadTool
 from ..utils.tracing import trace_block, trace_context
+from .context_compaction import (
+    ContextCompactionError,
+    apply_semantic_compaction,
+    collapse_verified_working_context,
+    microcompact_control_messages,
+    semantic_compaction_messages,
+    snip_consumed_tool_artifacts,
+)
+from .evidence_selection import select_representative_evidence
 from .fork_policy import (
     FORK_TOOL_NAME,
     candidate_fingerprint,
@@ -47,9 +58,10 @@ from .models import (
 )
 from .policy import call_policy
 from .research_sufficiency import (
-    active_next_actions,
     AssessmentValidationError,
     ResearchAssessment,
+    active_next_actions,
+    aggregate_strategy_attempts,
     assessment_schema_prompt,
     build_research_requirements,
     control_message,
@@ -63,8 +75,16 @@ from .research_sufficiency import (
     reconcile_strategy_attempt_outcomes,
     repair_assessment_prompt,
     repair_final_prompt,
+    stable_action_id,
     unattempted_actions,
 )
+from .tool_availability import (
+    availability_alert_from_event,
+    classify_fallback_backend_alerts,
+    classify_tool_availability,
+)
+
+_TOOL_ARTIFACT_OFFLOAD_CHARS = 4000
 
 
 __all__ = [
@@ -101,6 +121,10 @@ class ResearchAgentState(TypedDict):
     total_tool_calls_used: int
     estimated_tokens_used: int
     retries_used: int
+    source_candidate_count: int
+    source_open_count: int
+    duplicate_source_count: int
+    acquisition_call_count: int
     execution_events: list[dict[str, Any]]
     lineage_objectives: list[str]
     draft: dict[str, Any] | None
@@ -123,9 +147,13 @@ class ResearchAgentState(TypedDict):
     result: ResearchResult | None
 
 
-_FINALIZATION_OUTPUT_TOKEN_RESERVE = 1024
-_ASSESSMENT_OUTPUT_TOKEN_RESERVE = 2048
+_FINALIZATION_OUTPUT_TOKEN_RESERVE = 12000
+_ASSESSMENT_OUTPUT_TOKEN_RESERVE = 12000
 _ASSESSMENT_INPUT_TOKEN_RESERVE = 10000
+_ROOT_FINALIZATION_TOKEN_MINIMUM = 40000
+_CHILD_FINALIZATION_TOKEN_MINIMUM = 8000
+_FINALIZATION_TOKEN_RESERVE_PERCENT = 15
+_FINALIZATION_COMPLEXITY_TOKEN_CAP = 20000
 _FINALIZATION_TIME_RESERVE_FRACTION = 0.1
 
 
@@ -147,12 +175,35 @@ def _remaining_seconds(state: ResearchAgentState) -> float:
 
 def _remaining_research_seconds(state: ResearchAgentState) -> float:
     """Leave each recursive level time to synthesize and return upstream."""
-    per_level_reserve = (
-        state["limits"].max_elapsed_seconds
-        * _FINALIZATION_TIME_RESERVE_FRACTION
-    )
+    per_level_reserve = state["limits"].max_elapsed_seconds * _FINALIZATION_TIME_RESERVE_FRACTION
     reserve = per_level_reserve * (state["identity"].depth + 1)
     return _remaining_seconds(state) - reserve
+
+
+def _finalization_token_reserve(state: ResearchAgentState) -> int:
+    """Hard token reserve that ordinary research cannot consume.
+
+    Root synthesis needs enough room to read a compact evidence matrix and
+    produce the user-facing report. Child agents keep a smaller independent
+    reserve so they can still return a useful memo to the parent.
+    """
+    subtree_budget = max(0, state["subtree_token_budget"])
+    minimum = (
+        _ROOT_FINALIZATION_TOKEN_MINIMUM
+        if state["identity"].depth == 0
+        else _CHILD_FINALIZATION_TOKEN_MINIMUM
+    )
+    base = max(
+        minimum,
+        subtree_budget * _FINALIZATION_TOKEN_RESERVE_PERCENT // 100,
+    )
+    complexity = min(
+        _FINALIZATION_COMPLEXITY_TOKEN_CAP,
+        150 * len(state.get("observed_evidence", []))
+        + 100 * len(state.get("strategy_attempts", []))
+        + 500 * len(state.get("child_results", [])),
+    )
+    return min(subtree_budget, base + complexity)
 
 
 def _delegable_token_budget(state: ResearchAgentState) -> int:
@@ -161,13 +212,27 @@ def _delegable_token_budget(state: ResearchAgentState) -> int:
         0,
         state["subtree_token_budget"] - state["estimated_tokens_used"],
     )
-    desired_reserve = (
-        _ASSESSMENT_INPUT_TOKEN_RESERVE
+    fixed_reserve = (
+        _ASSESSMENT_INPUT_TOKEN_RESERVE + _ASSESSMENT_OUTPUT_TOKEN_RESERVE + _FINALIZATION_OUTPUT_TOKEN_RESERVE
+    )
+    state_sensitive_reserve = (
+        4000
+        + 450 * len(state.get("observed_evidence", []))
+        + 250 * len(state.get("strategy_attempts", []))
+        + 750 * len(state.get("child_results", []))
         + _ASSESSMENT_OUTPUT_TOKEN_RESERVE
         + _FINALIZATION_OUTPUT_TOKEN_RESERVE
     )
-    parent_reserve = min(desired_reserve, remaining // 2)
-    return remaining - parent_reserve
+    desired_reserve = max(
+        fixed_reserve,
+        _finalization_token_reserve(state),
+        min(60000, state_sensitive_reserve),
+    )
+    # This is a floor against the original subtree allocation, not a fraction
+    # of the currently remaining tokens. Otherwise several sequential fork
+    # batches can repeatedly delegate half of the previous "reserve" until the
+    # parent has no capacity left to assess and synthesize child results.
+    return max(0, remaining - desired_reserve)
 
 
 def _delegable_tool_budget(
@@ -223,9 +288,7 @@ def _validate_invocation(
     limits.validate()
     checkpoint_thread_id = config.get("configurable", {}).get("thread_id")
     if checkpoint_thread_id != identity.thread_id:
-        raise ValueError(
-            "LangGraph configurable.thread_id must match identity.thread_id"
-        )
+        raise ValueError("LangGraph configurable.thread_id must match identity.thread_id")
 
 
 @contextmanager
@@ -324,6 +387,17 @@ def _build_tool_map(tools: Iterable[Any]) -> dict[str, Any]:
     return result
 
 
+def _tool_accepts_empty_arguments(tool: Any) -> bool:
+    if tool is None:
+        return False
+    try:
+        schema = tool.get_openai_tool_schema()
+        parameters = schema.get("function", {}).get("parameters", {})
+    except (AttributeError, TypeError):
+        return False
+    return isinstance(parameters, dict) and not parameters.get("required")
+
+
 def _normalize_tool_calls(raw_calls: Any) -> list[dict[str, Any]]:
     calls: list[dict[str, Any]] = []
     for index, raw in enumerate(raw_calls or []):
@@ -371,10 +445,7 @@ def _action_for_tool_call(
         action
         for action in candidates
         if action.query.strip().lower()
-        and (
-            action.query.strip().lower() in argument_text
-            or argument_text in action.query.strip().lower()
-        )
+        and (action.query.strip().lower() in argument_text or argument_text in action.query.strip().lower())
     ]
     if len(exact) == 1:
         return exact[0]
@@ -384,6 +455,98 @@ def _action_for_tool_call(
     if len(candidates) == 1 and argument_text:
         return candidates[0]
     return None
+
+
+def _action_id(action: NextResearchAction) -> str:
+    """Expose the stable action identity used by tool/evidence lineage."""
+    return stable_action_id(action)
+
+
+def _identified_action(action: NextResearchAction) -> NextResearchAction:
+    if action.action_id:
+        return action
+    return NextResearchAction(
+        action.requirement_id,
+        action.strategy,
+        action.query,
+        action.expected_value,
+        action.expected_improvement,
+        _action_id(action),
+    )
+
+
+def _initial_research_actions(
+    requirements: Iterable[ResearchRequirement],
+) -> tuple[NextResearchAction, ...]:
+    """Give the first real tool call an explicit requirement/action lineage."""
+    return tuple(
+        _identified_action(
+            NextResearchAction(
+                requirement.requirement_id,
+                "other",
+                requirement.description,
+                "high",
+                "Establish the first source-locatable evidence for this requirement.",
+            )
+        )
+        for requirement in requirements
+        if requirement.required
+    )
+
+
+def _tool_artifact_id(
+    tool_name: str,
+    arguments: dict[str, Any],
+    result: Any,
+) -> str:
+    """Identify the exact raw tool result before L1 durable offload is applied."""
+    encoded = json.dumps(
+        {
+            "tool": tool_name,
+            "arguments": arguments,
+            "result": result,
+        },
+        ensure_ascii=False,
+        sort_keys=True,
+        default=str,
+    )
+    return "artifact-" + hashlib.sha256(encoded.encode("utf-8")).hexdigest()[:16]
+
+
+def _semantic_tool_error(tool_name: str, result: Any) -> str | None:
+    """Recognize error payloads returned without a Python exception."""
+    if isinstance(result, dict):
+        raw_error = result.get("error")
+        if raw_error is not None and str(raw_error).strip():
+            return str(raw_error).strip()
+        status = str(result.get("status") or "").strip().lower()
+        if status in {"error", "failed", "failure"}:
+            return str(result.get("message") or status).strip()
+    text = str(result or "").strip()
+    if tool_name == "browser" and re.match(
+        r"^\[Browser (?:Error|Warning)\]",
+        text,
+        re.IGNORECASE,
+    ):
+        return text[:1000]
+    return None
+
+
+def _is_relevant_evidence(
+    action: NextResearchAction,
+    *,
+    finding: Any,
+    title: Any,
+    source_ref: Any,
+) -> bool:
+    """Gate evidence by controlled action scope and source locatability.
+
+    Search and reader tools already execute the action-bound query. Repeating a
+    lexical-overlap test here creates false negatives for synonyms and numerical
+    results, so relevance is inherited only from a successfully bound action;
+    this gate independently requires a finding and a locatable source.
+    """
+    return bool(action.requirement_id.strip() and str(source_ref or "").strip() and str(finding or title or "").strip())
 
 
 def _parse_final_draft(content: str) -> dict[str, Any]:
@@ -412,9 +575,11 @@ def _bounded_finalization_messages(
     state: ResearchAgentState,
 ) -> list[dict[str, Any]]:
     """Build a compact same-policy snapshot instead of replaying long history."""
-    evidence = _deduplicate_evidence(state["observed_evidence"])
-    if len(evidence) > 32:
-        evidence = [*evidence[:16], *evidence[-16:]]
+    evidence = select_representative_evidence(
+        _deduplicate_evidence(state["observed_evidence"]),
+        state.get("coverage", []),
+        limit=24 if state["identity"].depth == 0 else 12,
+    )
     payload = {
         "objective": state["task"].objective,
         "expected_output": state["task"].expected_output,
@@ -422,9 +587,11 @@ def _bounded_finalization_messages(
         "termination_reason": (
             state["termination_reason"].value
             if state.get("termination_reason") is not None
-            else hard_termination_reason(state.get("stop_reason")).value
-            if hard_termination_reason(state.get("stop_reason")) is not None
-            else None
+            else (
+                hard_termination_reason(state.get("stop_reason")).value
+                if hard_termination_reason(state.get("stop_reason")) is not None
+                else None
+            )
         ),
         "stop_detail": state.get("stop_reason"),
         "requirements": [asdict(item) for item in state["research_requirements"]],
@@ -453,7 +620,7 @@ def _bounded_finalization_messages(
                 "summary": item.summary[:1000],
                 "unresolved": list(item.unresolved[:8]),
             }
-            for item in state["child_results"]
+            for item in state.get("child_results", [])
         ],
         "tool_outcomes": [
             {
@@ -481,8 +648,7 @@ def _bounded_finalization_messages(
                 "(completed|partial|failed), summary, findings (array of strings), "
                 "and unresolved (array of strings). Preserve uncertainty and do not "
                 "invent evidence. The runtime will independently enforce research "
-                "status and termination reason.\n\nSTATE:\n"
-                + json.dumps(payload, ensure_ascii=False, default=str)
+                "status and termination reason.\n\nSTATE:\n" + json.dumps(payload, ensure_ascii=False, default=str)
             ),
         },
     ]
@@ -503,6 +669,9 @@ def _evidence_item(
     excerpt: Any = "",
     excerpt_type: str = "paraphrase",
     limitations: str = "",
+    requirement_id: str = "",
+    action_id: str = "",
+    artifact_id: str = "",
 ) -> EvidenceItem | None:
     clean_ref = str(source_ref or "").strip()
     clean_excerpt = str(excerpt or "").strip()
@@ -510,7 +679,10 @@ def _evidence_item(
     if not clean_ref or not clean_finding:
         return None
     return EvidenceItem(
-        evidence_id=_stable_evidence_id(clean_ref, clean_excerpt or clean_finding),
+        evidence_id=_stable_evidence_id(
+            f"{clean_ref}#{requirement_id}",
+            clean_excerpt or clean_finding,
+        ),
         finding=clean_finding,
         source_type=source_type,
         title=str(title or clean_ref).strip(),
@@ -519,14 +691,93 @@ def _evidence_item(
         excerpt=clean_excerpt[:4000],
         excerpt_type=excerpt_type,
         limitations=limitations,
+        requirement_id=requirement_id,
+        action_id=action_id,
+        artifact_id=artifact_id,
     )
 
 
-def _extract_evidence(tool_name: str, args: dict[str, Any], result: Any) -> list[EvidenceItem]:
+def _extract_evidence(
+    tool_name: str,
+    args: dict[str, Any],
+    result: Any,
+    *,
+    action: NextResearchAction | None = None,
+    artifact_id: str = "",
+) -> list[EvidenceItem]:
+    if action is None or _semantic_tool_error(tool_name, result) is not None:
+        return []
+    lineage = {
+        "requirement_id": action.requirement_id,
+        "action_id": _action_id(action),
+        "artifact_id": artifact_id,
+    }
     evidence: list[EvidenceItem] = []
-    if tool_name == "web_search" and isinstance(result, dict):
+    if tool_name == "acquire_evidence" and isinstance(result, dict):
+        search_backend = str(result.get("search_backend") or "configured search backend")
+        for document in result.get("documents", []):
+            if not isinstance(document, dict):
+                continue
+            source_ref = str(document.get("url") or "").strip()
+            document_title = str(document.get("title") or source_ref).strip()
+            document_format = str(document.get("format") or "html").strip().lower()
+            extractor = str(document.get("extractor") or "structured-browser").strip()
+            warnings = document.get("warnings", [])
+            warning_text = "; ".join(
+                str(item).strip()
+                for item in warnings
+                if isinstance(item, str) and item.strip()
+            )
+            blocks = document.get("blocks", [])
+            if not source_ref or not isinstance(blocks, list):
+                continue
+            for block in blocks:
+                if not isinstance(block, dict):
+                    continue
+                locator = str(block.get("locator") or "").strip()
+                heading = str(block.get("heading") or "").strip()
+                block_text = str(block.get("text") or "").strip()
+                if not locator or not block_text:
+                    continue
+                if not _is_relevant_evidence(
+                    action,
+                    finding=block_text[:1000],
+                    title=heading or document_title,
+                    source_ref=source_ref,
+                ):
+                    continue
+                limitations = (
+                    f"Full-content block acquired via {search_backend} and extracted "
+                    f"with {extractor}."
+                )
+                if warning_text:
+                    limitations += f" Warnings: {warning_text}"
+                found = _evidence_item(
+                    finding=block_text[:1000],
+                    source_type="paper" if document_format == "pdf" else "web",
+                    title=(
+                        f"{document_title} — {heading}"
+                        if heading and heading != document_title
+                        else document_title
+                    ),
+                    source_ref=source_ref,
+                    locator=locator,
+                    excerpt=block_text[:4000],
+                    limitations=limitations,
+                    **lineage,
+                )
+                if found:
+                    evidence.append(found)
+    elif tool_name == "web_search" and isinstance(result, dict):
         for item in result.get("results", []):
             if not isinstance(item, dict):
+                continue
+            if not _is_relevant_evidence(
+                action,
+                finding=item.get("snippet") or item.get("title"),
+                title=item.get("title"),
+                source_ref=item.get("url"),
+            ):
                 continue
             found = _evidence_item(
                 finding=item.get("snippet") or item.get("title"),
@@ -536,6 +787,7 @@ def _extract_evidence(tool_name: str, args: dict[str, Any], result: Any) -> list
                 locator=item.get("url"),
                 excerpt=item.get("snippet"),
                 limitations="Search-result snippet; open the source for stronger verification.",
+                **lineage,
             )
             if found:
                 evidence.append(found)
@@ -544,9 +796,14 @@ def _extract_evidence(tool_name: str, args: dict[str, Any], result: Any) -> list
             if not isinstance(item, dict):
                 continue
             paper_id = item.get("id") or item.get("paper_id") or ""
-            source_ref = item.get("pdf_url") or item.get("url") or (
-                f"arxiv:{paper_id}" if paper_id else ""
-            )
+            source_ref = item.get("pdf_url") or item.get("url") or (f"arxiv:{paper_id}" if paper_id else "")
+            if not _is_relevant_evidence(
+                action,
+                finding=item.get("summary") or item.get("title"),
+                title=item.get("title"),
+                source_ref=source_ref,
+            ):
+                continue
             found = _evidence_item(
                 finding=item.get("summary") or item.get("title"),
                 source_type="paper",
@@ -555,18 +812,89 @@ def _extract_evidence(tool_name: str, args: dict[str, Any], result: Any) -> list
                 locator=paper_id or source_ref,
                 excerpt=item.get("summary"),
                 limitations="Paper metadata or abstract; verify the full text when needed.",
+                **lineage,
+            )
+            if found:
+                evidence.append(found)
+    elif tool_name == "browser" and isinstance(result, dict):
+        source_ref = str(result.get("url") or args.get("url") or "").strip()
+        document_title = str(result.get("title") or source_ref).strip()
+        document_format = str(result.get("format") or "html").strip().lower()
+        extractor = str(result.get("extractor") or "structured-browser").strip()
+        warnings = result.get("warnings", [])
+        warning_text = "; ".join(
+            str(item).strip()
+            for item in warnings
+            if isinstance(item, str) and item.strip()
+        )
+        blocks = result.get("blocks", [])
+        if not source_ref or not isinstance(blocks, list):
+            return evidence
+        for block in blocks:
+            if not isinstance(block, dict):
+                continue
+            locator = str(block.get("locator") or "").strip()
+            heading = str(block.get("heading") or "").strip()
+            block_text = str(block.get("text") or "").strip()
+            if not locator or not block_text:
+                continue
+            if not _is_relevant_evidence(
+                action,
+                finding=block_text[:1000],
+                title=heading or document_title,
+                source_ref=source_ref,
+            ):
+                continue
+            limitations = f"Full-content block extracted with {extractor}."
+            if warning_text:
+                limitations += f" Warnings: {warning_text}"
+            found = _evidence_item(
+                finding=block_text[:1000],
+                source_type="paper" if document_format == "pdf" else "web",
+                title=(
+                    f"{document_title} — {heading}"
+                    if heading and heading != document_title
+                    else document_title
+                ),
+                source_ref=source_ref,
+                locator=locator,
+                excerpt=block_text[:4000],
+                limitations=limitations,
+                **lineage,
             )
             if found:
                 evidence.append(found)
     elif tool_name == "browser":
+        browser_text = str(result)
+        alternative_match = re.match(
+            r"^\[ALTERNATIVE_SOURCE: (https?://[^\]]+)\]",
+            browser_text,
+            re.IGNORECASE,
+        )
+        source_ref = (
+            alternative_match.group(1) if alternative_match else args.get("url")
+        )
+        if not _is_relevant_evidence(
+            action,
+            finding=browser_text[:1000],
+            title=source_ref,
+            source_ref=source_ref,
+        ):
+            return evidence
         found = _evidence_item(
-            finding=str(result)[:1000],
+            finding=browser_text[:1000],
             source_type="web",
-            title=args.get("url"),
-            source_ref=args.get("url"),
-            locator=args.get("url"),
-            excerpt=str(result)[:4000],
-            limitations="Extracted webpage text; exact section locator may be unavailable.",
+            title=source_ref,
+            source_ref=source_ref,
+            locator=source_ref,
+            excerpt=browser_text[:4000],
+            limitations=(
+                "Official alternative source used because the requested page was blocked; "
+                "exact section locator may be unavailable."
+                if alternative_match
+                else "Extracted webpage text; exact section locator may be unavailable."
+            ),
+            **lineage,
         )
         if found:
             evidence.append(found)
@@ -611,6 +939,7 @@ def _extract_evidence(tool_name: str, args: dict[str, Any], result: Any) -> list
             excerpt=content[:4000],
             excerpt_type="quote",
             limitations=limitations,
+            **lineage,
         )
         if found:
             evidence.append(found)
@@ -660,9 +989,7 @@ def _fork_tool_instances(tools: Iterable[Any]) -> list[Any]:
             isolated.append(copy.deepcopy(tool))
         except Exception as exc:
             name = str(getattr(tool, "name", type(tool).__name__))
-            raise RuntimeError(
-                f"tool {name!r} cannot be isolated for a child Research Agent"
-            ) from exc
+            raise RuntimeError(f"tool {name!r} cannot be isolated for a child Research Agent") from exc
     return isolated
 
 
@@ -676,21 +1003,9 @@ def _child_task(
     # made every homogeneous child assess itself against the entire root Brief,
     # so parallel forks repeated the whole research problem recursively.
     planning_keys = {"research_requirements", "directions", "research_gaps"}
-    child_context = {
-        key: value
-        for key, value in parent.context.items()
-        if key not in planning_keys
-    }
-    child_context.update(
-        {
-            key: value
-            for key, value in candidate.context.items()
-            if key not in planning_keys
-        }
-    )
-    requirements_by_id = {
-        item.requirement_id: item for item in parent_requirements
-    }
+    child_context = {key: value for key, value in parent.context.items() if key not in planning_keys}
+    child_context.update({key: value for key, value in candidate.context.items() if key not in planning_keys})
+    requirements_by_id = {item.requirement_id: item for item in parent_requirements}
     selected_requirements = [
         requirements_by_id[requirement_id]
         for requirement_id in candidate.requirement_ids
@@ -705,9 +1020,7 @@ def _child_task(
             }
             for item in selected_requirements
         ]
-        child_context["parent_requirement_ids"] = [
-            item.requirement_id for item in selected_requirements
-        ]
+        child_context["parent_requirement_ids"] = [item.requirement_id for item in selected_requirements]
     else:
         child_context["research_requirements"] = [
             {
@@ -780,41 +1093,23 @@ def create_research_agent_state(
         child_thread_ids=[],
         child_results=[],
         observed_evidence=[],
-        deadline_at=(
-            deadline_at
-            if deadline_at is not None
-            else time.time() + limits.max_elapsed_seconds
-        ),
+        deadline_at=(deadline_at if deadline_at is not None else time.time() + limits.max_elapsed_seconds),
         subtree_thread_budget=(
-            subtree_thread_budget
-            if subtree_thread_budget is not None
-            else limits.max_total_threads
+            subtree_thread_budget if subtree_thread_budget is not None else limits.max_total_threads
         ),
-        subtree_tool_budget=(
-            subtree_tool_budget
-            if subtree_tool_budget is not None
-            else limits.max_total_tool_calls
-        ),
-        subtree_token_budget=(
-            subtree_token_budget
-            if subtree_token_budget is not None
-            else limits.max_total_tokens
-        ),
-        subtree_retry_budget=(
-            subtree_retry_budget
-            if subtree_retry_budget is not None
-            else limits.max_total_retries
-        ),
+        subtree_tool_budget=(subtree_tool_budget if subtree_tool_budget is not None else limits.max_total_tool_calls),
+        subtree_token_budget=(subtree_token_budget if subtree_token_budget is not None else limits.max_total_tokens),
+        subtree_retry_budget=(subtree_retry_budget if subtree_retry_budget is not None else limits.max_total_retries),
         total_threads_used=1,
         total_tool_calls_used=0,
         estimated_tokens_used=0,
         retries_used=0,
+        source_candidate_count=0,
+        source_open_count=0,
+        duplicate_source_count=0,
+        acquisition_call_count=0,
         execution_events=[],
-        lineage_objectives=(
-            list(lineage_objectives)
-            if lineage_objectives is not None
-            else [task.objective]
-        ),
+        lineage_objectives=(list(lineage_objectives) if lineage_objectives is not None else [task.objective]),
         draft=None,
         draft_raw="",
         last_content="",
@@ -888,9 +1183,7 @@ def _fallback_assessment(
             termination_reason=TerminationReason.COVERAGE_COMPLETE,
             output_status=OutputStatus.FALLBACK,
         )
-    all_required_supported = bool(existing) and all(
-        item.status == RequirementStatus.SUPPORTED for item in existing
-    )
+    all_required_supported = bool(existing) and all(item.status == RequirementStatus.SUPPORTED for item in existing)
     if all_required_supported and (evidence or not state["task"].require_evidence):
         # A structure failure cannot erase coverage that was already validated in
         # an earlier checkpoint. It also cannot manufacture new support.
@@ -916,8 +1209,7 @@ def _fallback_assessment(
         gap
         for gap in state.get("critical_gaps", [])
         if any(
-            item.requirement_id == gap.requirement_id
-            and item.status != RequirementStatus.SUPPORTED
+            item.requirement_id == gap.requirement_id and item.status != RequirementStatus.SUPPORTED
             for item in existing
         )
     )
@@ -936,8 +1228,7 @@ def _fallback_assessment(
             state.get("next_actions", []),
             attempts,
         )
-        if action.requirement_id in gap_ids
-        and action.expected_value in {"high", "medium"}
+        if action.requirement_id in gap_ids and action.expected_value in {"high", "medium"}
     )
     if pending_actions:
         return ResearchAssessment(
@@ -956,6 +1247,60 @@ def _fallback_assessment(
     )
 
 
+def _runtime_exhaustion_assessment(
+    state: ResearchAgentState,
+    attempts: tuple[StrategyAttempt, ...],
+) -> ResearchAssessment | None:
+    """Stop after three distinct no-progress paths for every open requirement.
+
+    The model remains responsible for ordinary semantic sufficiency decisions.
+    This conservative runtime fuse only handles the repeated-failure case that
+    otherwise burns the whole token budget while cycling across tool families.
+    """
+    required_ids = {
+        requirement.requirement_id for requirement in state["research_requirements"] if requirement.required
+    }
+    open_coverage = tuple(
+        item
+        for item in state["coverage"]
+        if item.requirement_id in required_ids and item.status != RequirementStatus.SUPPORTED
+    )
+    if not open_coverage:
+        return None
+
+    families_by_requirement: dict[str, set[str]] = {}
+    for attempt in attempts:
+        if attempt.outcome != "no_progress":
+            continue
+        families_by_requirement.setdefault(attempt.requirement_id, set()).add(attempt.strategy.strip().lower())
+    if any(len(families_by_requirement.get(item.requirement_id, set())) < 3 for item in open_coverage):
+        return None
+
+    previous_gaps = {
+        gap.requirement_id: gap for gap in state.get("critical_gaps", []) if gap.requirement_id in required_ids
+    }
+    gaps = tuple(
+        previous_gaps.get(item.requirement_id)
+        or CriticalGap(
+            item.requirement_id,
+            item.remaining_gap or "Three distinct research strategy families produced no usable evidence.",
+            "high",
+        )
+        for item in open_coverage
+    )
+    return ResearchAssessment(
+        decision=ResearchDecision.STOP_RESEARCH,
+        coverage=tuple(state["coverage"]),
+        critical_gaps=gaps,
+        termination_reason=TerminationReason.EVIDENCE_EXHAUSTED,
+        exhaustion_reason=(
+            "Every open requirement has three distinct no-progress strategy families; "
+            "continuing would repeat exhausted evidence paths."
+        ),
+        output_status=OutputStatus.VALID,
+    )
+
+
 def build_research_agent_graph(
     policy: Any,
     tools: Iterable[Any] = (),
@@ -963,6 +1308,9 @@ def build_research_agent_graph(
     checkpointer: BaseCheckpointSaver | None = None,
     inherit_checkpointer: bool = False,
     child_checkpointer: BaseCheckpointSaver | None = None,
+    tool_artifact_store: Any | None = None,
+    state_schema: Any = ResearchAgentState,
+    allow_fork_tool: bool = True,
 ) -> Any:
     """Build the one graph shared by root, child, and grandchild Agents."""
     if inherit_checkpointer and checkpointer is not None:
@@ -970,15 +1318,9 @@ def build_research_agent_graph(
     tool_list = list(tools)
     tool_map = _build_tool_map(tool_list)
     effective_checkpointer = (
-        None
-        if inherit_checkpointer
-        else checkpointer if checkpointer is not None else InMemorySaver()
+        None if inherit_checkpointer else checkpointer if checkpointer is not None else InMemorySaver()
     )
-    descendant_checkpointer = (
-        child_checkpointer
-        if child_checkpointer is not None
-        else effective_checkpointer
-    )
+    descendant_checkpointer = child_checkpointer if child_checkpointer is not None else effective_checkpointer
 
     def prepare(
         state: ResearchAgentState,
@@ -987,15 +1329,10 @@ def build_research_agent_graph(
         _validate_invocation(state, config)
         with _node_trace("prepare", state) as observation:
             if state["messages"]:
-                requirements = tuple(
-                    state.get("research_requirements")
-                    or build_research_requirements(state["task"])
-                )
+                requirements = tuple(state.get("research_requirements") or build_research_requirements(state["task"]))
                 migration: dict[str, Any] = {
                     "research_requirements": list(requirements),
-                    "coverage": list(
-                        state.get("coverage") or initial_coverage(requirements)
-                    ),
+                    "coverage": list(state.get("coverage") or initial_coverage(requirements)),
                     "critical_gaps": list(state.get("critical_gaps", [])),
                     "next_actions": list(state.get("next_actions", [])),
                     "strategy_attempts": list(state.get("strategy_attempts", [])),
@@ -1004,19 +1341,17 @@ def build_research_agent_graph(
                         len(state.get("strategy_attempts", [])),
                     ),
                     "assessment_decision": state.get("assessment_decision"),
-                    "assessment_output_status": state.get(
-                        "assessment_output_status", OutputStatus.VALID
-                    ),
+                    "assessment_output_status": state.get("assessment_output_status", OutputStatus.VALID),
                     "assessment_error": state.get("assessment_error"),
                     "termination_reason": state.get("termination_reason"),
-                    "finalization_requested": bool(
-                        state.get("finalization_requested", False)
-                    ),
+                    "finalization_requested": bool(state.get("finalization_requested", False)),
                     "output_status": state.get("output_status", OutputStatus.VALID),
                     "draft_raw": state.get("draft_raw", ""),
-                    "last_assessed_evidence_count": int(
-                        state.get("last_assessed_evidence_count", 0)
-                    ),
+                    "last_assessed_evidence_count": int(state.get("last_assessed_evidence_count", 0)),
+                    "source_candidate_count": int(state.get("source_candidate_count", 0)),
+                    "source_open_count": int(state.get("source_open_count", 0)),
+                    "duplicate_source_count": int(state.get("duplicate_source_count", 0)),
+                    "acquisition_call_count": int(state.get("acquisition_call_count", 0)),
                 }
                 observation.add_output({"resumed": True, "state_migrated": True})
                 return migration
@@ -1055,11 +1390,7 @@ def build_research_agent_graph(
                 "stop_reason": "max_iterations_exhausted",
                 "termination_reason": TerminationReason.BUDGET_FORCED,
             }
-        available_seconds = (
-            _remaining_seconds(state)
-            if finalization_requested
-            else _remaining_research_seconds(state)
-        )
+        available_seconds = _remaining_seconds(state) if finalization_requested else _remaining_research_seconds(state)
         if available_seconds <= 0:
             update: dict[str, Any] = {
                 "pending_tool_calls": [],
@@ -1070,34 +1401,107 @@ def build_research_agent_graph(
             if finalization_requested:
                 update["finalization_requested"] = False
             return update
-        remaining_tokens = (
-            state["subtree_token_budget"] - state["estimated_tokens_used"]
+        remaining_tokens = state["subtree_token_budget"] - state["estimated_tokens_used"]
+        consumed_artifact_ids = {
+            artifact_id
+            for attempt in state.get("strategy_attempts", [])[: state.get("last_assessed_strategy_attempt_count", 0)]
+            for artifact_id in attempt.artifact_ids
+        }
+        working_messages = microcompact_control_messages(
+            snip_consumed_tool_artifacts(
+                state["messages"],
+                consumed_artifact_ids=consumed_artifact_ids,
+            )
         )
-        policy_messages = (
-            _bounded_finalization_messages(state)
-            if finalization_requested
-            else state["messages"]
+        working_messages = collapse_verified_working_context(
+            working_messages,
+            state_projection={
+                "coverage": [asdict(item) for item in state.get("coverage", [])],
+                "critical_gaps": [asdict(item) for item in state.get("critical_gaps", [])],
+                "next_actions": [asdict(item) for item in active_next_actions(state.get("next_actions", []))],
+                "evidence": [
+                    {
+                        "evidence_id": item.evidence_id,
+                        "requirement_id": item.requirement_id,
+                        "artifact_id": item.artifact_id,
+                        "finding": item.finding[:300],
+                        "source_ref": item.source_ref[:300],
+                    }
+                    for item in state.get("observed_evidence", [])[-12:]
+                ],
+                "strategy_attempts": list(aggregate_strategy_attempts(state.get("strategy_attempts", [])))[-12:],
+            },
         )
+        compaction_token_charge = 0
+        compaction_event: dict[str, Any] | None = None
+        if (
+            not finalization_requested
+            and sum(len(str(message.get("content") or "")) for message in working_messages) > 48000
+        ):
+            try:
+                compaction_messages = semantic_compaction_messages(
+                    working_messages,
+                    keep_recent=4,
+                )
+                compaction_response = await asyncio.wait_for(
+                    call_policy(policy, compaction_messages, []),
+                    timeout=max(0.001, available_seconds),
+                )
+                compaction_token_charge = _estimate_tokens(
+                    compaction_messages,
+                    compaction_response,
+                )
+                working_messages = apply_semantic_compaction(
+                    working_messages,
+                    str(compaction_response.get("content") or ""),
+                    keep_recent=4,
+                )
+                compaction_event = _event(
+                    "working_context_semantically_compacted",
+                    state["identity"],
+                    input_messages=len(compaction_messages),
+                )
+            except ContextCompactionError as exc:
+                compaction_event = _event(
+                    "working_context_semantic_compaction_skipped",
+                    state["identity"],
+                    error=str(exc),
+                )
+            except Exception as exc:
+                compaction_event = _event(
+                    "working_context_semantic_compaction_failed",
+                    state["identity"],
+                    error=str(exc),
+                )
+        remaining_tokens = max(0, remaining_tokens - compaction_token_charge)
+        available_seconds = _remaining_seconds(state) if finalization_requested else _remaining_research_seconds(state)
+        policy_messages = _bounded_finalization_messages(state) if finalization_requested else working_messages
         estimated_prompt_tokens = max(
             1,
-            sum(len(str(item.get("content") or "")) for item in policy_messages)
-            // 4,
+            sum(len(str(item.get("content") or "")) for item in policy_messages) // 4,
         )
         reserve = (
             0
             if finalization_requested
-            else estimated_prompt_tokens + _FINALIZATION_OUTPUT_TOKEN_RESERVE
+            else (
+                _finalization_token_reserve(state)
+                + estimated_prompt_tokens
+                + _ASSESSMENT_OUTPUT_TOKEN_RESERVE
+            )
         )
-        if (
-            remaining_tokens <= reserve
-            or estimated_prompt_tokens >= max(1, remaining_tokens - reserve)
-        ):
+        if remaining_tokens <= reserve or estimated_prompt_tokens >= max(1, remaining_tokens - reserve):
             update = {
                 "pending_tool_calls": [],
                 "pending_fork_calls": [],
                 "stop_reason": "token_budget_exhausted",
                 "termination_reason": TerminationReason.BUDGET_FORCED,
+                "estimated_tokens_used": (state["estimated_tokens_used"] + compaction_token_charge),
             }
+            if compaction_event is not None:
+                update["execution_events"] = [
+                    *state["execution_events"],
+                    compaction_event,
+                ]
             if finalization_requested:
                 update["finalization_requested"] = False
             return update
@@ -1105,7 +1509,14 @@ def build_research_agent_graph(
         with _node_trace("think_and_plan", state) as observation:
             # Tool availability can be bound per async research run, so resolve
             # schemas here instead of freezing a deny-all scope at graph compile.
-            schemas = [] if finalization_requested else [*_tool_schemas(tool_list), fork_tool_schema()]
+            schemas = (
+                []
+                if finalization_requested
+                else [
+                    *_tool_schemas(tool_list),
+                    *([fork_tool_schema()] if allow_fork_tool else []),
+                ]
+            )
             action_retries = 0
             while True:
                 try:
@@ -1167,14 +1578,19 @@ def build_research_agent_graph(
                 assistant_message["reasoning_content"] = response["reasoning_content"]
 
             update: dict[str, Any] = {
-                "messages": [*state["messages"], assistant_message],
+                "messages": [*working_messages, assistant_message],
                 "iteration": state["iteration"] + 1,
                 "last_content": content,
                 "pending_stop_reason": None,
                 "finalization_requested": False,
-                "estimated_tokens_used": state["estimated_tokens_used"] + token_charge,
+                "estimated_tokens_used": (state["estimated_tokens_used"] + compaction_token_charge + token_charge),
                 "retries_used": state["retries_used"] + action_retries,
             }
+            if compaction_event is not None:
+                update["execution_events"] = [
+                    *state["execution_events"],
+                    compaction_event,
+                ]
             if token_exhausted:
                 update["pending_tool_calls"] = []
                 update["pending_fork_calls"] = []
@@ -1199,19 +1615,21 @@ def build_research_agent_graph(
                 observation.add_output({"action": "assess_candidate"})
                 return update
 
-            fork_calls = [
-                call
-                for call in calls
-                if call["function"].get("name") == FORK_TOOL_NAME
-            ]
+            fork_calls = (
+                [
+                    call
+                    for call in calls
+                    if call["function"].get("name") == FORK_TOOL_NAME
+                ]
+                if allow_fork_tool
+                else []
+            )
             if fork_calls:
                 assistant_message["tool_calls"] = fork_calls
-                update["messages"] = [*state["messages"], assistant_message]
+                update["messages"] = [*working_messages, assistant_message]
                 update["pending_tool_calls"] = []
                 update["pending_fork_calls"] = fork_calls
-                observation.add_output(
-                    {"action": "fork_children", "fork_calls": len(fork_calls)}
-                )
+                observation.add_output({"action": "fork_children", "fork_calls": len(fork_calls)})
                 return update
 
             update["pending_fork_calls"] = []
@@ -1230,9 +1648,7 @@ def build_research_agent_graph(
                 update["pending_stop_reason"] = "max_tool_calls_exhausted"
             else:
                 update["pending_tool_calls"] = calls
-            observation.add_output(
-                {"action": "use_tool", "tool_calls": len(update["pending_tool_calls"])}
-            )
+            observation.add_output({"action": "use_tool", "tool_calls": len(update["pending_tool_calls"])})
             return update
 
     async def assess_research_state(
@@ -1244,9 +1660,7 @@ def build_research_agent_graph(
         evidence = _deduplicate_evidence(state["observed_evidence"])
         evidence_count = len(evidence)
         previous_count = int(state.get("last_assessed_evidence_count", 0))
-        new_evidence_ids = tuple(
-            item.evidence_id for item in evidence[previous_count:]
-        )
+        new_evidence_ids = tuple(item.evidence_id for item in evidence[previous_count:])
         attempts = tuple(state.get("strategy_attempts", []))
         hard_reason = hard_termination_reason(state.get("stop_reason"))
         forced_stop_reason: str | None = None
@@ -1259,7 +1673,8 @@ def build_research_agent_graph(
         recent_tool_failures = tuple(
             str(event.get("error") or event.get("tool") or "tool failure")
             for event in state["execution_events"][-12:]
-            if event.get("kind") == "tool_finished" and not event.get("ok", False)
+            if (event.get("kind") == "tool_finished" and not event.get("ok", False))
+            or event.get("kind") == "tool_rejected_unbound"
         )
         recent_tool_outcomes = tuple(
             {
@@ -1278,6 +1693,8 @@ def build_research_agent_graph(
                 hard_reason=hard_reason,
                 has_research_tools=bool(tool_list),
             )
+        elif runtime_exhaustion := _runtime_exhaustion_assessment(state, attempts):
+            assessment = runtime_exhaustion
         else:
             prompt = assessment_schema_prompt(
                 task=state["task"],
@@ -1286,10 +1703,11 @@ def build_research_agent_graph(
                 evidence=evidence,
                 critical_gaps=tuple(state["critical_gaps"]),
                 attempts=attempts,
-                child_results=tuple(state["child_results"]),
+                child_results=tuple(state.get("child_results", [])),
                 candidate_final=state.get("draft_raw", ""),
                 recent_tool_failures=recent_tool_failures,
                 recent_tool_outcomes=recent_tool_outcomes,
+                focus_evidence_ids=new_evidence_ids,
             )
             assessment_messages = [
                 {
@@ -1301,28 +1719,13 @@ def build_research_agent_graph(
                 },
                 {"role": "user", "content": prompt},
             ]
-            remaining_tokens = (
-                state["subtree_token_budget"] - state["estimated_tokens_used"]
-            )
+            remaining_tokens = state["subtree_token_budget"] - state["estimated_tokens_used"]
             assessment_input_tokens = max(
                 1,
-                sum(len(str(item.get("content") or "")) for item in assessment_messages)
-                // 4,
+                sum(len(str(item.get("content") or "")) for item in assessment_messages) // 4,
             )
-            finalization_reserve = max(
-                _FINALIZATION_OUTPUT_TOKEN_RESERVE,
-                sum(
-                    len(str(item.get("content") or ""))
-                    for item in state["messages"]
-                )
-                // 4
-                + _FINALIZATION_OUTPUT_TOKEN_RESERVE,
-            )
-            if remaining_tokens <= (
-                assessment_input_tokens
-                + _ASSESSMENT_OUTPUT_TOKEN_RESERVE
-                + finalization_reserve
-            ):
+            finalization_reserve = _finalization_token_reserve(state)
+            if remaining_tokens <= (assessment_input_tokens + _ASSESSMENT_OUTPUT_TOKEN_RESERVE + finalization_reserve):
                 forced_stop_reason = "token_budget_exhausted"
                 hard_reason = TerminationReason.BUDGET_FORCED
                 assessment = _fallback_assessment(
@@ -1357,7 +1760,13 @@ def build_research_agent_graph(
                             {"role": "assistant", "content": raw_assessment},
                             {
                                 "role": "user",
-                                "content": repair_assessment_prompt(raw_assessment, str(exc)),
+                                "content": repair_assessment_prompt(
+                                    raw_assessment,
+                                    str(exc),
+                                    evidence_bindings={
+                                        item.evidence_id: item.requirement_id for item in evidence
+                                    },
+                                ),
                             },
                         ]
                         repaired = await asyncio.wait_for(
@@ -1391,10 +1800,7 @@ def build_research_agent_graph(
         scheduled_actions = merge_next_action_queue(
             state.get("next_actions", []),
             assessment,
-            active_consumed=(
-                len(attempts)
-                > state.get("last_assessed_strategy_attempt_count", 0)
-            ),
+            active_consumed=(len(attempts) > state.get("last_assessed_strategy_attempt_count", 0)),
         )
         messages = list(state["messages"])
         draft = state.get("draft")
@@ -1438,23 +1844,21 @@ def build_research_agent_graph(
                 state["estimated_tokens_used"] + token_charge,
             ),
             "execution_events": [
-            *state["execution_events"],
-            _event(
-                "research_state_assessed",
-                state["identity"],
-                decision=assessment.decision.value,
-                termination_reason=(
-                    assessment.termination_reason.value
-                    if assessment.termination_reason is not None
-                    else None
+                *state["execution_events"],
+                _event(
+                    "research_state_assessed",
+                    state["identity"],
+                    decision=assessment.decision.value,
+                    termination_reason=(
+                        assessment.termination_reason.value if assessment.termination_reason is not None else None
+                    ),
+                    evidence_count=evidence_count,
+                    new_evidence_count=len(new_evidence_ids),
+                    critical_gap_count=len(assessment.critical_gaps),
+                    next_action_count=len(scheduled_actions),
+                    assessment_output_status=assessment.output_status.value,
+                    assessment_error=assessment_error,
                 ),
-                evidence_count=evidence_count,
-                new_evidence_count=len(new_evidence_ids),
-                critical_gap_count=len(assessment.critical_gaps),
-                next_action_count=len(scheduled_actions),
-                assessment_output_status=assessment.output_status.value,
-                assessment_error=assessment_error,
-            ),
             ],
         }
         if forced_stop_reason is not None:
@@ -1469,15 +1873,17 @@ def build_research_agent_graph(
         local_tool_calls = state["tool_calls_used"]
         total_tool_calls = state["total_tool_calls_used"]
         retries_used = state["retries_used"]
+        source_candidate_count = int(state.get("source_candidate_count", 0))
+        source_open_count = int(state.get("source_open_count", 0))
+        duplicate_source_count = int(state.get("duplicate_source_count", 0))
+        acquisition_call_count = int(state.get("acquisition_call_count", 0))
         strategy_attempts = list(state.get("strategy_attempts", []))
         events = list(state["execution_events"])
         stop_reason = state["pending_stop_reason"]
 
         notepad = tool_map.get("notepad")
         notepad_scope = (
-            notepad.bind_snapshot(state.get("notepad_entries", []))
-            if isinstance(notepad, NotepadTool)
-            else None
+            notepad.bind_snapshot(state.get("notepad_entries", [])) if isinstance(notepad, NotepadTool) else None
         )
 
         def _checkpointed_notepad() -> list[dict[str, Any]]:
@@ -1509,11 +1915,127 @@ def build_research_agent_graph(
                     arguments = {}
 
                 tool = tool_map.get(tool_name)
+                scheduled_actions = active_next_actions(state.get("next_actions", []))
+                if not scheduled_actions and state.get("assessment_decision") is None and tool_name != "notepad":
+                    argument_query = str(arguments.get("query") or "").strip()
+                    if not argument_query:
+                        argument_query = " ".join(
+                            str(value).strip()
+                            for value in arguments.values()
+                            if isinstance(value, (str, int, float)) and str(value).strip()
+                        )
+                    bootstrap_requirements = tuple(
+                        requirement for requirement in state["research_requirements"] if requirement.required
+                    )
+                    if not argument_query and bootstrap_requirements and _tool_accepts_empty_arguments(tool):
+                        argument_query = bootstrap_requirements[0].description
+                    if argument_query and bootstrap_requirements:
+                        scheduled_actions = (
+                            _identified_action(
+                                NextResearchAction(
+                                    bootstrap_requirements[0].requirement_id,
+                                    "other",
+                                    argument_query,
+                                    "high",
+                                    "Establish initial source-locatable evidence.",
+                                )
+                            ),
+                        )
                 matched_action = _action_for_tool_call(
                     tool_name,
                     arguments,
-                    active_next_actions(state.get("next_actions", [])),
+                    scheduled_actions,
                 )
+                if (
+                    matched_action is not None
+                    and getattr(tool, "accepts_relevance_query", False)
+                    and not str(arguments.get("query") or "").strip()
+                ):
+                    # Browser can rank late sections only when it receives the
+                    # action-bound Core Question. Third-party tools are left
+                    # untouched unless they explicitly advertise support.
+                    arguments = {**arguments, "query": matched_action.query}
+                if tool_name != "notepad" and matched_action is None:
+                    error = (
+                        "research tool call rejected because it is not bound to the "
+                        "single active requirement/action/strategy"
+                    )
+                    events.append(
+                        _event(
+                            "tool_rejected_unbound",
+                            state["identity"],
+                            tool=tool_name,
+                            error=error,
+                        )
+                    )
+                    new_messages.append(
+                        {
+                            "role": "tool",
+                            "tool_call_id": call["id"],
+                            "name": tool_name,
+                            "content": _serialize_tool_result(
+                                {"error": error},
+                                state["limits"].max_tool_output_chars,
+                            ),
+                        }
+                    )
+                    continue
+                open_circuit = next(
+                    (
+                        event
+                        for event in reversed(events)
+                        if event.get("kind") == "tool_unavailable"
+                        and event.get("tool") == tool_name
+                        and event.get("circuit_open") is True
+                    ),
+                    None,
+                )
+                if open_circuit is not None:
+                    error = (
+                        f"tool unavailable circuit is open: "
+                        f"{open_circuit.get('message') or tool_name}"
+                    )
+                    if matched_action is not None:
+                        strategy_attempts.append(
+                            StrategyAttempt(
+                                requirement_id=matched_action.requirement_id,
+                                strategy=matched_action.strategy,
+                                query=str(arguments.get("query") or matched_action.query),
+                                outcome="no_progress",
+                                action_id=_action_id(matched_action),
+                            )
+                        )
+                    events.append(
+                        _event(
+                            "tool_call_skipped_unavailable",
+                            state["identity"],
+                            tool=tool_name,
+                            alert_id=open_circuit.get("alert_id"),
+                            error=error,
+                            requirement_id=(
+                                matched_action.requirement_id
+                                if matched_action is not None
+                                else None
+                            ),
+                        )
+                    )
+                    new_messages.append(
+                        {
+                            "role": "tool",
+                            "tool_call_id": call["id"],
+                            "name": tool_name,
+                            "content": _serialize_tool_result(
+                                {
+                                    "error": error,
+                                    "availability_alert_id": open_circuit.get(
+                                        "alert_id"
+                                    ),
+                                },
+                                state["limits"].max_tool_output_chars,
+                            ),
+                        }
+                    )
+                    continue
                 result: Any
                 error: str | None = None
                 action_retries = 0
@@ -1548,7 +2070,9 @@ def build_research_agent_graph(
                                     )
                                 else:
                                     result = execution
-                                error = None
+                                error = _semantic_tool_error(tool_name, result)
+                                if error is not None:
+                                    permanent_error = True
                             except asyncio.CancelledError:
                                 raise
                             except asyncio.TimeoutError:
@@ -1563,6 +2087,19 @@ def build_research_agent_graph(
                                 error = str(exc)
                                 result = {"error": error}
 
+                        immediate_alert = classify_tool_availability(
+                            tool_name,
+                            error,
+                            arguments,
+                        )
+                        if (
+                            immediate_alert is not None
+                            and immediate_alert.category != "service_degraded"
+                        ):
+                            # Quota, auth, adapter, blocked-source, and TLS failures
+                            # will not improve by immediately repeating the same call.
+                            permanent_error = True
+
                         retry_available = min(
                             state["limits"].max_retries_per_action - action_retries,
                             state["subtree_retry_budget"] - retries_used,
@@ -1571,11 +2108,7 @@ def build_research_agent_graph(
                             state["limits"].max_tool_calls - local_tool_calls,
                             state["subtree_tool_budget"] - total_tool_calls,
                         )
-                        if (
-                            error is None
-                            or permanent_error
-                            or stop_reason == "time_budget_exhausted"
-                        ):
+                        if error is None or permanent_error or stop_reason == "time_budget_exhausted":
                             break
                         if retry_available <= 0 or call_available <= 0:
                             break
@@ -1587,15 +2120,59 @@ def build_research_agent_graph(
                     else:
                         observation.add_output({"ok": True, "retries": action_retries})
 
-                extracted: list[EvidenceItem] = []
-                if error is None:
-                    extracted = _extract_evidence(tool_name, arguments, result)
-                    known_ids = {item.evidence_id for item in collected}
-                    new_ids = tuple(
-                        item.evidence_id
-                        for item in extracted
-                        if item.evidence_id not in known_ids
+                availability_alert = classify_tool_availability(
+                    tool_name,
+                    error,
+                    arguments,
+                )
+                fallback_alerts = (
+                    classify_fallback_backend_alerts(
+                        tool_name,
+                        result,
+                        arguments,
                     )
+                    if error is None
+                    else ()
+                )
+                if availability_alert is not None and isinstance(result, dict):
+                    result = {
+                        **result,
+                        "availability_alert": asdict(availability_alert),
+                    }
+                if fallback_alerts and isinstance(result, dict):
+                    result = {
+                        **result,
+                        "availability_alerts": [
+                            asdict(alert) for alert in fallback_alerts
+                        ],
+                    }
+                artifact_id = _tool_artifact_id(tool_name, arguments, result)
+                if tool_name == "acquire_evidence" and isinstance(result, dict):
+                    acquisition_metrics = result.get("metrics", {})
+                    if isinstance(acquisition_metrics, dict):
+                        source_candidate_count += max(
+                            0, int(acquisition_metrics.get("candidate_count", 0))
+                        )
+                        source_open_count += max(
+                            0, int(acquisition_metrics.get("opened_count", 0))
+                        )
+                        duplicate_source_count += max(
+                            0,
+                            int(acquisition_metrics.get("duplicate_candidate_count", 0))
+                            + int(acquisition_metrics.get("cache_hit_count", 0)),
+                        )
+                    acquisition_call_count += 1
+                extracted: list[EvidenceItem] = []
+                if error is None and matched_action is not None:
+                    extracted = _extract_evidence(
+                        tool_name,
+                        arguments,
+                        result,
+                        action=matched_action,
+                        artifact_id=artifact_id,
+                    )
+                    known_ids = {item.evidence_id for item in collected}
+                    new_ids = tuple(item.evidence_id for item in extracted if item.evidence_id not in known_ids)
                     collected.extend(extracted)
                 else:
                     new_ids = ()
@@ -1607,6 +2184,8 @@ def build_research_agent_graph(
                             query=str(arguments.get("query") or matched_action.query),
                             outcome="evidence_found" if new_ids else "no_progress",
                             evidence_ids=new_ids,
+                            action_id=_action_id(matched_action),
+                            artifact_ids=(artifact_id,),
                         )
                     )
                 events.append(
@@ -1617,17 +2196,111 @@ def build_research_agent_graph(
                         ok=error is None,
                         retries=action_retries,
                         error=error,
+                        artifact_id=artifact_id,
+                        requirement_id=(matched_action.requirement_id if matched_action is not None else None),
+                        action_id=(_action_id(matched_action) if matched_action is not None else None),
+                        strategy=(matched_action.strategy if matched_action is not None else None),
                     )
                 )
+                if availability_alert is not None and not any(
+                    event.get("kind") == "tool_unavailable"
+                    and event.get("alert_id") == availability_alert.alert_id
+                    for event in events
+                ):
+                    events.append(
+                        _event(
+                            "tool_unavailable",
+                            state["identity"],
+                            **asdict(availability_alert),
+                        )
+                    )
+                for fallback_alert in fallback_alerts:
+                    if any(
+                        event.get("kind") == "tool_unavailable"
+                        and event.get("alert_id") == fallback_alert.alert_id
+                        for event in events
+                    ):
+                        continue
+                    events.append(
+                        _event(
+                            "tool_unavailable",
+                            state["identity"],
+                            **asdict(fallback_alert),
+                        )
+                    )
+                full_tool_result = json.dumps(
+                    result,
+                    ensure_ascii=False,
+                    default=str,
+                )
+                tool_message_content: str
+                if tool_artifact_store is not None and tool_name != "notepad":
+                    try:
+                        receipt = await asyncio.to_thread(
+                            tool_artifact_store.persist_tool_artifact,
+                            artifact_id,
+                            tool_name=tool_name,
+                            arguments=arguments,
+                            result=result,
+                            origin_thread_id=state["identity"].thread_id,
+                        )
+                        required_receipt = (
+                            receipt.get("artifact_id") == artifact_id
+                            and isinstance(receipt.get("artifact_path"), str)
+                            and isinstance(receipt.get("content_hash"), str)
+                            and len(str(receipt.get("content_hash"))) == 64
+                            and isinstance(receipt.get("size_bytes"), int)
+                        )
+                        if not required_receipt:
+                            raise RuntimeError("invalid tool artifact receipt")
+                        preview_limit = (
+                            1200 if len(full_tool_result) > _TOOL_ARTIFACT_OFFLOAD_CHARS else len(full_tool_result)
+                        )
+                        tool_message_content = json.dumps(
+                            {
+                                "status": "offloaded",
+                                "artifact_id": artifact_id,
+                                "artifact_path": receipt["artifact_path"],
+                                "content_hash": receipt["content_hash"],
+                                "size_bytes": receipt["size_bytes"],
+                                "evidence_ids": list(new_ids),
+                                "preview": full_tool_result[:preview_limit],
+                            },
+                            ensure_ascii=False,
+                        )
+                        events.append(
+                            _event(
+                                "tool_artifact_offloaded",
+                                state["identity"],
+                                artifact_id=artifact_id,
+                                artifact_path=receipt["artifact_path"],
+                                content_hash=receipt["content_hash"],
+                                size_bytes=receipt["size_bytes"],
+                            )
+                        )
+                    except Exception as exc:
+                        # Losslessness wins over context size: if durable storage
+                        # cannot be proven, keep the complete original payload.
+                        tool_message_content = full_tool_result
+                        events.append(
+                            _event(
+                                "tool_artifact_offload_failed",
+                                state["identity"],
+                                artifact_id=artifact_id,
+                                error=str(exc),
+                            )
+                        )
+                else:
+                    tool_message_content = _serialize_tool_result(
+                        result,
+                        state["limits"].max_tool_output_chars,
+                    )
                 new_messages.append(
                     {
                         "role": "tool",
                         "tool_call_id": call["id"],
                         "name": tool_name,
-                        "content": _serialize_tool_result(
-                            result,
-                            state["limits"].max_tool_output_chars,
-                        ),
+                        "content": tool_message_content,
                     }
                 )
                 if stop_reason == "time_budget_exhausted":
@@ -1637,12 +2310,30 @@ def build_research_agent_graph(
             if notepad_scope is not None:
                 notepad_scope.__exit__(None, None, None)
 
+        research_tool_names = set(tool_map) - {"notepad"}
+        circuit_tools = {
+            str(event.get("tool") or "")
+            for event in events
+            if event.get("kind") == "tool_unavailable"
+            and event.get("circuit_open") is True
+        }
+        if (
+            stop_reason is None
+            and research_tool_names
+            and research_tool_names.issubset(circuit_tools)
+        ):
+            stop_reason = "tool_services_unavailable"
+
         return {
             "messages": [*state["messages"], *new_messages],
             "notepad_entries": notepad_entries,
             "tool_calls_used": local_tool_calls,
             "total_tool_calls_used": total_tool_calls,
             "retries_used": retries_used,
+            "source_candidate_count": source_candidate_count,
+            "source_open_count": source_open_count,
+            "duplicate_source_count": duplicate_source_count,
+            "acquisition_call_count": acquisition_call_count,
             "execution_events": events,
             "pending_tool_calls": [],
             "observed_evidence": _deduplicate_evidence(collected),
@@ -1689,6 +2380,7 @@ def build_research_agent_graph(
                 identity=child_identity,
                 limits=state["limits"],
                 checkpointer=descendant_checkpointer,
+                tool_artifact_store=tool_artifact_store,
                 deadline_at=state["deadline_at"],
                 subtree_thread_budget=thread_budget,
                 subtree_tool_budget=tool_budget,
@@ -1729,9 +2421,7 @@ def build_research_agent_graph(
         _validate_invocation(state, config)
         candidates: list[ForkCandidate] = []
         for call in state["pending_fork_calls"]:
-            candidates.extend(
-                parse_fork_candidates(call["function"].get("arguments", "{}"))
-            )
+            candidates.extend(parse_fork_candidates(call["function"].get("arguments", "{}")))
 
         remaining_thread_slots = max(
             0,
@@ -1740,8 +2430,7 @@ def build_research_agent_graph(
         remaining_children = max(
             0,
             min(
-                state["limits"].max_children
-                - len(set(state["completed_fork_fingerprints"])),
+                state["limits"].max_children - len(set(state["completed_fork_fingerprints"])),
                 remaining_thread_slots,
             ),
         )
@@ -1751,19 +2440,14 @@ def build_research_agent_graph(
             identity=state["identity"],
             max_fork_depth=state["limits"].max_fork_depth,
             max_children=remaining_children,
-            parent_requirement_ids=(
-                item.requirement_id for item in state["research_requirements"]
-            ),
+            parent_requirement_ids=(item.requirement_id for item in state["research_requirements"]),
             completed_fingerprints=state["completed_fork_fingerprints"],
             ancestor_objectives=state["lineage_objectives"],
         )
         if not candidates:
             rejected.append("fork request contained no valid candidates")
         if _remaining_seconds(state) <= 0:
-            rejected.extend(
-                f"{candidate.objective}: time budget exhausted"
-                for candidate in accepted
-            )
+            rejected.extend(f"{candidate.objective}: time budget exhausted" for candidate in accepted)
             accepted = []
 
         thread_budgets = _split_budget(
@@ -1795,8 +2479,7 @@ def build_research_agent_graph(
                         token_budget=token_budget,
                         retry_budget=retry_budget,
                     )
-                    for candidate, thread_budget, tool_budget, token_budget, retry_budget
-                    in zip(
+                    for candidate, thread_budget, tool_budget, token_budget, retry_budget in zip(
                         accepted,
                         thread_budgets,
                         tool_budgets,
@@ -1845,10 +2528,7 @@ def build_research_agent_graph(
                 {
                     "accepted": len(new_results),
                     "rejected": len(rejected),
-                    "successful": sum(
-                        result.status == ResearchStatus.COMPLETED
-                        for result in new_results
-                    ),
+                    "successful": sum(result.status == ResearchStatus.COMPLETED for result in new_results),
                 }
             )
 
@@ -1862,9 +2542,7 @@ def build_research_agent_graph(
             "child_thread_ids": [*state["child_thread_ids"], *child_thread_ids],
             "child_results": all_results,
             "observed_evidence": evidence,
-            "coverage": list(
-                merge_child_coverage_evidence(state["coverage"], new_results)
-            ),
+            "coverage": list(merge_child_coverage_evidence(state["coverage"], new_results)),
             "strategy_attempts": [
                 *state.get("strategy_attempts", []),
                 *(
@@ -1874,27 +2552,21 @@ def build_research_agent_graph(
                         query=attempt.query,
                         outcome=attempt.outcome,
                         evidence_ids=attempt.evidence_ids,
+                        action_id=attempt.action_id,
+                        artifact_ids=attempt.artifact_ids,
                     )
                     for result in new_results
                     for attempt in result.strategy_attempts
                 ),
             ],
-            "total_threads_used": (
-                state["total_threads_used"]
-                + sum(result.thread_count for result in new_results)
-            ),
+            "total_threads_used": (state["total_threads_used"] + sum(result.thread_count for result in new_results)),
             "total_tool_calls_used": (
-                state["total_tool_calls_used"]
-                + sum(result.tool_calls_used for result in new_results)
+                state["total_tool_calls_used"] + sum(result.tool_calls_used for result in new_results)
             ),
             "estimated_tokens_used": (
-                state["estimated_tokens_used"]
-                + sum(result.estimated_tokens_used for result in new_results)
+                state["estimated_tokens_used"] + sum(result.estimated_tokens_used for result in new_results)
             ),
-            "retries_used": (
-                state["retries_used"]
-                + sum(result.retries_used for result in new_results)
-            ),
+            "retries_used": (state["retries_used"] + sum(result.retries_used for result in new_results)),
             "execution_events": [
                 *state["execution_events"],
                 *child_events,
@@ -1925,9 +2597,7 @@ def build_research_agent_graph(
                 draft = _parse_final_draft(raw)
             except AssessmentValidationError as exc:
                 error = str(exc)
-                if raw.strip() and _remaining_seconds(state) > 0 and (
-                    state["subtree_token_budget"] - state["estimated_tokens_used"] > 0
-                ):
+                if raw.strip():
                     repair_messages = [
                         {
                             "role": "system",
@@ -1938,6 +2608,25 @@ def build_research_agent_graph(
                         },
                         {"role": "user", "content": repair_final_prompt(raw, error)},
                     ]
+                else:
+                    repair_messages = [
+                        *_bounded_finalization_messages(state),
+                        {
+                            "role": "user",
+                            "content": (
+                                "FINAL_OUTPUT_RETRY\nThe prior final response contained no "
+                                "answer text. Answer now without analysis or tool calls. Return "
+                                "exactly one JSON object with status, summary, findings, and "
+                                "unresolved."
+                            ),
+                        },
+                    ]
+                remaining_tokens = state["subtree_token_budget"] - state["estimated_tokens_used"]
+                repair_input_tokens = max(
+                    1,
+                    sum(len(str(item.get("content") or "")) for item in repair_messages) // 4,
+                )
+                if _remaining_seconds(state) > 0 and remaining_tokens > repair_input_tokens:
                     try:
                         response = await asyncio.wait_for(
                             call_policy(policy, repair_messages, []),
@@ -1955,13 +2644,9 @@ def build_research_agent_graph(
                 plain = raw.strip()
                 draft = {
                     "status": "partial" if plain or evidence else "failed",
-                    "summary": plain or (
-                        "Research stopped before a structured synthesis was available."
-                    ),
+                    "summary": plain or ("Research stopped before a structured synthesis was available."),
                     "findings": [item.finding for item in evidence[:12]],
-                    "unresolved": [
-                        "Final output used a deterministic fallback after one structure repair."
-                    ],
+                    "unresolved": ["Final output used a deterministic fallback after one structure repair."],
                 }
                 output_status = OutputStatus.FALLBACK
 
@@ -2002,17 +2687,30 @@ def build_research_agent_graph(
             unresolved = _coerce_strings(draft.get("unresolved"))
             evidence = _deduplicate_evidence(state["observed_evidence"])
             stop_reason = state["stop_reason"]
+            child_results = tuple(state.get("child_results", []))
             incomplete_children = [
-                child
-                for child in state["child_results"]
-                if child.status != ResearchStatus.COMPLETED
+                child for child in child_results if child.status != ResearchStatus.COMPLETED
             ]
-            for child in state["child_results"]:
+            for child in child_results:
                 if child.status != ResearchStatus.COMPLETED:
-                    unresolved.append(
-                        f"Child task {child.task_id} returned {child.status.value}."
-                    )
+                    unresolved.append(f"Child task {child.task_id} returned {child.status.value}.")
                 unresolved.extend(child.unresolved)
+
+            alerts_by_id = {}
+            for event in state["execution_events"]:
+                if event.get("kind") != "tool_unavailable":
+                    continue
+                alert = availability_alert_from_event(event)
+                if alert.alert_id:
+                    alerts_by_id[alert.alert_id] = alert
+            for child in child_results:
+                for alert in child.tool_alerts:
+                    alerts_by_id[alert.alert_id] = alert
+            tool_alerts = tuple(alerts_by_id.values())
+            for alert in tool_alerts:
+                unresolved.append(
+                    f"External information alert: {alert.message} {alert.action_required}"
+                )
 
             requested_status = str(draft.get("status") or "completed").lower()
             termination_reason = state.get("termination_reason")
@@ -2061,8 +2759,9 @@ def build_research_agent_graph(
                 findings=tuple(findings),
                 evidence=tuple(evidence),
                 unresolved=tuple(dict.fromkeys(unresolved)),
+                tool_alerts=tool_alerts,
                 child_result_refs=tuple(
-                    child.task_id for child in state["child_results"]
+                    child.task_id for child in state.get("child_results", [])
                 ),
                 stop_reason=stop_reason,
                 termination_reason=termination_reason,
@@ -2076,6 +2775,10 @@ def build_research_agent_graph(
                 thread_count=state["total_threads_used"],
                 estimated_tokens_used=state["estimated_tokens_used"],
                 retries_used=state["retries_used"],
+                source_candidate_count=int(state.get("source_candidate_count", 0)),
+                source_open_count=int(state.get("source_open_count", 0)),
+                duplicate_source_count=int(state.get("duplicate_source_count", 0)),
+                acquisition_call_count=int(state.get("acquisition_call_count", 0)),
             )
             observation.add_output(
                 {
@@ -2093,9 +2796,7 @@ def build_research_agent_graph(
                         state["identity"],
                         status=result.status.value,
                         termination_reason=(
-                            result.termination_reason.value
-                            if result.termination_reason is not None
-                            else None
+                            result.termination_reason.value if result.termination_reason is not None else None
                         ),
                         output_status=result.output_status.value,
                     ),
@@ -2103,13 +2804,12 @@ def build_research_agent_graph(
             }
 
     def route_after_think(state: ResearchAgentState) -> str:
-        if state["pending_fork_calls"]:
+        if allow_fork_tool and state.get("pending_fork_calls", []):
             return "fork_children"
         if state["pending_tool_calls"]:
             return "use_tools"
-        if (
-            state.get("assessment_decision") == ResearchDecision.STOP_RESEARCH
-            and not state.get("finalization_requested")
+        if state.get("assessment_decision") == ResearchDecision.STOP_RESEARCH and not state.get(
+            "finalization_requested"
         ):
             return "finalize_output"
         return "assess_research_state"
@@ -2124,28 +2824,32 @@ def build_research_agent_graph(
             return "think_and_plan"
         return "finalize_output"
 
-    builder = StateGraph(ResearchAgentState)
+    builder = StateGraph(state_schema)
     builder.add_node("prepare", prepare)
     builder.add_node("think_and_plan", think_and_plan)
     builder.add_node("use_tools", use_tools)
-    builder.add_node("fork_children", fork_children)
+    if allow_fork_tool:
+        builder.add_node("fork_children", fork_children)
     builder.add_node("assess_research_state", assess_research_state)
     builder.add_node("finalize_output", finalize_output)
     builder.add_node("synthesize", synthesize)
     builder.add_edge(START, "prepare")
     builder.add_edge("prepare", "think_and_plan")
+    think_routes = {
+        "use_tools": "use_tools",
+        "assess_research_state": "assess_research_state",
+        "finalize_output": "finalize_output",
+    }
+    if allow_fork_tool:
+        think_routes["fork_children"] = "fork_children"
     builder.add_conditional_edges(
         "think_and_plan",
         route_after_think,
-        {
-            "fork_children": "fork_children",
-            "use_tools": "use_tools",
-            "assess_research_state": "assess_research_state",
-            "finalize_output": "finalize_output",
-        },
+        think_routes,
     )
     builder.add_edge("use_tools", "assess_research_state")
-    builder.add_edge("fork_children", "assess_research_state")
+    if allow_fork_tool:
+        builder.add_edge("fork_children", "assess_research_state")
     builder.add_conditional_edges(
         "assess_research_state",
         route_after_assessment,
@@ -2173,6 +2877,7 @@ async def _run_research_agent_state(
     subtree_token_budget: int | None = None,
     subtree_retry_budget: int | None = None,
     lineage_objectives: list[str] | None = None,
+    tool_artifact_store: Any | None = None,
 ) -> ResearchAgentState:
     """Start or resume one deterministic Agent thread and return its final state."""
     effective_limits = limits or AgentLimits()
@@ -2181,6 +2886,7 @@ async def _run_research_agent_state(
         tools,
         checkpointer=checkpointer,
         child_checkpointer=checkpointer,
+        tool_artifact_store=tool_artifact_store,
     )
     config = {"configurable": {"thread_id": identity.thread_id}}
     snapshot = await graph.aget_state(config)
@@ -2219,6 +2925,7 @@ async def run_research_agent(
     identity: ExecutionIdentity,
     limits: AgentLimits | None = None,
     checkpointer: BaseCheckpointSaver | None = None,
+    tool_artifact_store: Any | None = None,
 ) -> ResearchResult:
     """Run one scoped task through the shared homogeneous AgentGraph."""
     final_state = await _run_research_agent_state(
@@ -2228,6 +2935,7 @@ async def run_research_agent(
         identity=identity,
         limits=limits,
         checkpointer=checkpointer,
+        tool_artifact_store=tool_artifact_store,
     )
     result = final_state.get("result")
     if not isinstance(result, ResearchResult):

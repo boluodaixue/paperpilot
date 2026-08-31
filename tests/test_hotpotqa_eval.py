@@ -159,7 +159,7 @@ def test_evaluation_tool_budget_override_is_recordable_and_non_mutating() -> Non
     assert configured_local_tool_budget(config) == 12
     assert configured_tool_budget(evaluation) == 588
     assert configured_local_tool_budget(evaluation) == 84
-    assert configured_token_budget(config) == 120000
+    assert configured_token_budget(config) == 300000
     assert configured_token_budget(evaluation) == 1_000_000
     assert configured_elapsed_budget(config) == 300.0
     assert configured_elapsed_budget(evaluation) == 1_800.0

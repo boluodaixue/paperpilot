@@ -53,12 +53,8 @@ def test_schema_has_explicit_operations_statuses_and_per_vault_keys(
     queue = _queue(tmp_path)
 
     with sqlite3.connect(queue.db_path) as connection:
-        jobs = connection.execute(
-            "SELECT sql FROM sqlite_master WHERE name = 'vault_write_jobs'"
-        ).fetchone()[0]
-        lease = connection.execute(
-            "SELECT sql FROM sqlite_master WHERE name = 'vault_writer_lease'"
-        ).fetchone()[0]
+        jobs = connection.execute("SELECT sql FROM sqlite_master WHERE name = 'vault_write_jobs'").fetchone()[0]
+        lease = connection.execute("SELECT sql FROM sqlite_master WHERE name = 'vault_writer_lease'").fetchone()[0]
 
     assert VAULT_WRITE_OPERATION_TYPES == {
         "create_memory",
@@ -67,6 +63,7 @@ def test_schema_has_explicit_operations_statuses_and_per_vault_keys(
         "memory_note",
         "memory_import",
         "legacy_copy",
+        "tool_artifact",
     }
     assert VAULT_WRITE_JOB_STATUSES == {
         "queued",
@@ -235,14 +232,10 @@ def test_claim_next_can_target_one_recovery_job_without_bypassing_running_job(
     lease = queue.claim_writer(owner="writer", lease_seconds=20, now=10)
     assert lease is not None
 
-    targeted = queue.claim_next(
-        lease, lease_seconds=20, job_id=second.job_id, now=10
-    )
+    targeted = queue.claim_next(lease, lease_seconds=20, job_id=second.job_id, now=10)
     assert targeted is not None
     assert targeted.job_id == second.job_id
-    assert queue.claim_next(
-        lease, lease_seconds=20, job_id=first.job_id, now=11
-    ) is None
+    assert queue.claim_next(lease, lease_seconds=20, job_id=first.job_id, now=11) is None
 
 
 def test_expired_writer_takes_over_running_job_and_stale_owner_is_fenced(
@@ -265,9 +258,7 @@ def test_expired_writer_takes_over_running_job_and_stale_owner_is_fenced(
 
     with pytest.raises(RuntimeError, match="lease was lost"):
         old_queue.assert_fence(old_lease, job_id=job.job_id, now=15)
-    assert old_queue.renew_job(
-        job.job_id, old_lease, lease_seconds=20, now=15
-    ) is None
+    assert old_queue.renew_job(job.job_id, old_lease, lease_seconds=20, now=15) is None
 
 
 def test_renew_job_renews_global_and_job_fence_together(tmp_path: Path) -> None:
@@ -295,9 +286,7 @@ def test_run_fenced_holds_database_writer_fence_and_rolls_back_on_error(
     queue.claim_next(lease, lease_seconds=10, now=1)
     calls: list[str] = []
 
-    assert queue.run_fenced(
-        job.job_id, lease, lambda: calls.append("published") or "ok", now=2
-    ) == "ok"
+    assert queue.run_fenced(job.job_id, lease, lambda: calls.append("published") or "ok", now=2) == "ok"
     assert calls == ["published"]
 
     def fail_action() -> None:
@@ -325,9 +314,7 @@ def test_terminal_transitions_clear_command_and_are_idempotent(
 
     if method == "complete":
         terminal = queue.complete(job.job_id, lease, {"path": "notes/one.md"}, now=2)
-        repeated = queue.complete(
-            job.job_id, lease, {"path": "notes/one.md"}, now=99
-        )
+        repeated = queue.complete(job.job_id, lease, {"path": "notes/one.md"}, now=99)
         assert terminal.result == {"path": "notes/one.md"}
     else:
         transition = getattr(queue, method)
