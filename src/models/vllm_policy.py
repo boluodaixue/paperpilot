@@ -260,6 +260,8 @@ class VLLMPolicy:
                 tool_calls=final_tool_calls,
                 was_truncated=was_truncated,
             )
+            if getattr(resp, "usage", None) is not None:
+                result["usage"] = resp.usage
             if getattr(raw_msg, "reasoning_content", None):
                 result["reasoning_content"] = raw_msg.reasoning_content
             self.was_truncated = was_truncated

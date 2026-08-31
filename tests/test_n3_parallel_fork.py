@@ -12,12 +12,17 @@ from tests._research_assessment import assessment_response
 from src.research import (
     AgentLimits,
     ExecutionIdentity,
+    ForkReason,
     ResearchStatus,
     ResearchTask,
     build_research_agent_graph,
     create_research_agent_state,
     run_research_agent,
 )
+from src.research.agent_graph import _child_task
+from src.research.fork_policy import evaluate_fork_candidates, fork_tool_schema
+from src.research.models import ForkCandidate, ResearchRequirement
+from src.research.research_sufficiency import build_research_requirements
 
 
 def _fork_call(candidates: list[dict[str, Any]]) -> dict[str, Any]:
@@ -54,6 +59,72 @@ def _final(summary: str, finding: str) -> dict[str, Any]:
         ),
         "tool_calls": [],
     }
+
+
+def test_child_requirements_keep_the_parent_requirement_identity() -> None:
+    parent = ResearchTask(
+        "root",
+        "Compare all model families",
+        context={
+            "directions": ["Chinese reasoning", "code", "long context"],
+            "research_gaps": ["architecture"],
+            "research_requirements": [
+                {"requirement_id": "R1", "description": "Compare code quality"},
+                {"requirement_id": "R2", "description": "Compare long-context quality"},
+            ],
+            "known_information": ["Reusable memory context"],
+        },
+    )
+    candidate = ForkCandidate(
+        objective="Research only Gemini long-context evidence",
+        expected_output="A scoped evidence memo",
+        requirement_ids=("R2",),
+    )
+
+    parent_requirements = build_research_requirements(parent)
+    child = _child_task(parent, candidate, parent_requirements)
+    requirements = build_research_requirements(child)
+
+    assert requirements == (
+        ResearchRequirement("R2", "Compare long-context quality"),
+    )
+    assert child.context["parent_requirement_ids"] == ["R2"]
+    assert child.context["known_information"] == ["Reusable memory context"]
+    assert child.context["parent_objective"] == parent.objective
+    assert "directions" not in child.context
+    assert "research_gaps" not in child.context
+
+
+def test_multi_requirement_fork_requires_a_valid_parent_mapping() -> None:
+    parent = ResearchTask("root", "Compare code and context")
+    identity = _root_identity("root-lineage")
+    missing = ForkCandidate(
+        objective="Research code",
+        expected_output="Code evidence",
+        reasons=(ForkReason.CONTEXT_ISOLATION,),
+    )
+    unknown = ForkCandidate(
+        objective="Research context",
+        expected_output="Context evidence",
+        requirement_ids=("R9",),
+        reasons=(ForkReason.CONTEXT_ISOLATION,),
+    )
+    accepted, rejected = evaluate_fork_candidates(
+        [missing, unknown],
+        parent_task=parent,
+        identity=identity,
+        max_fork_depth=2,
+        max_children=2,
+        parent_requirement_ids=("R1", "R2"),
+    )
+
+    assert accepted == []
+    assert any("missing parent requirement mapping" in item for item in rejected)
+    assert any("unknown parent requirements R9" in item for item in rejected)
+    candidate_schema = fork_tool_schema()["function"]["parameters"]["properties"][
+        "candidates"
+    ]["items"]
+    assert "requirement_ids" in candidate_schema["required"]
 
 
 @dataclass
@@ -189,10 +260,12 @@ def _candidate(
     estimated_tool_calls: int = 0,
     independent: bool = True,
     context: dict[str, Any] | None = None,
+    requirement_ids: list[str] | None = None,
 ) -> dict[str, Any]:
     return {
         "objective": objective,
         "expected_output": f"Evidence for {objective}",
+        "requirement_ids": requirement_ids or ["R1"],
         "context": context or {},
         "reasons": [reason],
         "estimated_tool_calls": estimated_tool_calls,
@@ -231,6 +304,54 @@ async def test_independent_candidates_run_in_parallel_with_isolated_instances() 
     assert len(set(tracker.child_policy_ids)) == 2
     assert len(set(tracker.tool_instance_ids)) == 2
     assert all(thread.startswith("root-parallel.child.") for thread in final["child_thread_ids"])
+
+
+@pytest.mark.asyncio
+async def test_tree_results_preserve_root_requirement_lineage_through_aggregation() -> None:
+    tracker = ForkTracker()
+    candidates = [
+        _candidate("collect code evidence", "parallel", requirement_ids=["R1"]),
+        _candidate("collect context evidence", "parallel", requirement_ids=["R2"]),
+    ]
+    identity = _root_identity("root-requirement-lineage")
+    graph = build_research_agent_graph(
+        ForkingPolicy(candidates, tracker),
+        [ConcurrentWebTool(tracker)],
+    )
+    final = await graph.ainvoke(
+        create_research_agent_state(
+            ResearchTask(
+                "root-lineage",
+                "Compare code and long-context quality.",
+                context={
+                    "research_requirements": [
+                        {"requirement_id": "R1", "description": "Compare code quality"},
+                        {
+                            "requirement_id": "R2",
+                            "description": "Compare long-context quality",
+                        },
+                    ]
+                },
+            ),
+            identity,
+            AgentLimits(max_children=2),
+        ),
+        config={"configurable": {"thread_id": identity.thread_id}},
+    )
+
+    result = final["result"]
+    assert result.status == ResearchStatus.COMPLETED
+    assert {item.requirement_id for item in result.coverage} == {"R1", "R2"}
+    assert all(item.status.value == "supported" for item in result.coverage)
+    assert all(item.evidence_ids for item in result.coverage)
+    child_requirement_sets = {
+        tuple(
+            item["requirement_id"]
+            for item in json.loads(prompt)["context"]["research_requirements"]
+        )
+        for prompt in tracker.child_user_prompts
+    }
+    assert child_requirement_sets == {("R1",), ("R2",)}
 
 
 @pytest.mark.asyncio

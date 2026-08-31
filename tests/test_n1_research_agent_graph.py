@@ -11,6 +11,9 @@ from langgraph.checkpoint.memory import InMemorySaver
 
 from src.research.agent_graph import (
     ResearchAgentState,
+    _action_for_tool_call,
+    _delegable_token_budget,
+    _delegable_tool_budget,
     _remaining_research_seconds,
     _stable_evidence_id,
     build_research_agent_graph,
@@ -20,6 +23,7 @@ from src.research.models import (
     AgentLimits,
     EvidenceItem,
     ExecutionIdentity,
+    NextResearchAction,
     OutputStatus,
     ResearchResult,
     ResearchStatus,
@@ -27,6 +31,7 @@ from src.research.models import (
     TerminationReason,
 )
 from src.research import run_research_agent
+from src.research.research_sufficiency import active_next_actions
 from src.tools.web_search import MockWebSearchTool
 
 
@@ -62,6 +67,23 @@ def test_evidence_ids_are_stable_and_content_addressed() -> None:
     assert first != _stable_evidence_id("https://example.com/other", "same excerpt")
 
 
+def test_only_prioritized_active_action_receives_rewritten_tool_call() -> None:
+    actions = (
+        NextResearchAction("R1", "primary_document", "official report", "high", "A"),
+        NextResearchAction("R2", "paper_search", "benchmark paper", "high", "B"),
+    )
+
+    active = active_next_actions(actions)
+    matched = _action_for_tool_call(
+        "web_search",
+        {"query": "materially rewritten search terms"},
+        active,
+    )
+
+    assert active == actions[:1]
+    assert matched == actions[0]
+
+
 def test_deeper_agents_stop_research_earlier_to_leave_upstream_synthesis_time() -> None:
     limits = AgentLimits(max_elapsed_seconds=300.0)
     root_identity = _root_identity("root-layered-reserve")
@@ -89,6 +111,44 @@ def test_deeper_agents_stop_research_earlier_to_leave_upstream_synthesis_time() 
     grandchild_remaining = _remaining_research_seconds(grandchild)
     assert root_remaining - child_remaining == pytest.approx(30.0, abs=0.01)
     assert child_remaining - grandchild_remaining == pytest.approx(30.0, abs=0.01)
+
+    wide_limits = AgentLimits(max_elapsed_seconds=1800.0)
+    wide_root = _state(task, root_identity, wide_limits)
+    wide_child = _state(task, child_identity, wide_limits)
+    wide_child["deadline_at"] = wide_root["deadline_at"]
+    assert _remaining_research_seconds(wide_root) - _remaining_research_seconds(
+        wide_child
+    ) == pytest.approx(180.0, abs=0.01)
+
+
+def test_fork_budget_keeps_parent_tool_and_token_capacity() -> None:
+    limits = AgentLimits(
+        max_tool_calls=20,
+        max_total_tool_calls=100,
+        max_total_tokens=120000,
+    )
+    state = _state(
+        ResearchTask("parent-reserve", "Retain parent aggregation capacity."),
+        _root_identity("root-parent-reserve"),
+        limits,
+    )
+    state["total_tool_calls_used"] = 10
+    state["estimated_tokens_used"] = 20000
+
+    delegated_tools = _delegable_tool_budget(state, 4)
+    delegated_tokens = _delegable_token_budget(state)
+
+    assert delegated_tools == 72
+    assert (
+        state["subtree_tool_budget"]
+        - state["total_tool_calls_used"]
+        - delegated_tools
+        == 18
+    )
+    assert delegated_tokens < (
+        state["subtree_token_budget"] - state["estimated_tokens_used"]
+    )
+    assert delegated_tokens > 0
 
 
 def _assessment_state(messages: list[dict[str, Any]]) -> dict[str, Any] | None:
@@ -586,6 +646,20 @@ async def test_many_sources_with_a_critical_gap_continues_until_the_gap_is_suppo
 
 @pytest.mark.asyncio
 async def test_no_global_zero_increment_rule_forces_stop_when_an_action_remains() -> None:
+    class DistinctWebTool(FixedWebTool):
+        async def execute(self, **kwargs) -> dict:
+            self.calls.append(kwargs)
+            index = len(self.calls)
+            return {
+                "results": [
+                    {
+                        "title": f"Primary source {index}",
+                        "url": f"https://example.com/primary/{index}",
+                        "snippet": f"Independent evidence {index}.",
+                    }
+                ]
+            }
+
     class ReplanningPolicy:
         def __init__(self) -> None:
             self.assessments = 0
@@ -614,7 +688,7 @@ async def test_no_global_zero_increment_rule_forces_stop_when_an_action_remains(
     policy = ReplanningPolicy()
     graph = build_research_agent_graph(
         policy,
-        [FixedWebTool()],
+        [DistinctWebTool()],
     )
     final = await graph.ainvoke(
         _state(
@@ -689,8 +763,11 @@ async def test_evidence_exhausted_requires_two_executed_no_progress_strategies()
         def __call__(self, messages, *, tools=None):
             assessment = _assessment_state(messages)
             if assessment is not None:
-                attempts = assessment["strategy_attempts"]
-                if not attempts:
+                attempt_count = sum(
+                    item["attempt_count"]
+                    for item in assessment["strategy_attempt_summary"]
+                )
+                if attempt_count == 0:
                     return _assessment_response(
                         assessment,
                         decision="continue",
@@ -698,7 +775,7 @@ async def test_evidence_exhausted_requires_two_executed_no_progress_strategies()
                         coverage_status="unsupported",
                         strategy="primary_document",
                     )
-                if len(attempts) == 1:
+                if attempt_count == 1:
                     return _assessment_response(
                         assessment,
                         decision="replan",
@@ -756,6 +833,20 @@ async def test_evidence_exhausted_requires_two_executed_no_progress_strategies()
 
 @pytest.mark.asyncio
 async def test_checkpoint_resume_preserves_requirements_gaps_actions_attempts_and_decision() -> None:
+    class DistinctWebTool(FixedWebTool):
+        async def execute(self, **kwargs) -> dict:
+            self.calls.append(kwargs)
+            index = len(self.calls)
+            return {
+                "results": [
+                    {
+                        "title": f"Checkpoint source {index}",
+                        "url": f"https://example.com/checkpoint/{index}",
+                        "snippet": f"Checkpoint evidence {index}.",
+                    }
+                ]
+            }
+
     class CheckpointPolicy:
         def __init__(self, *, pause: bool) -> None:
             self.pause = pause
@@ -765,7 +856,11 @@ async def test_checkpoint_resume_preserves_requirements_gaps_actions_attempts_an
         async def __call__(self, messages, *, tools=None):
             assessment = _assessment_state(messages)
             if assessment is not None:
-                if not assessment["strategy_attempts"]:
+                attempt_count = sum(
+                    item["attempt_count"]
+                    for item in assessment["strategy_attempt_summary"]
+                )
+                if attempt_count == 0:
                     return _assessment_response(
                         assessment,
                         decision="continue",
@@ -784,9 +879,10 @@ async def test_checkpoint_resume_preserves_requirements_gaps_actions_attempts_an
     saver = InMemorySaver()
     identity = _root_identity("root-sufficiency-checkpoint")
     first_policy = CheckpointPolicy(pause=True)
+    tool = DistinctWebTool()
     graph = build_research_agent_graph(
         first_policy,
-        [FixedWebTool()],
+        [tool],
         checkpointer=saver,
     )
     invocation = asyncio.create_task(
@@ -810,7 +906,7 @@ async def test_checkpoint_resume_preserves_requirements_gaps_actions_attempts_an
 
     rebuilt = build_research_agent_graph(
         CheckpointPolicy(pause=False),
-        [FixedWebTool()],
+        [tool],
         checkpointer=saver,
     )
     restored = (await rebuilt.aget_state(_config(identity.thread_id))).values
@@ -979,7 +1075,7 @@ async def test_assessment_json_is_repaired_once_without_polluting_research_state
 
 
 @pytest.mark.asyncio
-async def test_failed_assessment_repair_keeps_tools_available_for_an_actionable_gap() -> None:
+async def test_failed_assessment_repair_does_not_invent_a_research_action() -> None:
     class InvalidThenGroundedPolicy:
         def __init__(self) -> None:
             self.research_round = 0
@@ -1008,10 +1104,41 @@ async def test_failed_assessment_repair_keeps_tools_available_for_an_actionable_
         identity=identity,
     )
 
-    assert result.status == ResearchStatus.COMPLETED
-    assert result.termination_reason == TerminationReason.COVERAGE_COMPLETE
+    assert result.status == ResearchStatus.PARTIAL
+    assert result.termination_reason == TerminationReason.TOOL_FAILURE
+    assert result.tool_calls_used == 0
+    assert result.coverage[0].status.value == "unsupported"
+
+
+@pytest.mark.asyncio
+async def test_repeated_assessment_contract_failure_stops_without_a_synthetic_loop() -> None:
+    class AlwaysInvalidAssessmentPolicy:
+        def __call__(self, messages, *, tools=None):
+            content = str(messages[-1].get("content") or "")
+            if _assessment_state(messages) is not None:
+                return {"content": "not-json", "tool_calls": []}
+            if content.startswith("REPAIR_ASSESSMENT_JSON"):
+                return {"content": "still-not-json", "tool_calls": []}
+            if tools == []:
+                return _final(
+                    "Assessment routing failed after evidence collection.",
+                    "Collected evidence remains available.",
+                )
+            return {"content": "", "tool_calls": [_tool_call()]}
+
+    identity = _root_identity("root-assessment-contract-failure")
+    result = await run_research_agent(
+        ResearchTask("assessment-failure", "Keep researching after structural failure."),
+        AlwaysInvalidAssessmentPolicy(),
+        [FixedWebTool()],
+        identity=identity,
+        limits=AgentLimits(max_iterations=2, max_tool_calls=10),
+    )
+
+    assert result.status == ResearchStatus.PARTIAL
+    assert result.termination_reason == TerminationReason.TOOL_FAILURE
+    assert result.stop_reason is None
     assert result.tool_calls_used == 1
-    assert result.coverage[0].status.value == "supported"
 
 
 @pytest.mark.asyncio

@@ -15,6 +15,7 @@ from .models import (
     RequirementStatus,
     ResearchDecision,
     ResearchRequirement,
+    ResearchResult,
     ResearchTask,
     StrategyAttempt,
     TerminationReason,
@@ -24,6 +25,14 @@ from .models import (
 _JSON_FENCE = re.compile(r"```(?:json)?\s*(.*?)\s*```", re.IGNORECASE | re.DOTALL)
 _EXPECTED_VALUES = {"high", "medium", "low"}
 _IMPACTS = {"high", "medium", "low"}
+_STRATEGIES = {
+    "official_database",
+    "primary_document",
+    "query_rewrite",
+    "paper_search",
+    "other",
+}
+_ASSESSMENT_PROJECTION_CHAR_BUDGET = 30000
 
 
 class AssessmentValidationError(ValueError):
@@ -56,16 +65,39 @@ def build_research_requirements(task: ResearchTask) -> tuple[ResearchRequirement
     """Create stable R1..Rn requirements from the confirmed Brief task context."""
     context = task.context if isinstance(task.context, dict) else {}
     explicit = context.get("research_requirements")
-    descriptions: list[str] = []
+    explicit_requirements: list[tuple[str | None, str, bool]] = []
     if isinstance(explicit, (list, tuple)):
         for item in explicit:
             if isinstance(item, dict):
                 description = str(item.get("description") or "").strip()
+                requirement_id = str(item.get("requirement_id") or "").strip() or None
+                required = bool(item.get("required", True))
             else:
                 description = str(item).strip()
+                requirement_id = None
+                required = True
             if description:
-                descriptions.append(description)
-    if not descriptions:
+                explicit_requirements.append(
+                    (requirement_id, description, required)
+                )
+    if explicit_requirements:
+        requirements: list[ResearchRequirement] = []
+        used_ids: set[str] = set()
+        next_index = 1
+        for requirement_id, description, required in explicit_requirements:
+            while f"R{next_index}" in used_ids:
+                next_index += 1
+            if not requirement_id or requirement_id in used_ids:
+                requirement_id = f"R{next_index}"
+                next_index += 1
+            used_ids.add(requirement_id)
+            requirements.append(
+                ResearchRequirement(requirement_id, description, required)
+            )
+        return tuple(requirements)
+
+    descriptions: list[str] = []
+    if not explicit_requirements:
         # Directions are the confirmed work items. Memory gaps are appended when
         # they add a distinct necessary requirement; scope remains a boundary.
         descriptions.extend(_clean_sequence(context.get("directions")))
@@ -89,6 +121,45 @@ def initial_coverage(
             remaining_gap=requirement.description,
         )
         for requirement in requirements
+    )
+
+
+def merge_child_coverage_evidence(
+    parent_coverage: Iterable[RequirementCoverage],
+    child_results: Iterable[ResearchResult],
+) -> tuple[RequirementCoverage, ...]:
+    """Attach child evidence to parent requirements without inheriting child status."""
+    parent_coverage = tuple(parent_coverage)
+    valid_parent_ids = {item.requirement_id for item in parent_coverage}
+    evidence_by_requirement: dict[str, set[str]] = {
+        item.requirement_id: set(item.evidence_ids) for item in parent_coverage
+    }
+    for result in child_results:
+        child_evidence_ids = {item.evidence_id for item in result.evidence}
+        for item in result.coverage:
+            if item.requirement_id not in valid_parent_ids:
+                continue
+            evidence_by_requirement[item.requirement_id].update(
+                evidence_id
+                for evidence_id in item.evidence_ids
+                if evidence_id in child_evidence_ids
+            )
+    return tuple(
+        RequirementCoverage(
+            requirement_id=item.requirement_id,
+            status=item.status,
+            evidence_ids=tuple(
+                dict.fromkeys(
+                    [
+                        *item.evidence_ids,
+                        *sorted(evidence_by_requirement[item.requirement_id]),
+                    ]
+                )
+            ),
+            rationale=item.rationale,
+            remaining_gap=item.remaining_gap,
+        )
+        for item in parent_coverage
     )
 
 
@@ -202,9 +273,10 @@ def _parse_actions(raw: Any, requirement_ids: set[str]) -> tuple[NextResearchAct
         query = str(item.get("query") or "").strip()
         expected_value = str(item.get("expected_value") or "").strip().lower()
         improvement = str(item.get("expected_improvement") or "").strip()
+        if strategy not in _STRATEGIES:
+            raise AssessmentValidationError("next action strategy is not canonical")
         if (
             requirement_id not in requirement_ids
-            or not strategy
             or not query
             or expected_value not in _EXPECTED_VALUES
             or not improvement
@@ -222,6 +294,39 @@ def _parse_actions(raw: Any, requirement_ids: set[str]) -> tuple[NextResearchAct
     return tuple(actions)
 
 
+def _normalized_action_key(
+    requirement_id: str,
+    strategy: str,
+    query: str,
+) -> tuple[str, str, str]:
+    return (
+        requirement_id.strip(),
+        strategy.strip().lower(),
+        " ".join(query.lower().split()),
+    )
+
+
+def unattempted_actions(
+    actions: Iterable[NextResearchAction],
+    attempts: Iterable[StrategyAttempt],
+) -> tuple[NextResearchAction, ...]:
+    """Return actions whose requirement, strategy, and query were not executed."""
+    attempted = {
+        _normalized_action_key(item.requirement_id, item.strategy, item.query)
+        for item in attempts
+    }
+    return tuple(
+        item
+        for item in actions
+        if _normalized_action_key(
+            item.requirement_id,
+            item.strategy,
+            item.query,
+        )
+        not in attempted
+    )
+
+
 def parse_research_assessment(
     content: str,
     *,
@@ -232,6 +337,7 @@ def parse_research_assessment(
     output_status: OutputStatus = OutputStatus.VALID,
 ) -> ResearchAssessment:
     """Parse and deterministically validate one semantic assessment response."""
+    attempts = tuple(attempts)
     payload = parse_json_object(content)
     decision = _enum_value(ResearchDecision, payload.get("decision"), "decision")
     evidence_ids = {item.evidence_id for item in evidence}
@@ -282,6 +388,10 @@ def parse_research_assessment(
         if not any(item.impact in {"high", "medium"} for item in gaps):
             raise AssessmentValidationError(
                 "continue/replan requires a high- or medium-impact gap"
+            )
+        if len(unattempted_actions(actionable, attempts)) != len(actionable):
+            raise AssessmentValidationError(
+                "continue/replan next actions must not repeat an executed action"
             )
     if decision == ResearchDecision.REPLAN:
         if not replan_reason:
@@ -381,6 +491,189 @@ def hard_termination_reason(stop_reason: str | None) -> TerminationReason | None
     return TerminationReason.TOOL_FAILURE
 
 
+def aggregate_strategy_attempts(
+    attempts: Iterable[StrategyAttempt],
+) -> tuple[dict[str, Any], ...]:
+    """Project the append-only attempt ledger into requirement/strategy outcomes."""
+    aggregates: dict[tuple[str, str], dict[str, Any]] = {}
+    query_sets: dict[tuple[str, str], set[str]] = {}
+    evidence_sets: dict[tuple[str, str], set[str]] = {}
+    for item in attempts:
+        key = (item.requirement_id, item.strategy.strip().lower())
+        if key not in aggregates:
+            aggregates[key] = {
+                "requirement_id": item.requirement_id,
+                "strategy": item.strategy.strip().lower(),
+                "attempt_count": 0,
+                "evidence_found_count": 0,
+                "no_progress_count": 0,
+                "last_query": "",
+                "last_outcome": "",
+            }
+            query_sets[key] = set()
+            evidence_sets[key] = set()
+        aggregate = aggregates[key]
+        aggregate["attempt_count"] += 1
+        if item.outcome == "evidence_found":
+            aggregate["evidence_found_count"] += 1
+        elif item.outcome == "no_progress":
+            aggregate["no_progress_count"] += 1
+        aggregate["last_query"] = item.query[:600]
+        aggregate["last_outcome"] = item.outcome
+        query_sets[key].add(" ".join(item.query.lower().split()))
+        evidence_sets[key].update(item.evidence_ids)
+    projected: list[dict[str, Any]] = []
+    for key, aggregate in aggregates.items():
+        projected.append(
+            {
+                **aggregate,
+                "distinct_query_count": len(query_sets[key]),
+                "evidence_count": len(evidence_sets[key]),
+            }
+        )
+    return tuple(projected)
+
+
+def _child_result_projection(
+    child_results: Iterable[ResearchResult],
+) -> list[dict[str, Any]]:
+    return [
+        {
+            "task_id": result.task_id,
+            "status": result.status.value,
+            "termination_reason": (
+                result.termination_reason.value
+                if result.termination_reason is not None
+                else None
+            ),
+            "summary": result.summary[:800],
+            "coverage": [
+                {
+                    "requirement_id": item.requirement_id,
+                    "status": item.status.value,
+                    "evidence_ids": list(item.evidence_ids),
+                    "remaining_gap": item.remaining_gap,
+                }
+                for item in result.coverage
+            ],
+            "critical_gaps": [item.__dict__ for item in result.critical_gaps],
+        }
+        for result in child_results
+    ]
+
+
+def build_assessment_projection(
+    *,
+    task: ResearchTask,
+    requirements: tuple[ResearchRequirement, ...],
+    coverage: tuple[RequirementCoverage, ...],
+    evidence: Iterable[EvidenceItem],
+    critical_gaps: tuple[CriticalGap, ...],
+    attempts: tuple[StrategyAttempt, ...],
+    child_results: Iterable[ResearchResult],
+    candidate_final: str,
+    recent_tool_failures: tuple[str, ...],
+    recent_tool_outcomes: tuple[dict[str, str], ...],
+) -> dict[str, Any]:
+    """Build a bounded semantic projection while retaining raw state in checkpoint."""
+    evidence = tuple(evidence)
+    child_results = tuple(child_results)
+    candidate_ids: set[str] = {
+        evidence_id
+        for item in coverage
+        for evidence_id in item.evidence_ids
+    }
+    candidate_ids.update(
+        evidence_id
+        for item in attempts
+        if item.outcome == "evidence_found"
+        for evidence_id in item.evidence_ids
+    )
+    candidate_ids.update(
+        evidence_id
+        for result in child_results
+        for item in result.coverage
+        for evidence_id in item.evidence_ids
+    )
+    classified_ids = {
+        evidence_id
+        for item in attempts
+        for evidence_id in item.evidence_ids
+    }
+    classified_ids.update(
+        evidence_id
+        for item in coverage
+        for evidence_id in item.evidence_ids
+    )
+    candidate_ids.update(
+        item.evidence_id
+        for item in evidence
+        if item.evidence_id not in classified_ids
+    )
+
+    source_type_counts: dict[str, int] = {}
+    for item in evidence:
+        source_type_counts[item.source_type] = (
+            source_type_counts.get(item.source_type, 0) + 1
+        )
+    payload: dict[str, Any] = {
+        "objective": task.objective,
+        "require_evidence": task.require_evidence,
+        "expected_output": task.expected_output,
+        "constraints": list(task.constraints),
+        "requirements": [item.__dict__ for item in requirements],
+        "previous_coverage": [
+            {
+                "requirement_id": item.requirement_id,
+                "status": item.status.value,
+                "evidence_ids": list(item.evidence_ids),
+                "rationale": item.rationale,
+                "remaining_gap": item.remaining_gap,
+            }
+            for item in coverage
+        ],
+        "evidence_inventory": {
+            "total_count": len(evidence),
+            "candidate_count": len(candidate_ids),
+            "included_count": 0,
+            "omitted_candidate_count": 0,
+            "source_type_counts": source_type_counts,
+        },
+        "evidence": [],
+        "previous_critical_gaps": [item.__dict__ for item in critical_gaps],
+        "strategy_attempt_summary": list(aggregate_strategy_attempts(attempts)),
+        "child_result_summary": _child_result_projection(child_results),
+        "recent_tool_failures": list(recent_tool_failures),
+        "recent_tool_outcomes": list(recent_tool_outcomes),
+        "candidate_final_response": candidate_final[:2000],
+    }
+    candidate_evidence = [
+        item for item in evidence if item.evidence_id in candidate_ids
+    ]
+    for item in candidate_evidence:
+        compact = {
+            "evidence_id": item.evidence_id,
+            "finding": item.finding[:320],
+            "source_type": item.source_type,
+            "title": item.title[:180],
+            "source_ref": item.source_ref[:300],
+            "limitations": item.limitations[:180],
+        }
+        payload["evidence"].append(compact)
+        if len(json.dumps(payload, ensure_ascii=False, default=str)) > (
+            _ASSESSMENT_PROJECTION_CHAR_BUDGET
+        ):
+            payload["evidence"].pop()
+            break
+    included = len(payload["evidence"])
+    payload["evidence_inventory"]["included_count"] = included
+    payload["evidence_inventory"]["omitted_candidate_count"] = max(
+        0,
+        len(candidate_evidence) - included,
+    )
+    return payload
+
+
 def assessment_schema_prompt(
     *,
     task: ResearchTask,
@@ -389,55 +682,24 @@ def assessment_schema_prompt(
     evidence: Iterable[EvidenceItem],
     critical_gaps: tuple[CriticalGap, ...],
     attempts: tuple[StrategyAttempt, ...],
+    child_results: Iterable[ResearchResult],
     candidate_final: str,
     recent_tool_failures: tuple[str, ...],
+    recent_tool_outcomes: tuple[dict[str, str], ...],
 ) -> str:
     """Build the bounded same-policy prompt for semantic sufficiency assessment."""
-    evidence_payload = [
-        {
-            "evidence_id": item.evidence_id,
-            "finding": item.finding[:1000],
-            "source_type": item.source_type,
-            "title": item.title,
-            "source_ref": item.source_ref,
-            "limitations": item.limitations,
-        }
-        for item in evidence
-    ]
-    payload = {
-        "objective": task.objective,
-        "require_evidence": task.require_evidence,
-        "expected_output": task.expected_output,
-        "constraints": list(task.constraints),
-        "requirements": [
-            {
-                "requirement_id": item.requirement_id,
-                "description": item.description,
-                "required": item.required,
-            }
-            for item in requirements
-        ],
-        "previous_coverage": [
-            {
-                "requirement_id": item.requirement_id,
-                "status": item.status.value,
-                "evidence_ids": list(item.evidence_ids),
-                "remaining_gap": item.remaining_gap,
-            }
-            for item in coverage
-        ],
-        "evidence": evidence_payload,
-        "previous_critical_gaps": [item.__dict__ for item in critical_gaps],
-        "strategy_attempts": [
-            {
-                **item.__dict__,
-                "evidence_ids": list(item.evidence_ids),
-            }
-            for item in attempts
-        ],
-        "recent_tool_failures": list(recent_tool_failures),
-        "candidate_final_response": candidate_final[:8000],
-    }
+    payload = build_assessment_projection(
+        task=task,
+        requirements=requirements,
+        coverage=coverage,
+        evidence=evidence,
+        critical_gaps=critical_gaps,
+        attempts=attempts,
+        child_results=child_results,
+        candidate_final=candidate_final,
+        recent_tool_failures=recent_tool_failures,
+        recent_tool_outcomes=recent_tool_outcomes,
+    )
     return (
         "ASSESS_RESEARCH_STATE\n"
         "You are the same Research Agent policy, performing a structured in-graph "
@@ -445,10 +707,24 @@ def assessment_schema_prompt(
         "Decide continue, replan, or stop_research from confirmed requirements, "
         "evidence strength, actionable next-step value, and real constraints. Do not "
         "claim supported without citing listed Evidence IDs. Replan needs a materially "
-        "different strategy. Return JSON only with: decision; coverage entries for "
+        "different strategy. A Continue action must not repeat an action already shown "
+        "in the strategy-attempt summary; repeated queries are not new research value. "
+        "When important gaps have multiple no-progress strategy families and no "
+        "materially different executable path remains, choose evidence_exhausted. "
+        "Return JSON only with: decision; coverage entries for "
         "every requirement (requirement_id,status,evidence_ids,rationale,remaining_gap); "
-        "critical_gaps (requirement_id,reason,impact); next_actions "
-        "(requirement_id,strategy,query,expected_value,expected_improvement); "
+        "critical_gaps (requirement_id,reason,impact where impact is exactly high, "
+        "medium, or low); next_actions (requirement_id,strategy,query,expected_value,"
+        "expected_improvement). "
+        "strategy MUST be exactly one of official_database, primary_document, "
+        "query_rewrite, paper_search, or other; put detailed plans in query or "
+        "expected_improvement, never in strategy. "
+        "expected_value is a priority label and MUST be exactly high, medium, or low; "
+        "put the prose description of the expected result only in "
+        "expected_improvement. Return at most one current best next_action per "
+        "requirement and order requirements from highest to lowest execution priority; "
+        "the runtime activates one action at a time so every real tool call has an "
+        "unambiguous requirement and strategy. "
         "termination_reason; replan_reason; exhaustion_reason. Valid termination "
         "reasons you may return: coverage_complete, saturated, evidence_exhausted. "
         "budget_forced, tool_failure, and user_cancelled are runtime-only reasons; "
@@ -462,19 +738,133 @@ def repair_assessment_prompt(content: str, error: str) -> str:
         "REPAIR_ASSESSMENT_JSON\n"
         "Repair the following assessment into the exact requested JSON schema. "
         "Do not call tools and do not add evidence or change the research objective.\n"
+        "Required shape: {\"decision\":\"continue|replan|stop_research\","
+        "\"coverage\":[{\"requirement_id\":\"R1\",\"status\":"
+        "\"supported|weak|conflicted|unsupported\",\"evidence_ids\":[],"
+        "\"rationale\":\"...\",\"remaining_gap\":\"...|null\"}],"
+        "\"critical_gaps\":[{\"requirement_id\":\"R1\",\"reason\":\"...\","
+        "\"impact\":\"high|medium|low\"}],\"next_actions\":[{"
+        "\"requirement_id\":\"R1\",\"strategy\":\"official_database|primary_document|"
+        "query_rewrite|paper_search|other\","
+        "\"query\":\"...\",\"expected_value\":\"high|medium|low\","
+        "\"expected_improvement\":\"...\"}],\"termination_reason\":null,"
+        "\"replan_reason\":null,\"exhaustion_reason\":null}. "
+        "The vertical-bar values above are alternatives, never literal output. "
+        "strategy is only the strategy-family enum; move detailed strategy prose "
+        "into query or expected_improvement. expected_value is only the priority "
+        "enum; move any descriptive text from "
+        "expected_value into expected_improvement.\n"
         f"Validation error: {error}\nInvalid response:\n{content[:12000]}"
     )
 
 
-def control_message(assessment: ResearchAssessment) -> str:
-    action_payload = [item.__dict__ for item in assessment.next_actions]
+def reconcile_strategy_attempt_outcomes(
+    attempts: Iterable[StrategyAttempt],
+    coverage: Iterable[RequirementCoverage],
+) -> tuple[StrategyAttempt, ...]:
+    """Count tool output as progress only when validated coverage cites it."""
+    cited_by_requirement = {
+        item.requirement_id: set(item.evidence_ids) for item in coverage
+    }
+    reconciled: list[StrategyAttempt] = []
+    for attempt in attempts:
+        cited = cited_by_requirement.get(attempt.requirement_id, set())
+        made_progress = bool(cited.intersection(attempt.evidence_ids))
+        reconciled.append(
+            StrategyAttempt(
+                requirement_id=attempt.requirement_id,
+                strategy=attempt.strategy,
+                query=attempt.query,
+                outcome="evidence_found" if made_progress else "no_progress",
+                evidence_ids=attempt.evidence_ids,
+            )
+        )
+    return tuple(reconciled)
+
+
+def active_next_actions(
+    actions: Iterable[NextResearchAction],
+) -> tuple[NextResearchAction, ...]:
+    """Activate one prioritized action so real tool calls remain traceable."""
+    return tuple(actions)[:1]
+
+
+def merge_next_action_queue(
+    previous_actions: Iterable[NextResearchAction],
+    assessment: ResearchAssessment,
+    *,
+    active_consumed: bool,
+) -> tuple[NextResearchAction, ...]:
+    """Preserve unexecuted actions while applying a local assessment update."""
+    if assessment.decision == ResearchDecision.STOP_RESEARCH:
+        return ()
+
+    gap_ids = {item.requirement_id for item in assessment.critical_gaps}
+    pending = list(previous_actions)
+    if active_consumed and pending:
+        pending = pending[1:]
+    pending_candidates = [
+        action
+        for action in pending
+        if action.requirement_id in gap_ids
+        and action.expected_value in {"high", "medium"}
+    ]
+    pending = []
+    pending_requirements: set[str] = set()
+    for action in pending_candidates:
+        if action.requirement_id not in pending_requirements:
+            pending_requirements.add(action.requirement_id)
+            pending.append(action)
+
+    proposed_candidates = [
+        action
+        for action in assessment.next_actions
+        if action.requirement_id in gap_ids
+        and action.expected_value in {"high", "medium"}
+    ]
+    proposed = []
+    proposed_requirements: set[str] = set()
+    for action in proposed_candidates:
+        if action.requirement_id not in proposed_requirements:
+            proposed_requirements.add(action.requirement_id)
+            proposed.append(action)
+    if assessment.decision == ResearchDecision.REPLAN:
+        pending = [
+            action
+            for action in pending
+            if action.requirement_id not in proposed_requirements
+        ]
+
+    merged = list(pending)
+    scheduled_requirements = {action.requirement_id for action in merged}
+    for action in proposed:
+        if action.requirement_id not in scheduled_requirements:
+            scheduled_requirements.add(action.requirement_id)
+            merged.append(action)
+    return tuple(merged)
+
+
+def control_message(
+    assessment: ResearchAssessment,
+    *,
+    scheduled_actions: Iterable[NextResearchAction] | None = None,
+) -> str:
+    actions = (
+        assessment.next_actions
+        if scheduled_actions is None
+        else tuple(scheduled_actions)
+    )
+    action_payload = [
+        item.__dict__ for item in active_next_actions(actions)
+    ]
     gap_payload = [item.__dict__ for item in assessment.critical_gaps]
     return (
         "RESEARCH_STATE_DECISION\n"
         f"Decision: {assessment.decision.value}.\n"
         f"Critical gaps: {json.dumps(gap_payload, ensure_ascii=False)}\n"
-        f"Next actions: {json.dumps(action_payload, ensure_ascii=False)}\n"
-        "Keep tools available and work only on these unresolved requirements. "
+        f"Active next action: {json.dumps(action_payload, ensure_ascii=False)}\n"
+        f"Queued action count: {max(0, len(actions) - 1)}.\n"
+        "Keep tools available and execute only the single active action in this loop. "
         "Do not silently expand the confirmed objective."
     )
 

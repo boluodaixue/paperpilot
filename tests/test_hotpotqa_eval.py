@@ -7,6 +7,7 @@ import pytest
 from evaluation.benchmarks.hotpotqa import HotpotQABenchmark
 from scripts.run_eval import (
     configured_local_tool_budget,
+    configured_elapsed_budget,
     configured_token_budget,
     configured_tool_budget,
     evaluation_config_with_tool_budget,
@@ -151,6 +152,7 @@ def test_evaluation_tool_budget_override_is_recordable_and_non_mutating() -> Non
         588,
         max_tool_calls=84,
         max_total_tokens=1_000_000,
+        max_elapsed_seconds=1_800.0,
     )
 
     assert configured_tool_budget(config) == 36
@@ -159,6 +161,8 @@ def test_evaluation_tool_budget_override_is_recordable_and_non_mutating() -> Non
     assert configured_local_tool_budget(evaluation) == 84
     assert configured_token_budget(config) == 120000
     assert configured_token_budget(evaluation) == 1_000_000
+    assert configured_elapsed_budget(config) == 300.0
+    assert configured_elapsed_budget(evaluation) == 1_800.0
     assert config["research"]["limits"]["max_total_tool_calls"] == 36
 
 

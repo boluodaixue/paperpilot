@@ -6,9 +6,15 @@ import json
 import pytest
 
 from src.research.models import (
+    CriticalGap,
     EvidenceItem,
+    NextResearchAction,
     OutputStatus,
     ResearchDecision,
+    ResearchResult,
+    ResearchStatus,
+    RequirementCoverage,
+    RequirementStatus,
     ResearchRequirement,
     ResearchTask,
     StrategyAttempt,
@@ -16,9 +22,16 @@ from src.research.models import (
 )
 from src.research.research_sufficiency import (
     AssessmentValidationError,
+    ResearchAssessment,
+    active_next_actions,
+    build_assessment_projection,
     build_research_requirements,
     hard_termination_reason,
+    merge_next_action_queue,
+    merge_child_coverage_evidence,
     parse_research_assessment,
+    reconcile_strategy_attempt_outcomes,
+    unattempted_actions,
 )
 
 
@@ -314,3 +327,281 @@ def test_assessment_output_status_can_record_one_successful_repair() -> None:
         output_status=OutputStatus.REPAIRED,
     )
     assert assessment.output_status == OutputStatus.REPAIRED
+
+
+def test_assessment_rejects_free_form_strategy_family() -> None:
+    payload = _payload(
+        decision="continue",
+        statuses=("supported", "unsupported"),
+        gaps=[_gap()],
+        actions=[_action(strategy="search many different official pages")],
+    )
+
+    with pytest.raises(AssessmentValidationError, match="strategy is not canonical"):
+        parse_research_assessment(
+            payload,
+            requirements=REQUIREMENTS,
+            evidence=EVIDENCE,
+            attempts=(),
+        )
+
+
+def test_continue_rejects_an_action_that_was_already_executed() -> None:
+    action = _action(strategy="paper_search")
+    payload = _payload(
+        decision="continue",
+        statuses=("supported", "unsupported"),
+        gaps=[_gap()],
+        actions=[action],
+    )
+    attempts = (
+        StrategyAttempt(
+            "R2",
+            "paper_search",
+            action["query"],
+            "no_progress",
+        ),
+    )
+
+    with pytest.raises(AssessmentValidationError, match="must not repeat"):
+        parse_research_assessment(
+            payload,
+            requirements=REQUIREMENTS,
+            evidence=EVIDENCE,
+            attempts=attempts,
+        )
+    assert unattempted_actions(
+        (NextResearchAction("R2", "paper_search", action["query"], "high", "x"),),
+        attempts,
+    ) == ()
+
+
+def test_long_history_projection_is_bounded_and_preserves_attempt_outcomes() -> None:
+    strategies = (
+        "official_database",
+        "primary_document",
+        "query_rewrite",
+        "paper_search",
+        "other",
+    )
+    evidence = tuple(
+        EvidenceItem(
+            evidence_id=f"E{index}",
+            finding=(f"Finding {index} " * 100),
+            source_type="paper",
+            title=f"Source {index}",
+            source_ref=f"https://example.com/{index}",
+        )
+        for index in range(200)
+    )
+    attempts = tuple(
+        StrategyAttempt(
+            "R1" if index % 2 == 0 else "R2",
+            strategies[index % len(strategies)],
+            f"distinct query {index}",
+            "evidence_found" if index % 3 == 0 else "no_progress",
+            (f"E{index}",),
+        )
+        for index in range(200)
+    )
+
+    projection = build_assessment_projection(
+        task=ResearchTask("projection", "Bound a long research history"),
+        requirements=REQUIREMENTS,
+        coverage=(
+            RequirementCoverage("R1", RequirementStatus.WEAK, ("E0",)),
+            RequirementCoverage("R2", RequirementStatus.UNSUPPORTED),
+        ),
+        evidence=evidence,
+        critical_gaps=(CriticalGap("R2", "Still unresolved", "high"),),
+        attempts=attempts,
+        child_results=(),
+        candidate_final="",
+        recent_tool_failures=(),
+        recent_tool_outcomes=(),
+    )
+
+    assert len(json.dumps(projection, ensure_ascii=False)) <= 30500
+    assert "strategy_attempts" not in projection
+    assert sum(
+        item["attempt_count"] for item in projection["strategy_attempt_summary"]
+    ) == 200
+    assert len(projection["strategy_attempt_summary"]) <= len(strategies) * 2
+    assert projection["evidence_inventory"]["included_count"] < 200
+    assert projection["evidence_inventory"]["omitted_candidate_count"] > 0
+
+
+def test_strategy_progress_requires_validated_coverage_citation() -> None:
+    attempts = (
+        StrategyAttempt("R1", "paper_search", "relevant", "evidence_found", ("E1",)),
+        StrategyAttempt("R1", "query_rewrite", "noise", "evidence_found", ("E2",)),
+        StrategyAttempt("R2", "primary_document", "other", "no_progress", ("E3",)),
+    )
+    coverage = (
+        RequirementCoverage("R1", RequirementStatus.WEAK, ("E1",)),
+        RequirementCoverage("R2", RequirementStatus.UNSUPPORTED),
+    )
+
+    reconciled = reconcile_strategy_attempt_outcomes(attempts, coverage)
+
+    assert [item.outcome for item in reconciled] == [
+        "evidence_found",
+        "no_progress",
+        "no_progress",
+    ]
+    assert reconciled[1].evidence_ids == ("E2",)
+
+
+def test_child_evidence_is_linked_without_inheriting_child_coverage_status() -> None:
+    parent = (
+        RequirementCoverage("R1", RequirementStatus.UNSUPPORTED),
+        RequirementCoverage("R2", RequirementStatus.WEAK, ("E0",)),
+    )
+    child = ResearchResult(
+        task_id="child-r1",
+        status=ResearchStatus.PARTIAL,
+        summary="Scoped R1 evidence",
+        evidence=EVIDENCE,
+        coverage=(
+            RequirementCoverage("R1", RequirementStatus.SUPPORTED, ("E1",)),
+            RequirementCoverage("R9", RequirementStatus.SUPPORTED, ("E1",)),
+        ),
+    )
+
+    merged = merge_child_coverage_evidence(parent, (child,))
+
+    assert merged[0].status == RequirementStatus.UNSUPPORTED
+    assert merged[0].evidence_ids == ("E1",)
+    assert merged[1] == parent[1]
+
+
+def test_active_next_actions_preserves_model_priority_without_fixed_stop_gate() -> None:
+    actions = (
+        NextResearchAction("R2", "paper_search", "first", "high", "resolve R2"),
+        NextResearchAction("R1", "query_rewrite", "second", "medium", "resolve R1"),
+    )
+
+    assert active_next_actions(actions) == actions[:1]
+
+
+def test_next_action_queue_consumes_active_and_preserves_unexecuted_tail() -> None:
+    previous = (
+        NextResearchAction("R1", "primary_document", "done", "high", "A"),
+        NextResearchAction("R2", "paper_search", "pending", "high", "B"),
+        NextResearchAction("R3", "official_database", "also pending", "medium", "C"),
+    )
+    assessment = parse_research_assessment(
+        _payload(
+            decision="continue",
+            statuses=("weak", "weak"),
+            gaps=[_gap("R1"), _gap("R2")],
+            actions=[_action("R1", "query_rewrite")],
+        ),
+        requirements=REQUIREMENTS,
+        evidence=EVIDENCE,
+        attempts=(),
+    )
+
+    queue = merge_next_action_queue(
+        previous,
+        assessment,
+        active_consumed=True,
+    )
+
+    assert [(item.requirement_id, item.query) for item in queue] == [
+        ("R2", "pending"),
+        ("R1", "Find the original primary document"),
+    ]
+
+
+def test_replan_replaces_only_same_requirement_and_stop_clears_queue() -> None:
+    previous = (
+        NextResearchAction("R1", "primary_document", "old R1", "high", "A"),
+        NextResearchAction("R2", "paper_search", "pending R2", "high", "B"),
+    )
+    replanned = parse_research_assessment(
+        _payload(
+            decision="replan",
+            statuses=("weak", "weak"),
+            gaps=[_gap("R1"), _gap("R2")],
+            actions=[_action("R1", "query_rewrite")],
+            replan_reason="The old R1 path is low value.",
+        ),
+        requirements=REQUIREMENTS,
+        evidence=EVIDENCE,
+        attempts=(
+            StrategyAttempt("R1", "primary_document", "old R1", "no_progress"),
+        ),
+    )
+    queue = merge_next_action_queue(
+        previous,
+        replanned,
+        active_consumed=False,
+    )
+    assert [(item.requirement_id, item.query) for item in queue] == [
+        ("R2", "pending R2"),
+        ("R1", "Find the original primary document"),
+    ]
+
+    stopped = parse_research_assessment(
+        _payload(decision="stop_research", termination_reason="coverage_complete"),
+        requirements=REQUIREMENTS,
+        evidence=EVIDENCE,
+        attempts=(),
+    )
+    assert merge_next_action_queue(previous, stopped, active_consumed=False) == ()
+
+
+def test_requirement_keyed_queue_stays_bounded_and_rotates_across_assessments() -> None:
+    coverage = (
+        RequirementCoverage("R1", RequirementStatus.WEAK),
+        RequirementCoverage("R2", RequirementStatus.WEAK),
+    )
+    gaps = (
+        CriticalGap("R1", "R1 remains weak", "high"),
+        CriticalGap("R2", "R2 remains weak", "high"),
+    )
+
+    def assessment(round_index: int) -> ResearchAssessment:
+        return ResearchAssessment(
+            decision=ResearchDecision.CONTINUE,
+            coverage=coverage,
+            critical_gaps=gaps,
+            next_actions=(
+                NextResearchAction(
+                    "R1",
+                    "query_rewrite",
+                    f"R1 query {round_index}",
+                    "high",
+                    "Improve R1",
+                ),
+                NextResearchAction(
+                    "R1",
+                    "paper_search",
+                    f"duplicate R1 {round_index}",
+                    "high",
+                    "Also improve R1",
+                ),
+                NextResearchAction(
+                    "R2",
+                    "official_database",
+                    f"R2 query {round_index}",
+                    "high",
+                    "Improve R2",
+                ),
+            ),
+        )
+
+    queue: tuple[NextResearchAction, ...] = ()
+    active_requirements: list[str] = []
+    for round_index in range(10):
+        queue = merge_next_action_queue(
+            queue,
+            assessment(round_index),
+            active_consumed=bool(queue),
+        )
+        assert len(queue) == 2
+        assert len({item.requirement_id for item in queue}) == len(queue)
+        active_requirements.append(queue[0].requirement_id)
+
+    assert active_requirements == ["R1", "R2"] * 5

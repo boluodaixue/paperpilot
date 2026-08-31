@@ -12,6 +12,7 @@ import re
 import sys
 import time
 from collections import Counter
+from contextlib import asynccontextmanager
 from dataclasses import asdict
 from pathlib import Path
 from typing import Any
@@ -25,10 +26,16 @@ if str(PROJECT_ROOT) not in sys.path:
 from evaluation.benchmarks.hotpotqa import HotpotQABenchmark
 from evaluation.benchmarks.memory_wiki import evaluate_memory_wiki
 from evaluation.benchmarks.research_bench import ResearchBench
+from evaluation.judge import LLMJudge
 from evaluation.report import EvaluationReport
 from src.models.model_router import ModelRouter
 from src.research.models import ResearchWorkflowResult
-from src.research.runtime import build_research_runtime, load_config, setup_logging
+from src.research.runtime import (
+    build_research_runtime,
+    load_config,
+    open_research_runtime,
+    setup_logging,
+)
 
 
 async def extract_grounded_hotpotqa_answer(
@@ -105,6 +112,7 @@ def evaluation_config_with_tool_budget(
     max_total_tool_calls: int | None,
     max_tool_calls: int | None = None,
     max_total_tokens: int | None = None,
+    max_elapsed_seconds: float | None = None,
 ) -> dict[str, Any]:
     """Return a copy with optional evaluation-only resource budgets."""
     result = copy.deepcopy(config)
@@ -115,6 +123,8 @@ def evaluation_config_with_tool_budget(
         limits["max_total_tool_calls"] = max_total_tool_calls
     if max_total_tokens is not None:
         limits["max_total_tokens"] = max_total_tokens
+    if max_elapsed_seconds is not None:
+        limits["max_elapsed_seconds"] = max_elapsed_seconds
     return result
 
 
@@ -135,6 +145,118 @@ def configured_local_tool_budget(config: dict[str, Any]) -> int:
 def configured_token_budget(config: dict[str, Any]) -> int:
     """Resolve the global token budget recorded in evaluation output."""
     return int(config.get("research", {}).get("limits", {}).get("max_total_tokens", 120000))
+
+
+def configured_elapsed_budget(config: dict[str, Any]) -> float:
+    """Resolve the per-question wall-clock budget recorded in evaluation output."""
+    return float(
+        config.get("research", {}).get("limits", {}).get("max_elapsed_seconds", 300.0)
+    )
+
+
+def judge_backend(config: dict[str, Any]) -> str:
+    """Resolve the external evaluation backend without changing AgentGraph routing."""
+    model = config.get("model", {})
+    return str(
+        model.get("backend_mapping", {}).get("judge", model.get("backend", "deepseek"))
+    )
+
+
+def judge_sampling_kwargs(config: dict[str, Any]) -> dict[str, Any]:
+    """Resolve Judge-only sampling without changing Research AgentGraph policy."""
+    model = config.get("model", {})
+    backend = judge_backend(config)
+    sampling = model.get("backend_sampling", {})
+    result = dict(sampling.get(backend, {}))
+    result.update(sampling.get("modules", {}).get("judge", {}))
+    return result
+
+
+def add_llm_judge_metrics(
+    detail: dict[str, Any],
+    judge_result: dict[str, Any],
+) -> None:
+    """Attach Judge output while keeping the ResearchBench rule score identifiable."""
+    rule_score = float(detail.get("composite_score", 0.0))
+    detail["rule_composite_score"] = rule_score
+    detail["llm_judge"] = judge_result
+    if "error" in judge_result:
+        detail["judge_status"] = "failed"
+        detail["judge_average"] = None
+        detail["rule_judge_composite_score"] = None
+        return
+    judge_average = float(judge_result.get("average", 0.0))
+    detail["judge_status"] = "valid"
+    detail["judge_average"] = judge_average
+    detail["rule_judge_composite_score"] = round(
+        0.6 * rule_score + 0.4 * (judge_average / 10.0),
+        6,
+    )
+
+
+@asynccontextmanager
+async def evaluation_runtime(
+    config: dict[str, Any],
+    checkpoint_db_path: str | None,
+):
+    """Use durable evaluation checkpoints when requested by a long real run."""
+    if checkpoint_db_path:
+        durable_config = isolated_evaluation_config(config, checkpoint_db_path)
+        async with open_research_runtime(
+            checkpoint_db_path, config=durable_config
+        ) as runtime:
+            yield runtime
+        return
+    runtime = build_research_runtime(config=config, checkpointer=InMemorySaver())
+    try:
+        yield runtime
+    finally:
+        await runtime.close()
+
+
+def isolated_evaluation_config(
+    config: dict[str, Any],
+    checkpoint_db_path: str,
+) -> dict[str, Any]:
+    """Keep durable benchmark artifacts isolated while preserving DB resume."""
+    isolated = copy.deepcopy(config)
+    root = Path(checkpoint_db_path).resolve().parent
+    isolated.setdefault("research", {})["vault_root"] = str(root / "vault")
+    isolated.setdefault("runtime", {})["retrieval_db_path"] = str(
+        root / "retrieval.db"
+    )
+    isolated.setdefault("chat", {})["db_path"] = str(root / "chat.db")
+    return isolated
+
+
+async def run_or_resume_evaluation_workflow(
+    runtime: Any,
+    question: str,
+    *,
+    thread_id: str,
+) -> ResearchWorkflowResult:
+    """Resume a durable ResearchBench item instead of restarting its research."""
+    state = await runtime.get_state(thread_id)
+    existing = state.get("workflow_result") if state else None
+    if isinstance(existing, ResearchWorkflowResult):
+        return existing
+    if state:
+        if state.get("confirmed"):
+            final = await runtime.continue_research(thread_id)
+        else:
+            status = str(state.get("workflow_status") or "")
+            if status == "waiting_confirmation":
+                final = await runtime.review(thread_id, "confirm")
+            else:
+                await runtime.continue_research(thread_id)
+                final = await runtime.review(thread_id, "confirm")
+    else:
+        await runtime.start(question, thread_id=thread_id)
+        final = await runtime.review(thread_id, "confirm")
+    result = final.get("workflow_result")
+    if not isinstance(result, ResearchWorkflowResult):
+        raise RuntimeError("evaluation workflow ended without a structured result")
+    return result
 
 
 def workflow_metrics(result: ResearchWorkflowResult) -> dict[str, Any]:
@@ -223,12 +345,16 @@ def researchbench_summary(
     budget: int,
     local_budget: int,
     token_budget: int,
+    elapsed_budget: float = 300.0,
 ) -> dict[str, Any]:
     """Aggregate comparison-ready ResearchBench metrics without inventing data."""
     details = report.details
     scores = [detail["composite_score"] for detail in details if "composite_score" in detail]
     successful = [detail for detail in details if "error" not in detail]
     rcs_details = [detail["rcs"] for detail in successful if "rcs" in detail]
+    judge_details = [
+        detail for detail in successful if detail.get("judge_status") == "valid"
+    ]
 
     def counts(field: str, *, default: str = "unknown") -> dict[str, int]:
         return dict(Counter(str(detail.get(field) or default) for detail in details))
@@ -237,10 +363,37 @@ def researchbench_summary(
         "budget": budget,
         "local_tool_budget": local_budget,
         "token_budget": token_budget,
+        "elapsed_budget_seconds": elapsed_budget,
         "average_composite": sum(scores) / len(scores) if scores else 0.0,
+        "average_rule_composite": sum(scores) / len(scores) if scores else 0.0,
+        "average_judge": (
+            sum(float(detail["judge_average"]) for detail in judge_details)
+            / len(judge_details)
+            if judge_details
+            else None
+        ),
+        "average_rule_judge_composite": (
+            sum(float(detail["rule_judge_composite_score"]) for detail in judge_details)
+            / len(judge_details)
+            if judge_details
+            else None
+        ),
+        "judge_success": len(judge_details),
+        "judge_failed": sum(
+            detail.get("judge_status") == "failed" for detail in successful
+        ),
         "num_success": len(successful),
         "num_failed": len(details) - len(successful),
         "elapsed_seconds": sum(detail.get("elapsed_seconds", 0.0) for detail in details),
+        "research_elapsed_seconds": sum(
+            detail.get("research_elapsed_seconds", 0.0) for detail in details
+        ),
+        "rule_evaluation_elapsed_seconds": sum(
+            detail.get("rule_evaluation_elapsed_seconds", 0.0) for detail in details
+        ),
+        "judge_elapsed_seconds": sum(
+            detail.get("judge_elapsed_seconds", 0.0) for detail in details
+        ),
         "evidence_count": sum(detail.get("evidence_count", 0) for detail in details),
         "source_count": sum(detail.get("source_count", 0) for detail in details),
         "thread_count": sum(detail.get("thread_count", 0) for detail in details),
@@ -277,6 +430,9 @@ async def _evaluate_research_bench(
     config: dict[str, Any],
     question_ids: list[str] | None = None,
     stratified: bool = False,
+    use_llm_judge: bool = False,
+    checkpoint_db_path: str | None = None,
+    progress_output_dir: str | None = None,
 ) -> EvaluationReport:
     logger = logging.getLogger("run_eval")
     bench = ResearchBench()
@@ -290,19 +446,55 @@ async def _evaluate_research_bench(
     budget = configured_tool_budget(config)
     local_budget = configured_local_tool_budget(config)
     token_budget = configured_token_budget(config)
-    runtime = build_research_runtime(config=config, checkpointer=InMemorySaver())
-    try:
+    elapsed_budget = configured_elapsed_budget(config)
+    judge = (
+        LLMJudge(
+            backend=judge_backend(config),
+            **judge_sampling_kwargs(config),
+        )
+        if use_llm_judge
+        else None
+    )
+    async with evaluation_runtime(config, checkpoint_db_path) as runtime:
         for index, question in enumerate(questions, 1):
             question_id = question["id"]
             logger.info("[%s/%s] Evaluating %s", index, len(questions), question_id)
             started = time.monotonic()
+            research_elapsed = 0.0
+            rule_elapsed = 0.0
+            judge_elapsed = 0.0
             try:
-                workflow = await runtime.run_auto_confirmed(question["query"], thread_id=runtime.new_thread_id())
+                thread_id = f"researchbench-{question_id}"
+                research_started = time.monotonic()
+                workflow = await run_or_resume_evaluation_workflow(
+                    runtime,
+                    question["query"],
+                    thread_id=thread_id,
+                )
+                research_elapsed = time.monotonic() - research_started
+                rule_started = time.monotonic()
                 detail = bench.evaluate_report(workflow.report_markdown, question_id)
+                rule_elapsed = time.monotonic() - rule_started
                 detail.update(workflow_metrics(workflow))
                 detail["budget"] = budget
                 detail["local_tool_budget"] = local_budget
                 detail["token_budget"] = token_budget
+                detail["elapsed_budget_seconds"] = elapsed_budget
+                detail["checkpoint_thread_id"] = thread_id
+                detail["checkpoint_db_path"] = checkpoint_db_path
+                if judge is not None:
+                    judge_started = time.monotonic()
+                    judge_result = await asyncio.to_thread(
+                        judge.score_single,
+                        workflow.report_markdown,
+                        question["query"],
+                        question.get("ground_truth"),
+                    )
+                    judge_elapsed = time.monotonic() - judge_started
+                    add_llm_judge_metrics(detail, judge_result)
+                detail["research_elapsed_seconds"] = research_elapsed
+                detail["rule_evaluation_elapsed_seconds"] = rule_elapsed
+                detail["judge_elapsed_seconds"] = judge_elapsed
                 detail["elapsed_seconds"] = time.monotonic() - started
                 report.add_detail(detail)
             except Exception as exc:
@@ -316,11 +508,27 @@ async def _evaluate_research_bench(
                         "budget": budget,
                         "local_tool_budget": local_budget,
                         "token_budget": token_budget,
+                        "elapsed_budget_seconds": elapsed_budget,
+                        "research_elapsed_seconds": research_elapsed,
+                        "rule_evaluation_elapsed_seconds": rule_elapsed,
+                        "judge_elapsed_seconds": judge_elapsed,
                         "elapsed_seconds": time.monotonic() - started,
                     }
                 )
-    finally:
-        await runtime.close()
+            if progress_output_dir:
+                report.set_summary(
+                    researchbench_summary(
+                        report,
+                        budget=budget,
+                        local_budget=local_budget,
+                        token_budget=token_budget,
+                        elapsed_budget=elapsed_budget,
+                    )
+                )
+                report.save(
+                    progress_output_dir,
+                    filename="ResearchBench_Evaluation_progress.json",
+                )
 
     report.set_summary(
         researchbench_summary(
@@ -328,6 +536,7 @@ async def _evaluate_research_bench(
             budget=budget,
             local_budget=local_budget,
             token_budget=token_budget,
+            elapsed_budget=elapsed_budget,
         )
     )
     return report
@@ -339,6 +548,9 @@ def evaluate_research_bench(
     config: dict[str, Any],
     question_ids: list[str] | None = None,
     stratified: bool = False,
+    use_llm_judge: bool = False,
+    checkpoint_db_path: str | None = None,
+    progress_output_dir: str | None = None,
 ) -> EvaluationReport:
     return asyncio.run(
         _evaluate_research_bench(
@@ -347,6 +559,9 @@ def evaluate_research_bench(
             config,
             question_ids=question_ids,
             stratified=stratified,
+            use_llm_judge=use_llm_judge,
+            checkpoint_db_path=checkpoint_db_path,
+            progress_output_dir=progress_output_dir,
         )
     )
 
@@ -512,6 +727,22 @@ def main() -> None:
         default=None,
         help="Evaluation-only global token budget override",
     )
+    parser.add_argument(
+        "--max-elapsed-seconds",
+        type=float,
+        default=None,
+        help="Evaluation-only per-question wall-clock budget override",
+    )
+    parser.add_argument(
+        "--llm-judge",
+        action="store_true",
+        help="Run the configured external LLM Judge for every generated ResearchBench report",
+    )
+    parser.add_argument(
+        "--checkpoint-db",
+        default=None,
+        help="Persistent SQLite checkpoint path for resumable long evaluations",
+    )
     parser.add_argument("--config", default=None)
     parser.add_argument("--output-dir", "--output_dir", default="outputs/evaluation")
     parser.add_argument(
@@ -527,10 +758,13 @@ def main() -> None:
         parser.error("--max-total-tool-calls must be at least 1")
     if args.max_total_tokens is not None and args.max_total_tokens < 1:
         parser.error("--max-total-tokens must be at least 1")
+    if args.max_elapsed_seconds is not None and args.max_elapsed_seconds <= 0:
+        parser.error("--max-elapsed-seconds must be positive")
     if args.smoke and (
         args.max_tool_calls is not None
         or args.max_total_tool_calls is not None
         or args.max_total_tokens is not None
+        or args.max_elapsed_seconds is not None
     ):
         parser.error("--smoke cannot be combined with tool-budget overrides")
     if args.benchmark != "research_bench" and (args.question_ids or args.stratified or args.domain):
@@ -547,6 +781,7 @@ def main() -> None:
             args.max_total_tool_calls,
             max_tool_calls=args.max_tool_calls,
             max_total_tokens=args.max_total_tokens,
+            max_elapsed_seconds=args.max_elapsed_seconds,
         )
 
     if args.benchmark == "memory_wiki":
@@ -558,6 +793,9 @@ def main() -> None:
             config,
             question_ids=args.question_ids,
             stratified=args.stratified,
+            use_llm_judge=args.llm_judge,
+            checkpoint_db_path=args.checkpoint_db,
+            progress_output_dir=args.output_dir,
         )
     else:
         report = evaluate_hotpotqa(

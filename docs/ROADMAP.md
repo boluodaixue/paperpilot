@@ -7,7 +7,7 @@
 | 能力 | 状态 | 结果 |
 |---|---|---|
 | 同质 Research AgentGraph | ✅ | 根、子、孙复用同一图，fork 与全树预算可恢复 |
-| 研究充分性与终止机制 | ✅ | 固定完成门已替换；真实三题确认不再第 4 轮强停，并暴露语义收敛成本 |
+| 研究充分性与终止机制 | ✅ | 固定完成门已替换；真实三题完整运行到 LLM Judge，确认不再第 4 轮强停，并诚实披露预算收束 |
 | Research Workflow | ✅ | Brief 修改/确认、interrupt、SQLite checkpoint 和重启恢复 |
 | Markdown Memory | ✅ | 多 `memory_id`、报告/证据/来源/笔记/导入和 WikiLink |
 | Obsidian 接入 | ✅ | 安全打开 Memory、报告和引用，不写 `.obsidian/` |
@@ -16,7 +16,7 @@
 | 单一 Vault Writer | ✅ | 持久队列、lease、staging/journal、幂等和崩溃恢复 |
 | 持久化检索 | ✅ | FTS5 增量索引、最终哈希复核和可删除重建 |
 | 可选混合检索 | ✅ | 本地多语言语义 + FTS + WikiLink，失败降级 |
-| 离线自动化验收 | ✅ | `747 passed, 2 skipped`；N1–N6 `122 passed` |
+| 离线自动化验收 | ✅ | `772 passed, 2 skipped`；N1–N6 `138 passed` |
 
 ## 当前优先级
 
@@ -27,7 +27,7 @@
 - [x] 实现 Continue / Replan / Stop Research；
 - [x] 分离 research status、termination reason 和 output status；
 - [x] 将 RCS 接入最终评测，而不是运行时停止阈值；
-- [x] 运行专项、全量回归和相同三题真实验收；三题均按 `time_budget_exhausted → budget_forced` 诚实停止，后续需继续改善语义收敛和最终输出稳定性。
+- [x] 运行专项、全量回归和相同三题真实验收；三题分别按轮次、token、时间边界 `budget_forced` 诚实停止，完整 LLM Judge 均成功，后续需改善 requirement/证据匹配与语义收敛。
 
 ### 1. 作品集发布
 
@@ -38,11 +38,11 @@
 
 ### 2. 真实模型演示
 
-- [ ] 使用真实模型、搜索和论文读取跑完整任务；
+- [x] 使用真实模型、搜索和论文读取跑三题完整 ResearchBench 与 LLM Judge；
 - [ ] 验证一次服务重启恢复；
 - [ ] 在 Obsidian 中检查 Markdown 与 backlinks；
 - [ ] 验证 Memory 问答与继续研究；
-- [ ] 记录成本、耗时、失败点和改进项。
+- [x] 记录调用、token、耗时、规则分、RCS、Judge、停止原因和失败点。
 
 ### 3. 展示材料
 
