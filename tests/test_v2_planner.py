@@ -162,3 +162,38 @@ async def test_empty_model_question_array_still_returns_conservative_plan() -> N
     assert len(plan.core_questions) == 3
     assert plan.report_outline == ("Research findings", "Limitations", "Sources")
     assert plan.fallback_reason is None
+
+
+@pytest.mark.asyncio
+async def test_planner_keeps_experimental_requirements_out_of_production_prompt() -> None:
+    policy = RecordingPolicy([
+        {
+            "core_questions": [],
+            "report_outline": ["Comparison"],
+            "source_guidance": ["Use original benchmark reports"],
+            "work_hints": [],
+            "evidence_requirements": [{
+                "question": "Compare Chinese reasoning",
+                "description": "Report the same-version benchmark score and test conditions.",
+                "evidence_kind": "benchmark_result",
+                "minimum_verified_claims": 2,
+                "minimum_independent_sources": 2,
+                "primary_source_required": True,
+                "required": True,
+            }],
+        }
+    ])
+
+    plan = await plan_research(_brief(), policy)
+
+    assert all(
+        item.minimum_verified_claims == 1
+        and item.minimum_independent_sources == 1
+        and item.primary_source_required is False
+        for item in plan.evidence_requirements
+    )
+    assert {
+        item.question_id for item in plan.evidence_requirements
+    } == {
+        item.question_id for item in plan.core_questions
+    }

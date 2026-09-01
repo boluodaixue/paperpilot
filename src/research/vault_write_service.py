@@ -549,10 +549,13 @@ class VaultWriteService:
         memory_id: str | None = None,
         created_at: str | None = None,
         report_body_markdown: str | None = None,
+        report_architecture: str = "supervisor_v2",
     ) -> tuple[str, MemoryManifest]:
         if memory_id is None:
             return self.memory_store.persist_research(
-                brief, result, identity, report_body_markdown=report_body_markdown
+                brief, result, identity,
+                report_body_markdown=report_body_markdown,
+                report_architecture=report_architecture,
             )
         if memory_id == LEGACY_MEMORY_ID:
             raise ValueError("M-legacy is read-only and cannot accept research output")
@@ -562,6 +565,7 @@ class VaultWriteService:
             identity,
             memory_id=memory_id,
             report_body_markdown=report_body_markdown,
+            report_architecture=report_architecture,
         )
         plan = build_research_bundle_plan(
             self.memory_store,
@@ -571,6 +575,7 @@ class VaultWriteService:
             memory_id=memory_id,
             created_at=created_at or self.memory_store._timestamp(),
             report_body_markdown=report_body_markdown,
+            report_architecture=report_architecture,
         )
         payload = self._submit(plan, request_hash=request_hash)
         manifest = self._manifest(payload)

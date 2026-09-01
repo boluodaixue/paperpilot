@@ -153,6 +153,7 @@ class ForkCandidate:
     objective: str
     expected_output: str
     requirement_ids: tuple[str, ...] = ()
+    scope_signature: str = ""
     context: dict[str, Any] = field(default_factory=dict)
     reasons: tuple[ForkReason, ...] = ()
     estimated_tool_calls: int = 0
@@ -175,6 +176,8 @@ class EvidenceItem:
     requirement_id: str = ""
     action_id: str = ""
     artifact_id: str = ""
+    assignment_id: str = ""
+    parent_assignment_id: str = ""
 
 
 @dataclass(frozen=True)
@@ -455,4 +458,14 @@ class ResearchWorkflowResult:
     acquisition_call_count: int = 0
     repair_applied: bool = False
     repair_actions: tuple[str, ...] = ()
+    reportable_claim_rejection_count: int = 0
+    candidate_claim_count: int = 0
+    verified_claim_count: int = 0
+    support_assessment_count: int = 0
+    entailed_assessment_count: int = 0
+    evidence_requirement_coverage: tuple[dict[str, Any], ...] = ()
+    composer_claim_count: int = 0
+    shared_comparison: bool = False
+    shared_selected_evidence_count: int = 0
+    coordination_metrics: dict[str, int] = field(default_factory=dict)
     memory_id: str | None = None

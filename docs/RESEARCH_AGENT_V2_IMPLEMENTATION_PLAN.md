@@ -626,3 +626,141 @@ draft_brief → review_brief → prepare_research
 - 硬门：required assignment `1.0`、material citation coverage `1.0`、invalid citation `0`、Worker duplicate `0.0`，且非 budget-forced；Citation repair 被明确记录为 `repair_applied=true`，不再错误降级有效状态。本轮首次同时保住 r5 的 Judge `7.2` 内容质量与 r6 的 `valid` 状态，单题金丝雀通过。
 - Red：8 个 Challenge 全部进入 `unresolved_disclosed`，披露率 `1.0`、resolution `0.0`。报告安全保留了中国监管原文、真实案例/市场数据、SLB coupon/违约条款等证据缺口，没有伪造解决；但 Composer 正文中仍有一句“无挑战信息”，与程序追加的 Red 未决表矛盾。扩展多题灰度前应确定性删除或改写这类与实际 Challenge 状态冲突的模板句。
 - 决策：默认仍保持 Legacy，不直接切换。下一步先做依赖 fail-fast 与 acquisition 原始错误透传，修复 Composer 挑战状态一致性，再用两道不同类型问题进行小规模灰度，而不是继续重复 `fin_006`。
+
+#### 依赖预检、Browser 错误透传与跨类型小规模灰度
+
+- 启动依赖检查：结构化 Browser 初始化时先验证 `beautifulsoup4`、`markdownify`、`pypdf`；仅在显式启用 Docling 时验证 `docling`。缺包或导入失败会在研究开始前一次性报出，而不是消耗搜索预算后让所有 HTML/PDF 静默失败；Legacy 模式不加载这些可选依赖。
+- Browser 原始错误：统一获取器的并发共享任务现在同时返回 document/error；失败记录保留请求 URL、Browser status、具体异常和 warnings。两道灰度共 51 个 fetch error 中，`Browser returned no structured content` 为 0；可见错误包括 HTTP 403/404/412、SSL 失败及具体重定向目标。
+- Composer/Red 一致性：只要存在 research challenge，Lead 提示明确禁止声称“没有挑战”；成文后再确定性删除中英文矛盾句，并把安全修复加入 unresolved/history。`unresolved_disclosed` 继续作为有约束力的未解决状态，目标 Claim 不会因披露而重新进入事实正文。
+- Composer schema 容错：法律题前两次隔离运行分别暴露“JSON 修复仍不是合法 JSON”和 `unresolved` 类型错误。第二次格式修复仍失败或正文缺失时，Composer 现在只用已经过 inventory 校验的 Evidence Claims/IDs 生成确定性降级报告；`null`、单字符串、混合数组或其他 `unresolved` 形态会安全规范化，并明确记录 `repaired`，不再把已完成的研究整体判为失败。
+- 定向回归：依赖、获取器、Composer 与 Citation 相关回归最终为 `43 passed`。灰度前的扩大回归为 `75 passed, 1 skipped`；此前完整回归为 `963 passed, 3 skipped, 1 failed`，唯一失败是 60ms lease heartbeat 的既有负载时序抖动，隔离重跑 `1 passed`。本节新增 Composer 容错后关闭 LangSmith/LangChain tracing、使用 ASCII 临时目录执行最终完整回归：`973 passed, 3 skipped`，耗时 `146.84s`、退出码 `0`。
+
+法律灰度 `law_002`（PIPL 与 GDPR 跨境传输及合规成本）：
+
+- 有效结果：`outputs/evaluation/researchbench-v2-grey-law002-r3/ResearchBench_Evaluation_20260901_051425.json`；状态 `partial / coverage_complete / repaired`，Judge `3.2/10`，30 Evidence、21 sources、25 tool calls、388,868 tokens、59 unresolved；研究阶段 `961.688s`，总计 `1,029.953s`。
+- 结构指标：material citation coverage `0.3333`、invalid citations `7`、Challenge acceptance `1.0`、resolution `0.0`、unresolved disclosure `1.0`；报告公开 9 项未解决 Red 问题，没有出现“无挑战”矛盾句。
+- 获取轨迹：21 次 acquisition、168 candidates、64 selected、45 opened、7 cache hits、19 fetch errors；40 个 `beautifulsoup+markdownify`、3 个 `pypdf`、2 个 `tavily-extract`。调用预算未耗尽，主要失败不是搜索/打开上限。
+
+医疗灰度 `med_004`（CRISPR 治疗 SCD/TDT 的疗效与长期安全）：
+
+- 有效结果：`outputs/evaluation/researchbench-v2-grey-med004-r1/ResearchBench_Evaluation_20260901_053203.json`；状态 `partial / coverage_complete / repaired`，Judge `3.8/10`，43 Evidence、21 sources、29 tool calls、369,836 tokens、58 unresolved；研究阶段 `935.813s`，总计 `1,024.110s`。
+- 结构指标：material citation coverage `0.8857`、invalid citations `17`、Challenge acceptance `0.9091`、resolution `0.0`、unresolved disclosure `1.0`；报告公开 10 项未解决 Red 问题、拒绝 1 项，没有把长期安全性缺口伪装成已解决。
+- 获取轨迹：25 次 acquisition、195 candidates、79 selected、47 opened、18 cache hits、32 fetch errors；28 个 `beautifulsoup+markdownify`、4 个 `pypdf`、15 个 `tavily-extract`。NEJM 直连 403 时仍从可访问 PDF 得到页码化临床结果，证明 PDF 轻量抽取链路可用。
+
+灰度结论：
+
+- 本轮要求的三个可靠性问题已经关闭：结构化依赖可 fail-fast、Browser 原始错误可审计、Composer 不再生成与 Red 状态直接矛盾的“无挑战”断言；两类问题也都能跑到完整评测而不因 Composer schema 崩溃。
+- 多领域质量门未通过。两题均非 budget-forced，低分主因是 Citation Audit/repair 把大量带内部 Evidence ID 的材料性段落降级，同时抓取正文中的站内 URL 进入最终报告后被判为 invalid；报告因此膨胀成“原始正文片段 + citation issue 清单”，而不是紧凑的研究综合。法律题还混入澳大利亚隐私法和低质量成本估算，医疗题则出现同一 NEJM/EMA URL 同时被列为 invalid 与 missing 的审计矛盾。
+- 下一步不应继续提高调用预算或立即切默认。应先修 Citation Audit 的内部 marker/正式 URL 边界、禁止原始抓取正文直接进入最终 Supported findings、合并去重互相矛盾的 citation issues，并让审计失败保留可验证的已引用综合正文，而不是把整段移入 unresolved。
+- 默认审计保持 `research.architecture=legacy`、`supervisor_v2.enabled=false`、`content_extraction.mode=legacy`，Tavily Extract、Docling、OCR 默认关闭；本轮没有切换默认架构。
+
+#### 结构化 Claim/Citation 边界与跨类型复验
+
+- Composer 合同由自由 `report_markdown` 改为结构化 `ReportSection -> ReportAssertion{text, claim_ids}`。Lead 不再书写 Evidence marker、URL 或引用列表；程序通过 `claim_ids -> evidence_ids` 确定性生成 `[[EVIDENCE:id]]`，最终 Renderer 再统一生成 References。Composer 上下文不再包含 `source_ref` 或原始 excerpt，只接收清洗后的 Claim、来源标题/类型和 locator。
+- 新增 Claim hygiene：正文禁止裸 URL、Markdown 图片/链接、HTML、导航与长网页块。对于含有效事实但形态嘈杂的 finding，采用纯抽取式原子 Claim 派生，从已有文本中选择与 Core Question 最相关的事实句；不调用模型改写，不新增事实。纯导航/元数据仍隔离，并记录 `reportable_claim_rejection_count`。
+- Core Question 选择改为轮转：先为每个问题选择第一条 Claim，再选择第二条，避免前几个问题占满 Composer 上限。Composer 若遗漏已有 Claim 支撑的必答问题会触发一次结构修复，仍失败则确定性使用验证后的 Claims；没有任何可报告 Claim 的问题写入 `uncovered_question_ids` 并使 ResearchStatus 保持 partial。
+- Citation Audit 现在只接受内部 Evidence marker，任何正文裸 URL 均为结构错误；含 URL/未知 marker 的行不会同时再生成 missing issue。同一文本只保留优先级最高的问题（invalid > conflict > overclaim > locator > missing）。修复后的历史 issue 保存在结构化 ledger，并标记 `repaired/removed`；评测只把仍未解决的 invalid/locator 计入 `invalid_citation_count`。
+- 安全回退不再把 `Citation audit removed or downgraded: <完整原文>` 写回报告。报告只显示聚合数量，详细 claim_text 仅保存在评测 JSON；Red 未解决问题独立追加，并对 reason/follow-up 做 URL 清洗和长度限制。新增硬指标：`raw_url_count_before_render`、`citation_issue_conflict_count`、`audit_log_leak_count` 必须均为 0。
+- 定向回归：结构化 Composer、Citation、Workflow、评测与并发新增的共享管线/Blackboard 组合为 `51 passed`。完整回归在中间版本得到 `968 passed, 3 skipped, 1 failed`；唯一失败是 Web 异步轮询在 LangSmith 429 负载下仍停留在 proposal，关闭遥测后隔离重跑 `1 passed`。合并最终代码并关闭遥测后全量回归为 `996 passed, 3 skipped`，退出码 `0`。
+
+法律 `law_002`：
+
+- `r4`（结构化 Citation 边界、原子 Claim 派生前）：`completed / coverage_complete / valid`，Judge `3.4/10`，38 Evidence、23 sources、33 tool calls、411,400 tokens。material citation coverage `1.0`、invalid `0`、裸 URL `0`、citation issue conflict `0`、audit-log leak `0`；但 `reportable_claim_rejection_count=31`，正文几乎只有 GDPR 两个二手来源，缺失 PIPL 与成本比较。
+- `r5`（加入 Core Question 轮转与抽取式原子 Claim）：`completed / coverage_complete / valid`，Judge `2.6/10`，34 Evidence、23 sources、30 tool calls、418,054 tokens。四项 Citation 边界指标继续全部为 0，Claim 隔离数从 31 降到 1；但语义 Citation Audit 将 16 条 invalid 与 5 条 overclaim 标记为 removed，最终只剩一份中国网信办来源。该结果证明简单清洗能恢复候选 Claim，却不能替代 claim/excerpt 的真实语义支撑。
+
+医疗 `med_004`：
+
+- `r2` 在研究正式开始前因一次 SQLite `database is locked` 中止，0 Evidence、0 tool calls，属于无效运行样本；全新 checkpoint 的 `r3` 未复现锁错误。
+- `r3`（结构化 Citation 边界 + 问题覆盖守卫）：`partial / coverage_complete / valid`，Judge `1.6/10`，33 Evidence、17 sources、33 tool calls、413,321 tokens。material citation coverage `1.0`、invalid `0`、裸 URL `0`、citation issue conflict `0`、audit-log leak `0`，`reportable_claim_rejection_count=23`。问题覆盖守卫正确把缺失临床疗效、长期安全和监管一手文件的产物保持为 partial；最终仅一条 ATMP 上市后措施证据存活，未把空报告误标 completed。
+
+本轮结论：
+
+- 已解决原灰度的 Citation 边界根因：没有正文裸 URL、同一内容不再同时 invalid/missing、审计原文不再泄漏到 Supported findings、正式引用只有一条确定性链路。
+- 多领域内容门仍未通过，且 Judge 均低于 5。下一瓶颈不再是预算、JSON schema 或 Citation renderer，而是获取/选择阶段没有稳定命中问题所需的一手资料，以及 `EvidenceItem.finding` 与 `excerpt` 缺少逐条蕴含保证。下一步应在 Evidence 进入 Claim 前增加 entailment/relevance gate，并针对 Core Question 做官方来源缺口回补；不应放宽 Citation Audit 或继续提高预算。
+- Canary gate 同时要求 `research_status=completed`；因此最终自动判定为：`law_002` 因 `judge_average_below_5` 阻断，`med_004` 因 `research_status_not_completed` 与 `judge_average_below_5` 阻断。新增 gate 回归与 CLI 评测回归 `24 passed`。
+- 默认继续保持 `research.architecture=legacy`、`supervisor_v2.enabled=false`、`content_extraction.mode=legacy`；未切换默认架构。
+
+#### 第一性原理 Evidence–Claim 中间层重构
+
+- 根因修正：删除 V2 生产路径中的 `EvidenceItem.finding -> EvidenceClaim` 直通。`finding` 不再被视为可交付结论；原始资料依次进入 `SourceDocument -> EvidencePassage -> CandidateClaim -> SupportAssessment -> EvidenceClaim`。`EvidencePassage` 保存 exact text、locator 与 content hash；Candidate 必须携带 exact quote 且该 quote 可确定性定位于 Passage。
+- 证明义务：新增 `EvidenceRequirement`。Planner 可为每个 Core Question 生成 1–3 个明确证明槽位，声明 evidence kind、最低 verified Claim 数、最低独立来源数和是否必须一手来源；模型缺省或结构错误时，每个 Core Question 至少生成一个保守 Requirement。Worker 的 research requirement ID 已改为 EvidenceRequirement ID，而 Blackboard 继续以 Core Question 协调所有权。
+- 独立验证：Worker 完成资料获取后，另起一次无工具 Support Verifier 调用。Verifier 只看到 Requirement、Candidate 和对应 Passage，不能搜索、改写 Claim 或使用外部知识；verdict 为 `entailed / partially_entailed / contradicted / irrelevant`。只有 `entailed` 且 confidence >= 0.7 才物化 EvidenceClaim。partial 仅在 supported_scope 是 Passage 中的 exact substring 时生成更窄 Candidate，并再独立验证一次。
+- 安全回退：Verifier 不可用时只允许“exact quote 一致且与 EvidenceRequirement 有确定性词项关联”的抽取式 Candidate；跨语言或相关性无法确定时保守返回 partial，不默认放行。网页导航、完整 Markdown 链接、last-updated 元数据、乱码、表格行、英文句子残片和无事实形态标题在 Candidate 阶段即被隔离。
+- 不可绕过的 proof graph：生产 Worker 同时返回 documents、passages、candidate_claims 和 support_assessments。Supervisor、Red 和 Composer 都会验证 EvidenceClaim 的 passage IDs、assessment IDs、Candidate 文本、entailed verdict、confidence 与 Evidence ID lineage；篡改 Claim 文本或伪造 ID 不能进入覆盖计算或报告。
+- 完成语义：Supervisor 不再按“存在任意 Claim”判定 resolved。每个 EvidenceRequirement 必须满足 verified Claim 数、独立来源数和一手来源条件；Core Question 只有在其全部 required Requirements supported 时才 resolved。Red fallback 也从宽泛问题改为针对具体未覆盖 Requirement 生成 requested evidence 和 suggested query。
+- Composer/Citation：bounded Claim 选择先覆盖每个 required EvidenceRequirement，再加入第二条证据；Composer 只消费 verified Claims。Citation Audit 不再触发新的研究波次，V2 图固定为 `red_review -> drafting -> citation_audit -> persist_result`；Audit 只承担最终结构/语义保险和有界修复。
+- 新指标与门：新增 Claim entailment pass rate、verified Claim yield、Evidence Requirement coverage、primary-source Requirement coverage、Composer Claim survival、Citation Audit removal rate。Canary 要求 Requirement coverage 与 primary-source coverage 均为 100%，且 Citation Audit removal rate <= 5%。
+- 离线真实样本：新增 `scripts/analyze_saved_evidence_claims.py`，无需网络即可重放旧 checkpoint。`law_002 r5` 的 34 条旧 Evidence 生成 31 个 extractive Candidates，exact-quote violation 为 0，但保守 Requirement-aware fallback 仅放行 4 条；`med_004 r3` 的 42 条旧 Evidence 生成 30 个 Candidates，exact-quote violation 为 0，仅放行 8 条。这说明旧系统的 Evidence 数量显著高估了可证明结论数量，新覆盖语义会将其正确暴露为研究缺口。
+- 测试：新增 law/medical gold Passage fixtures、exact quote、Verifier rejection、partial narrowing/reverification、tampered lineage、primary-source coverage 和 Requirement-first Composer tests。相关 V2/共享管线/Blackboard/CLI 指标回归 `129 passed`。首次最终全量为 `1011 passed, 3 skipped, 1 failed`；唯一失败仍是 150ms lease 的既有全量负载时序抖动，隔离复跑 `1 passed`。第二次最终全量为 `1013 passed, 3 skipped`、退出码 `0`。默认仍为 Legacy，尚未启动新的外部灰度。
+
+#### 第一性原理外部灰度与状态修正
+
+- `law_002 r6`：首次新链路真实运行，`partial / evidence_exhausted / fallback`、Judge `2.4`、20 Evidence、12 sources、22 tool calls、研究约 730 秒。proof graph 指标为 30 Candidate Assessments、2 entailed，entailment/yield `0.0667`，Requirement coverage 与 primary-source coverage 均为 0。诊断发现 Planner 未约束每个 Requirement 的最低 Claim/来源数，模型生成了 20 Claims、8 enforcement Claims、4 independent sources 等超预算门槛；该轮作为无效门槛配置样本保留。
+- 门槛修复：`EvidenceRequirement` 合同硬限制 `minimum_verified_claims=1..3`、`minimum_independent_sources=1..2`；Planner 对模型值进行 clamp，并新增越界合同/Planner 回归 `51 passed`。
+- `law_002 r7`：门槛修复后的有效研究运行，`partial / evidence_exhausted / fallback`、Judge `2.0`、31 Evidence、20 sources、31 tool calls、研究约 854 秒。entailment/yield `0.0968`，Requirement coverage 仍为 0。Red 找到少量真实 SCC/TikTok事实，但旧逻辑把 medium weak/non-comparable challenge 的目标 Claim 全部封锁，报告再次整体 abstain。
+- Red 语义修复：`unsupported/conflict/weak_source` 继续 hard-block；high non-comparable/uncertainty hard-block；medium/low non-comparable/uncertainty 只禁止扩大比较，允许保留 verified narrow fact 并披露限制。
+- `law_002 r8`：限定保留后的运行变为 `completed / coverage_complete / valid`，Judge `2.4`、37 Evidence、24 sources、28 tool calls、研究约 1226 秒。entailment/yield `0.3143`、Requirement/primary coverage 均为 `1.0`，但 material citation coverage 为 0，Citation Audit removal rate 达 `1.3`；最终仅保留两条二手引用。该轮进一步暴露两个状态模型错误，不能作为上线通过样本。
+- Red 后 coverage 修正：所有 unresolved Red 目标 Claim 均不再贡献 Requirement coverage；hard-block Claim 从报告 proof graph 移除，soft-limit Claim 可保留窄事实但不能使 Requirement completed。Red 结束后重新计算 Requirement/Core Question coverage 和 termination reason，避免“报告内容被挑战但状态仍 completed”。
+- Composer 不可改写：r8 的 11 个 verified Claims 被 Composer 改写为 15 个综合句，加入 Passage 未直接支持的新事实，Audit 因此删除 13 条。现已取消 Composer 的事实文本权限：模型只返回章节和 claim_ids；每个 ID 确定性展开为一个 immutable Verified Claim 原文，多 Claim 不再合并成新事实句。模型返回的 text 字段即使包含 URL/错误陈述也被忽略。
+- 最终验证：Red coverage 重算、hard/soft constraint 和 immutable Composer 专项 `39 passed`；最终完整回归 `1021 passed, 3 skipped`，退出码 `0`。按预先约定未继续运行医疗题；三轮法律灰度已经证明共同瓶颈仍是一手来源检索与 Passage 质量，继续换领域不会验证新的架构假设。默认继续保持 Legacy。
+
+#### 单一语义裁判、可用 partial 与最终 law r9
+
+- 目标函数修正：Support Verifier 成为唯一 Claim 语义裁判。V2 Citation Audit 固定 `semantic=false`，只检查 Evidence ID、locator、Search snippet、裸 URL、WikiLink 和 marker coverage；不再用第二个模型重新推翻已验证 Claim。
+- Red 职责收敛：只有 unresolved `conflict` hard-block Verified Claim。unsupported/weak-source/non-comparable/uncertainty 仍从 Requirement coverage 中排除目标 Claim，但窄事实可进入 partial 报告并披露限制；Red 不再重复裁决 Passage entailment。
+- 信息量恢复：每个 Passage 最多提取2条原子 Candidate，每个 Worker 总计最多24条；partial support 仍只能 exact-scope 缩窄后重验。Composer 继续只选择 IDs 并输出 immutable Claim 原文。
+- 有用性指标：新增 weighted Evidence Requirement coverage 和 verified Claims in report；Canary 除完整 coverage 外，还要求最终至少3条 Verified Claims。Citation Audit removal rate 继续要求 <=5%。
+- 官方来源路由：Requirement 查询可自动推断 CAC/gov.cn、EUR-Lex/EDPB/EC、FDA、EMA、ClinicalTrials.gov 等 preferred domains，并将初始候选池提高到12。`law r9` artifact 证明 preferred domains 已正确传入，但 Tavily 首轮仍未召回官方站点，只返回维基文库与失效镜像。因此新增通用二阶段获取：首轮没有 preferred-domain 候选时，自动追加至多两个 `site:domain` 定向搜索并合并去重，不硬编码页面 URL。
+- `law_002 r9`：`partial / evidence_exhausted / valid`，Judge `1.8`、19 Evidence、14 sources、23 tool calls、研究约607秒。material citation coverage `1.0`、invalid/raw URL/conflict/log leak 均为0，Citation removal `0`，Composer survival `1.0`；但 34 Candidate Assessments 仅2条 entailed（yield `0.0588`），Requirement/weighted/primary coverage均为0，最终报告只有2条与核心问题弱相关的 Claim。该轮证明多重删除问题已关闭，剩余主瓶颈确定为官方来源召回和 Passage/Requirement 相关性。
+- 测试：单一裁判、多 Candidate、官方域名推断/定向重搜、有用性门专项 `39 passed`。最终全量为 `1025 passed, 3 skipped, 2 failed`，两项失败均为150ms/200ms超短 lease 在全量负载下过期；隔离重跑 `2 passed`。默认继续保持 Legacy；二阶段 site 搜索完成后未再消耗外部灰度。
+
+#### 回滚严格 Proof Graph，恢复旧版 V2 生产路径
+
+后续逐阶段执行计划见 [`RESEARCH_AGENT_V2_BASELINE_IMPROVEMENT_PLAN.md`](RESEARCH_AGENT_V2_BASELINE_IMPROVEMENT_PLAN.md)。
+
+- 回滚范围：`run_research_worker()` 恢复 `EvidenceItem -> 轻量原子 Claim -> BlueWorkerResult`，不再调用 Support Verifier；Supervisor 恢复按 source-locatable Claim 的 question IDs 判断覆盖；supplemental merge 恢复同一语义；Red 恢复读取完整 Evidence package，结束后不再用实验 Requirement coverage 重写 Supervisor 状态。
+- Planner 恢复只生成 Core Questions、report outline、source guidance 和 work hints；EvidenceRequirement 仍由合同自动生成一对一默认对象供实验工具使用，但模型不再生成证明槽位，生产 Supervisor/Worker 不读取其阈值。
+- Composer 恢复综合文本能力：每个 Assertion 重新包含 `text + claim_ids`，允许基于多个已选 Claims 形成可读分析；继续保留结构化 ID、裸 URL/图片/HTML 拒绝、未知 ID inventory repair、Red 状态一致性和审计日志隔离。
+- Citation Audit 恢复旧版语义审计，同时保留后续已经证明有效的 deterministic marker/locator、URL、WikiLink、表格安全和 issue 去重修复。旧版 V2 Canary gate 也恢复为 output status、budget、Core Question assignment、material citation coverage、invalid citation、Lead reserve 和 Judge，不再使用实验 Requirement/Verifier 指标硬阻断。
+- 保留的改进：统一 acquire_evidence、HTML/PDF 全文抽取、Tavily/多后端回退、共享文档缓存、Browser 原始错误、dependency fail-fast、Docling 关闭/熔断、动态预算、Red 未决披露、官方域名推断，以及 preferred domain 未召回时的二阶段 `site:domain` 定向重搜。
+- 实验代码保留但断开：SourceDocument/EvidencePassage/CandidateClaim/SupportAssessment、离线 replay、Verifier/narrowing 和 Requirement coverage 仍可由测试或实验函数显式调用，不接入 V2 生产图，便于以后在有标注集时校准而无需重写。
+- 回归：回滚相关 Planner/Worker/Supervisor/Red/Composer/Citation/Workflow/共享比较测试全部通过；最终完整回归 `1041 passed, 3 skipped`，退出码 `0`。默认仍为 Legacy；回滚后尚未启动新的外部灰度。
+
+#### 同质递归 Fork 与 Supervisor–Worker 的共享黑板公平对照
+
+- 对照边界：固定使用 `fin_006`、同一 `ResearchPlan`（5 个 required Core Questions）、同一 DeepSeek 采样、同一 `acquire_evidence`/结构化抽取、同一动态 Evidence Selector、Claim hygiene、Composer 与 Citation Audit。两边均关闭 Red 和 supplemental wave，预算统一为 `1200s / 500,000 tokens / 96 tool calls`；唯一运行时差异是 Legacy 根 Agent自然选择 `fork_research`，或 Supervisor 确定性分配 WorkPacket。
+- 共享黑板：新增独立 SQLite blackboard，记录不可变计划、assignment/lease、query fingerprint、canonical source、agent status、跨范围 Evidence signal 与 append-only events。Agent只研究 own scope；相同查询/来源复用；跨范围 Evidence 只发布 signal，不主动扩张。黑板是被动协调基础设施，不做规划、充分性裁决或动态重分配。最初与 LangGraph checkpoint 共库的 Supervisor r1 在 4 Worker 并发下触发 `database is locked`，已改为同目录独立 `checkpoint.blackboard.sqlite`；失败样本保留，r2/r3 未复现。
+- 共享下游：两种架构的原始 Evidence 均完整保留；最终报告统一按 `max(12, required_count*4)`、上限 36，单问题 6、普通来源 2、官方一手来源 4 且 locator 不同进行选择，再统一生成 EvidenceClaim。Composer 与 Citation 只接收该有界 inventory；报告持久化保留各自 `architecture` frontmatter。V2 公平模式不再在 Worker 边界提前丢弃 Evidence。
+- Legacy r2（自然 Fork 成功）：1 批 4 个 child，`thread_count=5`；黑板为 `18 queries / 30 sources / 20 source reuses`。结果 `partial / budget_forced / valid`，Judge `6.2`，103 Evidence、26 sources、22 Agent tool calls、389,313 tokens；研究 `974.25s`。4 个 child 均 partial/blocked，父 Agent随后本地补缺。该轮证明同质 Fork 有能力产出本组最高质量报告，但耗时、Token 和收尾压力较高。
+- Legacy r3（自然未 Fork）：Fork 连续 offered 10 次但调用 0 次，`thread_count=1`；黑板 `8 queries / 17 sources`。结果 `partial / budget_forced / valid`，Judge `1.6`，35 Evidence、15 sources、11 tools、347,422 tokens；研究 `1186.766s`。同配置下 r2 Fork、r3 不 Fork，说明自然触发存在高方差；黑板只能协调已创建 Agent，不能解决根 Agent不 Fork 的串行墙钟问题。
+- Supervisor r2/r3：两轮都确定性创建 4 Worker、覆盖全部 questions；Judge 均为 `4.4`。r3 严格有界结果为 `partial / coverage_complete / valid`，88 Evidence、24 sources、25 tools、301,245 tokens，研究 `463.75s`；黑板 `23 queries / 34 sources / 27 source reuses`。Supervisor 比 Legacy r3 快约 2.56 倍、Token 少约 13%，但报告仍混入网页元数据、缺少系统性对照，内容质量没有超过 Legacy Fork r2。
+- 架构判断：同质递归 Fork 不是能力上不可行；当自然 Fork 发生时，本题 Judge 高于 Supervisor（6.2 vs 4.4）。其主要问题是 Fork 触发不稳定、父子预算/充分性状态均容易以 fallback/blocked 收尾、整体墙钟和结果方差较大。Supervisor 的优势是 assignment 稳定、并行墙钟短、Token 较低；当前弱点是 Worker 独立检索产生更多但更嘈杂的 Evidence，集中调度没有自动转化为更好的对比综合。单题两轮不足以宣称任一架构全面胜出。
+- 结构指标：两边共同下游均达到 required assignment `1.0`、material citation coverage `1.0`、invalid citation `0`、裸 URL `0`；因此质量差异不再来自引用格式或 Composer/Citation 配置。真实瓶颈是 Core Question 与 Evidence 的语义相关性、官方条款命中率以及 Worker/child 的充分性判断。真实运行未产生 cross-scope signal，说明该机制可用但模型尚未主动采用。
+- 验证：黑板、自然 Fork、Supervisor 共用合同、共享计划、动态 Selector、持久化和共享 Composer/Citation 的扩大回归 `185 passed`；进入真实对照前全量 `992 passed, 3 skipped`。最终有界 Citation 与子树指标合并后全量回归为 `997 passed, 3 skipped`，耗时 `146.21s`、退出码 0；默认配置未切换，所有公平配置独立位于 `configs/researchbench-shared-fin006-*.yaml`。
+
+#### 同质 Fork 显式控制决策与可返还预算租约
+
+- 三种原策略保持不变：`parallel`、`context_isolation`、`deep_tool_chain` 继续由现有 Fork Gate 校验。新增的 `fork / local_research / merge / complete` 只要求同一个 Agent 在每轮工具调用前明确控制选择和 rationale；它不强制 Fork，也不硬编码问题拆分。连续本地轮达到阈值时仅要求重新考虑 Fork，仍可说明理由后继续本地研究。
+- 控制结构修复：真实模型会表达 Fork 意图但使用近似 reason（如 `parallel_work`），首次 r4 因严格枚举安全回退 local。现加入一次仅修 JSON/枚举结构的无工具调用，并明确禁止改变原 `fork`/`local` 语义；修复历史写入 control event。r4 作为无效灰度 checkpoint 保留。
+- 预算资金池：黑板新增全局 pool 与持久化 lease。500k 总预算中保护 75k finalization 与 50k parent merge，剩余 375k 可租赁；Child 初始 60k，接近 assessment/finalization 阈值时按 25k top-up，单 Child 上限 125k，结束后原子归还未用额度。top-up 在 think 前和 assessment 前都执行，避免一次本地轮后直接因局部上限停止。默认配置仍关闭，灰度配置显式启用。
+- 递归委托修复：r5 显示 Child 把自己 owned requirement 委托给 Grandchild 时，被黑板误判为同级抢占。现允许“当前 owner -> 直接子 Agent”的原子转交，同时继续拒绝 sibling 抢占；相关 assignment、恢复与递归测试通过。r5 作为无效样本保留。
+- r6 有效灰度：Root 显式决策自然 Fork 4 个一级 Child，随后 3 个方向进入二级递归，总 `thread_count=8`。黑板记录 `5 fork_called / 4 accepted batches / 11 fork_not_called`，15 queries、32 canonical sources、11 source reuses。共授予 7 个 lease，7 个均释放；7 次 top-up 成功、6 次因 pool 已分配完拒绝。子树实际占用约 362k，池剩约 12.6k，125k 父/最终保护未被侵占。运行没有 assignment failure 或 SQLite lock。
+- r6 结果：`outputs/evaluation/researchbench-shared-fin006-legacy-r6/ResearchBench_Evaluation_20260901_202624.json`；`partial / budget_forced / valid`，Judge `3.4`，99 Evidence、25 sources、19 Agent tool calls、398,955 tokens；研究 `887.719s`、总计 `957.062s`。结构指标保持 assignment `1.0`、material citation coverage `1.0`、invalid `0`；但 Evidence requirement coverage `0.6`，最终仍缺系统性的募集资金、披露与投资者保护比较。
+- 架构判断：显式决策解决了“Fork 被普通工具淹没”的可观测性和触发问题；可返还 lease 解决了局部 60k 一刀切，Child 能使用全局 refill pool，且保护父合并/报告额度。新瓶颈是二级拆分粒度：当前黑板 assignment 以 requirement 为唯一 owner，而 Child 往往希望把同一 requirement 拆成多个互不相同的 clause/source subtask。Gate 只能接受其中一个 Grandchild，其余因同 requirement/child budget 被拒绝；更稳定 Fork 因而没有自动提升质量，r6 Judge 仍低于旧 r2 的 6.2。
+- 下一步不是继续放宽预算。应在保留 requirement owner 的同时增加 `sub_assignment_id` 层，让一个 requirement 内的不同 clause/source 任务可并行、可见且不重复；或者在该能力完成前把灰度 `max_fork_depth` 暂时限制为 1。还需继续提高 Evidence entailment/requirement relevance，避免更多 Agent 只产生更多弱 Evidence。
+- 验证：控制合同、三类 Fork reason、结构修复、预算 pool/top-up/release、父子转交、同级防抢占、恢复与既有递归回归均通过；最终全量为 `1044 passed, 3 skipped`，耗时 `180.19s`、退出码 0。默认 `configs/default.yaml` 未启用 `homogeneous_fork`，未切换默认架构。
+
+#### 同质递归 Assignment Tree、全局线程兜底与递归侦察门
+
+- 数据模型拆分：固定 Research Plan 的 requirement 只负责顶层覆盖与最终责任；递归执行改用独立 `assignment_id`，并记录 `parent_assignment_id`、多 requirement IDs、scope signature、objective、Fork reasons、owner、depth、status 与 lease。Root、Child、Grandchild 组成可恢复 assignment tree；一个孙 assignment 完成不会直接把整个 requirement 标成 supported。
+- 同 requirement 多方向：一个 requirement 下允许多个 scope 不同的 sibling assignment，例如 investor protection 可分别派发 coupon/term adjustment、default/acceleration、investor remedies。相同 parent 下 scope signature 或 objective 高度重叠会拒绝；改名为 `v2/retry` 不能绕过去重。只有 assignment owner 可更新状态，只有父 assignment owner 可创建直接子节点，sibling 不能偷取任务。
+- 全局黑板视图：所有同质 Agent 可见不可变全局计划、完整 assignment tree、兄弟 scope、recent queries/sources、Evidence lineage 与 requirement gaps。Query、source、Evidence、Agent 状态和事件均携带 assignment lineage；旧 requirement 级表/API 保留作增量迁移兼容，递归主链路只使用 assignment nodes。黑板继续独立于 checkpoint SQLite。
+- 预算职责拆分：`explicit_control_decision` 与 `budget_leases_enabled` 已分开。本轮显式控制开启、token lease 关闭；原 pool/top-up/release 代码保留为 opt-in。旧的静态子树线程平均切分被黑板原子全局 `max_total_threads` 替代：每个 Child 可提出多个 Grandchild，只有整个 run 的 assignment 总数达到硬上限时拒绝，避免每个 Child 被预先锁成一个孙节点名额。
+- Fork 语义保持：`parallel`、`context_isolation`、`deep_tool_chain` 仍为 OR，满足任意一项即可 Fork，没有增加第四种 reason。为稳定递归时机，depth>0 且存在研究工具的 Child 必须先完成至少一次本地 research tool call，再根据已观察到的 Evidence gap 决定是否递归；Root 首轮不受此限制。该侦察门是决策时机约束，不改变三种理由。
+- 证据与完成语义：Grandchild Evidence 先归并到直接父 assignment，再由 Child 聚合进 requirement，最后 Root 汇总计划。只有 Root sufficiency assessment 可写 requirement coverage；assignment 的 completed/blocked/failed 与 requirement 的 unsupported/weak/supported/conflicted 分开。查询、来源和 Evidence lineage 在 SQLite 重启后保持。
+- r7（Assignment Tree，仍受旧静态线程切分）：`partial / budget_forced / valid`，Judge `8.2`，133 Evidence、19 report sources、17 tools、444,867 tokens、10 threads，研究 `940.812s`；requirement coverage `0.8`、Claim pass `0.5833`、Citation coverage `0.8077`。相比 r6 Judge `3.4`、coverage `0.6` 明显提升，但 Child 的三个不同孙 scope 仍有两个被 `child budget exhausted` 拒绝。
+- r8（只放宽为全局线程上限，无侦察门）：递归宽度跑通，但多个 Child 在本地研究前立即 Fork，早期泛化分支占满 10 threads。结果退化为 `partial / budget_forced / fallback`，Judge `1.4`，33 Evidence、7 sources、7 tools、418,032 tokens。该轮证明“能递归”不等于“应立即递归”，显式控制会从不 Fork 摆向过度 Fork。
+- r9 首次尝试在 alignment 阶段返回非 JSON brief，33 秒失败且 0 tools/threads/Evidence，作为无效上游结构样本保留。全新 checkpoint 的 r9b 正常运行。
+- r9b（全局线程上限 + 递归侦察门 + objective 去重）：Root 首轮 Fork 4 个一级方向；4 Child 先完成本地查询，再由披露和投资者保护分支按具体缺口派发 5 个 Grandchild。黑板共 10 assignments、7 fork calls、17 completed queries、24 completed/6 failed source fetches，未出现 requirement overlap 或 sibling theft。结果 `partial / budget_forced / valid`，Judge `8.8`，75 Evidence、24 report sources、18 tools、434,480 tokens，研究 `809.781s`；material citation coverage `1.0`、invalid `0`、requirement coverage `0.8`、primary-source coverage `1.0`、Claim pass/yield `0.625`。这是同题当前最高 Judge，也比 r7 少约 131 秒。
+- r9b 的剩余问题：仍有 59 unresolved，Citation Audit removal `0.1667` 并触发一次 citation repair；5 个孙任务中 2 blocked、3 failed，主要缺口是 ICMA GBP/SLBP 正文和中国 SLB 官方规则的可定位条款。最终仍以 `budget_forced` 结束，说明下一阶段应减少达到全局线程上限后的无效 Fork 控制轮，并改善官方全文命中/子任务终止质量，而不是继续扩展递归宽度。
+- 验证：同 requirement 不同 scope、duplicate/renamed retry、父子授权、sibling 防抢占、Requirement 不提前完成、query/source/Evidence lineage 恢复、全局原子线程上限、三 reason OR、max depth/thread、显式控制与 lease 关闭等专项通过。最终完整回归为 `1052 passed, 3 skipped`，退出码 0。`configs/default.yaml` 仍保持 Legacy 默认且未启用 homogeneous Fork；Supervisor–Worker 未套用递归 assignment 调度，公平对照边界未改变。

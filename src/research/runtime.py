@@ -67,6 +67,8 @@ from .memory_workflows import (
     resume_memory_workflow,
 )
 from .retrieval import configure_persistent_retrieval
+from .research_blackboard import ResearchBlackboard
+from .research_control import HomogeneousForkConfig
 from .models import (
     AgentLimits,
     ExecutionIdentity,
@@ -85,8 +87,10 @@ from .workflow import (
 )
 from .vault import LEGACY_MEMORY_ID, scan_legacy_memory_markdown
 from .v2_contracts import (
+    CoreQuestion,
     ResearchArchitecture,
     ResearchArchitectureSettings,
+    ResearchPlan,
     SupervisorV2Config,
 )
 from ..tools.content_extraction import content_extraction_config_from_config
@@ -136,9 +140,11 @@ __all__ = [
     "build_research_runtime",
     "build_research_tools",
     "limits_from_config",
+    "homogeneous_fork_config_from_config",
     "load_config",
     "open_research_runtime",
     "research_architecture_settings_from_config",
+    "shared_comparison_plan_from_config",
     "setup_logging",
     "vault_root_from_config",
 ]
@@ -302,6 +308,101 @@ def research_architecture_settings_from_config(
     )
 
 
+def shared_comparison_plan_from_config(
+    config: dict[str, Any],
+) -> ResearchPlan | None:
+    """Parse an opt-in fixed plan used only for architecture comparisons."""
+
+    research = _research_config(config)
+    raw = research.get("shared_comparison", {})
+    if raw in ({}, None):
+        return None
+    if not isinstance(raw, Mapping):
+        raise ValueError("research.shared_comparison must be a mapping")
+    allowed = {"enabled", "fixed_plan"}
+    unknown = sorted(str(key) for key in raw if key not in allowed)
+    if unknown:
+        raise ValueError(
+            "unknown research.shared_comparison settings: " + ", ".join(unknown)
+        )
+    enabled = raw.get("enabled", False)
+    if not isinstance(enabled, bool):
+        raise ValueError("research.shared_comparison.enabled must be a boolean")
+    if not enabled:
+        return None
+    fixed = raw.get("fixed_plan")
+    if not isinstance(fixed, Mapping):
+        raise ValueError(
+            "research.shared_comparison.fixed_plan must be a mapping when enabled"
+        )
+    allowed_plan = {
+        "brief_revision",
+        "core_questions",
+        "report_outline",
+        "source_guidance",
+        "work_hints",
+    }
+    unknown_plan = sorted(str(key) for key in fixed if key not in allowed_plan)
+    if unknown_plan:
+        raise ValueError(
+            "unknown fixed comparison plan settings: " + ", ".join(unknown_plan)
+        )
+    raw_questions = fixed.get("core_questions")
+    if not isinstance(raw_questions, list) or not raw_questions:
+        raise ValueError("fixed comparison plan requires core_questions")
+    questions: list[CoreQuestion] = []
+    allowed_question = {
+        "description", "required", "priority", "origin", "verification"
+    }
+    for raw_question in raw_questions:
+        if not isinstance(raw_question, Mapping):
+            raise ValueError("fixed comparison core question must be a mapping")
+        unknown_question = sorted(
+            str(key) for key in raw_question if key not in allowed_question
+        )
+        if unknown_question:
+            raise ValueError(
+                "unknown fixed core question settings: "
+                + ", ".join(unknown_question)
+            )
+        questions.append(CoreQuestion.create(
+            str(raw_question.get("description") or ""),
+            required=raw_question.get("required", True),
+            priority=str(raw_question.get("priority") or "high"),
+            origin=str(raw_question.get("origin") or "fixed_comparison"),
+            verification=str(
+                raw_question.get("verification") or "source-locatable evidence"
+            ),
+        ))
+    return ResearchPlan.create(
+        int(fixed.get("brief_revision", 0)),
+        tuple(questions),
+        report_outline=tuple(fixed.get("report_outline", ()) or ()),
+        source_guidance=tuple(fixed.get("source_guidance", ()) or ()),
+        work_hints=tuple(fixed.get("work_hints", ()) or ()),
+    )
+
+
+def homogeneous_fork_config_from_config(
+    config: dict[str, Any],
+) -> HomogeneousForkConfig:
+    research = _research_config(config)
+    raw = research.get("homogeneous_fork", {})
+    if not isinstance(raw, Mapping):
+        raise ValueError("research.homogeneous_fork must be a mapping")
+    allowed = HomogeneousForkConfig.__dataclass_fields__.keys()
+    unknown = sorted(str(key) for key in raw if key not in allowed)
+    if unknown:
+        raise ValueError(
+            "unknown research.homogeneous_fork settings: " + ", ".join(unknown)
+        )
+    settings = HomogeneousForkConfig(
+        **{key: raw[key] for key in allowed if key in raw}
+    )
+    settings.validate()
+    return settings
+
+
 def limits_from_config(config: dict[str, Any]) -> AgentLimits:
     values = _research_config(config).get("limits", {})
     allowed = AgentLimits.__dataclass_fields__.keys()
@@ -433,6 +534,15 @@ def _vault_scope(root: Path) -> str:
     return f"vault-{digest}"
 
 
+def _research_blackboard_path(
+    write_db_path: str | os.PathLike[str],
+) -> Path:
+    """Keep concurrent blackboard writes outside the LangGraph checkpoint DB."""
+
+    path = Path(write_db_path)
+    return path.with_name(path.stem + ".blackboard.sqlite")
+
+
 def _build_vault_write_service(
     *,
     config: dict[str, Any],
@@ -491,6 +601,9 @@ class ResearchRuntime:
         vault_write_service: VaultWriteService | None = None,
         write_db_path: str | os.PathLike[str] | None = None,
         write_queue: VaultWriteQueue | None = None,
+        research_blackboard: ResearchBlackboard | None = None,
+        shared_comparison_plan: ResearchPlan | None = None,
+        homogeneous_fork_config: HomogeneousForkConfig | None = None,
     ) -> None:
         self.config = config
         self.policy = policy
@@ -524,6 +637,16 @@ class ResearchRuntime:
         )
         if self.vault_write_service.memory_store is not memory_store:
             raise ValueError("Vault write service must share the Runtime Memory Store")
+        self.research_blackboard = research_blackboard or (
+            ResearchBlackboard(
+                _research_blackboard_path(write_db_path)
+            )
+            if write_db_path is not None else None
+        )
+        self.shared_comparison_plan = shared_comparison_plan
+        self.homogeneous_fork_config = (
+            homogeneous_fork_config or HomogeneousForkConfig()
+        )
         self.proposal_ttl_seconds = _runtime_setting(
             config, "proposal_ttl_seconds", 86400
         )
@@ -543,6 +666,9 @@ class ResearchRuntime:
             research_architecture=research_architecture,
             supervisor_v2_config=self.supervisor_v2_config,
             vault_write_service=self.vault_write_service,
+            research_blackboard=self.research_blackboard,
+            shared_comparison_plan=self.shared_comparison_plan,
+            homogeneous_fork_config=self.homogeneous_fork_config,
         )
         self.memory_note_graph = build_memory_note_workflow(
             memory_store,
@@ -1304,6 +1430,9 @@ def build_research_runtime(
     write_db_path: str | os.PathLike[str] | None = None,
     write_queue: VaultWriteQueue | None = None,
     vault_write_service: VaultWriteService | None = None,
+    research_blackboard: ResearchBlackboard | None = None,
+    shared_comparison_plan: ResearchPlan | None = None,
+    homogeneous_fork_config: HomogeneousForkConfig | None = None,
 ) -> ResearchRuntime:
     """Construct the single production Research Workflow dependency graph."""
     effective_config = config if config is not None else load_config(config_path)
@@ -1321,6 +1450,16 @@ def build_research_runtime(
         if memory_store is not None
         else MarkdownMemoryStore(vault_root_from_config(effective_config))
     )
+    effective_shared_plan = (
+        shared_comparison_plan
+        if shared_comparison_plan is not None
+        else shared_comparison_plan_from_config(effective_config)
+    )
+    effective_fork_config = (
+        homogeneous_fork_config
+        if homogeneous_fork_config is not None
+        else homogeneous_fork_config_from_config(effective_config)
+    )
     return ResearchRuntime(
         config=effective_config,
         policy=policy if policy is not None else _build_policy(effective_config),
@@ -1334,6 +1473,9 @@ def build_research_runtime(
         vault_write_service=vault_write_service,
         write_db_path=write_db_path,
         write_queue=write_queue,
+        research_blackboard=research_blackboard,
+        shared_comparison_plan=effective_shared_plan,
+        homogeneous_fork_config=effective_fork_config,
     )
 
 

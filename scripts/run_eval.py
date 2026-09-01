@@ -289,9 +289,14 @@ def workflow_metrics(result: ResearchWorkflowResult) -> dict[str, Any]:
         "report_manifest": result.memory_manifest.report_path,
         "evidence_manifests": list(result.memory_manifest.evidence_paths),
         "source_manifests": list(result.memory_manifest.source_paths),
+        "shared_comparison": result.shared_comparison,
+        "shared_selected_evidence_count": result.shared_selected_evidence_count,
+        "coordination_metrics": dict(result.coordination_metrics),
     }
     if result.research_architecture == "supervisor_v2":
         metrics["v2"] = v2_structure_metrics(result)
+    if result.shared_comparison:
+        metrics["shared_structure"] = v2_structure_metrics(result)
     return metrics
 
 
@@ -310,6 +315,49 @@ def v2_structure_metrics(result: ResearchWorkflowResult) -> dict[str, Any]:
     )
     invalid_citations = sum(
         item.get("category") in {"invalid", "locator"}
+        and item.get("status", "pending") not in {"repaired", "removed"}
+        for item in result.citation_issues
+    )
+    issue_spans = tuple(
+        (
+            str(item.get("claim_text") or "").strip(),
+            str(item.get("category") or ""),
+        )
+        for item in result.citation_issues
+        if str(item.get("claim_text") or "").strip()
+    )
+    citation_issue_conflicts = sum(
+        first_category != second_category
+        and {first_category, second_category} == {"invalid", "missing"}
+        and (first_text in second_text or second_text in first_text)
+        for index, (first_text, first_category) in enumerate(issue_spans)
+        for second_text, second_category in issue_spans[index + 1:]
+    )
+    raw_url_count = len(re.findall(r"https?://", result.report_markdown, re.IGNORECASE))
+    audit_log_leak_count = len(re.findall(
+        r"Citation audit removed or downgraded:",
+        result.report_markdown,
+        re.IGNORECASE,
+    ))
+    requirement_rows = tuple(result.evidence_requirement_coverage)
+    supported_requirements = sum(
+        item.get("status") == "supported" for item in requirement_rows
+    )
+    weighted_requirement_coverage = sum(
+        1.0 if item.get("status") == "supported"
+        else 0.5 if item.get("status") == "weak"
+        else 0.0
+        for item in requirement_rows
+    )
+    primary_requirements = tuple(
+        item for item in requirement_rows if item.get("primary_source_required")
+    )
+    supported_primary_requirements = sum(
+        item.get("status") == "supported" and item.get("primary_source_present")
+        for item in primary_requirements
+    )
+    audit_removed = sum(
+        item.get("status") in {"removed", "repaired"}
         for item in result.citation_issues
     )
     return {
@@ -347,6 +395,39 @@ def v2_structure_metrics(result: ResearchWorkflowResult) -> dict[str, Any]:
             result.report_markdown
         ),
         "invalid_citation_count": int(invalid_citations),
+        "raw_url_count_before_render": raw_url_count,
+        "citation_issue_conflict_count": citation_issue_conflicts,
+        "audit_log_leak_count": audit_log_leak_count,
+        "reportable_claim_rejection_count": result.reportable_claim_rejection_count,
+        "claim_entailment_pass_rate": (
+            result.entailed_assessment_count / result.support_assessment_count
+            if result.support_assessment_count else 0.0
+        ),
+        "verified_claim_yield": (
+            result.verified_claim_count / result.candidate_claim_count
+            if result.candidate_claim_count else 0.0
+        ),
+        "evidence_requirement_coverage_rate": (
+            supported_requirements / len(requirement_rows)
+            if requirement_rows else 0.0
+        ),
+        "weighted_evidence_requirement_coverage_rate": (
+            weighted_requirement_coverage / len(requirement_rows)
+            if requirement_rows else 0.0
+        ),
+        "primary_source_requirement_coverage_rate": (
+            supported_primary_requirements / len(primary_requirements)
+            if primary_requirements else 1.0
+        ),
+        "composer_claim_survival_rate": (
+            result.composer_claim_count / result.verified_claim_count
+            if result.verified_claim_count else 0.0
+        ),
+        "citation_audit_removal_rate": (
+            audit_removed / result.composer_claim_count
+            if result.composer_claim_count else 0.0
+        ),
+        "verified_claims_in_report": result.composer_claim_count,
         "finalization_reserve_tokens": result.finalization_token_reserve,
         "supplemental_wave_count": result.supplemental_wave_count,
         "repair_applied": result.repair_applied,
@@ -360,6 +441,9 @@ def v2_canary_gate(detail: dict[str, Any]) -> tuple[bool, tuple[str, ...]]:
     metrics = detail.get("v2") if isinstance(detail.get("v2"), dict) else {}
     if detail.get("output_status") != "valid":
         failures.append("output_status_not_valid")
+    research_status = detail.get("research_status", detail.get("status"))
+    if research_status is not None and research_status != "completed":
+        failures.append("research_status_not_completed")
     if detail.get("termination_reason") == "budget_forced":
         failures.append("budget_forced")
     if float(metrics.get("core_question_assignment_rate", 0.0)) < 1.0:
@@ -368,6 +452,12 @@ def v2_canary_gate(detail: dict[str, Any]) -> tuple[bool, tuple[str, ...]]:
         failures.append("material_claim_citation_coverage_below_80pct")
     if int(metrics.get("invalid_citation_count", 0)) != 0:
         failures.append("invalid_citations_present")
+    if int(metrics.get("raw_url_count_before_render", 0)) != 0:
+        failures.append("raw_urls_present")
+    if int(metrics.get("citation_issue_conflict_count", 0)) != 0:
+        failures.append("citation_issue_conflicts_present")
+    if int(metrics.get("audit_log_leak_count", 0)) != 0:
+        failures.append("citation_audit_log_leaked")
     if int(metrics.get("finalization_reserve_tokens", 0)) <= 0:
         failures.append("finalization_reserve_missing")
     judge_average = detail.get("judge_average")

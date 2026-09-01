@@ -62,7 +62,10 @@ def test_deterministic_citation_fallback_removes_only_unsafe_line() -> None:
     assert "Uncited comparison heading" not in body
     assert "The official result is 42%" in body
     assert audit.status == "repaired"
-    assert audit.issues == ()
+    assert len(audit.issues) == 1
+    assert audit.issues[0].status == "removed"
+    assert "Citation audit removed or downgraded" not in body
+    assert "structured audit ledger" not in audit.issues[0].claim_text
 
 
 def test_safe_citation_fallback_never_leaves_a_broken_table() -> None:
@@ -171,7 +174,7 @@ def test_legacy_and_v2_graphs_are_explicitly_distinct(tmp_path) -> None:
 
 
 @pytest.mark.asyncio
-async def test_citation_gap_uses_one_remaining_wave_then_reaudits(monkeypatch, tmp_path) -> None:
+async def test_citation_gap_uses_final_insurance_repair_without_new_research(monkeypatch, tmp_path) -> None:
     calls = []
     plan, supervisor, challenge, draft = package()
     original_claim = supervisor.worker_results[0].claims[0]
@@ -209,30 +212,12 @@ async def test_citation_gap_uses_one_remaining_wave_then_reaudits(monkeypatch, t
             ))
         return CitationAuditOutcome(status="passed")
 
-    async def fake_execute(packets, **kwargs):
-        del kwargs
-        calls.append("supplemental")
-        packet = packets[0]
-        evidence = EvidenceItem(
-            "evidence-citation-followup", "Independent confirmation", "web",
-            "Independent report", "https://example.com/independent", "section:3",
-            "The independent report confirms the result.",
+    async def fake_repair(*args, **kwargs):
+        calls.append("repair")
+        return CitationAuditOutcome(
+            status="repaired",
+            repaired_markdown=draft.markdown,
         )
-        claim = EvidenceClaim.create(
-            "Independent evidence confirms the result.",
-            packet.question_ids,
-            (evidence.evidence_id,),
-            evidence.source_ref,
-            evidence.locator,
-            evidence.excerpt,
-        )
-        return (BlueWorkerResult(
-            packet.packet_id, ResearchStatus.COMPLETED, "follow-up complete",
-            claims=(claim,), evidence=(evidence,),
-        ),)
-
-    async def forbidden_repair(*args, **kwargs):
-        raise AssertionError("repair must wait until bounded citation research finishes")
 
     import src.research.workflow as workflow_module
     monkeypatch.setattr(workflow_module, "plan_research", fake_plan)
@@ -240,10 +225,7 @@ async def test_citation_gap_uses_one_remaining_wave_then_reaudits(monkeypatch, t
     monkeypatch.setattr(workflow_module, "run_research_challenge_loop", fake_challenge)
     monkeypatch.setattr(workflow_module, "compose_report", fake_compose)
     monkeypatch.setattr(workflow_module, "audit_citations", fake_audit)
-    monkeypatch.setattr(
-        workflow_module, "execute_supplemental_work_packets", fake_execute
-    )
-    monkeypatch.setattr(workflow_module, "repair_citations", forbidden_repair)
+    monkeypatch.setattr(workflow_module, "repair_citations", fake_repair)
 
     graph = build_research_workflow(
         AlignmentPolicy(), (), MarkdownMemoryStore(tmp_path),
@@ -260,7 +242,7 @@ async def test_citation_gap_uses_one_remaining_wave_then_reaudits(monkeypatch, t
         graph, thread_id=identity.thread_id, action="confirm"
     )
 
-    assert calls == ["draft", "audit", "supplemental", "draft", "audit"]
-    assert final["v2_citation_followup_used"] is True
-    assert final["v2_supervisor_outcome"].wave_count == 2
+    assert calls == ["draft", "audit", "repair"]
+    assert final["v2_citation_followup_used"] is False
+    assert final["v2_supervisor_outcome"].wave_count == 1
     assert final["workflow_status"] == "completed"

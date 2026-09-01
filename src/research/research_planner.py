@@ -179,9 +179,10 @@ def _plan_from_response(
         "Reject sources that do not directly mention or support the assigned topic; generic title matches are noise.",
     ])
     work_hints = _string_tuple(payload.get("work_hints"))
+    all_questions = (*required, *model_questions)
     return ResearchPlan.create(
         brief_revision=brief.revision,
-        core_questions=(*required, *model_questions),
+        core_questions=all_questions,
         report_outline=outline,
         source_guidance=source_guidance,
         work_hints=work_hints,

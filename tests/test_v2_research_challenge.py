@@ -8,6 +8,7 @@ import pytest
 
 from src.research.models import EvidenceItem, OutputStatus, ResearchStatus
 from src.research.research_challenge import (
+    _apply_red_constraints,
     adjudicate_research_challenges,
     review_research_package,
 )
@@ -15,6 +16,7 @@ from src.research.v2_contracts import (
     BlueWorkerResult,
     CoreQuestion,
     EvidenceClaim,
+    ResearchChallenge,
     ResearchPlan,
     SupervisorOutcome,
 )
@@ -341,3 +343,39 @@ async def test_adjudication_batches_and_conservatively_fills_omitted_decisions()
     assert len(policy.tools) == 2
     assert decisions[-1].decision.value == "accept"
     assert "omitted" in decisions[-1].reason
+
+
+def test_hard_red_constraint_removes_claim_and_reopens_coverage() -> None:
+    plan, outcome, question, claim = _package()
+    challenge = ResearchChallenge.create(
+        "conflict",
+        (question.question_id,),
+        (claim.claim_id,),
+        "A directly contradictory Passage remains unresolved.",
+        "medium",
+        status="unresolved_disclosed",
+    )
+
+    constrained = _apply_red_constraints(plan, outcome, (challenge,))
+
+    assert constrained.worker_results[0].claims == ()
+    assert constrained.resolved_question_ids == ()
+    assert constrained.unresolved_question_ids == (question.question_id,)
+
+
+def test_legacy_red_constraint_withholds_any_unresolved_target_claim() -> None:
+    plan, outcome, question, claim = _package()
+    challenge = ResearchChallenge.create(
+        "non_comparable",
+        (question.question_id,),
+        (claim.claim_id,),
+        "The narrow fact is valid but cannot support a direct comparison.",
+        "medium",
+        status="unresolved_disclosed",
+    )
+
+    constrained = _apply_red_constraints(plan, outcome, (challenge,))
+
+    assert constrained.worker_results[0].claims == ()
+    assert constrained.resolved_question_ids == ()
+    assert constrained.unresolved_question_ids == (question.question_id,)

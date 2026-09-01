@@ -115,6 +115,7 @@ def research_bundle_request_hash(
     *,
     memory_id: str,
     report_body_markdown: str | None = None,
+    report_architecture: str = "supervisor_v2",
 ) -> str:
     """Return the timestamp-independent identity of one research publication."""
     selected = _managed_memory(memory_id)
@@ -130,6 +131,7 @@ def research_bundle_request_hash(
             "memory_id": selected,
             "result": result,
             "report_body_markdown": report_body_markdown,
+            "report_architecture": report_architecture,
         }
     )
 
@@ -410,6 +412,7 @@ def build_research_bundle_plan(
     memory_id: str,
     created_at: str,
     report_body_markdown: str | None = None,
+    report_architecture: str = "supervisor_v2",
 ) -> MemoryWritePlan:
     """Build a managed research command with the report as its only anchor."""
     memory_id = _managed_memory(memory_id)
@@ -420,6 +423,7 @@ def build_research_bundle_plan(
         identity,
         memory_id=memory_id,
         report_body_markdown=report_body_markdown,
+        report_architecture=report_architecture,
     )
     created_at = _required_text(created_at, field_name="created_at")
 
@@ -478,6 +482,8 @@ def build_research_bundle_plan(
         created_at=created_at,
         updated_at=created_at,
     )
+    if report_body_markdown is not None:
+        renderer_kwargs["architecture"] = report_architecture
     report_markdown = (
         renderer(brief, result, report_body_markdown, **renderer_kwargs)
         if report_body_markdown is not None
@@ -502,6 +508,7 @@ def build_research_bundle_plan(
             "request": request_hash,
             "result": _value_hash(result),
             "report_body_markdown": _value_hash(report_body_markdown),
+            "report_architecture": _value_hash(report_architecture),
         },
         result={
             "report_path": report_path,

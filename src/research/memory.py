@@ -2408,6 +2408,7 @@ class MarkdownMemoryStore:
         *,
         memory_id: str | None = None,
         report_body_markdown: str | None = None,
+        report_architecture: str = "supervisor_v2",
     ) -> tuple[str, MemoryManifest]:
         """Atomically replace stable note paths; repeated calls create no duplicates."""
         identity.validate()
@@ -2451,6 +2452,8 @@ class MarkdownMemoryStore:
             created_at=timestamp,
             updated_at=timestamp,
         )
+        if report_body_markdown is not None:
+            renderer_kwargs["architecture"] = report_architecture
         report_markdown = (
             renderer(brief, result, report_body_markdown, **renderer_kwargs)
             if report_body_markdown is not None

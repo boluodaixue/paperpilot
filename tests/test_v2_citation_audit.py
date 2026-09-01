@@ -41,6 +41,24 @@ def test_deterministic_audit_rejects_unknown_ids_and_unknown_urls() -> None:
     assert any("forged.example" in item.claim_text for item in issues)
 
 
+def test_deterministic_audit_rejects_even_known_raw_url_without_double_missing() -> None:
+    line = "The official result is described at https://example.com/report"
+
+    issues = deterministic_citation_issues(f"# Findings\n\n{line}", _evidence())
+
+    assert [(item.category, item.claim_text) for item in issues] == [
+        ("invalid", "https://example.com/report")
+    ]
+
+
+def test_deterministic_audit_never_reports_invalid_and_missing_for_same_line() -> None:
+    line = "A long unsupported assertion uses [[EVIDENCE:forged-id]] in this report."
+
+    issues = deterministic_citation_issues(f"# Findings\n\n{line}", _evidence())
+
+    assert {item.category for item in issues} == {"invalid"}
+
+
 @pytest.mark.asyncio
 async def test_semantic_audit_is_tool_free_and_rejects_unknown_evidence() -> None:
     calls = []

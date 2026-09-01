@@ -16,6 +16,13 @@ _MANAGED_NOTE_ID = re.compile(r"^[A-Za-z][A-Za-z0-9]*-[A-Za-z0-9]+(?:-[A-Za-z0-9
 _EVIDENCE_MARKER = re.compile(r"\[\[EVIDENCE:([A-Za-z0-9._-]+)\]\]")
 
 
+def _bounded_evidence_finding(value: str, *, limit: int = 500) -> str:
+    clean = str(value or "").strip()
+    if len(clean) <= limit:
+        return clean
+    return clean[: max(1, limit - 3)].rstrip() + "..."
+
+
 def safe_note_id(prefix: str, value: str) -> str:
     clean = str(value or "").strip()
     if _SAFE_NOTE_ID.fullmatch(clean):
@@ -96,6 +103,7 @@ def render_v2_report(
     memory_id: str | None = None,
     created_at: str | None = None,
     updated_at: str | None = None,
+    architecture: str = "supervisor_v2",
 ) -> str:
     """Render an already-audited V2 body into the normal report note envelope."""
     body = str(report_body_markdown or "").strip()
@@ -112,7 +120,7 @@ def render_v2_report(
             id=report_note,
             type="report",
             root_thread_id=root_thread_id,
-            architecture="supervisor_v2",
+            architecture=architecture,
         )
     else:
         if created_at is None or updated_at is None:
@@ -126,7 +134,7 @@ def render_v2_report(
             updated_at=updated_at,
             origin="research",
             root_thread_id=root_thread_id,
-            architecture="supervisor_v2",
+            architecture=architecture,
         )
     return f"{frontmatter}\n\n{resolved.lstrip()}"
 
@@ -304,7 +312,9 @@ def render_report(
     report_evidence = select_representative_evidence(
         result.evidence,
         result.coverage,
-        limit=32,
+        limit=24,
+        max_per_requirement=6,
+        max_per_source=2,
     )
     all_links = [
         evidence_link(evidence_notes[item.evidence_id])
@@ -346,7 +356,7 @@ def render_report(
     for evidence in report_evidence:
         note = evidence_notes[evidence.evidence_id]
         evidence_lines.append(
-            f"- {evidence.finding} {evidence_link(note)}"
+            f"- {_bounded_evidence_finding(evidence.finding)} {evidence_link(note)}"
         )
     if not evidence_lines:
         evidence_lines = ["- No source-locatable evidence was collected."]

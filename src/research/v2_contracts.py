@@ -174,6 +174,53 @@ class CoreQuestion:
 
 
 @dataclass(frozen=True)
+class EvidenceRequirement:
+    """One explicit proof obligation belonging to a Core Question."""
+
+    requirement_id: str
+    question_id: str
+    description: str
+    evidence_kind: str = "factual"
+    minimum_verified_claims: int = 1
+    minimum_independent_sources: int = 1
+    primary_source_required: bool = False
+    required: bool = True
+
+    @classmethod
+    def create(
+        cls,
+        question_id: str,
+        description: str,
+        *,
+        evidence_kind: str = "factual",
+        minimum_verified_claims: int = 1,
+        minimum_independent_sources: int = 1,
+        primary_source_required: bool = False,
+        required: bool = True,
+    ) -> "EvidenceRequirement":
+        payload = {
+            "question_id": str(question_id).strip(),
+            "description": str(description).strip(),
+            "evidence_kind": str(evidence_kind).strip().lower() or "factual",
+            "minimum_verified_claims": int(minimum_verified_claims),
+            "minimum_independent_sources": int(minimum_independent_sources),
+            "primary_source_required": bool(primary_source_required),
+            "required": bool(required),
+        }
+        if not payload["question_id"] or not payload["description"]:
+            raise ValueError("EvidenceRequirement requires question and description")
+        if payload["minimum_verified_claims"] < 1:
+            raise ValueError("minimum_verified_claims must be at least 1")
+        if payload["minimum_verified_claims"] > 3:
+            raise ValueError("minimum_verified_claims cannot exceed 3")
+        if payload["minimum_independent_sources"] < 1:
+            raise ValueError("minimum_independent_sources must be at least 1")
+        if payload["minimum_independent_sources"] > 2:
+            raise ValueError("minimum_independent_sources cannot exceed 2")
+        return cls(stable_content_id("evidence-requirement", payload), **payload)
+
+
+@dataclass(frozen=True)
 class ResearchPlan:
     """Stable, serializable plan produced before external research begins."""
 
@@ -184,6 +231,7 @@ class ResearchPlan:
     source_guidance: tuple[str, ...] = ()
     work_hints: tuple[str, ...] = ()
     fallback_reason: str | None = None
+    evidence_requirements: tuple[EvidenceRequirement, ...] = ()
 
     @classmethod
     def create(
@@ -194,6 +242,7 @@ class ResearchPlan:
         source_guidance: tuple[str, ...] = (),
         work_hints: tuple[str, ...] = (),
         fallback_reason: str | None = None,
+        evidence_requirements: tuple[EvidenceRequirement, ...] = (),
     ) -> "ResearchPlan":
         questions = tuple(core_questions)
         if not questions:
@@ -201,6 +250,20 @@ class ResearchPlan:
         question_ids = [item.question_id for item in questions]
         if len(question_ids) != len(set(question_ids)):
             raise ValueError("ResearchPlan CoreQuestion IDs must be unique")
+        requirements = tuple(evidence_requirements) or tuple(
+            EvidenceRequirement.create(
+                item.question_id,
+                item.description,
+                required=item.required,
+            )
+            for item in questions
+        )
+        known_question_ids = set(question_ids)
+        if any(item.question_id not in known_question_ids for item in requirements):
+            raise ValueError("EvidenceRequirement references unknown CoreQuestion")
+        requirement_ids = [item.requirement_id for item in requirements]
+        if len(requirement_ids) != len(set(requirement_ids)):
+            raise ValueError("EvidenceRequirement IDs must be unique")
         payload = {
             "brief_revision": int(brief_revision),
             "core_questions": questions,
@@ -210,6 +273,7 @@ class ResearchPlan:
             "fallback_reason": (
                 str(fallback_reason).strip() if fallback_reason else None
             ),
+            "evidence_requirements": requirements,
         }
         return cls(stable_content_id("plan", payload), **payload)
 
@@ -260,6 +324,164 @@ class WorkPacket:
 
 
 @dataclass(frozen=True)
+class SourceDocument:
+    """One acquired source document, separate from its evidentiary passages."""
+
+    document_id: str
+    source_ref: str
+    title: str
+    source_type: str
+    authority_tier: str
+
+    @classmethod
+    def create(
+        cls,
+        source_ref: str,
+        title: str,
+        source_type: str,
+        authority_tier: str = "secondary",
+    ) -> "SourceDocument":
+        payload = {
+            "source_ref": str(source_ref).strip(),
+            "title": str(title).strip(),
+            "source_type": str(source_type).strip().lower() or "unknown",
+            "authority_tier": str(authority_tier).strip().lower() or "secondary",
+        }
+        if not payload["source_ref"]:
+            raise ValueError("SourceDocument requires source_ref")
+        if payload["authority_tier"] not in {"primary", "institutional", "secondary", "weak"}:
+            raise ValueError("unknown SourceDocument authority tier")
+        return cls(stable_content_id("document", payload), **payload)
+
+
+@dataclass(frozen=True)
+class EvidencePassage:
+    """Exact, source-locatable text; never a generated research conclusion."""
+
+    passage_id: str
+    document_id: str
+    evidence_id: str
+    requirement_id: str
+    exact_text: str
+    locator: str
+    content_hash: str
+
+    @classmethod
+    def create(
+        cls,
+        document_id: str,
+        evidence_id: str,
+        requirement_id: str,
+        exact_text: str,
+        locator: str,
+    ) -> "EvidencePassage":
+        text = str(exact_text).strip()
+        payload = {
+            "document_id": str(document_id).strip(),
+            "evidence_id": str(evidence_id).strip(),
+            "requirement_id": str(requirement_id).strip(),
+            "exact_text": text,
+            "locator": str(locator).strip(),
+            "content_hash": hashlib.sha256(text.encode("utf-8")).hexdigest(),
+        }
+        if not all(payload.values()):
+            raise ValueError("EvidencePassage requires document, evidence, text, and locator")
+        return cls(stable_content_id("passage", payload), **payload)
+
+
+@dataclass(frozen=True)
+class CandidateClaim:
+    """An atomic pre-verification proposition extracted from exact Passage text."""
+
+    candidate_id: str
+    text: str
+    question_ids: tuple[str, ...]
+    requirement_ids: tuple[str, ...]
+    passage_ids: tuple[str, ...]
+    exact_quote: str
+
+    @classmethod
+    def create(
+        cls,
+        text: str,
+        question_ids: tuple[str, ...],
+        requirement_ids: tuple[str, ...],
+        passage_ids: tuple[str, ...],
+        exact_quote: str,
+    ) -> "CandidateClaim":
+        payload = {
+            "text": str(text).strip(),
+            "question_ids": _clean_tuple(question_ids),
+            "requirement_ids": _clean_tuple(requirement_ids),
+            "passage_ids": _clean_tuple(passage_ids),
+            "exact_quote": str(exact_quote).strip(),
+        }
+        if not all(payload.values()):
+            raise ValueError("CandidateClaim requires text, lineage, and exact quote")
+        return cls(stable_content_id("candidate-claim", payload), **payload)
+
+
+@dataclass(frozen=True)
+class SupportAssessment:
+    """Independent Claim-to-Passage entailment decision."""
+
+    assessment_id: str
+    candidate_id: str
+    passage_ids: tuple[str, ...]
+    verdict: str
+    confidence: float
+    supported_scope: str = ""
+    unsupported_scope: str = ""
+    reason: str = ""
+    method: str = "semantic_verifier"
+
+    @classmethod
+    def create(
+        cls,
+        candidate_id: str,
+        passage_ids: tuple[str, ...],
+        verdict: str,
+        confidence: float,
+        *,
+        supported_scope: str = "",
+        unsupported_scope: str = "",
+        reason: str = "",
+        method: str = "semantic_verifier",
+    ) -> "SupportAssessment":
+        payload = {
+            "candidate_id": str(candidate_id).strip(),
+            "passage_ids": _clean_tuple(passage_ids),
+            "verdict": str(verdict).strip().lower(),
+            "confidence": max(0.0, min(1.0, float(confidence))),
+            "supported_scope": str(supported_scope).strip(),
+            "unsupported_scope": str(unsupported_scope).strip(),
+            "reason": str(reason).strip(),
+            "method": str(method).strip() or "semantic_verifier",
+        }
+        if payload["verdict"] not in {
+            "entailed", "partially_entailed", "contradicted", "irrelevant"
+        }:
+            raise ValueError("unknown SupportAssessment verdict")
+        if not payload["candidate_id"] or not payload["passage_ids"]:
+            raise ValueError("SupportAssessment requires candidate and passages")
+        return cls(stable_content_id("support-assessment", payload), **payload)
+
+
+@dataclass(frozen=True)
+class EvidenceRequirementCoverage:
+    """Deterministic coverage state computed only from verified Claims."""
+
+    requirement_id: str
+    question_id: str
+    status: str
+    verified_claim_ids: tuple[str, ...] = ()
+    source_refs: tuple[str, ...] = ()
+    reason: str = ""
+    primary_source_required: bool = False
+    primary_source_present: bool = False
+
+
+@dataclass(frozen=True)
 class EvidenceClaim:
     """A report-usable claim mapped to one or more existing Evidence IDs."""
 
@@ -273,6 +495,10 @@ class EvidenceClaim:
     limitations: str = ""
     confidence: str = "medium"
     comparability_notes: str = ""
+    requirement_ids: tuple[str, ...] = ()
+    passage_ids: tuple[str, ...] = ()
+    support_assessment_ids: tuple[str, ...] = ()
+    verification_status: str = "verified"
 
     @classmethod
     def create(
@@ -286,6 +512,10 @@ class EvidenceClaim:
         limitations: str = "",
         confidence: str = "medium",
         comparability_notes: str = "",
+        requirement_ids: tuple[str, ...] = (),
+        passage_ids: tuple[str, ...] = (),
+        support_assessment_ids: tuple[str, ...] = (),
+        verification_status: str = "verified",
     ) -> "EvidenceClaim":
         payload = {
             "claim": str(claim).strip(),
@@ -297,6 +527,10 @@ class EvidenceClaim:
             "limitations": str(limitations).strip(),
             "confidence": str(confidence).strip().lower() or "medium",
             "comparability_notes": str(comparability_notes).strip(),
+            "requirement_ids": _clean_tuple(requirement_ids) or _clean_tuple(question_ids),
+            "passage_ids": _clean_tuple(passage_ids),
+            "support_assessment_ids": _clean_tuple(support_assessment_ids),
+            "verification_status": str(verification_status).strip().lower() or "verified",
         }
         if not all(
             (
@@ -309,6 +543,8 @@ class EvidenceClaim:
             )
         ):
             raise ValueError("EvidenceClaim requires claim, IDs, source, locator, and excerpt")
+        if payload["verification_status"] not in {"verified", "unverified", "rejected"}:
+            raise ValueError("unknown EvidenceClaim verification status")
         return cls(stable_content_id("claim", payload), **payload)
 
 
@@ -362,6 +598,12 @@ class ResearchChallenge:
         if not payload["reason"]:
             raise ValueError("ResearchChallenge reason cannot be empty")
         return cls(stable_content_id("challenge", payload), **payload)
+
+
+def research_challenge_blocks_claim(challenge: ResearchChallenge) -> bool:
+    """Legacy V2 treats every unresolved targeted Red challenge as binding."""
+
+    return bool(challenge.target_claim_ids)
 
 
 @dataclass(frozen=True)
@@ -421,6 +663,22 @@ class CitationAuditOutcome:
 
 
 @dataclass(frozen=True)
+class ReportAssertion:
+    """One report statement whose citations derive from selected Claim IDs."""
+
+    text: str
+    claim_ids: tuple[str, ...]
+
+
+@dataclass(frozen=True)
+class ReportSection:
+    """A titled group of structured, evidence-linked report assertions."""
+
+    heading: str
+    assertions: tuple[ReportAssertion, ...]
+
+
+@dataclass(frozen=True)
 class ReportDraft:
     """Evidence-only Lead draft before deterministic citation rendering."""
 
@@ -430,6 +688,9 @@ class ReportDraft:
     evidence_ids: tuple[str, ...] = ()
     unresolved: tuple[str, ...] = ()
     output_status: OutputStatus = OutputStatus.VALID
+    sections: tuple[ReportSection, ...] = ()
+    quarantined_claim_count: int = 0
+    uncovered_question_ids: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -460,6 +721,10 @@ class BlueWorkerResult:
     usage: BlueWorkerUsage = BlueWorkerUsage()
     termination_reason: TerminationReason | None = None
     output_status: OutputStatus = OutputStatus.VALID
+    documents: tuple[SourceDocument, ...] = ()
+    passages: tuple[EvidencePassage, ...] = ()
+    candidate_claims: tuple[CandidateClaim, ...] = ()
+    support_assessments: tuple[SupportAssessment, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -490,6 +755,7 @@ class SupervisorOutcome:
     wave_count: int
     finalization_token_reserve: int
     termination_reason: TerminationReason | None = None
+    requirement_coverage: tuple[EvidenceRequirementCoverage, ...] = ()
 
 
 @dataclass(frozen=True)

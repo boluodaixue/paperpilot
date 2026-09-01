@@ -1,0 +1,38 @@
+[
+  {
+    "id": "law_cac_exemption",
+    "question": "What exemptions do China's cross-border data rules establish?",
+    "requirement": "Identify the official exemption and its procedural effect.",
+    "source_type": "official",
+    "source_ref": "https://www.cac.gov.cn/example",
+    "excerpt": "《促进和规范数据跨境流动规定》明确，符合跨境购物、跨境寄递等条件的数据出境活动，可以免予申报数据出境安全评估、订立个人信息出境标准合同或者通过个人信息保护认证。",
+    "expected_text": "《促进和规范数据跨境流动规定》明确，符合跨境购物、跨境寄递等条件的数据出境活动，可以免予申报数据出境安全评估、订立个人信息出境标准合同或者通过个人信息保护认证。"
+  },
+  {
+    "id": "law_navigation_noise",
+    "question": "Compare PIPL and GDPR transfer mechanisms.",
+    "requirement": "Locate the primary legal mechanisms.",
+    "source_type": "web",
+    "source_ref": "https://example.com/navigation",
+    "excerpt": "Navigation Cookie Privacy Policy Subscribe Download PDF Share this ORCID",
+    "expected_text": null
+  },
+  {
+    "id": "medical_tdt_endpoint",
+    "question": "What efficacy endpoint was reported for transfusion-dependent beta-thalassemia?",
+    "requirement": "Report transfusion independence with the exact numerator and denominator.",
+    "source_type": "paper",
+    "source_ref": "https://journal.example/tdt",
+    "excerpt": "Transfusion independence was achieved in 32 of 35 evaluable participants (91 percent).",
+    "expected_text": "Transfusion independence was achieved in 32 of 35 evaluable participants (91 percent)."
+  },
+  {
+    "id": "medical_scope_limit",
+    "question": "What does current follow-up establish about long-term safety?",
+    "requirement": "Separate observed follow-up from lifelong safety conclusions.",
+    "source_type": "paper",
+    "source_ref": "https://journal.example/follow-up",
+    "excerpt": "At the data cutoff, the median follow-up was 20.4 months; lifelong durability and late malignancy risk were not established.",
+    "expected_text": "At the data cutoff, the median follow-up was 20.4 months; lifelong durability and late malignancy risk were not established."
+  }
+]

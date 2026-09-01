@@ -11,7 +11,7 @@ PaperPilot-specific. See ``THIRD_PARTY_NOTICES.md``.
 from __future__ import annotations
 
 import asyncio
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Any, Awaitable, Callable, Iterable, Mapping, TypedDict
 
 from langgraph.checkpoint.base import BaseCheckpointSaver
@@ -26,8 +26,11 @@ from .models import (
     TerminationReason,
 )
 from .research_worker import run_research_worker
+from .research_blackboard import ResearchBlackboard
+from .evidence_claim_pipeline import claim_has_verified_lineage
 from .v2_contracts import (
     BlueWorkerResult,
+    EvidenceRequirementCoverage,
     ConductResearch,
     EvidenceClaim,
     ResearchComplete,
@@ -141,7 +144,10 @@ def _packets_for_questions(
                 objective=objective,
                 question_ids=tuple(group),
                 expected_output="Source-locatable Evidence Claims and unresolved gaps",
-                source_guidance=tuple(dict.fromkeys((*plan.source_guidance, *targeted_objectives))),
+                source_guidance=tuple(dict.fromkeys((
+                    *plan.source_guidance,
+                    *targeted_objectives,
+                ))),
                 max_tool_calls=tool_shares[index],
                 token_budget=token_shares[index],
                 deadline_at=budget.deadline_at,
@@ -227,6 +233,76 @@ def _resolved_question_ids(results: Iterable[BlueWorkerResult]) -> set[str]:
     }
 
 
+def _requirement_coverage(
+    plan: ResearchPlan,
+    results: Iterable[BlueWorkerResult],
+) -> tuple[EvidenceRequirementCoverage, ...]:
+    worker_results = tuple(results)
+    claims = tuple(
+        claim
+        for result in worker_results
+        for claim in result.claims
+        if claim.verification_status == "verified"
+        and (
+            not (result.candidate_claims or result.support_assessments)
+            or claim_has_verified_lineage(
+                claim,
+                result.candidate_claims,
+                result.support_assessments,
+                result.passages,
+            )
+        )
+    )
+    authority_by_source = {
+        item.source_ref: item.authority_tier
+        for result in worker_results
+        for item in result.documents
+    }
+    coverage: list[EvidenceRequirementCoverage] = []
+    for requirement in plan.evidence_requirements:
+        matching = tuple(
+            claim
+            for claim in claims
+            if requirement.requirement_id in claim.requirement_ids
+            or (
+                requirement.question_id in claim.question_ids
+                and set(claim.requirement_ids) <= set(claim.question_ids)
+            )
+        )
+        sources = tuple(dict.fromkeys(item.source_ref for item in matching))
+        has_primary = any(
+            authority_by_source.get(item.source_ref) == "primary"
+            for item in matching
+        )
+        complete = (
+            len(matching) >= requirement.minimum_verified_claims
+            and len(sources) >= requirement.minimum_independent_sources
+            and (not requirement.primary_source_required or has_primary)
+        )
+        reasons: list[str] = []
+        if len(matching) < requirement.minimum_verified_claims:
+            reasons.append(
+                f"needs {requirement.minimum_verified_claims} verified Claim(s)"
+            )
+        if len(sources) < requirement.minimum_independent_sources:
+            reasons.append(
+                f"needs {requirement.minimum_independent_sources} independent source(s)"
+            )
+        if requirement.primary_source_required and not has_primary:
+            reasons.append("requires a primary source")
+        coverage.append(EvidenceRequirementCoverage(
+            requirement_id=requirement.requirement_id,
+            question_id=requirement.question_id,
+            status="supported" if complete else ("weak" if matching else "uncovered"),
+            verified_claim_ids=tuple(item.claim_id for item in matching),
+            source_refs=sources,
+            reason="; ".join(reasons),
+            primary_source_required=requirement.primary_source_required,
+            primary_source_present=has_primary,
+        ))
+    return tuple(coverage)
+
+
 def _normalized_worker_result(result: BlueWorkerResult) -> BlueWorkerResult:
     claims = tuple(
         EvidenceClaim.create(
@@ -239,6 +315,10 @@ def _normalized_worker_result(result: BlueWorkerResult) -> BlueWorkerResult:
             limitations=item.limitations,
             confidence=item.confidence,
             comparability_notes=item.comparability_notes,
+            requirement_ids=tuple(item.requirement_ids),
+            passage_ids=tuple(item.passage_ids),
+            support_assessment_ids=tuple(item.support_assessment_ids),
+            verification_status=item.verification_status,
         )
         for item in result.claims
     )
@@ -253,6 +333,24 @@ def _normalized_worker_result(result: BlueWorkerResult) -> BlueWorkerResult:
         usage=result.usage,
         termination_reason=result.termination_reason,
         output_status=result.output_status,
+        documents=tuple(result.documents),
+        passages=tuple(result.passages),
+        candidate_claims=tuple(
+            replace(
+                item,
+                question_ids=tuple(item.question_ids),
+                requirement_ids=tuple(item.requirement_ids),
+                passage_ids=tuple(item.passage_ids),
+            )
+            for item in result.candidate_claims
+        ),
+        support_assessments=tuple(
+            replace(
+                item,
+                passage_ids=tuple(item.passage_ids),
+            )
+            for item in result.support_assessments
+        ),
     )
 
 
@@ -282,6 +380,7 @@ def _build_outcome(
         wave_count=int(state.get("wave_count", 0)),
         finalization_token_reserve=int(state.get("finalization_token_reserve", 0)),
         termination_reason=termination_reason,
+        requirement_coverage=(),
     )
 
 
@@ -293,6 +392,8 @@ def build_research_supervisor_graph(
     worker_runner: WorkerRunner = run_research_worker,
     worker_checkpointer: BaseCheckpointSaver | None = None,
     tool_artifact_store: Any | None = None,
+    coordination_board: ResearchBlackboard | None = None,
+    preserve_full_worker_evidence: bool = False,
 ) -> Any:
     """Build the checkpointed two-node Supervisor graph."""
     effective_checkpointer = checkpointer or InMemorySaver()
@@ -382,28 +483,86 @@ def build_research_supervisor_graph(
         completed_ids = {item.packet_id for item in state.get("worker_results", [])}
         packets = tuple(item for item in action.packets if item.packet_id not in completed_ids)
 
+        if coordination_board is not None and packets:
+            assignment_rows = []
+            for packet in packets:
+                worker_identity = _worker_identity(state["identity"], packet)
+                assignment_rows.extend(
+                    {
+                        "requirement_id": question_id,
+                        "owner_thread_id": worker_identity.thread_id,
+                        "parent_thread_id": state["identity"].thread_id,
+                        "objective": packet.objective,
+                        "status": "claimed",
+                    }
+                    for question_id in packet.question_ids
+                )
+            coordination_board.register_assignment_batch(
+                state["identity"].root_thread_id,
+                assignment_rows,
+                actor_thread_id=state["identity"].thread_id,
+                lease_seconds=300.0,
+            )
+            coordination_board.record_event(
+                state["identity"].root_thread_id,
+                "supervisor_packets_assigned",
+                actor_thread_id=state["identity"].thread_id,
+                payload={
+                    "wave": action.wave,
+                    "packet_ids": [packet.packet_id for packet in packets],
+                },
+            )
+
         async def run_one(packet: WorkPacket) -> BlueWorkerResult:
+            worker_identity = _worker_identity(state["identity"], packet)
+            if coordination_board is not None:
+                for question_id in packet.question_ids:
+                    coordination_board.update_assignment(
+                        state["identity"].root_thread_id,
+                        question_id,
+                        owner_thread_id=worker_identity.thread_id,
+                        status="researching",
+                        lease_seconds=300.0,
+                    )
             try:
-                return await worker_runner(
+                result = await worker_runner(
                     packet,
                     state["plan"],
                     policy,
                     tool_list,
-                    identity=_worker_identity(state["identity"], packet),
+                    identity=worker_identity,
                     limits=state["limits"],
                     checkpointer=effective_worker_checkpointer,
                     tool_artifact_store=tool_artifact_store,
+                    coordination_board=coordination_board,
+                    preserve_full_evidence=preserve_full_worker_evidence,
                 )
             except asyncio.CancelledError:
                 raise
             except Exception as exc:
-                return BlueWorkerResult(
+                result = BlueWorkerResult(
                     packet_id=packet.packet_id,
                     status=ResearchStatus.FAILED,
                     summary="Blue Worker failed before producing usable evidence.",
                     unresolved=(f"{type(exc).__name__}: {exc}",),
                     output_status=OutputStatus.FALLBACK,
                 )
+            if coordination_board is not None:
+                assignment_status = (
+                    "completed"
+                    if result.status == ResearchStatus.COMPLETED
+                    else "failed"
+                    if result.status == ResearchStatus.FAILED
+                    else "blocked"
+                )
+                for question_id in packet.question_ids:
+                    coordination_board.update_assignment(
+                        state["identity"].root_thread_id,
+                        question_id,
+                        owner_thread_id=worker_identity.thread_id,
+                        status=assignment_status,
+                    )
+            return result
 
         new_results = await asyncio.gather(*(run_one(packet) for packet in packets))
         merged = sorted(
@@ -456,6 +615,8 @@ async def run_research_supervisor(
     user_cancelled: bool = False,
     requested_termination_reason: TerminationReason | None = None,
     checkpoint_thread_id: str | None = None,
+    coordination_board: ResearchBlackboard | None = None,
+    preserve_full_worker_evidence: bool = False,
 ) -> SupervisorOutcome:
     """Start/resume the Supervisor and return its deterministic merged outcome."""
     identity.validate()
@@ -463,6 +624,42 @@ async def run_research_supervisor(
         raise ValueError("Supervisor requires a root identity")
     settings.validate()
     budget.validate()
+    if coordination_board is not None:
+        existing = coordination_board.snapshot(
+            identity.root_thread_id,
+            viewer_thread_id=identity.thread_id,
+        )
+        if not existing:
+            coordination_board.ensure_plan(
+                identity.root_thread_id,
+                plan_id=plan.plan_id,
+                objective=" | ".join(
+                    item.description for item in plan.core_questions
+                ),
+                requirements=(
+                    {
+                        "requirement_id": item.question_id,
+                        "description": item.description,
+                        "required": item.required,
+                    }
+                    for item in plan.core_questions
+                ),
+                report_outline=plan.report_outline,
+            )
+            coordination_board.register_assignment_batch(
+                identity.root_thread_id,
+                (
+                    {
+                        "requirement_id": item.question_id,
+                        "objective": item.description,
+                        "status": "unclaimed",
+                    }
+                    for item in plan.core_questions
+                    if item.required
+                ),
+                actor_thread_id=identity.thread_id,
+                lease_seconds=300.0,
+            )
     graph = build_research_supervisor_graph(
         policy=policy,
         tools=tools,
@@ -470,6 +667,8 @@ async def run_research_supervisor(
         worker_runner=worker_runner,
         worker_checkpointer=checkpointer,
         tool_artifact_store=tool_artifact_store,
+        coordination_board=coordination_board,
+        preserve_full_worker_evidence=preserve_full_worker_evidence,
     )
     checkpoint_key = str(checkpoint_thread_id or identity.thread_id).strip()
     if not checkpoint_key:

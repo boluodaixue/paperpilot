@@ -10,7 +10,7 @@ import json
 import re
 import time
 from contextlib import contextmanager
-from dataclasses import asdict
+from dataclasses import asdict, replace
 from pathlib import PurePosixPath, PureWindowsPath
 from typing import Any, Iterable, TypedDict
 
@@ -20,6 +20,7 @@ from langgraph.checkpoint.memory import InMemorySaver
 from langgraph.graph import END, START, StateGraph
 
 from ..tools.file_reader import FileReaderError
+from ..tools.evidence_acquisition import canonicalize_source_url
 from ..tools.notepad import NotepadTool
 from ..utils.tracing import trace_block, trace_context
 from .context_compaction import (
@@ -57,6 +58,14 @@ from .models import (
     TerminationReason,
 )
 from .policy import call_policy
+from .research_blackboard import ResearchBlackboard, normalize_scope_signature
+from .research_control import (
+    HomogeneousForkConfig,
+    ResearchControlAction,
+    decision_as_fork_tool_call,
+    parse_research_control_decision,
+    research_control_prompt,
+)
 from .research_sufficiency import (
     AssessmentValidationError,
     ResearchAssessment,
@@ -85,6 +94,8 @@ from .tool_availability import (
 )
 
 _TOOL_ARTIFACT_OFFLOAD_CHARS = 4000
+_CROSS_SCOPE_SIGNAL_TOOL_NAME = "signal_cross_scope"
+_BLACKBOARD_LEASE_SECONDS = 300.0
 
 
 __all__ = [
@@ -145,6 +156,94 @@ class ResearchAgentState(TypedDict):
     output_status: OutputStatus
     stop_reason: str | None
     result: ResearchResult | None
+    control_action: str | None
+    control_rationale: str | None
+    control_target_requirement_ids: list[str]
+    control_decision_error: str | None
+    control_repair_applied: bool
+    local_rounds_since_fork: int
+    own_assignment_id: str
+    parent_assignment_id: str
+
+
+def _owned_requirement_ids(state: ResearchAgentState) -> tuple[str, ...]:
+    context = state["task"].context if isinstance(state["task"].context, dict) else {}
+    inherited = context.get("parent_requirement_ids")
+    if isinstance(inherited, (list, tuple)):
+        values = tuple(dict.fromkeys(str(item).strip() for item in inherited if str(item).strip()))
+        if values:
+            return values
+    return tuple(
+        item.requirement_id
+        for item in state.get("research_requirements", [])
+        if item.required
+    )
+
+
+def _root_assignment_id(identity: ExecutionIdentity) -> str:
+    digest = hashlib.sha256(identity.root_thread_id.encode("utf-8")).hexdigest()[:16]
+    return f"assignment-root-{digest}"
+
+
+def _own_assignment_id(state: ResearchAgentState) -> str:
+    value = str(state.get("own_assignment_id") or "").strip()
+    if value:
+        return value
+    context = state["task"].context if isinstance(state["task"].context, dict) else {}
+    return str(context.get("own_assignment_id") or "").strip() or _root_assignment_id(
+        state["identity"]
+    )
+
+
+def _parent_assignment_id(state: ResearchAgentState) -> str:
+    value = str(state.get("parent_assignment_id") or "").strip()
+    if value:
+        return value
+    context = state["task"].context if isinstance(state["task"].context, dict) else {}
+    return str(context.get("parent_assignment_id") or "").strip()
+
+
+def _candidate_scope_signature(candidate: ForkCandidate) -> str:
+    return normalize_scope_signature(candidate.scope_signature, candidate.objective)
+
+
+def _candidate_assignment_id(
+    parent_assignment_id: str,
+    candidate: ForkCandidate,
+) -> str:
+    payload = json.dumps(
+        {
+            "parent_assignment_id": parent_assignment_id,
+            "requirement_ids": sorted(candidate.requirement_ids),
+            "scope_signature": _candidate_scope_signature(candidate),
+        },
+        ensure_ascii=False,
+        sort_keys=True,
+    )
+    return "assignment-" + hashlib.sha256(payload.encode("utf-8")).hexdigest()[:20]
+
+
+def _cross_scope_signal_schema() -> dict[str, Any]:
+    return {
+        "type": "function",
+        "function": {
+            "name": _CROSS_SCOPE_SIGNAL_TOOL_NAME,
+            "description": (
+                "Publish already-collected Evidence that is useful to a sibling requirement. "
+                "Do not start new research outside your assignment; signal the Evidence ID "
+                "and target requirement so its owner can reuse it."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "evidence_id": {"type": "string"},
+                    "target_requirement_id": {"type": "string"},
+                    "message": {"type": "string"},
+                },
+                "required": ["evidence_id", "target_requirement_id"],
+            },
+        },
+    }
 
 
 _FINALIZATION_OUTPUT_TOKEN_RESERVE = 12000
@@ -997,6 +1096,9 @@ def _child_task(
     parent: ResearchTask,
     candidate: ForkCandidate,
     parent_requirements: Iterable[ResearchRequirement] = (),
+    *,
+    assignment_id: str = "",
+    parent_assignment_id: str = "",
 ) -> ResearchTask:
     fingerprint = candidate_fingerprint(candidate)
     # Root Brief planning fields describe the root deliverable. Inheriting them
@@ -1030,6 +1132,9 @@ def _child_task(
             }
         ]
     child_context["parent_objective"] = parent.objective
+    child_context["own_assignment_id"] = assignment_id
+    child_context["parent_assignment_id"] = parent_assignment_id
+    child_context["assignment_scope_signature"] = _candidate_scope_signature(candidate)
     return ResearchTask(
         task_id=f"child-{fingerprint[:12]}",
         objective=candidate.objective,
@@ -1078,6 +1183,11 @@ def create_research_agent_state(
 ) -> ResearchAgentState:
     limits.validate()
     requirements = build_research_requirements(task)
+    context = task.context if isinstance(task.context, dict) else {}
+    own_assignment_id = str(context.get("own_assignment_id") or "").strip()
+    if not own_assignment_id:
+        own_assignment_id = _root_assignment_id(identity)
+    parent_assignment_id = str(context.get("parent_assignment_id") or "").strip()
     return ResearchAgentState(
         task=task,
         identity=identity,
@@ -1128,6 +1238,14 @@ def create_research_agent_state(
         output_status=OutputStatus.VALID,
         stop_reason=None,
         result=None,
+        control_action=None,
+        control_rationale=None,
+        control_target_requirement_ids=[],
+        control_decision_error=None,
+        control_repair_applied=False,
+        local_rounds_since_fork=0,
+        own_assignment_id=own_assignment_id,
+        parent_assignment_id=parent_assignment_id,
     )
 
 
@@ -1309,6 +1427,8 @@ def build_research_agent_graph(
     inherit_checkpointer: bool = False,
     child_checkpointer: BaseCheckpointSaver | None = None,
     tool_artifact_store: Any | None = None,
+    coordination_board: ResearchBlackboard | None = None,
+    homogeneous_fork_config: HomogeneousForkConfig | None = None,
     state_schema: Any = ResearchAgentState,
     allow_fork_tool: bool = True,
 ) -> Any:
@@ -1316,6 +1436,12 @@ def build_research_agent_graph(
     if inherit_checkpointer and checkpointer is not None:
         raise ValueError("cannot set checkpointer when inherit_checkpointer is true")
     tool_list = list(tools)
+    fork_settings = homogeneous_fork_config or HomogeneousForkConfig()
+    fork_settings.validate()
+    if fork_settings.enabled and coordination_board is None:
+        raise ValueError(
+            "enabled homogeneous Fork control requires a persistent research blackboard"
+        )
     tool_map = _build_tool_map(tool_list)
     effective_checkpointer = (
         None if inherit_checkpointer else checkpointer if checkpointer is not None else InMemorySaver()
@@ -1328,6 +1454,78 @@ def build_research_agent_graph(
     ) -> dict[str, Any]:
         _validate_invocation(state, config)
         with _node_trace("prepare", state) as observation:
+            if coordination_board is not None:
+                requirements = tuple(
+                    state.get("research_requirements")
+                    or build_research_requirements(state["task"])
+                )
+                context = (
+                    state["task"].context
+                    if isinstance(state["task"].context, dict)
+                    else {}
+                )
+                plan_id = str(
+                    context.get("research_plan_id")
+                    or f"plan-{state['identity'].root_thread_id}"
+                )
+                outline = context.get("report_outline", ())
+                if state["identity"].depth == 0:
+                    coordination_rows = context.get("coordination_requirements")
+                    if not isinstance(coordination_rows, (list, tuple)):
+                        coordination_rows = [
+                            {
+                                "requirement_id": item.requirement_id,
+                                "description": item.description,
+                                "required": item.required,
+                            }
+                            for item in requirements
+                        ]
+                    coordination_board.ensure_plan(
+                        state["identity"].root_thread_id,
+                        plan_id=plan_id,
+                        objective=str(
+                            context.get("global_objective")
+                            or state["task"].objective
+                        ),
+                        requirements=coordination_rows,
+                        report_outline=(
+                            outline
+                            if isinstance(outline, (list, tuple))
+                            else (str(outline),)
+                        ),
+                    )
+                    coordination_board.ensure_root_assignment(
+                        state["identity"].root_thread_id,
+                        assignment_id=_own_assignment_id(state),
+                        owner_thread_id=state["identity"].thread_id,
+                        objective=str(context.get("global_objective") or state["task"].objective),
+                        requirement_ids=(
+                            str(item["requirement_id"])
+                            for item in coordination_rows
+                            if bool(item.get("required", True))
+                        ),
+                    )
+                    if fork_settings.budget_leases_enabled:
+                        coordination_board.ensure_budget_pool(
+                            state["identity"].root_thread_id,
+                            total_tokens=state["subtree_token_budget"],
+                            protected_tokens=min(
+                                state["subtree_token_budget"],
+                                _finalization_token_reserve(state)
+                                + fork_settings.parent_merge_reserve_tokens,
+                            ),
+                        )
+                coordination_board.update_agent(
+                    state["identity"].root_thread_id,
+                    thread_id=state["identity"].thread_id,
+                    parent_thread_id=state["identity"].parent_thread_id or "",
+                    depth=state["identity"].depth,
+                    requirement_ids=_owned_requirement_ids(state),
+                    assignment_id=_own_assignment_id(state),
+                    parent_assignment_id=_parent_assignment_id(state),
+                    status="running",
+                    current_action="prepare",
+                )
             if state["messages"]:
                 requirements = tuple(state.get("research_requirements") or build_research_requirements(state["task"]))
                 migration: dict[str, Any] = {
@@ -1352,6 +1550,8 @@ def build_research_agent_graph(
                     "source_open_count": int(state.get("source_open_count", 0)),
                     "duplicate_source_count": int(state.get("duplicate_source_count", 0)),
                     "acquisition_call_count": int(state.get("acquisition_call_count", 0)),
+                    "own_assignment_id": _own_assignment_id(state),
+                    "parent_assignment_id": _parent_assignment_id(state),
                 }
                 observation.add_output({"resumed": True, "state_migrated": True})
                 return migration
@@ -1370,6 +1570,56 @@ def build_research_agent_graph(
                     _event("agent_started", state["identity"]),
                 ],
             }
+
+    def refresh_budget_lease(
+        state: ResearchAgentState,
+        config: RunnableConfig,
+    ) -> dict[str, Any]:
+        """Top up one child lease from the refundable global pool when needed."""
+
+        _validate_invocation(state, config)
+        if (
+            not fork_settings.budget_leases_enabled
+            or coordination_board is None
+            or state["identity"].depth == 0
+        ):
+            return {}
+        lease = coordination_board.budget_lease(
+            state["identity"].root_thread_id,
+            state["identity"].thread_id,
+        )
+        if lease is None or lease.get("status") != "active":
+            return {}
+        granted = int(lease["granted_tokens"])
+        used = int(state.get("estimated_tokens_used", 0))
+        remaining = max(0, granted - used)
+        threshold = max(
+            fork_settings.child_topup_tokens,
+            _CHILD_FINALIZATION_TOKEN_MINIMUM + _ASSESSMENT_OUTPUT_TOKEN_RESERVE,
+        )
+        updated_grant = granted
+        if remaining <= threshold and granted < int(lease["max_tokens"]):
+            updated_grant = coordination_board.request_budget_topup(
+                state["identity"].root_thread_id,
+                thread_id=state["identity"].thread_id,
+                used_tokens=used,
+                requested_tokens=fork_settings.child_topup_tokens,
+            )
+        if updated_grant <= int(state["subtree_token_budget"]):
+            return {}
+        return {
+            "subtree_token_budget": updated_grant,
+            "execution_events": [
+                *state["execution_events"],
+                _event(
+                    "child_budget_lease_topped_up",
+                    state["identity"],
+                    previous_tokens=state["subtree_token_budget"],
+                    granted_tokens=updated_grant,
+                    used_tokens=used,
+                ),
+            ],
+        }
 
     async def think_and_plan(
         state: ResearchAgentState,
@@ -1475,6 +1725,301 @@ def build_research_agent_graph(
                 )
         remaining_tokens = max(0, remaining_tokens - compaction_token_charge)
         available_seconds = _remaining_seconds(state) if finalization_requested else _remaining_research_seconds(state)
+        board_view: dict[str, Any] = {}
+        if coordination_board is not None and not finalization_requested:
+            try:
+                board_view = coordination_board.snapshot(
+                    state["identity"].root_thread_id,
+                    viewer_thread_id=state["identity"].thread_id,
+                    own_requirement_ids=_owned_requirement_ids(state),
+                    own_assignment_id=_own_assignment_id(state),
+                    limit=12,
+                )
+                if board_view:
+                    working_messages = [
+                        *working_messages,
+                        {
+                            "role": "user",
+                            "content": (
+                                "RESEARCH_COORDINATION_BOARD\n"
+                                "This is a compact live coordination view, not a new task. "
+                                "Stay inside your owned requirements, reuse completed work, "
+                                "and signal incidental cross-scope Evidence instead of "
+                                "expanding your scope.\n\n"
+                                + json.dumps(board_view, ensure_ascii=False, default=str)
+                            ),
+                        },
+                    ]
+                coordination_board.update_agent(
+                    state["identity"].root_thread_id,
+                    thread_id=state["identity"].thread_id,
+                    parent_thread_id=state["identity"].parent_thread_id or "",
+                    depth=state["identity"].depth,
+                    requirement_ids=_owned_requirement_ids(state),
+                    assignment_id=_own_assignment_id(state),
+                    parent_assignment_id=_parent_assignment_id(state),
+                    status="running",
+                    current_action="think_and_plan",
+                )
+                if allow_fork_tool:
+                    coordination_board.record_event(
+                        state["identity"].root_thread_id,
+                        "fork_tool_offered",
+                        actor_thread_id=state["identity"].thread_id,
+                        payload={"iteration": state["iteration"]},
+                    )
+            except Exception as exc:
+                working_messages = [
+                    *working_messages,
+                    {
+                        "role": "user",
+                        "content": (
+                            "RESEARCH_COORDINATION_BOARD unavailable for this turn: "
+                            f"{type(exc).__name__}. Continue within the scoped task."
+                        ),
+                    },
+                ]
+        control_action_value: str | None = None
+        control_rationale: str | None = None
+        control_targets: list[str] = []
+        control_error: str | None = None
+        control_repair_applied = False
+        control_event: dict[str, Any] | None = None
+        recursive_recon_required = (
+            fork_settings.enabled
+            and fork_settings.explicit_control_decision
+            and state["identity"].depth > 0
+            and bool(tool_list)
+            and int(state.get("tool_calls_used", 0))
+            < fork_settings.recursive_fork_min_local_tool_calls
+        )
+        if recursive_recon_required:
+            control_action_value = ResearchControlAction.LOCAL_RESEARCH.value
+            control_rationale = (
+                "Recursive Fork is deferred until this assignment performs "
+                f"at least {fork_settings.recursive_fork_min_local_tool_calls} "
+                "local research tool call(s) and identifies concrete evidence gaps."
+            )
+            control_event = _event(
+                "research_control_decided",
+                state["identity"],
+                action=control_action_value,
+                rationale=control_rationale,
+                target_requirement_ids=[],
+                error=None,
+                repair_applied=False,
+                recursive_recon_required=True,
+            )
+            if coordination_board is not None:
+                try:
+                    coordination_board.record_event(
+                        state["identity"].root_thread_id,
+                        "fork_not_called",
+                        actor_thread_id=state["identity"].thread_id,
+                        payload={
+                            "iteration": state["iteration"],
+                            "control_action": control_action_value,
+                            "rationale": control_rationale,
+                            "recursive_recon_required": True,
+                        },
+                    )
+                except Exception:
+                    pass
+        if (
+            fork_settings.enabled
+            and fork_settings.explicit_control_decision
+            and allow_fork_tool
+            and not finalization_requested
+            and not recursive_recon_required
+        ):
+            control_messages = research_control_prompt(
+                objective=state["task"].objective,
+                requirements=tuple(state["research_requirements"]),
+                coverage=(
+                    {
+                        **asdict(item),
+                        "status": item.status.value,
+                    }
+                    for item in state.get("coverage", [])
+                ),
+                child_summaries=(
+                    {
+                        "task_id": item.task_id,
+                        "status": item.status.value,
+                        "summary": item.summary[:500],
+                        "unresolved": list(item.unresolved[:4]),
+                    }
+                    for item in state.get("child_results", [])
+                ),
+                board_view=board_view,
+                depth=state["identity"].depth,
+                max_fork_depth=state["limits"].max_fork_depth,
+                max_children=max(
+                    0,
+                    state["limits"].max_children
+                    - len(set(state["completed_fork_fingerprints"])),
+                ),
+                local_rounds_since_fork=int(
+                    state.get("local_rounds_since_fork", 0)
+                ),
+                reconsider_after_local_rounds=(
+                    fork_settings.reconsider_after_local_rounds
+                ),
+            )
+            try:
+                control_response = await asyncio.wait_for(
+                    call_policy(policy, control_messages, []),
+                    timeout=max(0.001, available_seconds),
+                )
+                control_charge = _estimate_tokens(
+                    control_messages,
+                    control_response,
+                )
+                compaction_token_charge += control_charge
+                remaining_tokens = max(0, remaining_tokens - control_charge)
+                raw_control = str(control_response.get("content") or "")
+                valid_control_ids = tuple(
+                    item.requirement_id for item in state["research_requirements"]
+                )
+                try:
+                    decision = parse_research_control_decision(
+                        raw_control,
+                        valid_requirement_ids=valid_control_ids,
+                    )
+                except ValueError as first_error:
+                    repair_messages = [
+                        *control_messages,
+                        {"role": "assistant", "content": raw_control[:12000]},
+                        {
+                            "role": "user",
+                            "content": (
+                                "REPAIR_CONTROL_STRUCTURE_ONLY\n"
+                                f"Validation error: {first_error}\n"
+                                "Return the same semantic decision as valid JSON. "
+                                "Do not change fork to local_research or vice versa. "
+                                "Allowed Fork reasons are exactly: parallel, "
+                                "context_isolation, deep_tool_chain. Every candidate "
+                                "needs requirement_ids and at least one exact reason."
+                            ),
+                        },
+                    ]
+                    repaired_control = await asyncio.wait_for(
+                        call_policy(policy, repair_messages, []),
+                        timeout=max(0.001, _remaining_research_seconds(state)),
+                    )
+                    repair_charge = _estimate_tokens(
+                        repair_messages,
+                        repaired_control,
+                    )
+                    compaction_token_charge += repair_charge
+                    remaining_tokens = max(0, remaining_tokens - repair_charge)
+                    decision = parse_research_control_decision(
+                        str(repaired_control.get("content") or ""),
+                        valid_requirement_ids=valid_control_ids,
+                    )
+                    control_repair_applied = True
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                decision = None
+                control_error = f"{type(exc).__name__}: {exc}"
+                control_action_value = ResearchControlAction.LOCAL_RESEARCH.value
+                control_rationale = (
+                    "Control decision was invalid or unavailable; continue one "
+                    "bounded local round without forcing Fork."
+                )
+            else:
+                control_action_value = decision.action.value
+                control_rationale = decision.rationale
+                control_targets = list(decision.target_requirement_ids)
+            if coordination_board is not None:
+                try:
+                    coordination_board.record_event(
+                        state["identity"].root_thread_id,
+                        (
+                            "fork_called"
+                            if decision is not None
+                            and decision.action is ResearchControlAction.FORK
+                            else "fork_not_called"
+                        ),
+                        actor_thread_id=state["identity"].thread_id,
+                        payload={
+                            "iteration": state["iteration"],
+                            "control_action": control_action_value,
+                            "rationale": control_rationale,
+                            "error": control_error,
+                            "repair_applied": control_repair_applied,
+                        },
+                    )
+                except Exception:
+                    pass
+            control_event = _event(
+                "research_control_decided",
+                state["identity"],
+                action=control_action_value,
+                rationale=control_rationale,
+                target_requirement_ids=control_targets,
+                error=control_error,
+                repair_applied=control_repair_applied,
+            )
+            if (
+                decision is not None
+                and decision.action is ResearchControlAction.FORK
+            ):
+                fork_call = decision_as_fork_tool_call(
+                    decision,
+                    call_id=f"control-fork-{state['iteration']}",
+                )
+                return {
+                    "pending_tool_calls": [],
+                    "pending_fork_calls": [fork_call],
+                    "iteration": state["iteration"] + 1,
+                    "estimated_tokens_used": min(
+                        state["subtree_token_budget"],
+                        state["estimated_tokens_used"] + compaction_token_charge,
+                    ),
+                    "control_action": control_action_value,
+                    "control_rationale": control_rationale,
+                    "control_target_requirement_ids": control_targets,
+                    "control_decision_error": control_error,
+                    "control_repair_applied": control_repair_applied,
+                    "local_rounds_since_fork": 0,
+                    "execution_events": [
+                        *state["execution_events"],
+                        *([compaction_event] if compaction_event is not None else []),
+                        control_event,
+                    ],
+                }
+            if (
+                decision is not None
+                and decision.action
+                in {ResearchControlAction.MERGE, ResearchControlAction.COMPLETE}
+            ):
+                return {
+                    "pending_tool_calls": [],
+                    "pending_fork_calls": [],
+                    "iteration": state["iteration"] + 1,
+                    "last_content": decision.rationale,
+                    "draft": None,
+                    "draft_raw": "",
+                    "estimated_tokens_used": min(
+                        state["subtree_token_budget"],
+                        state["estimated_tokens_used"] + compaction_token_charge,
+                    ),
+                    "control_action": control_action_value,
+                    "control_rationale": control_rationale,
+                    "control_target_requirement_ids": control_targets,
+                    "control_decision_error": control_error,
+                    "control_repair_applied": control_repair_applied,
+                    "local_rounds_since_fork": int(
+                        state.get("local_rounds_since_fork", 0)
+                    ),
+                    "execution_events": [
+                        *state["execution_events"],
+                        *([compaction_event] if compaction_event is not None else []),
+                        control_event,
+                    ],
+                }
         policy_messages = _bounded_finalization_messages(state) if finalization_requested else working_messages
         estimated_prompt_tokens = max(
             1,
@@ -1502,6 +2047,12 @@ def build_research_agent_graph(
                     *state["execution_events"],
                     compaction_event,
                 ]
+            if control_event is not None:
+                update["execution_events"] = [
+                    *state["execution_events"],
+                    *([compaction_event] if compaction_event is not None else []),
+                    control_event,
+                ]
             if finalization_requested:
                 update["finalization_requested"] = False
             return update
@@ -1514,7 +2065,13 @@ def build_research_agent_graph(
                 if finalization_requested
                 else [
                     *_tool_schemas(tool_list),
-                    *([fork_tool_schema()] if allow_fork_tool else []),
+                    *(
+                        [fork_tool_schema()]
+                        if allow_fork_tool
+                        and not fork_settings.explicit_control_decision
+                        else []
+                    ),
+                    *([_cross_scope_signal_schema()] if coordination_board is not None else []),
                 ]
             )
             action_retries = 0
@@ -1568,6 +2125,30 @@ def build_research_agent_graph(
 
             content = str(response.get("content") or "")
             calls = [] if finalization_requested else _normalize_tool_calls(response.get("tool_calls"))
+            if (
+                coordination_board is not None
+                and allow_fork_tool
+                and not finalization_requested
+                and not fork_settings.explicit_control_decision
+            ):
+                fork_called = any(
+                    call["function"].get("name") == FORK_TOOL_NAME
+                    for call in calls
+                )
+                try:
+                    coordination_board.record_event(
+                        state["identity"].root_thread_id,
+                        "fork_called" if fork_called else "fork_not_called",
+                        actor_thread_id=state["identity"].thread_id,
+                        payload={
+                            "iteration": state["iteration"],
+                            "selected_tools": [
+                                call["function"].get("name") for call in calls
+                            ],
+                        },
+                    )
+                except Exception:
+                    pass
             assistant_message: dict[str, Any] = {
                 "role": "assistant",
                 "content": content,
@@ -1586,10 +2167,25 @@ def build_research_agent_graph(
                 "estimated_tokens_used": (state["estimated_tokens_used"] + compaction_token_charge + token_charge),
                 "retries_used": state["retries_used"] + action_retries,
             }
-            if compaction_event is not None:
+            if control_action_value is not None:
+                update.update({
+                    "control_action": control_action_value,
+                    "control_rationale": control_rationale,
+                    "control_target_requirement_ids": control_targets,
+                    "control_decision_error": control_error,
+                    "control_repair_applied": control_repair_applied,
+                    "local_rounds_since_fork": (
+                        int(state.get("local_rounds_since_fork", 0)) + 1
+                        if control_action_value
+                        == ResearchControlAction.LOCAL_RESEARCH.value
+                        else int(state.get("local_rounds_since_fork", 0))
+                    ),
+                })
+            if compaction_event is not None or control_event is not None:
                 update["execution_events"] = [
                     *state["execution_events"],
-                    compaction_event,
+                    *([compaction_event] if compaction_event is not None else []),
+                    *([control_event] if control_event is not None else []),
                 ]
             if token_exhausted:
                 update["pending_tool_calls"] = []
@@ -1823,6 +2419,23 @@ def build_research_agent_graph(
             finalization_requested = True
             draft_raw = ""
 
+        if coordination_board is not None and state["identity"].depth == 0:
+            for item in assessment.coverage:
+                try:
+                    coordination_board.update_requirement_coverage(
+                        state["identity"].root_thread_id,
+                        item.requirement_id,
+                        status=item.status.value,
+                        evidence_ids=item.evidence_ids,
+                        rationale=item.rationale,
+                        remaining_gap=item.remaining_gap or "",
+                        actor_thread_id=state["identity"].thread_id,
+                    )
+                except Exception:
+                    # The checkpointed assessment remains authoritative if the
+                    # passive coordination view is temporarily unavailable.
+                    pass
+
         update: dict[str, Any] = {
             "messages": messages,
             "draft": draft,
@@ -1914,6 +2527,76 @@ def build_research_agent_graph(
                 if not isinstance(arguments, dict):
                     arguments = {}
 
+                if (
+                    tool_name == _CROSS_SCOPE_SIGNAL_TOOL_NAME
+                    and coordination_board is not None
+                ):
+                    evidence_id = str(arguments.get("evidence_id") or "").strip()
+                    target_requirement_id = str(
+                        arguments.get("target_requirement_id") or ""
+                    ).strip()
+                    known_evidence_ids = {item.evidence_id for item in collected}
+                    board_plan = coordination_board.snapshot(
+                        state["identity"].root_thread_id,
+                        viewer_thread_id=state["identity"].thread_id,
+                    ).get("plan", {})
+                    valid_requirement_ids = {
+                        str(item.get("requirement_id") or "")
+                        for item in board_plan.get("requirements", [])
+                        if isinstance(item, dict)
+                    }
+                    own_ids = set(_owned_requirement_ids(state))
+                    if evidence_id not in known_evidence_ids:
+                        signal_result = {
+                            "status": "rejected",
+                            "error": "cross-scope signal requires already-collected Evidence",
+                        }
+                    elif target_requirement_id not in valid_requirement_ids:
+                        signal_result = {
+                            "status": "rejected",
+                            "error": "unknown target requirement",
+                        }
+                    elif target_requirement_id in own_ids:
+                        signal_result = {
+                            "status": "rejected",
+                            "error": "target requirement is already owned by this Agent",
+                        }
+                    else:
+                        signal_id = coordination_board.publish_signal(
+                            state["identity"].root_thread_id,
+                            evidence_id=evidence_id,
+                            discovered_by=state["identity"].thread_id,
+                            target_requirement_id=target_requirement_id,
+                            parent_thread_id=state["identity"].parent_thread_id or "",
+                            message=str(arguments.get("message") or ""),
+                        )
+                        signal_result = {
+                            "status": "published",
+                            "signal_id": signal_id,
+                            "target_requirement_id": target_requirement_id,
+                        }
+                        events.append(
+                            _event(
+                                "cross_scope_signal_published",
+                                state["identity"],
+                                signal_id=signal_id,
+                                evidence_id=evidence_id,
+                                target_requirement_id=target_requirement_id,
+                            )
+                        )
+                    new_messages.append(
+                        {
+                            "role": "tool",
+                            "tool_call_id": call["id"],
+                            "name": tool_name,
+                            "content": _serialize_tool_result(
+                                signal_result,
+                                state["limits"].max_tool_output_chars,
+                            ),
+                        }
+                    )
+                    continue
+
                 tool = tool_map.get(tool_name)
                 scheduled_actions = active_next_actions(state.get("next_actions", []))
                 if not scheduled_actions and state.get("assessment_decision") is None and tool_name != "notepad":
@@ -1980,6 +2663,81 @@ def build_research_agent_graph(
                         }
                     )
                     continue
+                board_query = ""
+                board_query_claimed = False
+                if (
+                    coordination_board is not None
+                    and tool_name == "acquire_evidence"
+                    and matched_action is not None
+                ):
+                    board_query = str(
+                        arguments.get("query") or matched_action.query
+                    ).strip()
+                    try:
+                        query_claim = coordination_board.claim_query(
+                            state["identity"].root_thread_id,
+                            requirement_id=matched_action.requirement_id,
+                            owner_thread_id=state["identity"].thread_id,
+                            assignment_id=_own_assignment_id(state),
+                            parent_assignment_id=_parent_assignment_id(state),
+                            query=board_query,
+                            lease_seconds=_BLACKBOARD_LEASE_SECONDS,
+                        )
+                    except Exception as exc:
+                        events.append(
+                            _event(
+                                "blackboard_query_claim_failed",
+                                state["identity"],
+                                error=f"{type(exc).__name__}: {exc}",
+                                requirement_id=matched_action.requirement_id,
+                            )
+                        )
+                    else:
+                        if not query_claim.acquired:
+                            strategy_attempts.append(
+                                StrategyAttempt(
+                                    requirement_id=matched_action.requirement_id,
+                                    strategy=matched_action.strategy,
+                                    query=board_query,
+                                    outcome="no_progress",
+                                    action_id=_action_id(matched_action),
+                                    artifact_ids=query_claim.artifact_ids,
+                                )
+                            )
+                            events.append(
+                                _event(
+                                    "blackboard_query_reused"
+                                    if query_claim.reason == "completed"
+                                    else "blackboard_query_skipped_running",
+                                    state["identity"],
+                                    requirement_id=matched_action.requirement_id,
+                                    owner_thread_id=query_claim.owner_thread_id,
+                                    artifact_ids=list(query_claim.artifact_ids),
+                                )
+                            )
+                            new_messages.append(
+                                {
+                                    "role": "tool",
+                                    "tool_call_id": call["id"],
+                                    "name": tool_name,
+                                    "content": _serialize_tool_result(
+                                        {
+                                            "status": "reused"
+                                            if query_claim.reason == "completed"
+                                            else "in_progress_elsewhere",
+                                            "owner_thread_id": query_claim.owner_thread_id,
+                                            "artifact_ids": list(query_claim.artifact_ids),
+                                            "coordination": (
+                                                "Do not repeat this query; use existing "
+                                                "Evidence or continue with a distinct strategy."
+                                            ),
+                                        },
+                                        state["limits"].max_tool_output_chars,
+                                    ),
+                                }
+                            )
+                            continue
+                        board_query_claimed = True
                 open_circuit = next(
                     (
                         event
@@ -2147,6 +2905,28 @@ def build_research_agent_graph(
                         ],
                     }
                 artifact_id = _tool_artifact_id(tool_name, arguments, result)
+                if (
+                    coordination_board is not None
+                    and board_query
+                    and board_query_claimed
+                ):
+                    try:
+                        coordination_board.complete_query(
+                            state["identity"].root_thread_id,
+                            board_query,
+                            owner_thread_id=state["identity"].thread_id,
+                            artifact_ids=(artifact_id,),
+                            failed=error is not None,
+                        )
+                    except Exception as exc:
+                        events.append(
+                            _event(
+                                "blackboard_query_completion_failed",
+                                state["identity"],
+                                error=f"{type(exc).__name__}: {exc}",
+                                artifact_id=artifact_id,
+                            )
+                        )
                 if tool_name == "acquire_evidence" and isinstance(result, dict):
                     acquisition_metrics = result.get("metrics", {})
                     if isinstance(acquisition_metrics, dict):
@@ -2162,15 +2942,94 @@ def build_research_agent_graph(
                             + int(acquisition_metrics.get("cache_hit_count", 0)),
                         )
                     acquisition_call_count += 1
+                    if coordination_board is not None:
+                        documents_by_url = {
+                            canonicalize_source_url(str(item.get("url") or "")): item
+                            for item in result.get("documents", [])
+                            if isinstance(item, dict) and item.get("url")
+                        }
+                        errors_by_url = {
+                            canonicalize_source_url(str(item.get("url") or "")): item
+                            for item in result.get("fetch_errors", [])
+                            if isinstance(item, dict) and item.get("url")
+                        }
+                        for selected_url in result.get("selected_urls", []):
+                            canonical_url = canonicalize_source_url(str(selected_url))
+                            try:
+                                source_claim = coordination_board.claim_source(
+                                    state["identity"].root_thread_id,
+                                    owner_thread_id=state["identity"].thread_id,
+                                    requirement_id=(
+                                        matched_action.requirement_id
+                                        if matched_action is not None else ""
+                                    ),
+                                    assignment_id=_own_assignment_id(state),
+                                    parent_assignment_id=_parent_assignment_id(state),
+                                    url=canonical_url,
+                                    lease_seconds=_BLACKBOARD_LEASE_SECONDS,
+                                )
+                                if source_claim.acquired:
+                                    fetch_error = errors_by_url.get(canonical_url)
+                                    coordination_board.complete_source(
+                                        state["identity"].root_thread_id,
+                                        canonical_url,
+                                        owner_thread_id=state["identity"].thread_id,
+                                        artifact_id=(
+                                            artifact_id
+                                            if canonical_url in documents_by_url else ""
+                                        ),
+                                        error=(
+                                            str(fetch_error.get("error") or "fetch failed")
+                                            if fetch_error is not None else ""
+                                        ),
+                                    )
+                            except Exception as exc:
+                                events.append(
+                                    _event(
+                                        "blackboard_source_update_failed",
+                                        state["identity"],
+                                        source_ref=canonical_url,
+                                        error=f"{type(exc).__name__}: {exc}",
+                                    )
+                                )
                 extracted: list[EvidenceItem] = []
                 if error is None and matched_action is not None:
-                    extracted = _extract_evidence(
-                        tool_name,
-                        arguments,
-                        result,
-                        action=matched_action,
-                        artifact_id=artifact_id,
-                    )
+                    extracted = [
+                        replace(
+                            item,
+                            assignment_id=_own_assignment_id(state),
+                            parent_assignment_id=_parent_assignment_id(state),
+                        )
+                        for item in _extract_evidence(
+                            tool_name,
+                            arguments,
+                            result,
+                            action=matched_action,
+                            artifact_id=artifact_id,
+                        )
+                    ]
+                    if coordination_board is not None:
+                        for item in extracted:
+                            try:
+                                coordination_board.register_evidence(
+                                    state["identity"].root_thread_id,
+                                    evidence_id=item.evidence_id,
+                                    assignment_id=item.assignment_id,
+                                    parent_assignment_id=item.parent_assignment_id,
+                                    requirement_id=item.requirement_id,
+                                    owner_thread_id=state["identity"].thread_id,
+                                    source_ref=item.source_ref,
+                                    locator=item.locator,
+                                )
+                            except Exception as exc:
+                                events.append(
+                                    _event(
+                                        "blackboard_evidence_lineage_failed",
+                                        state["identity"],
+                                        evidence_id=item.evidence_id,
+                                        error=f"{type(exc).__name__}: {exc}",
+                                    )
+                                )
                     known_ids = {item.evidence_id for item in collected}
                     new_ids = tuple(item.evidence_id for item in extracted if item.evidence_id not in known_ids)
                     collected.extend(extracted)
@@ -2199,6 +3058,8 @@ def build_research_agent_graph(
                         artifact_id=artifact_id,
                         requirement_id=(matched_action.requirement_id if matched_action is not None else None),
                         action_id=(_action_id(matched_action) if matched_action is not None else None),
+                        assignment_id=_own_assignment_id(state),
+                        parent_assignment_id=_parent_assignment_id(state),
                         strategy=(matched_action.strategy if matched_action is not None else None),
                     )
                 )
@@ -2361,6 +3222,7 @@ def build_research_agent_graph(
         state: ResearchAgentState,
         candidate: ForkCandidate,
         *,
+        assignment_id: str,
         thread_budget: int,
         tool_budget: int,
         token_budget: int,
@@ -2370,8 +3232,21 @@ def build_research_agent_graph(
             state["task"],
             candidate,
             state["research_requirements"],
+            assignment_id=assignment_id,
+            parent_assignment_id=_own_assignment_id(state),
         )
         child_identity = _child_identity(state["identity"], candidate)
+        if coordination_board is not None:
+            try:
+                coordination_board.update_assignment_node(
+                    state["identity"].root_thread_id,
+                    assignment_id,
+                    owner_thread_id=child_identity.thread_id,
+                    status="researching",
+                    lease_seconds=_BLACKBOARD_LEASE_SECONDS,
+                )
+            except Exception:
+                pass
         try:
             child_state = await _run_research_agent_state(
                 child_task,
@@ -2381,6 +3256,8 @@ def build_research_agent_graph(
                 limits=state["limits"],
                 checkpointer=descendant_checkpointer,
                 tool_artifact_store=tool_artifact_store,
+                coordination_board=coordination_board,
+                homogeneous_fork_config=fork_settings,
                 deadline_at=state["deadline_at"],
                 subtree_thread_budget=thread_budget,
                 subtree_tool_budget=tool_budget,
@@ -2412,6 +3289,32 @@ def build_research_agent_graph(
                     error=str(exc),
                 )
             ]
+        if coordination_board is not None:
+            assignment_status = (
+                "completed"
+                if result.status == ResearchStatus.COMPLETED
+                else "failed"
+                if result.status == ResearchStatus.FAILED
+                else "blocked"
+            )
+            try:
+                coordination_board.update_assignment_node(
+                    state["identity"].root_thread_id,
+                    assignment_id,
+                    owner_thread_id=child_identity.thread_id,
+                    status=assignment_status,
+                )
+            except Exception:
+                pass
+            if fork_settings.budget_leases_enabled:
+                try:
+                    coordination_board.release_budget_lease(
+                        state["identity"].root_thread_id,
+                        thread_id=child_identity.thread_id,
+                        used_tokens=result.estimated_tokens_used,
+                    )
+                except Exception:
+                    pass
         return candidate_fingerprint(candidate), child_identity.thread_id, result, events
 
     async def fork_children(
@@ -2423,10 +3326,19 @@ def build_research_agent_graph(
         for call in state["pending_fork_calls"]:
             candidates.extend(parse_fork_candidates(call["function"].get("arguments", "{}")))
 
-        remaining_thread_slots = max(
-            0,
-            state["subtree_thread_budget"] - state["total_threads_used"],
-        )
+        if coordination_board is not None:
+            remaining_thread_slots = max(
+                0,
+                state["limits"].max_total_threads
+                - coordination_board.metrics(state["identity"].root_thread_id).get(
+                    "assignment_count", 0
+                ),
+            )
+        else:
+            remaining_thread_slots = max(
+                0,
+                state["subtree_thread_budget"] - state["total_threads_used"],
+            )
         remaining_children = max(
             0,
             min(
@@ -2450,17 +3362,97 @@ def build_research_agent_graph(
             rejected.extend(f"{candidate.objective}: time budget exhausted" for candidate in accepted)
             accepted = []
 
-        thread_budgets = _split_budget(
-            remaining_thread_slots,
-            len(accepted),
-            minimum=1,
+        assignment_ids = [
+            _candidate_assignment_id(_own_assignment_id(state), candidate)
+            for candidate in accepted
+        ]
+        if coordination_board is not None and accepted:
+            rows = []
+            for candidate, assignment_id in zip(accepted, assignment_ids):
+                child_identity = _child_identity(state["identity"], candidate)
+                rows.append({
+                    "assignment_id": assignment_id,
+                    "parent_assignment_id": _own_assignment_id(state),
+                    "owner_thread_id": child_identity.thread_id,
+                    "parent_thread_id": state["identity"].thread_id,
+                    "requirement_ids": candidate.requirement_ids,
+                    "objective": candidate.objective,
+                    "scope_signature": _candidate_scope_signature(candidate),
+                    "reasons": tuple(reason.value for reason in candidate.reasons),
+                    "status": "claimed",
+                })
+            outcomes = coordination_board.register_assignment_nodes(
+                state["identity"].root_thread_id,
+                rows,
+                actor_thread_id=state["identity"].thread_id,
+                lease_seconds=_BLACKBOARD_LEASE_SECONDS,
+                max_total_assignments=state["limits"].max_total_threads,
+            )
+            scoped_candidates: list[ForkCandidate] = []
+            scoped_assignment_ids: list[str] = []
+            for candidate, assignment_id in zip(accepted, assignment_ids):
+                claim = outcomes[assignment_id]
+                if not claim.acquired:
+                    rejected.append(
+                        f"{candidate.objective}: assignment rejected ({claim.reason})"
+                    )
+                    continue
+                scoped_candidates.append(candidate)
+                scoped_assignment_ids.append(assignment_id)
+            accepted = scoped_candidates
+            assignment_ids = scoped_assignment_ids
+
+        if fork_settings.budget_leases_enabled and coordination_board is not None:
+            funded_candidates: list[ForkCandidate] = []
+            funded_assignment_ids: list[str] = []
+            token_budgets: list[int] = []
+            for candidate, assignment_id in zip(accepted, assignment_ids):
+                child_identity = _child_identity(state["identity"], candidate)
+                try:
+                    granted = coordination_board.grant_budget_lease(
+                        state["identity"].root_thread_id,
+                        thread_id=child_identity.thread_id,
+                        parent_thread_id=state["identity"].thread_id,
+                        requested_tokens=fork_settings.initial_child_lease_tokens,
+                        max_tokens=fork_settings.max_child_lease_tokens,
+                    )
+                except Exception as exc:
+                    rejected.append(
+                        f"{candidate.objective}: child budget lease unavailable "
+                        f"({type(exc).__name__})"
+                    )
+                    try:
+                        coordination_board.update_assignment_node(
+                            state["identity"].root_thread_id,
+                            assignment_id,
+                            owner_thread_id=child_identity.thread_id,
+                            status="blocked",
+                        )
+                    except Exception:
+                        pass
+                    continue
+                funded_candidates.append(candidate)
+                funded_assignment_ids.append(assignment_id)
+                token_budgets.append(granted)
+            accepted = funded_candidates
+            assignment_ids = funded_assignment_ids
+        else:
+            token_budgets = _split_budget(
+                _delegable_token_budget(state),
+                len(accepted),
+            )
+
+        thread_budgets = (
+            [state["limits"].max_total_threads] * len(accepted)
+            if coordination_board is not None
+            else _split_budget(
+                remaining_thread_slots,
+                len(accepted),
+                minimum=1,
+            )
         )
         tool_budgets = _split_budget(
             _delegable_tool_budget(state, len(accepted)),
-            len(accepted),
-        )
-        token_budgets = _split_budget(
-            _delegable_token_budget(state),
             len(accepted),
         )
         retry_budgets = _split_budget(
@@ -2468,19 +3460,32 @@ def build_research_agent_graph(
             len(accepted),
         )
 
+        if coordination_board is not None:
+            coordination_board.record_event(
+                state["identity"].root_thread_id,
+                "fork_candidates_evaluated",
+                actor_thread_id=state["identity"].thread_id,
+                payload={
+                    "accepted": [candidate.objective for candidate in accepted],
+                    "rejected": rejected,
+                },
+            )
+
         with _node_trace("fork_children", state) as observation:
             completed = await asyncio.gather(
                 *(
                     _run_child(
                         state,
                         candidate,
+                        assignment_id=assignment_id,
                         thread_budget=thread_budget,
                         tool_budget=tool_budget,
                         token_budget=token_budget,
                         retry_budget=retry_budget,
                     )
-                    for candidate, thread_budget, tool_budget, token_budget, retry_budget in zip(
+                    for candidate, assignment_id, thread_budget, tool_budget, token_budget, retry_budget in zip(
                         accepted,
+                        assignment_ids,
                         thread_budgets,
                         tool_budgets,
                         token_budgets,
@@ -2504,9 +3509,12 @@ def build_research_agent_graph(
                     {
                         "task_id": result.task_id,
                         "thread_id": thread_id,
+                        "assignment_id": assignment_id,
                         "status": result.status.value,
                     }
-                    for thread_id, result in zip(child_thread_ids, new_results)
+                    for assignment_id, thread_id, result in zip(
+                        assignment_ids, child_thread_ids, new_results
+                    )
                 ],
                 "rejected": rejected,
                 "results": [asdict(result) for result in new_results],
@@ -2567,6 +3575,22 @@ def build_research_agent_graph(
                 state["estimated_tokens_used"] + sum(result.estimated_tokens_used for result in new_results)
             ),
             "retries_used": (state["retries_used"] + sum(result.retries_used for result in new_results)),
+            "source_candidate_count": (
+                int(state.get("source_candidate_count", 0))
+                + sum(result.source_candidate_count for result in new_results)
+            ),
+            "source_open_count": (
+                int(state.get("source_open_count", 0))
+                + sum(result.source_open_count for result in new_results)
+            ),
+            "duplicate_source_count": (
+                int(state.get("duplicate_source_count", 0))
+                + sum(result.duplicate_source_count for result in new_results)
+            ),
+            "acquisition_call_count": (
+                int(state.get("acquisition_call_count", 0))
+                + sum(result.acquisition_call_count for result in new_results)
+            ),
             "execution_events": [
                 *state["execution_events"],
                 *child_events,
@@ -2780,6 +3804,21 @@ def build_research_agent_graph(
                 duplicate_source_count=int(state.get("duplicate_source_count", 0)),
                 acquisition_call_count=int(state.get("acquisition_call_count", 0)),
             )
+            if coordination_board is not None:
+                try:
+                    coordination_board.update_agent(
+                        state["identity"].root_thread_id,
+                        thread_id=state["identity"].thread_id,
+                        parent_thread_id=state["identity"].parent_thread_id or "",
+                        depth=state["identity"].depth,
+                        requirement_ids=_owned_requirement_ids(state),
+                        assignment_id=_own_assignment_id(state),
+                        parent_assignment_id=_parent_assignment_id(state),
+                        status=result.status.value,
+                        current_action="finished",
+                    )
+                except Exception:
+                    pass
             observation.add_output(
                 {
                     "status": result.status.value,
@@ -2826,6 +3865,12 @@ def build_research_agent_graph(
 
     builder = StateGraph(state_schema)
     builder.add_node("prepare", prepare)
+    if fork_settings.budget_leases_enabled:
+        builder.add_node("refresh_budget_lease", refresh_budget_lease)
+        builder.add_node(
+            "refresh_budget_before_assessment",
+            refresh_budget_lease,
+        )
     builder.add_node("think_and_plan", think_and_plan)
     builder.add_node("use_tools", use_tools)
     if allow_fork_tool:
@@ -2834,10 +3879,17 @@ def build_research_agent_graph(
     builder.add_node("finalize_output", finalize_output)
     builder.add_node("synthesize", synthesize)
     builder.add_edge(START, "prepare")
-    builder.add_edge("prepare", "think_and_plan")
+    if fork_settings.budget_leases_enabled:
+        builder.add_edge("prepare", "refresh_budget_lease")
+        builder.add_edge("refresh_budget_lease", "think_and_plan")
+    else:
+        builder.add_edge("prepare", "think_and_plan")
     think_routes = {
         "use_tools": "use_tools",
-        "assess_research_state": "assess_research_state",
+        "assess_research_state": (
+            "refresh_budget_before_assessment"
+            if fork_settings.budget_leases_enabled else "assess_research_state"
+        ),
         "finalize_output": "finalize_output",
     }
     if allow_fork_tool:
@@ -2847,14 +3899,30 @@ def build_research_agent_graph(
         route_after_think,
         think_routes,
     )
-    builder.add_edge("use_tools", "assess_research_state")
+    if fork_settings.budget_leases_enabled:
+        builder.add_edge("use_tools", "refresh_budget_before_assessment")
+        builder.add_edge(
+            "refresh_budget_before_assessment",
+            "assess_research_state",
+        )
+    else:
+        builder.add_edge("use_tools", "assess_research_state")
     if allow_fork_tool:
-        builder.add_edge("fork_children", "assess_research_state")
+        builder.add_edge(
+            "fork_children",
+            (
+                "refresh_budget_before_assessment"
+                if fork_settings.budget_leases_enabled else "assess_research_state"
+            ),
+        )
     builder.add_conditional_edges(
         "assess_research_state",
         route_after_assessment,
         {
-            "think_and_plan": "think_and_plan",
+            "think_and_plan": (
+                "refresh_budget_lease"
+                if fork_settings.budget_leases_enabled else "think_and_plan"
+            ),
             "finalize_output": "finalize_output",
         },
     )
@@ -2878,6 +3946,8 @@ async def _run_research_agent_state(
     subtree_retry_budget: int | None = None,
     lineage_objectives: list[str] | None = None,
     tool_artifact_store: Any | None = None,
+    coordination_board: ResearchBlackboard | None = None,
+    homogeneous_fork_config: HomogeneousForkConfig | None = None,
 ) -> ResearchAgentState:
     """Start or resume one deterministic Agent thread and return its final state."""
     effective_limits = limits or AgentLimits()
@@ -2887,6 +3957,8 @@ async def _run_research_agent_state(
         checkpointer=checkpointer,
         child_checkpointer=checkpointer,
         tool_artifact_store=tool_artifact_store,
+        coordination_board=coordination_board,
+        homogeneous_fork_config=homogeneous_fork_config,
     )
     config = {"configurable": {"thread_id": identity.thread_id}}
     snapshot = await graph.aget_state(config)
@@ -2926,6 +3998,8 @@ async def run_research_agent(
     limits: AgentLimits | None = None,
     checkpointer: BaseCheckpointSaver | None = None,
     tool_artifact_store: Any | None = None,
+    coordination_board: ResearchBlackboard | None = None,
+    homogeneous_fork_config: HomogeneousForkConfig | None = None,
 ) -> ResearchResult:
     """Run one scoped task through the shared homogeneous AgentGraph."""
     final_state = await _run_research_agent_state(
@@ -2936,6 +4010,8 @@ async def run_research_agent(
         limits=limits,
         checkpointer=checkpointer,
         tool_artifact_store=tool_artifact_store,
+        coordination_board=coordination_board,
+        homogeneous_fork_config=homogeneous_fork_config,
     )
     result = final_state.get("result")
     if not isinstance(result, ResearchResult):

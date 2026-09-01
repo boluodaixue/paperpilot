@@ -1,0 +1,115 @@
+system:
+  name: "PaperPilot"
+  version: "0.2.0"
+  log_level: "INFO"
+  work_dir: "outputs"
+
+model:
+  backend: "deepseek"
+  backend_sampling:
+    deepseek:
+      temperature: 0.7
+      max_tokens: 4096
+      top_p: 1.0
+    modules:
+      research:
+        temperature: 0.7
+        max_tokens: 4096
+      judge:
+        temperature: 0.1
+        max_tokens: 2048
+  backend_mapping:
+    research: "deepseek"
+    judge: "deepseek"
+
+research:
+  architecture: "supervisor_v2"
+  shared_comparison:
+    enabled: true
+    fixed_plan:
+      brief_revision: 1
+      core_questions:
+        - description: "界定绿色债券与可持续发展挂钩债券（SLB）的核心结构，并核对 ICMA 与中国规则框架。"
+          required: true
+        - description: "比较绿色债券与 SLB 的募集资金用途约束、资金管理和合规路径。"
+          required: true
+        - description: "比较两类债券的信息披露频率、内容、KPI/SPT、报告和第三方验证要求。"
+          required: true
+        - description: "比较两类债券的投资者保护机制，包括资金追踪、票息或条款调整、违约风险和救济边界。"
+          required: true
+        - description: "基于一手来源形成结构化对照和结论，明确国际原则、中国实践及尚未解决的证据缺口。"
+          required: true
+      report_outline:
+        - "定义与规则框架"
+        - "募集资金用途"
+        - "信息披露与验证"
+        - "投资者保护"
+        - "对照结论与证据边界"
+      source_guidance:
+        - "优先使用 ICMA、政府、监管机构、交易商协会、交易所和国际组织的一手来源。"
+        - "必须打开来源正文并保留 section/page locator；搜索摘要不能作为最终证据。"
+      work_hints:
+        - "每项结论必须绑定对应 Core Question 和可定位 Evidence。"
+        - "发现跨范围 Evidence 时写入共享黑板，不扩张到已有同级负责人范围。"
+  supervisor_v2:
+    enabled: true
+    max_initial_workers: 4
+    max_research_waves: 1
+    red_review_enabled: false
+    max_red_review_rounds: 0
+    max_citation_repair_rounds: 1
+  vault_root: "outputs/evaluation/researchbench-shared-fin006-supervisor-r3/vault"
+  legacy_archive_root: "outputs/evaluation/researchbench-shared-fin006-supervisor-r3/legacy-archives"
+  report_review:
+    enabled: false
+  limits:
+    max_iterations: 18
+    max_tool_calls: 30
+    max_tool_output_chars: 24000
+    max_children: 4
+    max_fork_depth: 2
+    max_total_threads: 10
+    max_total_tool_calls: 96
+    max_elapsed_seconds: 1200.0
+    max_total_tokens: 500000
+    max_retries_per_action: 2
+    max_total_retries: 12
+
+content_extraction:
+  mode: "structured"
+  tavily_extract_fallback: true
+  docling_enabled: false
+  ocr_enabled: false
+  max_download_bytes: 12000000
+  max_blocks: 24
+  max_output_chars: 24000
+
+chat:
+  db_path: "data/chat.db"
+
+runtime:
+  proposal_ttl_seconds: 86400
+  terminal_retention_seconds: 604800
+  lease_seconds: 60
+  sweep_interval_seconds: 5
+  writer_coordination_interval_seconds: 0.1
+  retrieval_db_path: "outputs/evaluation/researchbench-shared-fin006-supervisor-r3/retrieval.db"
+  retrieval_reconciliation_seconds: 300
+  semantic_retrieval_enabled: false
+  semantic_embedding_model: "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2"
+  semantic_local_files_only: true
+
+tools:
+  enabled:
+    - acquire_evidence
+    - arxiv_reader
+    - file_reader
+    - calculator
+    - notepad
+  web_search:
+    mock_mode: false
+  evidence_acquisition:
+    default_candidates: 8
+    default_sources: 3
+    max_sources: 6
+    max_chars_per_source: 12000

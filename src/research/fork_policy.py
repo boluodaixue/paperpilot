@@ -41,6 +41,14 @@ def fork_tool_schema() -> dict[str, Any]:
                                         "that this child is delegated to investigate."
                                     ),
                                 },
+                                "scope_signature": {
+                                    "type": "string",
+                                    "description": (
+                                        "Short stable label for the precise delegated scope. "
+                                        "Different subtopics under the same requirement must "
+                                        "use different labels."
+                                    ),
+                                },
                                 "context": {"type": "object"},
                                 "reasons": {
                                     "type": "array",
@@ -109,6 +117,7 @@ def parse_fork_candidates(arguments: Any) -> list[ForkCandidate]:
                 objective=str(raw.get("objective") or "").strip(),
                 expected_output=str(raw.get("expected_output") or "").strip(),
                 requirement_ids=requirement_ids,
+                scope_signature=str(raw.get("scope_signature") or "").strip(),
                 context=context if isinstance(context, dict) else {},
                 reasons=tuple(reasons),
                 estimated_tool_calls=estimated_tool_calls,
@@ -123,6 +132,7 @@ def candidate_fingerprint(candidate: ForkCandidate) -> str:
         "objective": " ".join(candidate.objective.lower().split()),
         "expected_output": " ".join(candidate.expected_output.lower().split()),
         "requirement_ids": candidate.requirement_ids,
+        "scope_signature": " ".join(candidate.scope_signature.casefold().split()),
         "context": candidate.context,
     }
     encoded = json.dumps(normalized, ensure_ascii=False, sort_keys=True, default=str)

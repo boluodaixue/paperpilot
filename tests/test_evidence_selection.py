@@ -1,7 +1,17 @@
 """Representative evidence selection stays bounded, diverse, and deterministic."""
 
+from collections import Counter
+
 from src.research.evidence_selection import select_representative_evidence
-from src.research.models import EvidenceItem, RequirementCoverage, RequirementStatus
+from src.research.models import (
+    EvidenceItem,
+    RequirementCoverage,
+    RequirementStatus,
+    ResearchBrief,
+    ResearchResult,
+    ResearchStatus,
+)
+from src.research.rendering import render_report
 
 
 def _evidence(evidence_id: str, requirement_id: str, url: str) -> EvidenceItem:
@@ -11,6 +21,7 @@ def _evidence(evidence_id: str, requirement_id: str, url: str) -> EvidenceItem:
         source_type="paper" if "arxiv.org" in url else "web",
         title=f"Source {evidence_id}",
         source_ref=url,
+        locator=f"{url}#{evidence_id}",
         excerpt="Grounded excerpt",
         requirement_id=requirement_id,
     )
@@ -63,3 +74,109 @@ def test_selection_is_bounded_and_deterministic() -> None:
     assert len(first) == 24
     assert first == second
     assert {item.requirement_id for item in first} == {"R1", "R2", "R3", "R4"}
+
+
+def test_selection_enforces_requirement_and_source_caps() -> None:
+    evidence = tuple(
+        _evidence(
+            f"R{requirement}-{index}",
+            f"R{requirement}",
+            f"https://authority{index % 12}.gov/report",
+        )
+        for requirement in range(1, 5)
+        for index in range(12)
+    )
+
+    selected = select_representative_evidence(
+        evidence,
+        limit=24,
+        max_per_requirement=6,
+        max_per_source=2,
+    )
+
+    requirement_counts = Counter(item.requirement_id for item in selected)
+    source_counts = Counter(item.source_ref for item in selected)
+    assert len(selected) == 24
+    assert max(requirement_counts.values()) == 6
+    assert max(source_counts.values()) <= 2
+
+
+def test_selection_generically_prefers_government_source() -> None:
+    evidence = (
+        _evidence("secondary", "R1", "https://medium.com/example/summary"),
+        _evidence("official", "R1", "https://regulator.gov.cn/rules/standard"),
+    )
+
+    selected = select_representative_evidence(evidence, limit=1)
+
+    assert [item.evidence_id for item in selected] == ["official"]
+
+
+def test_dynamic_primary_source_cap_requires_distinct_locators() -> None:
+    evidence = tuple(
+        EvidenceItem(
+            evidence_id=f"official-{index}",
+            finding=f"Official clause {index}",
+            source_type="official",
+            title="Official standard",
+            source_ref="https://regulator.gov/standard",
+            locator=("page:1" if index == 4 else f"page:{index + 1}"),
+            excerpt=f"Clause {index}",
+            requirement_id="R1",
+        )
+        for index in range(5)
+    )
+
+    selected = select_representative_evidence(
+        evidence,
+        limit=12,
+        max_per_requirement=6,
+        max_per_source=2,
+        max_per_primary_source=4,
+    )
+
+    assert len(selected) == 4
+    assert len({item.locator for item in selected}) == 4
+
+
+def test_legacy_report_bounds_display_but_keeps_full_inventory() -> None:
+    evidence = tuple(
+        EvidenceItem(
+            evidence_id=f"E{index}",
+            finding=f"Finding {index}: " + ("x" * 900),
+            source_type="official",
+            title=f"Official source {index}",
+            source_ref=f"https://regulator{index}.gov/rule",
+            locator=f"section:{index}",
+            excerpt="Grounded excerpt",
+            requirement_id=f"R{index % 5 + 1}",
+        )
+        for index in range(30)
+    )
+    result = ResearchResult(
+        task_id="legacy-bounded-report",
+        status=ResearchStatus.COMPLETED,
+        summary="Bounded report.",
+        evidence=evidence,
+    )
+
+    report = render_report(
+        ResearchBrief(
+            question="Bound the legacy evidence view",
+            objective="Keep full evidence while rendering a concise report.",
+            scope=(),
+            directions=(),
+            constraints=(),
+            expected_output="A concise evidence-backed report.",
+        ),
+        result,
+        report_note="Report-bounded",
+        evidence_notes={item.evidence_id: item.evidence_id for item in evidence},
+        root_thread_id="root-bounded",
+    )
+
+    details = report.split("## Evidence-backed Details", 1)[1].split("## Unresolved", 1)[0]
+    assert details.count("|Evidence]]") == 24
+    assert "Showing 24 of 30 collected evidence items" in details
+    assert "x" * 600 not in details
+    assert len(result.evidence) == 30

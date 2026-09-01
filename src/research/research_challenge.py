@@ -27,9 +27,11 @@ from .models import (
     ToolAvailabilityAlert,
 )
 from .policy import call_policy
+from .evidence_claim_pipeline import claim_has_verified_lineage
 from .report_review import parse_json_object
 from .research_supervisor import (
     SupervisorBudget,
+    _requirement_coverage,
     plan_supplemental_work_packets,
     worker_identity_for_packet,
 )
@@ -45,6 +47,7 @@ from .v2_contracts import (
     SupervisorOutcome,
     SupervisorV2Config,
     WorkPacket,
+    research_challenge_blocks_claim,
     stable_content_id,
 )
 
@@ -145,6 +148,11 @@ def _validate_package(plan: ResearchPlan, outcome: SupervisorOutcome) -> None:
         raise ValueError("Supervisor outcome belongs to another ResearchPlan")
     question_ids = {item.question_id for item in plan.core_questions}
     claims, evidence_ids = _inventory(outcome)
+    worker_by_claim = {
+        claim.claim_id: result
+        for result in outcome.worker_results
+        for claim in result.claims
+    }
     for claim in claims.values():
         unknown_questions = set(claim.question_ids) - question_ids
         if unknown_questions:
@@ -152,6 +160,14 @@ def _validate_package(plan: ResearchPlan, outcome: SupervisorOutcome) -> None:
         unknown_evidence = set(claim.evidence_ids) - evidence_ids
         if unknown_evidence:
             raise ValueError(f"claim references unknown Evidence ID: {sorted(unknown_evidence)}")
+        worker = worker_by_claim[claim.claim_id]
+        if (worker.candidate_claims or worker.support_assessments) and not claim_has_verified_lineage(
+            claim,
+            worker.candidate_claims,
+            worker.support_assessments,
+            worker.passages,
+        ):
+            raise ValueError("claim lacks a valid pre-Composer support graph")
 
 
 def _red_prompt(plan: ResearchPlan, outcome: SupervisorOutcome) -> list[dict[str, Any]]:
@@ -175,6 +191,24 @@ def _red_prompt(plan: ResearchPlan, outcome: SupervisorOutcome) -> list[dict[str
             for result in outcome.worker_results
             for item in result.evidence
         ],
+        "documents": [
+            asdict(item)
+            for result in outcome.worker_results
+            for item in result.documents
+        ],
+        "passages": [
+            asdict(item)
+            for result in outcome.worker_results
+            for item in result.passages
+        ],
+        "support_assessments": [
+            asdict(item)
+            for result in outcome.worker_results
+            for item in result.support_assessments
+        ],
+        "requirement_coverage": [
+            asdict(item) for item in outcome.requirement_coverage
+        ],
         "unresolved_question_ids": list(outcome.unresolved_question_ids),
         "worker_unresolved": [
             text for result in outcome.worker_results for text in result.unresolved
@@ -184,7 +218,7 @@ def _red_prompt(plan: ResearchPlan, outcome: SupervisorOutcome) -> list[dict[str
         {
             "role": "system",
             "content": """You are the Red Research Reviewer. Review only the supplied
-Research Plan and evidence package. Do not use tools, research, write a report,
+Research Plan and source-locatable evidence package. Do not use tools, research, write a report,
 or expose hidden reasoning. Return exactly {\"challenges\": [...]} where every
 item has exactly: category, target_question_ids, target_claim_ids, reason,
 severity, requested_evidence, suggested_query. category must be one of
@@ -250,19 +284,62 @@ def _gap_fallback(
     plan: ResearchPlan,
     outcome: SupervisorOutcome,
 ) -> tuple[ResearchChallenge, ...]:
-    questions = {item.question_id: item for item in plan.core_questions}
+    requirements = {
+        item.requirement_id: item for item in plan.evidence_requirements
+    }
+    uncovered = tuple(
+        item
+        for item in outcome.requirement_coverage
+        if item.status != "supported"
+        and item.requirement_id in requirements
+        and requirements[item.requirement_id].required
+    )
+    if not uncovered:
+        return tuple(
+            ResearchChallenge.create(
+                category="missing_question",
+                target_question_ids=(question_id,),
+                target_claim_ids=(),
+                reason=(
+                    "Verified evidence requirements are incomplete for Core Question: "
+                    + next(
+                        item.description
+                        for item in plan.core_questions
+                        if item.question_id == question_id
+                    )
+                ),
+                severity="high",
+                requested_evidence=(
+                    "Exact source Passage and independently verified Claim for the "
+                    "required Core Question"
+                ),
+                suggested_query=next(
+                    item.description
+                    for item in plan.core_questions
+                    if item.question_id == question_id
+                ),
+            )
+            for question_id in outcome.unresolved_question_ids
+            if any(item.question_id == question_id for item in plan.core_questions)
+        )
     return tuple(
         ResearchChallenge.create(
             category="missing_question",
-            target_question_ids=(question_id,),
+            target_question_ids=(coverage.question_id,),
             target_claim_ids=(),
-            reason=f"Supervisor gap check found unresolved question: {questions[question_id].description}",
+            reason=(
+                "Verified evidence requirement is incomplete: "
+                f"{requirements[coverage.requirement_id].description}. {coverage.reason}"
+            ),
             severity="high",
-            requested_evidence="Source-locatable evidence for the required question",
-            suggested_query=questions[question_id].description,
+            requested_evidence=(
+                "Exact source Passage and an independently verified atomic Claim for: "
+                + requirements[coverage.requirement_id].description
+            ),
+            suggested_query=requirements[coverage.requirement_id].description,
         )
-        for question_id in outcome.unresolved_question_ids
-        if question_id in questions
+        for coverage in uncovered
+        if coverage.requirement_id in requirements
     )
 
 
@@ -586,15 +663,15 @@ def merge_supervisor_outcome(
     supplemental: tuple[BlueWorkerResult, ...],
 ) -> SupervisorOutcome:
     results = tuple(sorted((*previous.worker_results, *supplemental), key=lambda item: item.packet_id))
+    required = tuple(item.question_id for item in plan.core_questions if item.required) or tuple(
+        item.question_id for item in plan.core_questions
+    )
     resolved = {
         question_id
         for result in results
         for claim in result.claims
         for question_id in claim.question_ids
     }
-    required = tuple(item.question_id for item in plan.core_questions if item.required) or tuple(
-        item.question_id for item in plan.core_questions
-    )
     unresolved = tuple(item for item in required if item not in resolved)
     return SupervisorOutcome(
         plan_id=plan.plan_id,
@@ -608,6 +685,7 @@ def merge_supervisor_outcome(
             TerminationReason.COVERAGE_COMPLETE if not unresolved
             else TerminationReason.EVIDENCE_EXHAUSTED
         ),
+        requirement_coverage=(),
     )
 
 
@@ -620,6 +698,9 @@ def _normalize_loop_outcome(value: ResearchChallengeLoopOutcome) -> ResearchChal
                 claim,
                 question_ids=tuple(claim.question_ids),
                 evidence_ids=tuple(claim.evidence_ids),
+                requirement_ids=tuple(claim.requirement_ids),
+                passage_ids=tuple(claim.passage_ids),
+                support_assessment_ids=tuple(claim.support_assessment_ids),
             )
             for claim in result.claims
         )
@@ -634,6 +715,21 @@ def _normalize_loop_outcome(value: ResearchChallengeLoopOutcome) -> ResearchChal
                 unresolved=tuple(result.unresolved),
                 alerts=tuple(result.alerts),
                 usage=usage,
+                documents=tuple(result.documents),
+                passages=tuple(result.passages),
+                candidate_claims=tuple(
+                    replace(
+                        item,
+                        question_ids=tuple(item.question_ids),
+                        requirement_ids=tuple(item.requirement_ids),
+                        passage_ids=tuple(item.passage_ids),
+                    )
+                    for item in result.candidate_claims
+                ),
+                support_assessments=tuple(
+                    replace(item, passage_ids=tuple(item.passage_ids))
+                    for item in result.support_assessments
+                ),
             )
         )
     supervisor = replace(
@@ -642,6 +738,14 @@ def _normalize_loop_outcome(value: ResearchChallengeLoopOutcome) -> ResearchChal
         assigned_question_ids=tuple(value.supervisor_outcome.assigned_question_ids),
         resolved_question_ids=tuple(value.supervisor_outcome.resolved_question_ids),
         unresolved_question_ids=tuple(value.supervisor_outcome.unresolved_question_ids),
+        requirement_coverage=tuple(
+            replace(
+                item,
+                verified_claim_ids=tuple(item.verified_claim_ids),
+                source_refs=tuple(item.source_refs),
+            )
+            for item in value.supervisor_outcome.requirement_coverage
+        ),
     )
     challenges = tuple(
         replace(
@@ -682,11 +786,17 @@ def _recheck_prompt(
         if result.packet_id in packet_ids
         for claim in result.claims
     ]
-    evidence = [
+    passages = [
         asdict(item)
         for result in outcome.worker_results
         if result.packet_id in packet_ids
-        for item in result.evidence
+        for item in result.passages
+    ]
+    assessments = [
+        asdict(item)
+        for result in outcome.worker_results
+        if result.packet_id in packet_ids
+        for item in result.support_assessments
     ]
     return [
         {
@@ -700,7 +810,8 @@ deferred. resolved requires directly relevant supplemental evidence_ids.""",
         {"role": "user", "content": json.dumps({
             "challenges": [asdict(item) for item in challenges],
             "supplemental_claims": claims,
-            "supplemental_evidence": evidence,
+            "supplemental_passages": passages,
+            "supplemental_support_assessments": assessments,
         }, ensure_ascii=False)},
     ]
 
@@ -802,6 +913,91 @@ def _finalize_unresolved_challenges(
         if item.status in {"pending", "accepted", "deferred"}
         else item
         for item in challenges
+    )
+
+
+def _apply_red_constraints(
+    plan: ResearchPlan,
+    outcome: SupervisorOutcome,
+    challenges: tuple[ResearchChallenge, ...],
+) -> SupervisorOutcome:
+    """Recompute completion after Red invalidates Claim usage or coverage."""
+
+    open_items = tuple(
+        item
+        for item in challenges
+        if item.status in {"pending", "accepted", "deferred", "unresolved_disclosed"}
+    )
+    hard_blocked = {
+        claim_id
+        for item in open_items
+        if research_challenge_blocks_claim(item)
+        for claim_id in item.target_claim_ids
+    }
+    coverage_excluded = {
+        claim_id
+        for item in open_items
+        for claim_id in item.target_claim_ids
+    }
+    report_workers = tuple(
+        replace(
+            worker,
+            claims=tuple(
+                claim for claim in worker.claims if claim.claim_id not in hard_blocked
+            ),
+            status=(
+                ResearchStatus.PARTIAL
+                if worker.claims
+                and not tuple(
+                    claim for claim in worker.claims if claim.claim_id not in hard_blocked
+                )
+                and worker.status is ResearchStatus.COMPLETED
+                else worker.status
+            ),
+        )
+        for worker in outcome.worker_results
+    )
+    coverage_workers = tuple(
+        replace(
+            worker,
+            claims=tuple(
+                claim
+                for claim in worker.claims
+                if claim.claim_id not in coverage_excluded
+            ),
+        )
+        for worker in report_workers
+    )
+    coverage = _requirement_coverage(plan, coverage_workers)
+    supported_requirements = {
+        item.requirement_id for item in coverage if item.status == "supported"
+    }
+    required_questions = tuple(
+        item.question_id for item in plan.core_questions if item.required
+    ) or tuple(item.question_id for item in plan.core_questions)
+    required_by_question: dict[str, set[str]] = {}
+    for item in plan.evidence_requirements:
+        if item.required:
+            required_by_question.setdefault(item.question_id, set()).add(
+                item.requirement_id
+            )
+    resolved = tuple(
+        item
+        for item in required_questions
+        if required_by_question.get(item, set()) <= supported_requirements
+    )
+    unresolved = tuple(item for item in required_questions if item not in resolved)
+    return replace(
+        outcome,
+        worker_results=report_workers,
+        resolved_question_ids=resolved,
+        unresolved_question_ids=unresolved,
+        requirement_coverage=coverage,
+        termination_reason=(
+            TerminationReason.COVERAGE_COMPLETE
+            if not unresolved
+            else TerminationReason.EVIDENCE_EXHAUSTED
+        ),
     )
 
 

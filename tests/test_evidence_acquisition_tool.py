@@ -12,6 +12,7 @@ from src.research.agent_graph import _extract_evidence
 from src.research.models import NextResearchAction
 from src.research.runtime import build_research_tools
 from src.tools import EvidenceAcquisitionTool, canonicalize_source_url
+from src.tools.evidence_acquisition import inferred_primary_domains
 
 
 class FixedSearch:
@@ -83,6 +84,20 @@ def test_source_url_canonicalization_removes_tracking_and_fragments() -> None:
     assert canonicalize_source_url(
         "HTTPS://Example.COM/report/?utm_source=x&b=2&a=1#section"
     ) == "https://example.com/report?a=1&b=2"
+
+
+@pytest.mark.parametrize(
+    ("query", "expected"),
+    [
+        ("PIPL 数据出境 标准合同", ("cac.gov.cn", "gov.cn")),
+        ("GDPR Article 46 SCC EDPB", (
+            "eur-lex.europa.eu", "edpb.europa.eu", "ec.europa.eu"
+        )),
+        ("FDA approval and EMA EPAR", ("fda.gov", "ema.europa.eu")),
+    ],
+)
+def test_requirement_query_infers_primary_source_registries(query, expected) -> None:
+    assert inferred_primary_domains(query) == expected
 
 
 @pytest.mark.asyncio
@@ -229,6 +244,39 @@ async def test_acquisition_prefers_two_primary_documents_from_same_official_host
         "https://standards.org/green-bond-principles.pdf",
         "https://standards.org/slb-principles.pdf",
     ]
+
+
+@pytest.mark.asyncio
+async def test_acquisition_requeries_preferred_domain_when_initial_recall_misses_it() -> None:
+    class TargetedSearch:
+        def __init__(self):
+            self.queries = []
+
+        async def execute(self, query: str, top_n: int = 3):
+            self.queries.append((query, top_n))
+            if "site:eur-lex.europa.eu" in query:
+                return {"source": "test", "results": [{
+                    "title": "Official GDPR Chapter V",
+                    "url": "https://eur-lex.europa.eu/eli/reg/2016/679/oj",
+                    "snippet": "Official consolidated regulation.",
+                }]}
+            return {"source": "test", "results": [{
+                "title": "Unofficial GDPR summary",
+                "url": "https://example.com/gdpr-summary",
+                "snippet": "Secondary summary.",
+            }]}
+
+    search = TargetedSearch()
+    StructuredBrowser.calls.clear()
+    tool = EvidenceAcquisitionTool(search, StructuredBrowser(), default_sources=1)
+
+    result = await tool.execute("GDPR Article 46 SCC transfer safeguards")
+
+    assert any("site:eur-lex.europa.eu" in query for query, _ in search.queries)
+    assert result["selected_urls"] == [
+        "https://eur-lex.europa.eu/eli/reg/2016/679/oj"
+    ]
+    assert result["search_queries"][0] == "GDPR Article 46 SCC transfer safeguards"
 
 
 def test_v2_runtime_exposes_composite_acquisition_but_legacy_keeps_low_level_tools() -> None:

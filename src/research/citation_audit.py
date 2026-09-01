@@ -21,6 +21,14 @@ _SEMANTIC_FIELDS = {
 }
 _EDIT_FIELDS = {"operation", "target", "replacement"}
 _REPAIR_OPS = {"ADD_CITATION", "REPLACE_CITATION", "QUALIFY", "DELETE"}
+_ISSUE_PRIORITY = {"invalid": 0, "conflict": 1, "overclaim": 2, "locator": 3, "missing": 4}
+_NON_CLAIM_SECTIONS = {
+    "unresolved",
+    "references",
+    "execution",
+    "external information availability",
+    "红方未解决问题 / unresolved red-team issues",
+}
 
 
 def citation_followup_directives(
@@ -86,6 +94,18 @@ def _issue(
     )
 
 
+def _deduplicate_issues(issues: Iterable[CitationIssue]) -> tuple[CitationIssue, ...]:
+    """Keep one terminal issue per report span, with structural errors first."""
+
+    selected: dict[tuple[str, str], CitationIssue] = {}
+    for issue in issues:
+        key = (issue.section.casefold(), issue.claim_text.strip())
+        current = selected.get(key)
+        if current is None or _ISSUE_PRIORITY.get(issue.category, 99) < _ISSUE_PRIORITY.get(current.category, 99):
+            selected[key] = issue
+    return tuple(selected.values())
+
+
 def deterministic_citation_issues(
     markdown: str,
     evidence: Iterable[EvidenceItem],
@@ -104,10 +124,8 @@ def deterministic_citation_issues(
         elif item.limitations.startswith("Search-result snippet"):
             issues.append(_issue(marker, "document", (evidence_id,), "invalid", "high", "delete"))
 
-    known_urls = {item.source_ref for item in items if item.source_ref}
     for url in dict.fromkeys(_URL.findall(markdown)):
-        if url not in known_urls:
-            issues.append(_issue(url, "document", (), "invalid", "high", "delete"))
+        issues.append(_issue(url, "document", (), "invalid", "high", "delete"))
     for wikilink in dict.fromkeys(_WIKILINK.findall(markdown)):
         issues.append(_issue(wikilink, "document", (), "invalid", "high", "delete"))
 
@@ -119,14 +137,34 @@ def deterministic_citation_issues(
             section = line.lstrip("#").strip() or "document"
             in_unresolved = section.lower() == "unresolved"
             continue
-        if not line or in_unresolved or line.startswith(("---", "|---")):
+        if (
+            not line
+            or in_unresolved
+            or section.casefold() in _NON_CLAIM_SECTIONS
+            or line.startswith(("---", "|---"))
+        ):
+            continue
+        marker_ids = set(EVIDENCE_MARKER.findall(line))
+        structurally_invalid = bool(
+            _URL.search(line)
+            or _WIKILINK.search(line)
+            or any(
+                evidence_id not in inventory
+                or not inventory[evidence_id].source_ref
+                or not inventory[evidence_id].locator
+                or not inventory[evidence_id].excerpt
+                or inventory[evidence_id].limitations.startswith("Search-result snippet")
+                for evidence_id in marker_ids
+            )
+        )
+        if structurally_invalid:
             continue
         plain = EVIDENCE_MARKER.sub("", line)
         plain = _URL.sub("", plain)
         word_count = len(re.findall(r"\w+", plain, flags=re.UNICODE))
         if word_count >= 6 and not EVIDENCE_MARKER.search(line):
             issues.append(_issue(line, section, (), "missing", "medium", "add_citation"))
-    return tuple(dict.fromkeys(issues))
+    return _deduplicate_issues(issues)
 
 
 def _semantic_prompt(markdown: str, evidence: tuple[EvidenceItem, ...]):
@@ -141,7 +179,18 @@ locator. Use only exact report text and supplied IDs; return [] when supported."
         },
         {"role": "user", "content": json.dumps({
             "report_markdown": markdown,
-            "evidence": [asdict(item) for item in evidence],
+            "evidence": [
+                {
+                    "evidence_id": item.evidence_id,
+                    "source_type": item.source_type,
+                    "title": item.title,
+                    "source_ref": item.source_ref,
+                    "locator": item.locator,
+                    "excerpt": item.excerpt,
+                    "limitations": item.limitations,
+                }
+                for item in evidence
+            ],
         }, ensure_ascii=False)},
     ]
 
@@ -182,7 +231,8 @@ async def audit_citations(
             severity=item["severity"],
             repair_action=item["repair_action"],
         ))
-    return CitationAuditOutcome(status="issues" if issues else "passed", issues=tuple(issues))
+    deduplicated = _deduplicate_issues(issues)
+    return CitationAuditOutcome(status="issues" if deduplicated else "passed", issues=deduplicated)
 
 
 def _validate_repair_inventory(markdown: str, evidence: tuple[EvidenceItem, ...]) -> None:
@@ -190,10 +240,9 @@ def _validate_repair_inventory(markdown: str, evidence: tuple[EvidenceItem, ...]
     unknown_ids = set(EVIDENCE_MARKER.findall(markdown)) - known_ids
     if unknown_ids:
         raise ValueError(f"Citation repair added unknown Evidence IDs: {sorted(unknown_ids)}")
-    known_urls = {item.source_ref for item in evidence if item.source_ref}
-    unknown_urls = set(_URL.findall(markdown)) - known_urls
-    if unknown_urls:
-        raise ValueError(f"Citation repair added unknown URLs: {sorted(unknown_urls)}")
+    raw_urls = set(_URL.findall(markdown))
+    if raw_urls:
+        raise ValueError(f"Citation repair cannot add raw URLs: {sorted(raw_urls)}")
     if _WIKILINK.search(markdown):
         raise ValueError("Citation repair cannot add WikiLinks")
 
@@ -206,7 +255,7 @@ def _repair_prompt(markdown: str, evidence: tuple[EvidenceItem, ...], issues: tu
 sources. Return exactly edits and report_markdown. Each edit has operation,
 target, replacement. Allowed operations: ADD_CITATION, REPLACE_CITATION,
 QUALIFY, DELETE. Targets must be exact and unique at that replay step. Use only
-supplied Evidence IDs and URLs. QUALIFY may narrow a statement; DELETE requires
+supplied Evidence IDs and never write raw URLs. QUALIFY may narrow a statement; DELETE requires
 empty replacement.""",
         },
         {"role": "user", "content": json.dumps({
@@ -268,9 +317,25 @@ async def repair_citations(
         raise ValueError("Citation repair report contains undeclared edits")
     _validate_repair_inventory(revised, evidence_items)
     remaining = deterministic_citation_issues(revised, evidence_items)
+    repaired_issues = tuple(
+        CitationIssue(
+            issue_id=item.issue_id,
+            claim_text=item.claim_text,
+            section=item.section,
+            evidence_ids=item.evidence_ids,
+            category=item.category,
+            severity=item.severity,
+            repair_action=item.repair_action,
+            status="repaired",
+        )
+        for item in issue_items
+    )
     return CitationAuditOutcome(
         status="partial" if remaining else "repaired",
-        issues=remaining,
+        issues=(*repaired_issues, *remaining),
         repaired_markdown=revised,
-        unresolved=tuple(item.claim_text for item in remaining),
+        unresolved=(
+            (f"Citation audit left {len(remaining)} structural issue(s) unresolved.",)
+            if remaining else ()
+        ),
     )

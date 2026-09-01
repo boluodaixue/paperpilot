@@ -122,6 +122,28 @@ def _query_terms(text: str) -> set[str]:
     }
 
 
+def inferred_primary_domains(query: str) -> tuple[str, ...]:
+    """Infer authoritative registries from one scoped proof obligation."""
+
+    text = str(query or "").casefold()
+    domains: list[str] = []
+    rules = (
+        (("pipl", "个人信息保护", "数据出境", "网信办", "cac"), (
+            "cac.gov.cn", "gov.cn"
+        )),
+        (("gdpr", "edpb", "scc", "schrems", "eur-lex", "adequacy"), (
+            "eur-lex.europa.eu", "edpb.europa.eu", "ec.europa.eu"
+        )),
+        (("fda", "food and drug administration"), ("fda.gov",)),
+        (("ema", "epar", "european medicines agency"), ("ema.europa.eu",)),
+        (("clinical trial", "clinicaltrials"), ("clinicaltrials.gov",)),
+    )
+    for signals, values in rules:
+        if any(signal in text for signal in signals):
+            domains.extend(values)
+    return tuple(dict.fromkeys(domains))
+
+
 def _candidate_score(
     item: dict[str, Any],
     *,
@@ -429,14 +451,44 @@ class EvidenceAcquisitionTool:
         scoped_query = str(query or "").strip()
         if not scoped_query:
             return {"status": "error", "error": "acquire_evidence requires a query"}
-        candidate_limit = min(20, max(1, int(top_n or self.default_candidates)))
+        inferred_domains = inferred_primary_domains(scoped_query)
+        candidate_limit = min(20, max(
+            12 if inferred_domains else 1,
+            int(top_n or self.default_candidates),
+        ))
         source_limit = min(
             self.max_sources,
             max(1, int(max_sources or self.default_sources)),
         )
-        domains = tuple(preferred_domains or ())
+        domains = tuple(dict.fromkeys((
+            *(preferred_domains or ()),
+            *inferred_domains,
+        )))
         search_result = await self.search_tool.execute(scoped_query, top_n=candidate_limit)
-        raw_results = search_result.get("results", []) if isinstance(search_result, dict) else []
+        raw_results = list(
+            search_result.get("results", [])
+            if isinstance(search_result, dict) else []
+        )
+        search_queries = [scoped_query]
+        has_preferred_candidate = any(
+            any(
+                _host(str(item.get("url") or "")) == domain
+                or _host(str(item.get("url") or "")).endswith("." + domain)
+                for domain in domains
+            )
+            for item in raw_results
+            if isinstance(item, dict)
+        )
+        if domains and not has_preferred_candidate:
+            for domain in domains[:2]:
+                targeted_query = f"{scoped_query} site:{domain}"
+                targeted = await self.search_tool.execute(
+                    targeted_query,
+                    top_n=min(8, candidate_limit),
+                )
+                search_queries.append(targeted_query)
+                if isinstance(targeted, dict):
+                    raw_results.extend(targeted.get("results", []))
         ranked, duplicate_count = self._rank_candidates(
             raw_results,
             query=scoped_query,
@@ -514,6 +566,8 @@ class EvidenceAcquisitionTool:
             "documents": documents,
             "fetch_errors": fetch_errors,
             "metrics": metrics,
+            "preferred_domains": list(domains),
+            "search_queries": search_queries,
         }
         if not documents:
             search_error = search_result.get("error") if isinstance(search_result, dict) else None
@@ -526,4 +580,5 @@ __all__ = [
     "AcquisitionRegistry",
     "EvidenceAcquisitionTool",
     "canonicalize_source_url",
+    "inferred_primary_domains",
 ]

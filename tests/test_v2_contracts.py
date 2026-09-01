@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 from dataclasses import asdict
+import pytest
 
 from src.research.v2_contracts import (
     ChallengeDecision,
@@ -11,6 +12,7 @@ from src.research.v2_contracts import (
     CitationIssue,
     CoreQuestion,
     EvidenceClaim,
+    EvidenceRequirement,
     ResearchChallenge,
     ResearchPlan,
     WorkPacket,
@@ -133,3 +135,22 @@ def test_all_phase_one_contracts_are_json_serializable() -> None:
     assert question.question_id in encoded
     assert challenge.challenge_id in encoded
     assert issue.issue_id in encoded
+
+
+@pytest.mark.parametrize(
+    ("claims", "sources"),
+    [(0, 1), (4, 1), (1, 0), (1, 3)],
+)
+def test_evidence_requirement_rejects_impossible_or_unbounded_thresholds(
+    claims: int,
+    sources: int,
+) -> None:
+    question = CoreQuestion.create("Verify the bounded proof obligation")
+
+    with pytest.raises(ValueError):
+        EvidenceRequirement.create(
+            question.question_id,
+            "Bounded evidence requirement",
+            minimum_verified_claims=claims,
+            minimum_independent_sources=sources,
+        )

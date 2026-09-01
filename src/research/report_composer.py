@@ -10,15 +10,25 @@ from __future__ import annotations
 
 import json
 import re
+from dataclasses import asdict
 from typing import Any
 
+from .claim_hygiene import (
+    normalize_report_text,
+    reportable_claim_text,
+    safe_disclosure_text,
+)
 from .models import OutputStatus
+from .evidence_claim_pipeline import claim_has_verified_lineage
 from .policy import call_policy
 from .report_review import parse_json_object
 from .v2_contracts import (
     EvidenceClaim,
+    ReportAssertion,
     ReportDraft,
+    ReportSection,
     ResearchChallenge,
+    research_challenge_blocks_claim,
     ResearchChallengeLoopOutcome,
     ResearchPlan,
     SupervisorOutcome,
@@ -31,7 +41,7 @@ _FALSE_CHALLENGE_ABSENCE = (
     re.compile(r"(?:不存在|没有|未提供|无).{0,40}(?:挑战|红方).{0,20}(?:信息|记录|项目)?"),
     re.compile(r"无需.{0,30}(?:挑战|红方)"),
     re.compile(
-        r"\b(?:no|without)\s+(?:(?:accepted|deferred|pending|unresolved|red[- ]?team)\s+)?"
+        r"\b(?:no|without)\s+(?:(?:accepted|deferred|pending|unresolved|red[- ]?team)\s+)*"
         r"challenge(?:s|\s+information)?\b",
         re.IGNORECASE,
     ),
@@ -135,15 +145,40 @@ def _selected_claims(
         if item.source_ref and item.locator and item.excerpt
         and not item.limitations.startswith("Search-result snippet")
     }
-    return tuple(
-        claim
-        for result in outcome.worker_results
-        for claim in result.claims
-        if claim.claim_id not in blocked
-        and claim.evidence_ids
-        and all(item in evidence for item in claim.evidence_ids)
-        and claim.source_ref and claim.locator and claim.excerpt
-    )
+    selected: list[EvidenceClaim] = []
+    for result in outcome.worker_results:
+        for claim in result.claims:
+            if (
+                claim.claim_id in blocked
+                or not claim.evidence_ids
+                or not all(item in evidence for item in claim.evidence_ids)
+                or not claim.source_ref
+                or not claim.locator
+                or not claim.excerpt
+            ):
+                continue
+            clean = reportable_claim_text(claim.claim)
+            if clean is None:
+                continue
+            if clean == claim.claim.strip():
+                selected.append(claim)
+            else:
+                selected.append(EvidenceClaim.create(
+                    claim=clean,
+                    question_ids=claim.question_ids,
+                    evidence_ids=claim.evidence_ids,
+                    source_ref=claim.source_ref,
+                    locator=claim.locator,
+                    excerpt=claim.excerpt,
+                    limitations=claim.limitations,
+                    confidence=claim.confidence,
+                    comparability_notes=claim.comparability_notes,
+                    requirement_ids=claim.requirement_ids,
+                    passage_ids=claim.passage_ids,
+                    support_assessment_ids=claim.support_assessment_ids,
+                    verification_status=claim.verification_status,
+                ))
+    return tuple(selected)
 
 
 def _bounded_claims(
@@ -153,7 +188,7 @@ def _bounded_claims(
     per_question: int = 2,
     total_limit: int = 12,
 ) -> tuple[EvidenceClaim, ...]:
-    """Keep composer context bounded while preserving every Core Question."""
+    """Keep context bounded while preserving every verified proof obligation."""
     confidence_rank = {"high": 0, "medium": 1, "low": 2}
 
     def rank(item: EvidenceClaim) -> tuple[Any, ...]:
@@ -164,26 +199,203 @@ def _bounded_claims(
             item.claim_id,
         )
 
+    required_requirements = tuple(
+        item for item in plan.evidence_requirements if item.required
+    ) or tuple(plan.evidence_requirements)
+    total_limit = max(total_limit, len(required_requirements))
     selected: list[EvidenceClaim] = []
     selected_ids: set[str] = set()
-    for question in plan.core_questions:
-        candidates = sorted(
-            (item for item in claims if question.question_id in item.question_ids),
+    known_question_ids = {item.question_id for item in plan.core_questions}
+    candidates_by_requirement = {
+        requirement.requirement_id: sorted(
+            (
+                item
+                for item in claims
+                if requirement.requirement_id in item.requirement_ids
+                or (
+                    requirement.question_id in item.question_ids
+                    and set(item.requirement_ids) <= set(item.question_ids)
+                )
+            ),
             key=rank,
         )
-        for item in candidates[:per_question]:
+        for requirement in required_requirements
+    }
+    # Round-robin guarantees one Claim per proof obligation before adding a second.
+    for position in range(per_question):
+        for requirement in required_requirements:
+            candidates = candidates_by_requirement[requirement.requirement_id]
+            if position >= len(candidates):
+                continue
+            item = candidates[position]
             if item.claim_id not in selected_ids:
                 selected.append(item)
                 selected_ids.add(item.claim_id)
                 if len(selected) >= total_limit:
                     return tuple(selected)
-    for item in sorted(claims, key=rank):
+    for item in sorted(
+        (claim for claim in claims if set(claim.question_ids) & known_question_ids),
+        key=rank,
+    ):
         if item.claim_id not in selected_ids:
             selected.append(item)
             selected_ids.add(item.claim_id)
             if len(selected) >= total_limit:
                 break
     return tuple(selected)
+
+
+def _drop_false_challenge_assertions(
+    sections: tuple[ReportSection, ...],
+    challenges: tuple[ResearchChallenge, ...],
+) -> tuple[tuple[ReportSection, ...], bool]:
+    if not challenges:
+        return sections, False
+    removed = False
+    filtered: list[ReportSection] = []
+    for section in sections:
+        assertions = tuple(
+            item
+            for item in section.assertions
+            if not any(pattern.search(item.text) for pattern in _FALSE_CHALLENGE_ABSENCE)
+        )
+        removed = removed or len(assertions) != len(section.assertions)
+        if assertions:
+            filtered.append(ReportSection(section.heading, assertions))
+    return tuple(filtered), removed
+
+
+def _deterministic_sections(
+    claims: tuple[EvidenceClaim, ...],
+) -> tuple[ReportSection, ...]:
+    """Build a minimal structured report from already-validated Claims."""
+
+    findings = tuple(
+        ReportAssertion(text=clean, claim_ids=(claim.claim_id,))
+        for claim in claims
+        if (clean := reportable_claim_text(claim.claim)) is not None
+    )
+    limitations = tuple(
+        ReportAssertion(text=clean, claim_ids=(claim.claim_id,))
+        for claim in claims
+        if claim.limitations
+        and (clean := reportable_claim_text(claim.limitations, limit=500)) is not None
+    )
+    sections: list[ReportSection] = []
+    if findings:
+        sections.append(ReportSection("Findings", findings))
+    if limitations:
+        sections.append(ReportSection("Limitations", limitations))
+    return tuple(sections)
+
+
+def render_structured_report(
+    sections: tuple[ReportSection, ...],
+    claims: tuple[EvidenceClaim, ...],
+) -> tuple[str, tuple[str, ...]]:
+    """Render citations deterministically from Assertion-to-Claim lineage."""
+
+    claim_by_id = {item.claim_id: item for item in claims}
+    used_evidence: list[str] = []
+    lines = ["# Research result"]
+    for section in sections:
+        lines.extend(("", f"## {section.heading}", ""))
+        for assertion in section.assertions:
+            evidence_ids = tuple(dict.fromkeys(
+                evidence_id
+                for claim_id in assertion.claim_ids
+                for evidence_id in claim_by_id[claim_id].evidence_ids
+            ))
+            used_evidence.extend(evidence_ids)
+            markers = " ".join(
+                f"[[EVIDENCE:{evidence_id}]]" for evidence_id in evidence_ids
+            )
+            lines.append(f"- {assertion.text} {markers}".rstrip())
+    return "\n".join(lines).strip(), tuple(dict.fromkeys(used_evidence))
+
+
+def _parse_structured_composition(
+    payload: dict[str, Any],
+    claims: tuple[EvidenceClaim, ...],
+    required_question_ids: tuple[str, ...],
+    required_requirement_ids: tuple[str, ...] = (),
+) -> tuple[tuple[ReportSection, ...], list[str]]:
+    """Validate the model's structure before any Markdown is produced."""
+
+    raw_sections = payload.get("sections")
+    raw_unresolved = payload.get("unresolved", [])
+    if not isinstance(raw_sections, list) or not raw_sections:
+        raise ValueError("Lead report composer requires a non-empty sections list")
+    if not isinstance(raw_unresolved, list):
+        raise ValueError("Lead report unresolved must be a string list")
+    known_claim_ids = {item.claim_id for item in claims}
+    claim_by_id = {item.claim_id: item for item in claims}
+    sections: list[ReportSection] = []
+    seen: set[tuple[str, tuple[str, ...]]] = set()
+    for raw_section in raw_sections:
+        if not isinstance(raw_section, dict) or set(raw_section) != {"heading", "assertions"}:
+            raise ValueError("each report section requires heading and assertions")
+        heading = normalize_report_text(raw_section["heading"], limit=100).lstrip("# ")
+        assertions = raw_section["assertions"]
+        if not heading or not isinstance(assertions, list):
+            raise ValueError("report section heading/assertions are invalid")
+        parsed: list[ReportAssertion] = []
+        for raw_assertion in assertions:
+            if not isinstance(raw_assertion, dict) or set(raw_assertion) != {"text", "claim_ids"}:
+                raise ValueError("each report assertion requires text and claim_ids")
+            original = str(raw_assertion["text"] or "").strip()
+            text = reportable_claim_text(original)
+            if text is None or text != normalize_report_text(original):
+                raise ValueError("report assertion contains raw or non-reportable content")
+            claim_ids_value = raw_assertion["claim_ids"]
+            if not isinstance(claim_ids_value, list) or not claim_ids_value:
+                raise ValueError("report assertion requires Claim lineage")
+            claim_ids = tuple(dict.fromkeys(str(item) for item in claim_ids_value))
+            if set(claim_ids) - known_claim_ids:
+                raise ValueError("report assertion references unknown Claim IDs")
+            key = (text, claim_ids)
+            if key not in seen:
+                parsed.append(ReportAssertion(text, claim_ids))
+                seen.add(key)
+        if parsed:
+            sections.append(ReportSection(heading, tuple(parsed)))
+    if not sections:
+        raise ValueError("Lead report composer returned no reportable assertions")
+    represented_claim_ids = {
+        claim_id
+        for section in sections
+        for assertion in section.assertions
+        for claim_id in assertion.claim_ids
+    }
+    represented_questions = {
+        question_id
+        for claim_id in represented_claim_ids
+        for question_id in claim_by_id[claim_id].question_ids
+    }
+    missing_questions = set(required_question_ids) - represented_questions
+    if missing_questions:
+        raise ValueError(
+            "Lead report composer omitted selected required questions: "
+            + ", ".join(sorted(missing_questions))
+        )
+    represented_requirements = {
+        requirement_id
+        for claim_id in represented_claim_ids
+        for requirement_id in claim_by_id[claim_id].requirement_ids
+    }
+    missing_requirements = set(required_requirement_ids) - represented_requirements
+    if missing_requirements:
+        raise ValueError(
+            "Lead report composer omitted supported Evidence Requirements: "
+            + ", ".join(sorted(missing_requirements))
+        )
+    unresolved = [
+        clean
+        for item in raw_unresolved
+        if isinstance(item, str)
+        and (clean := safe_disclosure_text(item, limit=400))
+    ]
+    return tuple(sections), unresolved
 
 
 def _composer_prompt(
@@ -198,7 +410,6 @@ def _composer_prompt(
         for result in outcome.worker_results
         for item in result.evidence
     }
-    selected_evidence_ids = tuple(dict.fromkeys(item for claim in claims for item in claim.evidence_ids))
     payload = {
         "plan": {
             "plan_id": plan.plan_id,
@@ -211,38 +422,44 @@ def _composer_prompt(
                 }
                 for item in plan.core_questions
             ],
+            "evidence_requirements": [
+                asdict(item) for item in plan.evidence_requirements
+            ],
             "report_outline": [item[:500] for item in plan.report_outline[:12]],
             "source_guidance": [item[:600] for item in plan.source_guidance[:10]],
         },
         "selected_claims": [
             {
                 "claim_id": item.claim_id,
-                "claim": item.claim[:1000],
+                "claim": reportable_claim_text(item.claim),
                 "question_ids": list(item.question_ids),
+                "requirement_ids": list(item.requirement_ids),
                 "evidence_ids": list(item.evidence_ids),
-                "source_ref": item.source_ref,
+                "passage_ids": list(item.passage_ids),
+                "support_assessment_ids": list(item.support_assessment_ids),
+                "verification_status": item.verification_status,
                 "locator": item.locator,
-                "excerpt": item.excerpt[:800],
-                "limitations": item.limitations[:400],
+                "sources": [
+                    {
+                        "evidence_id": evidence_id,
+                        "title": evidence_by_id[evidence_id].title[:300],
+                        "source_type": evidence_by_id[evidence_id].source_type,
+                        "locator": evidence_by_id[evidence_id].locator[:300],
+                    }
+                    for evidence_id in item.evidence_ids
+                ],
+                "limitations": safe_disclosure_text(item.limitations, limit=400),
                 "confidence": item.confidence,
-                "comparability_notes": item.comparability_notes[:400],
+                "comparability_notes": safe_disclosure_text(
+                    item.comparability_notes, limit=400
+                ),
             }
             for item in claims
         ],
-        "evidence": [
-            {
-                "evidence_id": evidence_by_id[item].evidence_id,
-                "finding": evidence_by_id[item].finding[:800],
-                "source_type": evidence_by_id[item].source_type,
-                "title": evidence_by_id[item].title[:400],
-                "source_ref": evidence_by_id[item].source_ref,
-                "locator": evidence_by_id[item].locator,
-                "excerpt": evidence_by_id[item].excerpt[:1000],
-                "limitations": evidence_by_id[item].limitations[:400],
-            }
-            for item in selected_evidence_ids
-        ],
         "unresolved_question_ids": list(outcome.unresolved_question_ids),
+        "requirement_coverage": [
+            asdict(item) for item in outcome.requirement_coverage
+        ],
         "research_challenges": [
             {
                 "challenge_id": item.challenge_id,
@@ -254,6 +471,7 @@ def _composer_prompt(
                 "status": item.status,
                 "resolution_evidence_ids": list(item.resolution_evidence_ids),
                 "resolution_reason": item.resolution_reason[:500],
+                "blocks_claim": research_challenge_blocks_claim(item),
             }
             for item in challenges[:16]
         ],
@@ -272,15 +490,21 @@ def _composer_prompt(
             "role": "system",
             "content": """You are the Lead Researcher composing the final report draft.
 Use only selected Evidence Claims; do not research, call tools, or use unseen
-context. Every material factual statement must carry one or more exact internal
-markers like [[EVIDENCE:evidence-id]]. If evidence does not support a statement,
-omit it, qualify it as inference, or put it under Unresolved. Do not invent URLs
-or WikiLinks. An accepted, deferred, or pending challenge is a binding limit:
-do not restate its targeted claim as fact, and disclose it under Unresolved.
-The same rule applies to unresolved_disclosed. If research_challenges is not
+context. Return structured sections, not Markdown. Each assertion must contain
+plain report prose plus one or more exact claim_ids from selected_claims. Never
+write Evidence markers, URLs, Markdown links, images, HTML, navigation text, or
+raw source excerpts; the application renders citations from claim_ids. If the
+Claims do not support a statement, omit it or put a concise note in unresolved.
+An accepted, deferred, pending, or unresolved_disclosed challenge with
+blocks_claim=true is a hard exclusion: do not use its targeted Claim. For
+blocks_claim=false, you may state only the narrow verified Claim, must not make
+the challenged comparison or inference, and must preserve its limitation. If research_challenges is not
 empty, never claim that no challenge information exists; the workflow will
 append the authoritative Red-team issue inventory after your draft.
-Return exactly a JSON object with report_markdown and unresolved.""",
+Return exactly {"sections":[{"heading":"...","assertions":[{"text":"...",
+"claim_ids":["claim-id"]}]}],"unresolved":["..."]}. Synthesize a useful
+answer, keep every factual assertion traceable to the selected Claim IDs, and
+label unsupported extrapolation as inference or unresolved.""",
         },
         {"role": "user", "content": json.dumps(payload, ensure_ascii=False)},
     ]
@@ -310,20 +534,52 @@ async def compose_report(
     blocked_claim_ids = {
         claim_id
         for challenge in unresolved_challenges
+        if research_challenge_blocks_claim(challenge)
         for claim_id in challenge.target_claim_ids
     }
-    claims = _bounded_claims(
-        plan,
-        _selected_claims(outcome, blocked_claim_ids),
+    reportable_claims = _selected_claims(
+        outcome,
+        blocked_claim_ids,
+    )
+    unblocked_claim_count = sum(
+        claim.claim_id not in blocked_claim_ids
+        for result in outcome.worker_results
+        for claim in result.claims
+    )
+    quarantined_claim_count = max(0, unblocked_claim_count - len(reportable_claims))
+    claims = _bounded_claims(plan, reportable_claims)
+    required_question_ids = tuple(
+        item.question_id for item in plan.core_questions if item.required
+    ) or tuple(item.question_id for item in plan.core_questions)
+    reportable_question_ids = {
+        question_id for claim in reportable_claims for question_id in claim.question_ids
+    }
+    uncovered_question_ids = tuple(
+        item for item in required_question_ids if item not in reportable_question_ids
+    )
+    selected_question_ids = tuple(
+        item
+        for item in required_question_ids
+        if any(item in claim.question_ids for claim in claims)
+    )
+    selected_requirement_ids = tuple(
+        item.requirement_id
+        for item in plan.evidence_requirements
+        if item.required
+        and any(item.requirement_id in claim.requirement_ids for claim in claims)
     )
     challenge_unresolved = tuple(
-        f"Red challenge {item.challenge_id} ({item.category}, {item.severity}): {item.reason}"
+        safe_disclosure_text(
+            f"Red challenge {item.challenge_id} ({item.category}, {item.severity}): {item.reason}",
+            limit=400,
+        )
         for item in unresolved_challenges
     )
     if not claims:
         unresolved = tuple(dict.fromkeys((
             "No source-locatable evidence was available; report generation abstained.",
             *outcome.unresolved_question_ids,
+            *uncovered_question_ids,
             *challenge_unresolved,
         )))
         return ReportDraft(
@@ -337,11 +593,19 @@ async def compose_report(
             status="abstained",
             unresolved=unresolved,
             output_status=OutputStatus.FALLBACK,
+            sections=(),
+            quarantined_claim_count=quarantined_claim_count,
+            uncovered_question_ids=uncovered_question_ids,
         )
     messages = _composer_prompt(plan, outcome, claims, challenges, adjudications)
     response = await call_policy(policy, messages, [])
+    composition_repair_applied = False
+    composition_fallback_applied = False
     try:
         payload = parse_json_object(response, role="Lead report composer")
+        sections, unresolved = _parse_structured_composition(
+            payload, claims, selected_question_ids, selected_requirement_ids
+        )
     except ValueError:
         invalid_content = str(response.get("content") or "")[:16000]
         repair_messages = [
@@ -349,9 +613,9 @@ async def compose_report(
                 "role": "system",
                 "content": (
                     "Repair the Lead report composer response. Return exactly one valid "
-                    "JSON object with report_markdown (string) and unresolved (array of "
-                    "strings). Preserve only the supplied Evidence markers and do not add "
-                    "facts, URLs, citations, or commentary."
+                    "JSON object with sections and unresolved. Each section has heading and "
+                    "assertions; each assertion has plain text and selected claim_ids. Do "
+                    "not add facts, Evidence markers, URLs, links, HTML, or commentary."
                 ),
             },
             {
@@ -365,145 +629,62 @@ async def compose_report(
             },
         ]
         response = await call_policy(policy, repair_messages, [])
-        payload = parse_json_object(response, role="Lead report composer repair")
-    required_fields = {"report_markdown"}
-    missing_fields = required_fields - set(payload)
-    if missing_fields:
-        raise ValueError(
-            "Lead report composer is missing required fields: "
-            + ", ".join(sorted(missing_fields))
-        )
-    markdown = payload["report_markdown"]
-    unresolved = payload.get("unresolved", [])
-    if not isinstance(markdown, str) or not markdown.strip():
-        raise ValueError("Lead report composer returned an empty report")
-    if not isinstance(unresolved, list) or not all(isinstance(item, str) for item in unresolved):
-        raise ValueError("Lead report unresolved must be a string list")
-    known_ids = {
-        item.evidence_id for result in outcome.worker_results for item in result.evidence
-    }
-    known_urls = {
-        item.source_ref for result in outcome.worker_results for item in result.evidence
-    }
-    used_ids = tuple(dict.fromkeys(EVIDENCE_MARKER.findall(markdown)))
-    unknown = set(used_ids) - known_ids
-    unknown_urls = set(_URL.findall(markdown)) - known_urls
-    inventory_repair_applied = False
-    if unknown or unknown_urls:
-        repair_messages = [
-            {
-                "role": "system",
-                "content": (
-                    "Repair the report's evidence inventory without tools. Preserve the "
-                    "supported analysis, but replace or remove every unknown Evidence marker "
-                    "and URL. Use only the supplied allowed Evidence IDs and URLs; do not add "
-                    "facts. Return exactly one JSON object with report_markdown and unresolved."
-                ),
-            },
-            {
-                "role": "user",
-                "content": json.dumps(
-                    {
-                        "composer_evidence_package": json.loads(messages[-1]["content"]),
-                        "invalid_report_markdown": markdown,
-                        "unresolved": unresolved,
-                        "unknown_evidence_ids": sorted(unknown),
-                        "unknown_urls": sorted(unknown_urls),
-                        "allowed_evidence_ids": sorted(known_ids),
-                        "allowed_urls": sorted(known_urls),
-                    },
-                    ensure_ascii=False,
-                ),
-            },
-        ]
         try:
-            repaired_response = await call_policy(policy, repair_messages, [])
-            repaired_payload = parse_json_object(
-                repaired_response, role="Lead report evidence inventory repair"
+            payload = parse_json_object(response, role="Lead report composer repair")
+            sections, unresolved = _parse_structured_composition(
+                payload, claims, selected_question_ids, selected_requirement_ids
             )
-            repaired_markdown = repaired_payload.get("report_markdown")
-            repaired_unresolved = repaired_payload.get("unresolved", [])
-            if (
-                isinstance(repaired_markdown, str)
-                and repaired_markdown.strip()
-                and isinstance(repaired_unresolved, list)
-                and all(isinstance(item, str) for item in repaired_unresolved)
-                and not (set(EVIDENCE_MARKER.findall(repaired_markdown)) - known_ids)
-                and not (set(_URL.findall(repaired_markdown)) - known_urls)
-            ):
-                markdown = repaired_markdown
-                unresolved = repaired_unresolved
-                inventory_repair_applied = True
-        except Exception:
-            pass
-        used_ids = tuple(dict.fromkeys(EVIDENCE_MARKER.findall(markdown)))
-        unknown = set(used_ids) - known_ids
-        unknown_urls = set(_URL.findall(markdown)) - known_urls
+            composition_repair_applied = True
+        except ValueError:
+            sections = _deterministic_sections(claims)
+            unresolved = [
+                "Lead report composer returned invalid structured output twice; used a "
+                "deterministic Evidence Claim report."
+            ]
+            composition_fallback_applied = True
     safety_repairs: list[str] = []
-    if unknown:
-        markdown = drop_unsafe_markdown_lines(
-            markdown,
-            {f"[[EVIDENCE:{item}]]" for item in unknown},
-        )
+    if composition_repair_applied:
+        safety_repairs.append("Repaired malformed Lead composer structure.")
+    if composition_fallback_applied:
         safety_repairs.append(
-            "Removed draft lines containing unknown Evidence IDs: "
-            + ", ".join(sorted(unknown))
+            "Replaced invalid Lead composer output with a deterministic "
+            "Evidence Claim report."
         )
-        used_ids = tuple(dict.fromkeys(EVIDENCE_MARKER.findall(markdown)))
-    if unknown_urls:
-        markdown = drop_unsafe_markdown_lines(markdown, unknown_urls)
-        safety_repairs.append(
-            "Removed draft lines containing unknown URLs: "
-            + ", ".join(sorted(unknown_urls))
-        )
-        used_ids = tuple(dict.fromkeys(EVIDENCE_MARKER.findall(markdown)))
-    markdown, removed_false_challenge_absence = _drop_false_challenge_absence(
-        markdown,
+    sections, removed_false_challenge_absence = _drop_false_challenge_assertions(
+        sections,
         challenges,
     )
     if removed_false_challenge_absence:
         safety_repairs.append(
             "Removed draft statement contradicting supplied Red challenges."
         )
-    if not markdown.strip():
-        markdown = (
-            "# Research result\n\n"
-            "All drafted findings were removed because they contained unknown "
-            "evidence references or URLs.\n"
-        )
-    blocked_claims = {
-        claim.claim_id: claim.claim
-        for result in outcome.worker_results
-        for claim in result.claims
-        if claim.claim_id in blocked_claim_ids
-    }
-    leaked = tuple(
-        claim_id
-        for claim_id, claim_text in blocked_claims.items()
-        if claim_text and claim_text in markdown
-    )
-    if leaked:
-        raise ValueError(
-            f"Lead report restates unresolved challenged Claims: {sorted(leaked)}"
-        )
+    if not sections:
+        sections = _deterministic_sections(claims)
+        composition_fallback_applied = True
+        safety_repairs.append("Replaced an empty structured draft with validated Claims.")
+    markdown, used_ids = render_structured_report(sections, claims)
     return ReportDraft(
         plan_id=plan.plan_id,
         markdown=markdown,
         status=(
             "drafted_repaired"
-            if inventory_repair_applied or safety_repairs
+            if safety_repairs
             else "drafted"
         ),
         evidence_ids=used_ids,
         unresolved=tuple(dict.fromkeys((
             *(item.strip() for item in unresolved if item.strip()),
             *outcome.unresolved_question_ids,
+            *uncovered_question_ids,
             *challenge_unresolved,
             *safety_repairs,
         ))),
         output_status=(
             OutputStatus.REPAIRED
-            if inventory_repair_applied or safety_repairs
+            if safety_repairs
             else OutputStatus.VALID
         ),
+        sections=sections,
+        quarantined_claim_count=quarantined_claim_count,
+        uncovered_question_ids=uncovered_question_ids,
     )

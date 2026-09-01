@@ -70,6 +70,18 @@ def _workflow() -> ResearchWorkflowResult:
         source_candidate_count=4,
         duplicate_source_count=1,
         acquisition_call_count=2,
+        candidate_claim_count=3,
+        verified_claim_count=3,
+        support_assessment_count=3,
+        entailed_assessment_count=3,
+        evidence_requirement_coverage=({
+            "requirement_id": "ER1",
+            "question_id": "Q1",
+            "status": "supported",
+            "primary_source_required": False,
+            "primary_source_present": False,
+        },),
+        composer_claim_count=3,
     )
 
 
@@ -89,6 +101,18 @@ def test_v2_structure_metrics_are_deterministic_and_source_backed() -> None:
         "unresolved_challenge_disclosure_rate": 1.0,
         "material_claim_citation_coverage": 1.0,
         "invalid_citation_count": 0,
+        "raw_url_count_before_render": 0,
+        "citation_issue_conflict_count": 0,
+        "audit_log_leak_count": 0,
+        "reportable_claim_rejection_count": 0,
+        "claim_entailment_pass_rate": 1.0,
+        "verified_claim_yield": 1.0,
+        "evidence_requirement_coverage_rate": 1.0,
+        "weighted_evidence_requirement_coverage_rate": 1.0,
+        "primary_source_requirement_coverage_rate": 1.0,
+        "composer_claim_survival_rate": 1.0,
+        "citation_audit_removal_rate": 0.0,
+        "verified_claims_in_report": 3,
         "finalization_reserve_tokens": 18000,
         "supplemental_wave_count": 1,
         "repair_applied": False,
@@ -112,6 +136,76 @@ def test_canary_gate_blocks_expansion_on_any_documented_failure() -> None:
     assert set(reasons) == {
         "budget_forced", "invalid_citations_present", "judge_average_below_5"
     }
+
+
+def test_canary_gate_blocks_report_boundary_regressions() -> None:
+    detail = {
+        "output_status": "valid",
+        "termination_reason": "coverage_complete",
+        "judge_average": 6.0,
+        "v2": {
+            **v2_structure_metrics(_workflow()),
+            "raw_url_count_before_render": 1,
+            "citation_issue_conflict_count": 1,
+            "audit_log_leak_count": 1,
+        },
+    }
+
+    allowed, reasons = v2_canary_gate(detail)
+
+    assert not allowed
+    assert set(reasons) == {
+        "raw_urls_present",
+        "citation_issue_conflicts_present",
+        "citation_audit_log_leaked",
+    }
+
+
+def test_canary_gate_blocks_citation_valid_but_incomplete_research() -> None:
+    detail = {
+        "research_status": "partial",
+        "output_status": "valid",
+        "termination_reason": "coverage_complete",
+        "judge_average": 6.0,
+        "v2": v2_structure_metrics(_workflow()),
+    }
+
+    assert v2_canary_gate(detail) == (False, ("research_status_not_completed",))
+
+
+def test_legacy_v2_gate_does_not_use_experimental_requirement_metrics() -> None:
+    detail = {
+        "research_status": "completed",
+        "output_status": "valid",
+        "termination_reason": "coverage_complete",
+        "judge_average": 6.0,
+        "v2": {
+            **v2_structure_metrics(_workflow()),
+            "evidence_requirement_coverage_rate": 0.75,
+            "primary_source_requirement_coverage_rate": 0.5,
+            "citation_audit_removal_rate": 0.2,
+        },
+    }
+
+    allowed, reasons = v2_canary_gate(detail)
+
+    assert allowed
+    assert reasons == ()
+
+
+def test_legacy_v2_gate_does_not_require_experimental_verified_claim_count() -> None:
+    detail = {
+        "research_status": "completed",
+        "output_status": "valid",
+        "termination_reason": "coverage_complete",
+        "judge_average": 6.0,
+        "v2": {
+            **v2_structure_metrics(_workflow()),
+            "verified_claims_in_report": 2,
+        },
+    }
+
+    assert v2_canary_gate(detail) == (True, ())
 
 
 def test_material_claim_metric_ignores_unresolved_and_reference_inventory() -> None:
