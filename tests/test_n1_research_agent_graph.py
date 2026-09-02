@@ -1,4 +1,5 @@
 """N1 acceptance tests for the one homogeneous Research AgentGraph."""
+
 from __future__ import annotations
 
 import asyncio
@@ -9,28 +10,37 @@ import langfuse
 import pytest
 from langgraph.checkpoint.memory import InMemorySaver
 
+from src.research import run_research_agent
 from src.research.agent_graph import (
     ResearchAgentState,
     _action_for_tool_call,
+    _action_id,
     _delegable_token_budget,
     _delegable_tool_budget,
+    _finalization_token_reserve,
+    _extract_evidence,
     _remaining_research_seconds,
+    _runtime_exhaustion_assessment,
+    _semantic_tool_error,
     _stable_evidence_id,
+    _tool_artifact_id,
     build_research_agent_graph,
     create_research_agent_state,
 )
 from src.research.models import (
     AgentLimits,
+    CriticalGap,
     EvidenceItem,
     ExecutionIdentity,
     NextResearchAction,
     OutputStatus,
+    ResearchDecision,
     ResearchResult,
     ResearchStatus,
     ResearchTask,
+    StrategyAttempt,
     TerminationReason,
 )
-from src.research import run_research_agent
 from src.research.research_sufficiency import active_next_actions
 from src.tools.web_search import MockWebSearchTool
 
@@ -84,6 +94,70 @@ def test_only_prioritized_active_action_receives_rewritten_tool_call() -> None:
     assert matched == actions[0]
 
 
+def test_semantic_tool_errors_do_not_become_evidence() -> None:
+    action = NextResearchAction(
+        "R1",
+        "official_database",
+        "find the official benchmark",
+        "high",
+        "Support R1",
+    )
+    result = {
+        "query": "find the official benchmark",
+        "results": [],
+        "error": "search quota exhausted",
+    }
+
+    assert _semantic_tool_error("web_search", result) == "search quota exhausted"
+    assert (
+        _extract_evidence(
+            "web_search",
+            {"query": action.query},
+            result,
+            action=action,
+            artifact_id=_tool_artifact_id("web_search", {"query": action.query}, result),
+        )
+        == []
+    )
+    assert _semantic_tool_error(
+        "browser",
+        "[Browser Error] Network error: 403 Forbidden",
+    )
+
+
+def test_extracted_evidence_keeps_requirement_action_and_artifact_lineage() -> None:
+    action = NextResearchAction(
+        "R1",
+        "primary_document",
+        "Transformer attention official paper",
+        "high",
+        "Support the architecture requirement",
+    )
+    result = {
+        "results": [
+            {
+                "title": "Attention Is All You Need",
+                "url": "https://arxiv.org/abs/1706.03762",
+                "snippet": "The Transformer uses attention mechanisms.",
+            }
+        ]
+    }
+    artifact_id = _tool_artifact_id("web_search", {"query": action.query}, result)
+
+    evidence = _extract_evidence(
+        "web_search",
+        {"query": action.query},
+        result,
+        action=action,
+        artifact_id=artifact_id,
+    )
+
+    assert len(evidence) == 1
+    assert evidence[0].requirement_id == "R1"
+    assert evidence[0].action_id == _action_id(action)
+    assert evidence[0].artifact_id == artifact_id
+
+
 def test_deeper_agents_stop_research_earlier_to_leave_upstream_synthesis_time() -> None:
     limits = AgentLimits(max_elapsed_seconds=300.0)
     root_identity = _root_identity("root-layered-reserve")
@@ -116,9 +190,9 @@ def test_deeper_agents_stop_research_earlier_to_leave_upstream_synthesis_time() 
     wide_root = _state(task, root_identity, wide_limits)
     wide_child = _state(task, child_identity, wide_limits)
     wide_child["deadline_at"] = wide_root["deadline_at"]
-    assert _remaining_research_seconds(wide_root) - _remaining_research_seconds(
-        wide_child
-    ) == pytest.approx(180.0, abs=0.01)
+    assert _remaining_research_seconds(wide_root) - _remaining_research_seconds(wide_child) == pytest.approx(
+        180.0, abs=0.01
+    )
 
 
 def test_fork_budget_keeps_parent_tool_and_token_capacity() -> None:
@@ -139,16 +213,91 @@ def test_fork_budget_keeps_parent_tool_and_token_capacity() -> None:
     delegated_tokens = _delegable_token_budget(state)
 
     assert delegated_tools == 72
-    assert (
-        state["subtree_tool_budget"]
-        - state["total_tool_calls_used"]
-        - delegated_tools
-        == 18
-    )
-    assert delegated_tokens < (
-        state["subtree_token_budget"] - state["estimated_tokens_used"]
-    )
+    assert state["subtree_tool_budget"] - state["total_tool_calls_used"] - delegated_tools == 18
+    assert delegated_tokens < (state["subtree_token_budget"] - state["estimated_tokens_used"])
     assert delegated_tokens > 0
+
+
+def test_parent_token_reserve_grows_with_assessment_state_complexity() -> None:
+    limits = AgentLimits(max_total_tokens=200000)
+    identity = _root_identity("root-dynamic-reserve")
+    simple = _state(ResearchTask("simple", "Simple reserve."), identity, limits)
+    complex_state = _state(
+        ResearchTask("complex", "Complex reserve."),
+        _root_identity("root-dynamic-reserve-complex"),
+        limits,
+    )
+    complex_state["observed_evidence"] = [
+        EvidenceItem(
+            evidence_id=f"E{index}",
+            finding="finding " * 80,
+            source_type="paper",
+            title=f"Source {index}",
+            source_ref=f"https://example.test/{index}",
+            requirement_id="R1",
+        )
+        for index in range(40)
+    ]
+    complex_state["strategy_attempts"] = [
+        StrategyAttempt("R1", "paper_search", f"query {index}", "no_progress") for index in range(20)
+    ]
+
+    assert _delegable_token_budget(complex_state) < _delegable_token_budget(simple)
+
+
+def test_parent_token_reserve_is_not_eroded_by_sequential_fork_batches() -> None:
+    limits = AgentLimits(max_total_tokens=200000)
+    state = _state(
+        ResearchTask("sequential-reserve", "Keep synthesis capacity."),
+        _root_identity("root-sequential-reserve"),
+        limits,
+    )
+    state["estimated_tokens_used"] = 20000
+
+    first_delegable = _delegable_token_budget(state)
+    state["estimated_tokens_used"] += first_delegable - 10000
+    second_delegable = _delegable_token_budget(state)
+
+    assert first_delegable == 140000
+    assert second_delegable == 10000
+    assert state["subtree_token_budget"] - state["estimated_tokens_used"] - second_delegable == 40000
+
+
+def test_finalization_reserve_scales_for_root_and_child() -> None:
+    limits = AgentLimits(max_total_tokens=300000)
+    task = ResearchTask("reserve", "Keep enough room for synthesis.")
+    root = _state(task, _root_identity("root-final-reserve"), limits)
+    child = _state(
+        task,
+        ExecutionIdentity("child-final-reserve", "root-final-reserve", "root-final-reserve", 1),
+        limits,
+    )
+    child["subtree_token_budget"] = 60000
+
+    assert _finalization_token_reserve(root) == 45000
+    assert _finalization_token_reserve(child) == 9000
+
+
+def test_runtime_exhaustion_requires_three_distinct_strategy_families() -> None:
+    state = _state(
+        ResearchTask("runtime-exhaustion", "Stop exhausted paths."),
+        _root_identity("root-runtime-exhaustion"),
+    )
+    state["critical_gaps"] = [CriticalGap("R1", "Important evidence remains.")]
+    two = (
+        StrategyAttempt("R1", "paper_search", "q1", "no_progress"),
+        StrategyAttempt("R1", "primary_document", "q2", "no_progress"),
+    )
+    assert _runtime_exhaustion_assessment(state, two) is None
+
+    exhausted = _runtime_exhaustion_assessment(
+        state,
+        (*two, StrategyAttempt("R1", "official_database", "q3", "no_progress")),
+    )
+    assert exhausted is not None
+    assert exhausted.decision == ResearchDecision.STOP_RESEARCH
+    assert exhausted.termination_reason == TerminationReason.EVIDENCE_EXHAUSTED
+    assert exhausted.next_actions == ()
 
 
 def _assessment_state(messages: list[dict[str, Any]]) -> dict[str, Any] | None:
@@ -166,24 +315,24 @@ def _assessment_response(
     coverage_status: str = "supported",
     gap_impact: str = "high",
     strategy: str = "primary_document",
+    action_requirement_index: int = 0,
 ) -> dict[str, Any]:
-    evidence_ids = [item["evidence_id"] for item in state["evidence"]]
     requirements = state["requirements"]
     gaps = []
     actions = []
     if decision in {"continue", "replan"}:
         gaps = [
             {
-                "requirement_id": requirements[0]["requirement_id"],
+                "requirement_id": requirements[action_requirement_index]["requirement_id"],
                 "reason": "A material requirement remains unsupported.",
                 "impact": gap_impact,
             }
         ]
         actions = [
             {
-                "requirement_id": requirements[0]["requirement_id"],
+                "requirement_id": requirements[action_requirement_index]["requirement_id"],
                 "strategy": strategy,
-                "query": requirements[0]["description"],
+                "query": requirements[action_requirement_index]["description"],
                 "expected_value": "high",
                 "expected_improvement": "Resolve the material requirement with direct evidence.",
             }
@@ -194,7 +343,15 @@ def _assessment_response(
             {
                 "requirement_id": requirement["requirement_id"],
                 "status": coverage_status,
-                "evidence_ids": evidence_ids if coverage_status != "unsupported" else [],
+                "evidence_ids": (
+                    [
+                        item["evidence_id"]
+                        for item in state["evidence"]
+                        if not item.get("requirement_id") or item.get("requirement_id") == requirement["requirement_id"]
+                    ]
+                    if coverage_status != "unsupported"
+                    else []
+                ),
                 "rationale": "The listed evidence directly supports the requirement.",
                 "remaining_gap": None if coverage_status == "supported" else "Support is incomplete.",
             }
@@ -203,9 +360,7 @@ def _assessment_response(
         "critical_gaps": gaps,
         "next_actions": actions,
         "termination_reason": termination_reason,
-        "replan_reason": (
-            "The current strategy has low marginal value." if decision == "replan" else None
-        ),
+        "replan_reason": ("The current strategy has low marginal value." if decision == "replan" else None),
         "exhaustion_reason": None,
     }
     return {"content": json.dumps(payload), "tool_calls": []}
@@ -345,6 +500,10 @@ async def test_fixed_tool_path_returns_structured_source_locatable_result() -> N
     assert evidence.source_ref == "https://arxiv.org/abs/1706.03762"
     assert evidence.locator == evidence.source_ref
     assert evidence.excerpt
+    assert evidence.requirement_id == "R1"
+    assert evidence.action_id
+    assert evidence.artifact_id
+    assert result.strategy_attempts[0].action_id == evidence.action_id
     assert updates == [
         "prepare",
         "think_and_plan",
@@ -354,6 +513,149 @@ async def test_fixed_tool_path_returns_structured_source_locatable_result() -> N
         "finalize_output",
         "synthesize",
     ]
+
+
+@pytest.mark.asyncio
+async def test_unbound_research_call_is_rejected_before_tool_execution() -> None:
+    class RequiredQueryTool(FixedWebTool):
+        def get_openai_tool_schema(self) -> dict:
+            schema = super().get_openai_tool_schema()
+            schema["function"]["parameters"] = {
+                "type": "object",
+                "properties": {"query": {"type": "string"}},
+                "required": ["query"],
+            }
+            return schema
+
+    class EmptyArgumentsPolicy:
+        def __call__(self, messages, *, tools=None):
+            assessment = _assessment_state(messages)
+            if assessment is not None:
+                return _assessment_response(
+                    assessment,
+                    decision="continue",
+                    termination_reason=None,
+                    coverage_status="unsupported",
+                )
+            if tools == []:
+                return _final("Bounded fallback.", "No unbound tool was executed.", "partial")
+            return {
+                "content": "",
+                "tool_calls": [
+                    {
+                        "id": "call-unbound",
+                        "type": "function",
+                        "function": {
+                            "name": "web_search",
+                            "arguments": "{}",
+                        },
+                    }
+                ],
+            }
+
+    tool = RequiredQueryTool()
+    identity = _root_identity("root-unbound-tool")
+    final = await build_research_agent_graph(EmptyArgumentsPolicy(), [tool]).ainvoke(
+        _state(
+            ResearchTask("unbound", "Reject an unbound research call."),
+            identity,
+            AgentLimits(max_iterations=1, max_tool_calls=5),
+        ),
+        config=_config(identity.thread_id),
+    )
+
+    assert tool.calls == []
+    assert final["result"].tool_calls_used == 0
+    assert any(event["kind"] == "tool_rejected_unbound" for event in final["execution_events"])
+
+
+@pytest.mark.asyncio
+async def test_large_tool_result_is_trimmed_only_after_verified_artifact_write() -> None:
+    class CapturingStore:
+        def __init__(self) -> None:
+            self.calls: list[dict[str, Any]] = []
+
+        def persist_tool_artifact(self, artifact_id: str, **kwargs) -> dict[str, object]:
+            self.calls.append({"artifact_id": artifact_id, **kwargs})
+            return {
+                "artifact_id": artifact_id,
+                "artifact_path": f"Artifacts/root/{artifact_id}.json",
+                "content_hash": "a" * 64,
+                "size_bytes": 20000,
+            }
+
+    class LargeTool(FixedWebTool):
+        async def execute(self, **kwargs) -> dict:
+            self.calls.append(kwargs)
+            return {
+                "results": [
+                    {
+                        "title": "Transformer source",
+                        "url": "https://example.test/transformer",
+                        "snippet": "Transformer evidence " + ("x" * 20000),
+                    }
+                ]
+            }
+
+    store = CapturingStore()
+    policy = GroundedPolicy()
+    identity = _root_identity("root-artifact-trim")
+    result = await build_research_agent_graph(
+        policy,
+        [LargeTool()],
+        tool_artifact_store=store,
+    ).ainvoke(
+        _state(ResearchTask("artifact-trim", "Research Transformer evidence."), identity),
+        config=_config(identity.thread_id),
+    )
+
+    assert store.calls and len(str(store.calls[0]["result"])) > 20000
+    tool_message = next(
+        str(message.get("content") or "")
+        for message in result["messages"]
+        if message.get("role") == "tool" and "artifact_path" in str(message.get("content"))
+    )
+    assert len(tool_message) < 4000
+    assert "Artifacts/root/" in tool_message
+    assert result["result"].evidence
+
+
+@pytest.mark.asyncio
+async def test_failed_artifact_write_keeps_the_complete_tool_result_in_context() -> None:
+    class FailingStore:
+        def persist_tool_artifact(self, artifact_id: str, **kwargs) -> dict[str, object]:
+            del artifact_id, kwargs
+            raise OSError("injected artifact failure")
+
+    class LargeTool(FixedWebTool):
+        async def execute(self, **kwargs) -> dict:
+            self.calls.append(kwargs)
+            return {
+                "results": [
+                    {
+                        "title": "Transformer source",
+                        "url": "https://example.test/transformer",
+                        "snippet": "BEGIN-FULL " + ("x" * 14000) + " END-FULL",
+                    }
+                ]
+            }
+
+    policy = GroundedPolicy()
+    identity = _root_identity("root-artifact-failure")
+    final = await build_research_agent_graph(
+        policy,
+        [LargeTool()],
+        tool_artifact_store=FailingStore(),
+    ).ainvoke(
+        _state(ResearchTask("artifact-failure", "Research Transformer evidence."), identity),
+        config=_config(identity.thread_id),
+    )
+
+    assert any(
+        "BEGIN-FULL" in str(message.get("content") or "") and "END-FULL" in str(message.get("content") or "")
+        for message in final["messages"]
+        if message.get("role") == "tool"
+    )
 
 
 @pytest.mark.asyncio
@@ -425,6 +727,60 @@ async def test_tool_failure_degrades_to_partial_without_fabricating_evidence() -
     assert result.termination_reason == TerminationReason.TOOL_FAILURE
     assert result.evidence == ()
     assert any("No source-locatable evidence" in item for item in result.unresolved)
+
+
+@pytest.mark.asyncio
+async def test_service_unavailable_alert_is_checkpointed_and_opens_circuit() -> None:
+    class QuotaTool(FixedWebTool):
+        async def execute(self, **kwargs) -> dict:
+            self.calls.append(kwargs)
+            raise RuntimeError(
+                "BochaAI error: You do not have enough money or package quota"
+            )
+
+    class TwoCallsPolicy(GroundedPolicy):
+        def __call__(self, messages, *, tools=None):
+            assessment = _assessment_state(messages)
+            if assessment is not None:
+                return _assessment_response(assessment)
+            if messages[-1]["role"] == "tool" or tools == []:
+                return _final("Search service unavailable.", "No evidence was fabricated.")
+            return {
+                "content": "",
+                "tool_calls": [
+                    _tool_call(arguments={"query": "first query"}),
+                    {
+                        **_tool_call(arguments={"query": "second query"}),
+                        "id": "call-web-search-second",
+                    },
+                ],
+            }
+
+    tool = QuotaTool()
+    identity = _root_identity("root-tool-unavailable")
+    final = await build_research_agent_graph(TwoCallsPolicy(), [tool]).ainvoke(
+        _state(
+            ResearchTask("tool-unavailable", "Research with an unavailable search service."),
+            identity,
+        ),
+        config=_config(identity.thread_id),
+    )
+
+    result = final["result"]
+    assert len(tool.calls) == 1
+    assert result.termination_reason == TerminationReason.TOOL_FAILURE
+    assert len(result.tool_alerts) == 1
+    assert result.tool_alerts[0].category == "service_unavailable"
+    assert result.tool_alerts[0].circuit_open is True
+    alert_event = next(
+        event for event in final["execution_events"] if event["kind"] == "tool_unavailable"
+    )
+    assert alert_event["tool"] == "web_search"
+    assert any(
+        event["kind"] == "tool_call_skipped_unavailable"
+        for event in final["execution_events"]
+    )
+    assert any("External information alert" in item for item in result.unresolved)
 
 
 @pytest.mark.asyncio
@@ -532,6 +888,60 @@ async def test_final_synthesis_uses_a_bounded_checkpoint_snapshot_not_full_histo
 
 
 @pytest.mark.asyncio
+async def test_root_final_synthesis_returns_markdown_and_continues_on_length() -> None:
+    class MarkdownPolicy:
+        def __init__(self) -> None:
+            self.calls = 0
+            self.max_tokens = 4096
+
+        def __call__(self, messages, *, tools=None):
+            assert tools == []
+            self.calls += 1
+            if self.calls == 1:
+                assert "Return only the complete Markdown report" in messages[-1]["content"]
+                assert self.max_tokens == 32768
+                return {
+                    "content": "# Report\n\nFirst section.",
+                    "tool_calls": [],
+                    "finish_reason": "length",
+                }
+            assert "Continue immediately" in messages[-1]["content"]
+            return {
+                "content": "## Final section\n\nComplete.",
+                "tool_calls": [],
+                "finish_reason": "stop",
+            }
+
+    policy = MarkdownPolicy()
+    identity = _root_identity("root-direct-markdown-continuation")
+    state = _state(
+        ResearchTask(
+            "root-direct-markdown-continuation",
+            "Write the final report.",
+            require_evidence=False,
+        ),
+        identity,
+    )
+    state["finalization_requested"] = True
+    state["stop_reason"] = "token_budget_exhausted"
+    state["termination_reason"] = TerminationReason.BUDGET_FORCED
+
+    final = await build_research_agent_graph(policy, []).ainvoke(
+        state,
+        config=_config(identity.thread_id),
+    )
+
+    assert policy.calls == 2
+    assert "First section" in final["result"].report_markdown
+    assert "Final section" in final["result"].report_markdown
+    assert final["result"].output_status == OutputStatus.VALID
+    assert any(
+        event.get("kind") == "root_report_continued"
+        for event in final["execution_events"]
+    )
+
+
+@pytest.mark.asyncio
 async def test_hard_stop_replaces_an_invalid_candidate_with_fresh_final_synthesis() -> None:
     class FreshFinalPolicy:
         def __init__(self) -> None:
@@ -605,6 +1015,7 @@ async def test_many_sources_with_a_critical_gap_continues_until_the_gap_is_suppo
                         decision="continue",
                         termination_reason=None,
                         coverage_status="unsupported",
+                        action_requirement_index=1,
                     )
                 return _assessment_response(assessment)
             if tools == []:
@@ -636,11 +1047,7 @@ async def test_many_sources_with_a_critical_gap_continues_until_the_gap_is_suppo
     assert result.tool_calls_used == 2
     assert result.termination_reason == TerminationReason.COVERAGE_COMPLETE
     assert policy.finalized_without_tools is True
-    assessments = [
-        event
-        for event in final["execution_events"]
-        if event["kind"] == "research_state_assessed"
-    ]
+    assessments = [event for event in final["execution_events"] if event["kind"] == "research_state_assessed"]
     assert [event["decision"] for event in assessments] == ["continue", "stop_research"]
 
 
@@ -763,10 +1170,7 @@ async def test_evidence_exhausted_requires_two_executed_no_progress_strategies()
         def __call__(self, messages, *, tools=None):
             assessment = _assessment_state(messages)
             if assessment is not None:
-                attempt_count = sum(
-                    item["attempt_count"]
-                    for item in assessment["strategy_attempt_summary"]
-                )
+                attempt_count = sum(item["attempt_count"] for item in assessment["strategy_attempt_summary"])
                 if attempt_count == 0:
                     return _assessment_response(
                         assessment,
@@ -856,11 +1260,8 @@ async def test_checkpoint_resume_preserves_requirements_gaps_actions_attempts_an
         async def __call__(self, messages, *, tools=None):
             assessment = _assessment_state(messages)
             if assessment is not None:
-                attempt_count = sum(
-                    item["attempt_count"]
-                    for item in assessment["strategy_attempt_summary"]
-                )
-                if attempt_count == 0:
+                attempt_count = sum(item["attempt_count"] for item in assessment["strategy_attempt_summary"])
+                if attempt_count == 1:
                     return _assessment_response(
                         assessment,
                         decision="continue",
@@ -902,7 +1303,8 @@ async def test_checkpoint_resume_preserves_requirements_gaps_actions_attempts_an
     assert paused["coverage"]
     assert paused["critical_gaps"]
     assert paused["next_actions"]
-    assert paused["strategy_attempts"] == []
+    assert len(paused["strategy_attempts"]) == 1
+    assert paused["strategy_attempts"][0].action_id
 
     rebuilt = build_research_agent_graph(
         CheckpointPolicy(pause=False),
@@ -999,7 +1401,7 @@ async def test_invalid_execution_identity_is_rejected(
 
 
 @pytest.mark.asyncio
-async def test_unstructured_final_response_repairs_once_without_changing_research_status() -> None:
+async def test_root_markdown_final_response_is_valid_without_json_repair() -> None:
     class PlainPolicy:
         def __call__(self, messages, *, tools=None):
             return {"content": "A plain final answer.", "tool_calls": []}
@@ -1015,17 +1417,21 @@ async def test_unstructured_final_response_repairs_once_without_changing_researc
     assert isinstance(result, ResearchResult)
     assert result.status == ResearchStatus.COMPLETED
     assert result.termination_reason == TerminationReason.COVERAGE_COMPLETE
-    assert result.output_status == OutputStatus.FALLBACK
-    assert any("fallback" in item.lower() for item in result.unresolved)
+    assert result.output_status == OutputStatus.VALID
+    assert result.report_markdown == "A plain final answer."
 
 
 @pytest.mark.asyncio
 async def test_assessment_json_is_repaired_once_without_polluting_research_state() -> None:
     class RepairableAssessmentPolicy:
+        def __init__(self) -> None:
+            self.evidence_id = ""
+
         def __call__(self, messages, *, tools=None):
             content = str(messages[-1].get("content") or "")
             assessment = _assessment_state(messages)
             if assessment is not None:
+                self.evidence_id = assessment["evidence"][0]["evidence_id"]
                 return {"content": "not-json", "tool_calls": []}
             if content.startswith("REPAIR_ASSESSMENT_JSON"):
                 invalid = content.split("Invalid response:\n", 1)[0]
@@ -1038,7 +1444,7 @@ async def test_assessment_json_is_repaired_once_without_polluting_research_state
                         {
                             "requirement_id": "R1",
                             "status": "supported",
-                            "evidence_ids": ["evidence-cd1d67748dd98b1d"],
+                            "evidence_ids": [self.evidence_id],
                             "rationale": "The fixed source supports the requirement.",
                             "remaining_gap": None,
                         }
@@ -1065,11 +1471,7 @@ async def test_assessment_json_is_repaired_once_without_polluting_research_state
     )
     result = final["result"]
     assert result.status == ResearchStatus.COMPLETED
-    assessed = next(
-        event
-        for event in final["execution_events"]
-        if event["kind"] == "research_state_assessed"
-    )
+    assessed = next(event for event in final["execution_events"] if event["kind"] == "research_state_assessed")
     assert assessed["assessment_output_status"] == "repaired"
     assert assessed["assessment_error"]
 
@@ -1142,7 +1544,7 @@ async def test_repeated_assessment_contract_failure_stops_without_a_synthetic_lo
 
 
 @pytest.mark.asyncio
-async def test_final_json_is_repaired_once_without_changing_coverage_decision() -> None:
+async def test_root_plain_markdown_does_not_require_json_repair() -> None:
     class RepairableFinalPolicy:
         def __call__(self, messages, *, tools=None):
             content = str(messages[-1].get("content") or "")
@@ -1164,7 +1566,40 @@ async def test_final_json_is_repaired_once_without_changing_coverage_decision() 
     )
     assert result.status == ResearchStatus.COMPLETED
     assert result.termination_reason == TerminationReason.COVERAGE_COMPLETE
+    assert result.output_status == OutputStatus.VALID
+    assert result.report_markdown == "plain final"
+
+
+@pytest.mark.asyncio
+async def test_empty_final_content_retries_from_bounded_state_snapshot() -> None:
+    class EmptyThenFinalPolicy:
+        def __call__(self, messages, *, tools=None):
+            content = str(messages[-1].get("content") or "")
+            assessment = _assessment_state(messages)
+            if assessment is not None:
+                return _assessment_response(assessment)
+            if content.startswith("FINAL_OUTPUT_RETRY"):
+                return _final("Recovered final output.", "Grounded recovered finding.")
+            if tools == []:
+                return {
+                    "content": "",
+                    "reasoning_content": "I should provide the final answer next.",
+                    "tool_calls": [],
+                }
+            return {"content": "", "tool_calls": [_tool_call()]}
+
+    identity = _root_identity("root-empty-final-retry")
+    result = await run_research_agent(
+        ResearchTask("empty-final", "Recover a reasoning-only final response."),
+        EmptyThenFinalPolicy(),
+        [FixedWebTool()],
+        identity=identity,
+    )
+
+    assert result.status == ResearchStatus.COMPLETED
+    assert result.termination_reason == TerminationReason.COVERAGE_COMPLETE
     assert result.output_status == OutputStatus.REPAIRED
+    assert result.summary == "Recovered final output."
 
 
 @pytest.mark.asyncio

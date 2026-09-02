@@ -1,13 +1,14 @@
 """N3's small deterministic fork gate; it is not a controller or service."""
+
 from __future__ import annotations
 
 import hashlib
 import json
+import unicodedata
 from dataclasses import replace
 from typing import Any, Iterable
 
 from .models import ExecutionIdentity, ForkCandidate, ForkReason, ResearchTask
-
 
 FORK_TOOL_NAME = "fork_research"
 
@@ -39,6 +40,14 @@ def fork_tool_schema() -> dict[str, Any]:
                                     "description": (
                                         "Necessary requirement IDs from the current task "
                                         "that this child is delegated to investigate."
+                                    ),
+                                },
+                                "scope_signature": {
+                                    "type": "string",
+                                    "description": (
+                                        "Short stable label for the precise delegated scope. "
+                                        "Different subtopics under the same requirement must "
+                                        "use different labels."
                                     ),
                                 },
                                 "context": {"type": "object"},
@@ -89,20 +98,20 @@ def parse_fork_candidates(arguments: Any) -> list[ForkCandidate]:
         if not isinstance(raw, dict):
             continue
         reasons: list[ForkReason] = []
+        invalid_reason = False
         for value in raw.get("reasons", []):
             try:
                 reason = ForkReason(str(value))
             except ValueError:
+                invalid_reason = True
                 continue
             if reason not in reasons:
                 reasons.append(reason)
+        if invalid_reason:
+            reasons = []
         context = raw.get("context", {})
         requirement_ids = tuple(
-            dict.fromkeys(
-                str(value).strip()
-                for value in raw.get("requirement_ids", [])
-                if str(value).strip()
-            )
+            dict.fromkeys(str(value).strip() for value in raw.get("requirement_ids", []) if str(value).strip())
         )
         try:
             estimated_tool_calls = max(0, int(raw.get("estimated_tool_calls") or 0))
@@ -113,6 +122,7 @@ def parse_fork_candidates(arguments: Any) -> list[ForkCandidate]:
                 objective=str(raw.get("objective") or "").strip(),
                 expected_output=str(raw.get("expected_output") or "").strip(),
                 requirement_ids=requirement_ids,
+                scope_signature=str(raw.get("scope_signature") or "").strip(),
                 context=context if isinstance(context, dict) else {},
                 reasons=tuple(reasons),
                 estimated_tool_calls=estimated_tool_calls,
@@ -123,11 +133,20 @@ def parse_fork_candidates(arguments: Any) -> list[ForkCandidate]:
 
 
 def candidate_fingerprint(candidate: ForkCandidate) -> str:
+    """Exact deterministic assignment identity within one parent Agent.
+
+    This deliberately avoids fuzzy/semantic similarity.  The parent Agent owns
+    the judgment that two scopes are meaningfully distinct; code rejects only
+    the same normalized objective/scope/requirement tuple.
+    """
+    def normalize(value: str) -> str:
+        return " ".join(
+            unicodedata.normalize("NFKC", str(value or "")).casefold().split()
+        )
     normalized = {
-        "objective": " ".join(candidate.objective.lower().split()),
-        "expected_output": " ".join(candidate.expected_output.lower().split()),
-        "requirement_ids": candidate.requirement_ids,
-        "context": candidate.context,
+        "objective": normalize(candidate.objective),
+        "requirement_ids": sorted(candidate.requirement_ids),
+        "scope_signature": normalize(candidate.scope_signature),
     }
     encoded = json.dumps(normalized, ensure_ascii=False, sort_keys=True, default=str)
     return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
@@ -154,9 +173,7 @@ def evaluate_fork_candidates(
 
     valid_requirement_ids = tuple(
         dict.fromkeys(
-            str(requirement_id).strip()
-            for requirement_id in parent_requirement_ids
-            if str(requirement_id).strip()
+            str(requirement_id).strip() for requirement_id in parent_requirement_ids if str(requirement_id).strip()
         )
     )
     valid_requirement_id_set = set(valid_requirement_ids)
@@ -170,10 +187,7 @@ def evaluate_fork_candidates(
                     requirement_ids=(valid_requirement_ids[0],),
                 )
             else:
-                rejected.append(
-                    f"{candidate.objective or '<empty objective>'}: "
-                    "missing parent requirement mapping"
-                )
+                rejected.append(f"{candidate.objective or '<empty objective>'}: " "missing parent requirement mapping")
                 continue
         unknown_requirement_ids = set(requirement_ids) - valid_requirement_id_set
         if valid_requirement_ids and unknown_requirement_ids:
@@ -186,57 +200,64 @@ def evaluate_fork_candidates(
     proposals = bound_proposals
 
     seen = set(completed_fingerprints)
-    parent_objective = " ".join(parent_task.objective.lower().split())
-    blocked_objectives = {
-        " ".join(str(objective).lower().split())
-        for objective in ancestor_objectives
-        if str(objective).strip()
-    }
-    blocked_objectives.add(parent_objective)
     parallel_fingerprints = {
         candidate_fingerprint(item)
         for item in proposals
         if item.objective
         and item.expected_output
-        and " ".join(item.objective.lower().split()) not in blocked_objectives
         and candidate_fingerprint(item) not in seen
         and ForkReason.PARALLEL in item.reasons
         and item.independent
     }
     parallel_allowed = len(parallel_fingerprints) >= 2
-    accepted: list[ForkCandidate] = []
+    eligible: list[ForkCandidate] = []
+    eligible_seen = set(seen)
 
     for candidate in proposals:
         label = candidate.objective or "<empty objective>"
         if not candidate.objective or not candidate.expected_output:
             rejected.append(f"{label}: task scope is incomplete")
             continue
-        if " ".join(candidate.objective.lower().split()) in blocked_objectives:
-            rejected.append(f"{label}: duplicates an ancestor task")
-            continue
         fingerprint = candidate_fingerprint(candidate)
-        if fingerprint in seen:
+        if fingerprint in eligible_seen:
             rejected.append(f"{label}: duplicate task")
             continue
 
-        valid_parallel = (
-            ForkReason.PARALLEL in candidate.reasons
-            and candidate.independent
-            and parallel_allowed
-        )
+        valid_parallel = ForkReason.PARALLEL in candidate.reasons and candidate.independent and parallel_allowed
         valid_isolation = ForkReason.CONTEXT_ISOLATION in candidate.reasons
-        valid_depth = (
-            ForkReason.DEEP_TOOL_CHAIN in candidate.reasons
-            and candidate.estimated_tool_calls >= 3
-        )
+        valid_depth = ForkReason.DEEP_TOOL_CHAIN in candidate.reasons and candidate.estimated_tool_calls >= 3
         if not (valid_parallel or valid_isolation or valid_depth):
             rejected.append(f"{label}: no approved fork condition was satisfied")
             continue
-        if len(accepted) >= max_children:
-            rejected.append(f"{label}: child budget exhausted")
-            continue
+        eligible.append(candidate)
+        eligible_seen.add(fingerprint)
 
+    # Prefer breadth across necessary requirements before spending more than
+    # one child slot on a finer split of the same requirement. Stable ordering
+    # within both passes preserves the policy's priority signal.
+    accepted: list[ForkCandidate] = []
+    covered_requirements: set[str] = set()
+    selected_fingerprints: set[str] = set()
+    for candidate in eligible:
+        if len(accepted) >= max_children:
+            break
+        if candidate.requirement_ids and set(candidate.requirement_ids).issubset(covered_requirements):
+            continue
         accepted.append(candidate)
-        seen.add(fingerprint)
+        selected_fingerprints.add(candidate_fingerprint(candidate))
+        covered_requirements.update(candidate.requirement_ids)
+
+    for candidate in eligible:
+        if len(accepted) >= max_children:
+            break
+        fingerprint = candidate_fingerprint(candidate)
+        if fingerprint in selected_fingerprints:
+            continue
+        accepted.append(candidate)
+        selected_fingerprints.add(fingerprint)
+
+    for candidate in eligible:
+        if candidate_fingerprint(candidate) not in selected_fingerprints:
+            rejected.append(f"{candidate.objective}: child budget exhausted")
 
     return accepted, rejected

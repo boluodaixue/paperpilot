@@ -1,4 +1,5 @@
 """Minimal contracts shared by every homogeneous Research Agent execution."""
+
 from __future__ import annotations
 
 from dataclasses import dataclass, field
@@ -108,17 +109,65 @@ class ExecutionIdentity:
 class AgentLimits:
     """Hard bounds consumed by every level of the single AgentGraph."""
 
-    max_iterations: int = 8
-    max_tool_calls: int = 12
-    max_tool_output_chars: int = 12000
-    max_children: int = 4
+    max_iterations: int = 18
+    max_tool_calls: int = 30
+    max_tool_output_chars: int = 24000
+    max_children_per_agent: int = 5
     max_fork_depth: int = 2
-    max_total_threads: int = 7
-    max_total_tool_calls: int = 36
-    max_elapsed_seconds: float = 300.0
-    max_total_tokens: int = 120000
-    max_retries_per_action: int = 1
-    max_total_retries: int = 6
+    max_concurrent_agents: int = 10
+    max_total_agents: int = 24
+    # Deprecated aliases retained for config/checkpoint compatibility.  They
+    # are normalized into the canonical fields in ``__post_init__``.
+    max_children: int = 5
+    max_total_threads: int = 24
+    max_total_tool_calls: int = 96
+    max_elapsed_seconds: float = 900.0
+    max_total_tokens: int = 500000
+    max_retries_per_action: int = 2
+    max_total_retries: int = 12
+
+    def __post_init__(self) -> None:
+        default_children = 5
+        default_total = 24
+        if self.max_children_per_agent != default_children and self.max_children != default_children:
+            if self.max_children_per_agent != self.max_children:
+                raise ValueError(
+                    "max_children_per_agent conflicts with deprecated max_children"
+                )
+        elif self.max_children_per_agent == default_children and self.max_children != default_children:
+            object.__setattr__(self, "max_children_per_agent", self.max_children)
+        elif self.max_children_per_agent != default_children and self.max_children == default_children:
+            object.__setattr__(self, "max_children", self.max_children_per_agent)
+
+        if self.max_total_agents != default_total and self.max_total_threads != default_total:
+            if self.max_total_agents != self.max_total_threads:
+                raise ValueError(
+                    "max_total_agents conflicts with deprecated max_total_threads"
+                )
+        elif self.max_total_agents == default_total and self.max_total_threads != default_total:
+            object.__setattr__(self, "max_total_agents", self.max_total_threads)
+        elif self.max_total_agents != default_total and self.max_total_threads == default_total:
+            object.__setattr__(self, "max_total_threads", self.max_total_agents)
+        if self.max_concurrent_agents == 10 and self.max_total_agents < 10:
+            object.__setattr__(self, "max_concurrent_agents", self.max_total_agents)
+
+    @property
+    def effective_max_children_per_agent(self) -> int:
+        if "max_children_per_agent" not in self.__dict__:
+            return int(getattr(self, "max_children", 5))
+        return int(self.max_children_per_agent)
+
+    @property
+    def effective_max_total_agents(self) -> int:
+        if "max_total_agents" not in self.__dict__:
+            return int(getattr(self, "max_total_threads", 24))
+        return int(self.max_total_agents)
+
+    @property
+    def effective_max_concurrent_agents(self) -> int:
+        if "max_concurrent_agents" not in self.__dict__:
+            return min(10, self.effective_max_total_agents)
+        return int(self.max_concurrent_agents)
 
     def validate(self) -> None:
         if self.max_iterations < 1:
@@ -127,12 +176,16 @@ class AgentLimits:
             raise ValueError("max_tool_calls cannot be negative")
         if self.max_tool_output_chars < 500:
             raise ValueError("max_tool_output_chars must be at least 500")
-        if self.max_children < 0:
-            raise ValueError("max_children cannot be negative")
+        if self.effective_max_children_per_agent < 0:
+            raise ValueError("max_children_per_agent cannot be negative")
         if self.max_fork_depth not in (0, 1, 2):
             raise ValueError("max_fork_depth must be 0, 1, or 2")
-        if self.max_total_threads < 1:
-            raise ValueError("max_total_threads must be at least 1")
+        if self.effective_max_concurrent_agents < 1:
+            raise ValueError("max_concurrent_agents must be at least 1")
+        if self.effective_max_total_agents < 1:
+            raise ValueError("max_total_agents must be at least 1")
+        if self.effective_max_concurrent_agents > self.effective_max_total_agents:
+            raise ValueError("max_concurrent_agents cannot exceed max_total_agents")
         if self.max_total_tool_calls < 0:
             raise ValueError("max_total_tool_calls cannot be negative")
         if self.max_elapsed_seconds <= 0:
@@ -152,6 +205,7 @@ class ForkCandidate:
     objective: str
     expected_output: str
     requirement_ids: tuple[str, ...] = ()
+    scope_signature: str = ""
     context: dict[str, Any] = field(default_factory=dict)
     reasons: tuple[ForkReason, ...] = ()
     estimated_tool_calls: int = 0
@@ -171,6 +225,26 @@ class EvidenceItem:
     excerpt: str = ""
     excerpt_type: str = "paraphrase"
     limitations: str = ""
+    requirement_id: str = ""
+    action_id: str = ""
+    artifact_id: str = ""
+    assignment_id: str = ""
+    parent_assignment_id: str = ""
+
+
+@dataclass(frozen=True)
+class ToolAvailabilityAlert:
+    """Checkpoint-derived warning that an external information path is unavailable."""
+
+    alert_id: str
+    tool: str
+    category: str
+    scope: str
+    target: str
+    message: str
+    action_required: str
+    circuit_open: bool = False
+    error: str = ""
 
 
 @dataclass(frozen=True)
@@ -180,6 +254,7 @@ class ResearchRequirement:
     requirement_id: str
     description: str
     required: bool = True
+    requires_external_evidence: bool = True
 
 
 @dataclass(frozen=True)
@@ -211,6 +286,7 @@ class NextResearchAction:
     query: str
     expected_value: str
     expected_improvement: str
+    action_id: str = ""
 
 
 @dataclass(frozen=True)
@@ -222,6 +298,8 @@ class StrategyAttempt:
     query: str
     outcome: str
     evidence_ids: tuple[str, ...] = ()
+    action_id: str = ""
+    artifact_ids: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -234,6 +312,7 @@ class ResearchResult:
     findings: tuple[str, ...] = ()
     evidence: tuple[EvidenceItem, ...] = ()
     unresolved: tuple[str, ...] = ()
+    tool_alerts: tuple[ToolAvailabilityAlert, ...] = ()
     child_result_refs: tuple[str, ...] = ()
     stop_reason: str | None = None
     termination_reason: TerminationReason | None = None
@@ -247,6 +326,14 @@ class ResearchResult:
     thread_count: int = 1
     estimated_tokens_used: int = 0
     retries_used: int = 0
+    source_candidate_count: int = 0
+    source_open_count: int = 0
+    duplicate_source_count: int = 0
+    acquisition_call_count: int = 0
+    repair_applied: bool = False
+    repair_actions: tuple[str, ...] = ()
+    research_memo: str = ""
+    report_markdown: str = ""
 
 
 @dataclass(frozen=True)
@@ -411,4 +498,31 @@ class ResearchWorkflowResult:
     report_markdown: str
     memory_manifest: MemoryManifest
     report_review: ReportReviewOutcome | None = None
+    research_architecture: str = "legacy"
+    challenges: tuple[dict[str, Any], ...] = ()
+    citation_issues: tuple[dict[str, Any], ...] = ()
+    supplemental_wave_count: int = 0
+    finalization_token_reserve: int = 0
+    core_question_count: int = 0
+    assigned_core_question_count: int = 0
+    worker_packet_count: int = 0
+    unique_worker_packet_count: int = 0
+    source_open_count: int = 0
+    source_candidate_count: int = 0
+    duplicate_source_count: int = 0
+    acquisition_call_count: int = 0
+    repair_applied: bool = False
+    repair_actions: tuple[str, ...] = ()
+    reportable_claim_rejection_count: int = 0
+    candidate_claim_count: int = 0
+    verified_claim_count: int = 0
+    support_assessment_count: int = 0
+    entailed_assessment_count: int = 0
+    evidence_requirement_coverage: tuple[dict[str, Any], ...] = ()
+    composer_claim_count: int = 0
+    shared_comparison: bool = False
+    structured_report: bool = False
+    root_agent_report: bool = False
+    shared_selected_evidence_count: int = 0
+    coordination_metrics: dict[str, int] = field(default_factory=dict)
     memory_id: str | None = None

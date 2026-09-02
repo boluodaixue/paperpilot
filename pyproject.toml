@@ -36,6 +36,8 @@ dependencies = [
     "fastapi>=0.110",
     "uvicorn>=0.27",
     "beautifulsoup4>=4.12",
+    "markdownify>=0.13,<2.0",
+    "certifi>=2024.2.2",
     "pypdf>=5.0,<7.0",
     "sentence-transformers",
     "datasets",
@@ -43,6 +45,10 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
+# Optional layout-aware PDF extraction. OCR remains disabled by configuration.
+documents = [
+    "docling>=2.0,<3.0",
+]
 # vLLM 推理服务依赖
 serve = [
     "vllm>=0.4.0",
@@ -57,7 +63,7 @@ dev = [
     "flake8",
 ]
 # 全部可选依赖
-all = ["deep-research-agent[serve,dev]"]
+all = ["deep-research-agent[serve,documents,dev]"]
 
 [project.scripts]
 # 命令行快捷入口

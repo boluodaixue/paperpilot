@@ -72,9 +72,21 @@ requirements、coverage、critical gaps、next actions、真实 strategy attempt
 
 结果分别保存 `research_status`、`termination_reason` 和 `output_status`。停止原因区分 `coverage_complete`、`saturated`、`evidence_exhausted`、`budget_forced`、`tool_failure` 和 `user_cancelled`；子任务 `partial` 继续披露，但根状态只按根 Brief 的最终覆盖重新判断。RCS 只在最终评测输出中计算五个维度，不进入运行时停止路由。ResearchBench 可选使用持久 SQLite checkpoint 逐题恢复，并把规则分、完整报告分块 LLM Judge 和二者组合分分开保存；Judge 使用独立的 `modules.judge` 采样参数，不参与运行时终止，也不改变 Research policy。
 
+外部信息源异常使用确定性分类器，而不是等到最终报告才作为普通工具错误披露。额度耗尽、套餐不可用和认证失败会产生 checkpointed `tool_unavailable` 事件并打开工具级熔断；OpenAlex 标识符适配 404 作为适配器异常同样熔断。HTTP 403、TLS/证书失败只隔离具体来源，限流标记为服务降级，仍允许切换其他来源。熔断后的重复调用产生 `tool_call_skipped_unavailable`，不计作真实外部调用；全部研究工具不可用时以 `tool_failure` 结束。结构化告警同步进入 SSE、API 结果、最终报告和父子结果汇聚，错误诊断中的凭据在公开前会被脱敏。
+
+外部 HTTP 客户端使用平台信任库叠加 Mozilla CA，并始终保留主机名和证书验证。论文工具按标识符类型路由：OpenAlex 只直接接收其支持的 Work/DOI/PubMed ID，裸 arXiv ID 使用 arXiv `id_list`，失败后依次回退 Semantic Scholar 与 OpenAlex 搜索。任一首选后端失败或返回空结果都可继续使用其他免费学术后端；全部失败时才生成工具级不可用异常。Browser 对 403 不绕过访问控制，只在可确定同一发布方时读取官方 PDF，并把实际替代 URL 写入 Evidence 来源。
+
 完整契约、状态、路由和验收标准见 `docs/RESEARCH_SUFFICIENCY_TERMINATION_DESIGN.md`。
 
 根 Agent 只额外承担用户交互和最终报告发布权限，不是另一种 Manager Agent。
+
+### Task、Research State、Knowledge Store 与 Working Context
+
+研究运行时明确分离四类数据：用户确认后的 Task 永久定义完成契约；checkpointed Research State 保存 coverage、critical gaps、Claim/Evidence 映射、策略、预算与终止；Knowledge Store 保存完整工具 artifact、Evidence 和来源；Working Context 只是在每次 policy 调用前按当前 requirement 生成的有界临时投影。
+
+工具结果不能先截断再保存。完整 artifact 必须先通过现有持久写队列交给单一 Vault Writer，以内容哈希和幂等键原子发布到 `Artifacts/<thread-scope>/`；并行子 Agent 只能提交写入意图。确认 artifact 可恢复后，Working Context 才能按 L1 offload、L2 history snip、L3 microcompact、L4 deterministic collapse、L5 same-policy auto-compact 的顺序压缩。L4 manifest 保存被折叠消息哈希、artifact ID 和有界 Research State；L5 必须逐项回报 requirement、Evidence 和 artifact ID，否则回退到 L4。任何 artifact 写入或复核失败都保留完整 raw payload。压缩不得丢失 Research Brief、requirement、coverage、Claim↔Evidence、来源定位、冲突、策略、动作、预算、错误与 termination state。
+
+详细数据契约、水位、滞回、恢复和分级验收见 `docs/RESEARCH_SUFFICIENCY_TERMINATION_DESIGN.md` 第 13 节。
 
 ## 4. Research Workflow
 

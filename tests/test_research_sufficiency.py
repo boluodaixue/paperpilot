@@ -1,4 +1,5 @@
 """Acceptance tests for research sufficiency contracts and deterministic routing."""
+
 from __future__ import annotations
 
 import json
@@ -10,12 +11,12 @@ from src.research.models import (
     EvidenceItem,
     NextResearchAction,
     OutputStatus,
-    ResearchDecision,
-    ResearchResult,
-    ResearchStatus,
     RequirementCoverage,
     RequirementStatus,
+    ResearchDecision,
     ResearchRequirement,
+    ResearchResult,
+    ResearchStatus,
     ResearchTask,
     StrategyAttempt,
     TerminationReason,
@@ -27,13 +28,13 @@ from src.research.research_sufficiency import (
     build_assessment_projection,
     build_research_requirements,
     hard_termination_reason,
-    merge_next_action_queue,
     merge_child_coverage_evidence,
+    merge_next_action_queue,
     parse_research_assessment,
     reconcile_strategy_attempt_outcomes,
+    repair_assessment_prompt,
     unattempted_actions,
 )
-
 
 REQUIREMENTS = (
     ResearchRequirement("R1", "Answer the first necessary question."),
@@ -68,6 +69,29 @@ def test_confirmed_brief_requirements_are_stable_ordered_and_deduplicated() -> N
         ("R2", "Second"),
         ("R3", "Third"),
     ]
+
+
+def test_compound_brief_fields_become_atomic_requirements_with_deliverable() -> None:
+    task = ResearchTask(
+        "atomic-requirements",
+        "Compare systems",
+        context={
+            "directions": ["Compare code quality; Compare long-context quality"],
+            "research_gaps": ["Quantify uncertainty\nExplain conflicting evidence"],
+        },
+        expected_output="A table with a recommendation",
+    )
+
+    requirements = build_research_requirements(task)
+
+    assert [item.description for item in requirements] == [
+        "Compare code quality",
+        "Compare long-context quality",
+        "Quantify uncertainty",
+        "Explain conflicting evidence",
+        "Deliverable: A table with a recommendation",
+    ]
+    assert requirements[-1].required is False
 
 
 def _payload(
@@ -110,11 +134,16 @@ def _gap(requirement_id: str = "R2", impact: str = "high") -> dict:
     }
 
 
-def _action(requirement_id: str = "R2", strategy: str = "primary_document") -> dict:
+def _action(
+    requirement_id: str = "R2",
+    strategy: str = "primary_document",
+    *,
+    query: str = "Find the original primary document",
+) -> dict:
     return {
         "requirement_id": requirement_id,
         "strategy": strategy,
-        "query": "Find the original primary document",
+        "query": query,
         "expected_value": "high",
         "expected_improvement": "Resolve the material uncertainty.",
     }
@@ -173,9 +202,7 @@ def test_continue_requires_a_requirement_scoped_high_value_action() -> None:
 
 
 def test_replan_requires_a_materially_new_strategy() -> None:
-    attempted = (
-        StrategyAttempt("R2", "primary_document", "old query", "no_progress"),
-    )
+    attempted = (StrategyAttempt("R2", "primary_document", "old query", "no_progress"),)
     assessment = parse_research_assessment(
         _payload(
             decision="replan",
@@ -292,9 +319,7 @@ def test_semantic_assessment_cannot_fabricate_runtime_only_stop_reasons(reason: 
 
 
 def test_unknown_evidence_id_is_rejected_before_routing() -> None:
-    payload = json.loads(
-        _payload(decision="stop_research", termination_reason="coverage_complete")
-    )
+    payload = json.loads(_payload(decision="stop_research", termination_reason="coverage_complete"))
     payload["coverage"][0]["evidence_ids"] = ["MISSING"]
     with pytest.raises(AssessmentValidationError, match="unknown Evidence IDs"):
         parse_research_assessment(
@@ -370,10 +395,48 @@ def test_continue_rejects_an_action_that_was_already_executed() -> None:
             evidence=EVIDENCE,
             attempts=attempts,
         )
-    assert unattempted_actions(
-        (NextResearchAction("R2", "paper_search", action["query"], "high", "x"),),
-        attempts,
-    ) == ()
+    assert (
+        unattempted_actions(
+            (NextResearchAction("R2", "paper_search", action["query"], "high", "x"),),
+            attempts,
+        )
+        == ()
+    )
+
+
+def test_continue_requires_a_new_strategy_family_after_repeated_no_progress() -> None:
+    attempts = (
+        StrategyAttempt("R2", "paper_search", "query one", "no_progress"),
+        StrategyAttempt("R2", "paper_search", "query two", "no_progress"),
+    )
+    repeated_family = _payload(
+        decision="continue",
+        statuses=("supported", "unsupported"),
+        gaps=[_gap("R2")],
+        actions=[_action("R2", "paper_search", query="query three")],
+    )
+
+    with pytest.raises(AssessmentValidationError, match="strategy family"):
+        parse_research_assessment(
+            repeated_family,
+            requirements=REQUIREMENTS,
+            evidence=EVIDENCE,
+            attempts=attempts,
+        )
+
+    changed = parse_research_assessment(
+        _payload(
+            decision="replan",
+            statuses=("supported", "unsupported"),
+            gaps=[_gap("R2")],
+            actions=[_action("R2", "official_database", query="query three")],
+            replan_reason="The paper-search family produced no progress twice.",
+        ),
+        requirements=REQUIREMENTS,
+        evidence=EVIDENCE,
+        attempts=attempts,
+    )
+    assert changed.next_actions[0].strategy == "official_database"
 
 
 def test_long_history_projection_is_bounded_and_preserves_attempt_outcomes() -> None:
@@ -423,12 +486,98 @@ def test_long_history_projection_is_bounded_and_preserves_attempt_outcomes() -> 
 
     assert len(json.dumps(projection, ensure_ascii=False)) <= 30500
     assert "strategy_attempts" not in projection
-    assert sum(
-        item["attempt_count"] for item in projection["strategy_attempt_summary"]
-    ) == 200
+    assert sum(item["attempt_count"] for item in projection["strategy_attempt_summary"]) == 200
     assert len(projection["strategy_attempt_summary"]) <= len(strategies) * 2
     assert projection["evidence_inventory"]["included_count"] < 200
     assert projection["evidence_inventory"]["omitted_candidate_count"] > 0
+
+
+def test_assessment_projection_prioritizes_new_requirement_scoped_evidence() -> None:
+    evidence = tuple(
+        EvidenceItem(
+            evidence_id=f"E{index}",
+            finding=(f"Historical finding {index} " * 80),
+            source_type="paper",
+            title=f"Source {index}",
+            source_ref=f"https://example.com/{index}",
+            requirement_id="R1",
+        )
+        for index in range(80)
+    )
+    newest = EvidenceItem(
+        evidence_id="E-new",
+        finding="The new primary result directly answers R2.",
+        source_type="paper",
+        title="New primary result",
+        source_ref="https://example.com/new",
+        requirement_id="R2",
+        action_id="action-r2",
+        artifact_id="artifact-new",
+    )
+
+    projection = build_assessment_projection(
+        task=ResearchTask("projection-focus", "Prioritize current evidence"),
+        requirements=REQUIREMENTS,
+        coverage=(
+            RequirementCoverage("R1", RequirementStatus.WEAK, ("E0",)),
+            RequirementCoverage("R2", RequirementStatus.UNSUPPORTED),
+        ),
+        evidence=(*evidence, newest),
+        critical_gaps=(CriticalGap("R2", "Still unresolved", "high"),),
+        attempts=(),
+        child_results=(),
+        candidate_final="",
+        recent_tool_failures=(),
+        recent_tool_outcomes=(),
+        focus_evidence_ids=("E-new",),
+    )
+
+    assert projection["evidence"][0]["evidence_id"] == "E-new"
+    assert projection["evidence"][0]["requirement_id"] == "R2"
+    assert projection["evidence_inventory"]["focus_count"] == 1
+
+
+def test_supported_coverage_rejects_evidence_bound_to_another_requirement() -> None:
+    bound_evidence = (
+        EvidenceItem(
+            evidence_id="E-R1",
+            finding="Only R1 is supported.",
+            source_type="paper",
+            title="Scoped source",
+            source_ref="https://example.com/r1",
+            requirement_id="R1",
+        ),
+    )
+    payload = json.loads(
+        _payload(
+            decision="continue",
+            statuses=("weak", "weak"),
+            gaps=[_gap("R2")],
+            actions=[_action("R2")],
+        )
+    )
+    payload["coverage"][0]["evidence_ids"] = []
+    payload["coverage"][1]["evidence_ids"] = ["E-R1"]
+
+    with pytest.raises(AssessmentValidationError, match="bound to another requirement"):
+        parse_research_assessment(
+            json.dumps(payload),
+            requirements=REQUIREMENTS,
+            evidence=bound_evidence,
+            attempts=(),
+        )
+
+
+def test_assessment_repair_prompt_lists_exact_evidence_bindings() -> None:
+    prompt = repair_assessment_prompt(
+        "invalid",
+        "cross-bound evidence",
+        evidence_bindings={"E-R2": "R2", "E-free": ""},
+    )
+
+    assert "E-R2: R2" in prompt
+    assert "E-free: unbound" in prompt
+    assert "Remove every cross-requirement Evidence ID" in prompt
 
 
 def test_strategy_progress_requires_validated_coverage_citation() -> None:
@@ -529,9 +678,7 @@ def test_replan_replaces_only_same_requirement_and_stop_clears_queue() -> None:
         ),
         requirements=REQUIREMENTS,
         evidence=EVIDENCE,
-        attempts=(
-            StrategyAttempt("R1", "primary_document", "old R1", "no_progress"),
-        ),
+        attempts=(StrategyAttempt("R1", "primary_document", "old R1", "no_progress"),),
     )
     queue = merge_next_action_queue(
         previous,

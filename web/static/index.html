@@ -1367,8 +1367,21 @@ function appendProgress(ev) {
   switch (ev.type) {
     case 'state': div.textContent = `[${t}] ▸ ${ev.state}`; break;
     case 'confirmed': div.textContent = `[${t}] ✓ 研究说明已确认`; break;
+    case 'planning': div.textContent = `[${t}] ▸ 正在拆解核心研究问题`; break;
+    case 'blue_research': div.textContent = `[${t}] ✓ 首轮证据研究完成（${ev.worker_count||0} 个工作单元）`; break;
+    case 'red_review': div.textContent = `[${t}] ✓ 研究质量复核完成（${ev.challenge_count||0} 项挑战）`; break;
+    case 'supplemental': div.textContent = `[${t}] ✓ 定向补充研究完成`; break;
+    case 'drafting': div.textContent = `[${t}] ▸ 正在依据证据撰写报告`; break;
+    case 'citation_audit': div.textContent = `[${t}] ✓ 引用审计完成（${ev.issue_count||0} 项问题）`; break;
+    case 'persisting': div.textContent = `[${t}] ✓ 已通过单一写入器保存正式报告`; break;
     case 'agent_started': div.textContent = `[${t}] ▸ Agent 开始（层级 ${ev.depth}，${ev.thread_id}）`; break;
     case 'tool_finished': div.textContent = `[${t}] ${ev.ok?'✓':'✗'} 工具 ${ev.tool}（重试 ${ev.retries||0}）`; break;
+    case 'tool_unavailable':
+      div.textContent = `[${t}] ⚠ 外部信息源不可用：${ev.message||ev.tool} ${ev.action_required||''}`;
+      break;
+    case 'tool_call_skipped_unavailable':
+      div.textContent = `[${t}] ⏭ 已跳过不可用工具 ${ev.tool}，未再次发起外部调用`;
+      break;
     case 'fork_finished': div.textContent = `[${t}] ⇄ 子研究汇聚：接受 ${ev.accepted}，拒绝 ${ev.rejected}`; break;
     case 'agent_finished': div.textContent = `[${t}] ✓ Agent 完成（${ev.status}）`; break;
     case 'agent_failed': div.textContent = `[${t}] ✗ Agent 失败：${ev.error||''}`; break;

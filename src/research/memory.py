@@ -33,6 +33,7 @@ from .rendering import (
     render_evidence_note,
     render_memory_home,
     render_report,
+    render_v2_report,
     render_source_note,
     report_note_id,
     safe_note_id,
@@ -2406,6 +2407,8 @@ class MarkdownMemoryStore:
         identity: ExecutionIdentity,
         *,
         memory_id: str | None = None,
+        report_body_markdown: str | None = None,
+        report_architecture: str = "supervisor_v2",
     ) -> tuple[str, MemoryManifest]:
         """Atomically replace stable note paths; repeated calls create no duplicates."""
         identity.validate()
@@ -2440,15 +2443,21 @@ class MarkdownMemoryStore:
             source_note_by_ref.setdefault(evidence.source_ref, source_note_id(evidence))
 
         timestamp = self._timestamp() if memory_id is not None else None
-        report_markdown = render_report(
-            brief,
-            result,
+        renderer = render_v2_report if report_body_markdown is not None else render_report
+        renderer_kwargs = dict(
             report_note=report_note,
             evidence_notes=evidence_note_by_id,
             root_thread_id=identity.root_thread_id,
             memory_id=memory_id,
             created_at=timestamp,
             updated_at=timestamp,
+        )
+        if report_body_markdown is not None:
+            renderer_kwargs["architecture"] = report_architecture
+        report_markdown = (
+            renderer(brief, result, report_body_markdown, **renderer_kwargs)
+            if report_body_markdown is not None
+            else renderer(brief, result, **renderer_kwargs)
         )
 
         base_path = f"Memories/{memory_id}/" if memory_id is not None else ""

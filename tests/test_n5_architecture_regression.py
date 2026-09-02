@@ -67,9 +67,10 @@ AGENT_LIMIT_FIELDS = {
     "max_iterations",
     "max_tool_calls",
     "max_tool_output_chars",
-    "max_children",
+    "max_children_per_agent",
     "max_fork_depth",
-    "max_total_threads",
+    "max_concurrent_agents",
+    "max_total_agents",
     "max_total_tool_calls",
     "max_elapsed_seconds",
     "max_total_tokens",
@@ -113,7 +114,13 @@ def test_production_code_has_no_old_architecture_imports_or_active_symbols() -> 
 def test_default_config_contains_only_active_runtime_sections() -> None:
     config = yaml.safe_load((ROOT / "configs/default.yaml").read_text(encoding="utf-8"))
     assert set(config) == {
-        "system", "model", "research", "chat", "tools", "runtime"
+        "system",
+        "model",
+        "research",
+        "content_extraction",
+        "chat",
+        "tools",
+        "runtime",
     }
     assert set(config["model"]["backend_mapping"]) == {"research", "judge"}
     assert set(config["model"]["backend_sampling"]["modules"]) == {"research", "judge"}

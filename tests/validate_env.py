@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 """验证 .env / .env.local 配置是否正确"""
+
 from __future__ import annotations
 
 import os
@@ -49,11 +50,17 @@ print()
 print("=" * 60)
 print("工具层配置检查")
 print("=" * 60)
+print(check("TAVILY_API_KEY", optional=True))
+print(check("METASO_API_KEY", optional=True))
+print(check("EXA_API_KEY", optional=True))
+print(check("BOCHA_API_KEY", optional=True))
 print(check("SERPAPI_KEY", optional=True))
 print(check("SEARCH_BACKEND", optional=True))
-print(check("BING_SEARCH_KEY", optional=True))
+print(check("SEARCH_FALLBACK_BACKENDS", optional=True))
 print(check("ARXIV_READER_BACKEND", optional=True))
 print(check("SEMANTIC_SCHOLAR_API_KEY", optional=True))
+print(check("OPENALEX_API_KEY", optional=True))
+print(check("OPENALEX_EMAIL", optional=True))
 
 print()
 print("=" * 60)
@@ -86,11 +93,17 @@ else:
     print("  ✅ MIMO 配置看起来正确")
 
 # 检查 search 后端
-search_backend = os.getenv("SEARCH_BACKEND", "serpapi").lower()
-if search_backend == "serpapi" and not os.getenv("SERPAPI_KEY"):
-    print("  ⚠️  SEARCH_BACKEND=serpapi，但 SERPAPI_KEY 未设置")
-elif search_backend == "bing" and not os.getenv("BING_SEARCH_KEY"):
-    print("  ⚠️  SEARCH_BACKEND=bing，但 BING_SEARCH_KEY 未设置")
+search_backend = os.getenv("SEARCH_BACKEND", "tavily").lower()
+search_keys = {
+    "tavily": "TAVILY_API_KEY",
+    "metaso": "METASO_API_KEY",
+    "exa": "EXA_API_KEY",
+    "bocha": "BOCHA_API_KEY",
+    "serpapi": "SERPAPI_KEY",
+}
+required_search_key = search_keys.get(search_backend)
+if required_search_key and not os.getenv(required_search_key):
+    print(f"  ⚠️  SEARCH_BACKEND={search_backend}，" f"但 {required_search_key} 未设置")
 else:
     print("  ✅ 搜索后端配置正确")
 

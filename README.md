@@ -141,6 +141,10 @@ Copy-Item .env.template .env
 
 在 `.env` 中填写模型和检索服务所需的 API Key。项目支持 DeepSeek、OpenAI、MiMo 和本地 OpenAI-compatible vLLM。
 
+网页搜索默认使用 `Tavily → 秘塔 → Exa → 博查 → SerpAPI` 回退链，只调用已配置 Key 的备用源，无需部署 SearXNG 或其他常驻服务。首选源故障时会自动切换，但仍向界面发送明确的来源不可用告警；所有已配置来源都失败时才暂停整个网页搜索工具。
+
+论文检索把 `ARXIV_READER_BACKEND` 作为首选项，并在失败或空结果时自动在 arXiv、Semantic Scholar 和 OpenAlex 之间回退。裸 arXiv ID 会先按 arXiv 标识符查询，不会再误拼为 OpenAlex Work ID。外部 HTTPS 工具统一使用平台信任库与 Mozilla CA；网页返回 403 时，只会尝试同一发布方可验证的官方 PDF，不关闭证书校验或绕过访问控制。
+
 ### 2. 启动 Web
 
 ```bash
@@ -186,10 +190,10 @@ PaperPilot 保留了从原型到当前架构的完整 Git 提交历史，方便�
 pytest -q
 ```
 
-当前确定性测试结果：
+当前确定性测试覆盖：
 
 ```text
-747 passed, 2 skipped
+Evidence 闭环、L1–L5 上下文压缩、递归预算、checkpoint/Writer 崩溃恢复、Web/CLI 与 Memory 工作流
 ```
 
 测试覆盖递归与预算、checkpoint 恢复、用户确认、多 Memory 隔离、Writer 崩溃恢复、并发冲突、Markdown/WikiLink 契约、导入、FTS5、语义降级以及 Web/CLI 入口。

@@ -5,6 +5,7 @@ knowledge.  ``command_blob`` is deliberately opaque here: callers provide a
 versioned command envelope and its SHA-256 digest, while the Vault Writer is
 the only component that interprets it.
 """
+
 from __future__ import annotations
 
 import hashlib
@@ -20,7 +21,6 @@ from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from pathlib import Path
 from typing import TypeVar
-
 
 __all__ = [
     "VAULT_WRITE_JOB_STATUSES",
@@ -39,11 +39,10 @@ VAULT_WRITE_OPERATION_TYPES = frozenset(
         "memory_note",
         "memory_import",
         "legacy_copy",
+        "tool_artifact",
     }
 )
-VAULT_WRITE_JOB_STATUSES = frozenset(
-    {"queued", "running", "succeeded", "conflict", "failed"}
-)
+VAULT_WRITE_JOB_STATUSES = frozenset({"queued", "running", "succeeded", "conflict", "failed"})
 _TERMINAL_STATUSES = frozenset({"succeeded", "conflict", "failed"})
 _SHA256 = re.compile(r"^[0-9a-f]{64}$")
 _SAFE_JOB_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,159}$")
@@ -96,15 +95,9 @@ class VaultWriterLease:
 
 
 def _required_text(value: object, *, field_name: str) -> str:
-    if (
-        not isinstance(value, str)
-        or not value.strip()
-        or value != value.strip()
-        or len(value) > _MAX_TEXT_LENGTH
-    ):
+    if not isinstance(value, str) or not value.strip() or value != value.strip() or len(value) > _MAX_TEXT_LENGTH:
         raise ValueError(
-            f"{field_name} must be a non-empty trimmed string of at most "
-            f"{_MAX_TEXT_LENGTH} characters"
+            f"{field_name} must be a non-empty trimmed string of at most " f"{_MAX_TEXT_LENGTH} characters"
         )
     return value
 
@@ -179,9 +172,7 @@ class VaultWriteQueue:
             raise ValueError("busy_timeout_ms must be a positive integer")
         if busy_timeout_ms <= 0:
             raise ValueError("busy_timeout_ms must be a positive integer")
-        interval = _finite_time(
-            poll_interval_seconds, field_name="poll_interval_seconds"
-        )
+        interval = _finite_time(poll_interval_seconds, field_name="poll_interval_seconds")
         if interval <= 0:
             raise ValueError("poll_interval_seconds must be positive")
         self.db_path = os.fspath(db_path)
@@ -210,8 +201,7 @@ class VaultWriteQueue:
             connection = self._connect()
             try:
                 connection.execute("PRAGMA journal_mode = WAL")
-                connection.executescript(
-                    """
+                connection.executescript("""
                     CREATE TABLE IF NOT EXISTS vault_write_jobs (
                         vault_scope TEXT NOT NULL,
                         job_id TEXT NOT NULL,
@@ -221,6 +211,7 @@ class VaultWriteQueue:
                                 'create_memory', 'research_bundle',
                                 'report_review', 'memory_note',
                                 'memory_import', 'legacy_copy'
+                                , 'tool_artifact'
                             )
                         ),
                         memory_id TEXT NOT NULL,
@@ -282,8 +273,9 @@ class VaultWriteQueue:
                     );
                     CREATE INDEX IF NOT EXISTS idx_legacy_path_mappings_migration
                         ON legacy_path_mappings(vault_scope, migration_id);
-                    """
-                )
+                    """)
+                connection.commit()
+                self._migrate_tool_artifact_operation(connection)
                 connection.execute(
                     "INSERT OR IGNORE INTO vault_writer_lease "
                     "(vault_scope, lease_owner, lease_generation, lease_until) "
@@ -293,6 +285,89 @@ class VaultWriteQueue:
                 connection.commit()
             finally:
                 connection.close()
+
+    def _migrate_tool_artifact_operation(
+        self,
+        connection: sqlite3.Connection,
+    ) -> None:
+        """Upgrade the operation CHECK without discarding durable jobs."""
+        row = connection.execute(
+            "SELECT sql FROM sqlite_master " "WHERE type = 'table' AND name = 'vault_write_jobs'"
+        ).fetchone()
+        sql = "" if row is None else str(row[0] or "")
+        if "tool_artifact" in sql:
+            return
+        connection.execute("BEGIN IMMEDIATE")
+        try:
+            connection.execute("ALTER TABLE vault_write_jobs RENAME TO vault_write_jobs_before_artifacts")
+            connection.execute("DROP INDEX IF EXISTS idx_vault_write_jobs_claim")
+            connection.execute("""
+                CREATE TABLE vault_write_jobs (
+                    vault_scope TEXT NOT NULL,
+                    job_id TEXT NOT NULL,
+                    idempotency_key TEXT NOT NULL,
+                    operation_type TEXT NOT NULL CHECK (
+                        operation_type IN (
+                            'create_memory', 'research_bundle',
+                            'report_review', 'memory_note',
+                            'memory_import', 'legacy_copy',
+                            'tool_artifact'
+                        )
+                    ),
+                    memory_id TEXT NOT NULL,
+                    origin_thread_id TEXT,
+                    command_blob BLOB,
+                    command_hash TEXT NOT NULL,
+                    status TEXT NOT NULL CHECK (
+                        status IN (
+                            'queued', 'running', 'succeeded',
+                            'conflict', 'failed'
+                        )
+                    ),
+                    result_json TEXT,
+                    error_code TEXT,
+                    created_at REAL NOT NULL,
+                    completed_at REAL,
+                    lease_owner TEXT,
+                    lease_generation INTEGER,
+                    lease_until REAL,
+                    PRIMARY KEY (vault_scope, job_id),
+                    UNIQUE (vault_scope, idempotency_key),
+                    CHECK (
+                        (status IN ('queued', 'running') AND command_blob IS NOT NULL)
+                        OR
+                        (status IN ('succeeded', 'conflict', 'failed') AND command_blob IS NULL)
+                    ),
+                    CHECK (
+                        (lease_owner IS NULL AND lease_generation IS NULL AND lease_until IS NULL)
+                        OR
+                        (lease_owner IS NOT NULL AND lease_generation IS NOT NULL AND lease_until IS NOT NULL)
+                    )
+                )
+                """)
+            connection.execute("""
+                INSERT INTO vault_write_jobs (
+                    vault_scope, job_id, idempotency_key, operation_type,
+                    memory_id, origin_thread_id, command_blob, command_hash,
+                    status, result_json, error_code, created_at, completed_at,
+                    lease_owner, lease_generation, lease_until
+                )
+                SELECT
+                    vault_scope, job_id, idempotency_key, operation_type,
+                    memory_id, origin_thread_id, command_blob, command_hash,
+                    status, result_json, error_code, created_at, completed_at,
+                    lease_owner, lease_generation, lease_until
+                FROM vault_write_jobs_before_artifacts
+                """)
+            connection.execute("DROP TABLE vault_write_jobs_before_artifacts")
+            connection.execute(
+                "CREATE INDEX idx_vault_write_jobs_claim "
+                "ON vault_write_jobs(vault_scope, status, created_at, job_id)"
+            )
+            connection.commit()
+        except Exception:
+            connection.rollback()
+            raise
 
     @staticmethod
     def _legacy_manifest_paths(content: str) -> tuple[str, ...]:
@@ -357,9 +432,7 @@ class VaultWriteQueue:
                                     "session_id": str(row["session_id"]),
                                     "message_id": str(row["message_id"]),
                                     "legacy_paths": list(affected),
-                                    "content_hash": hashlib.sha256(
-                                        str(row["content"]).encode("utf-8")
-                                    ).hexdigest(),
+                                    "content_hash": hashlib.sha256(str(row["content"]).encode("utf-8")).hexdigest(),
                                 }
                             )
                 payload = {
@@ -381,8 +454,7 @@ class VaultWriteQueue:
             connection = self._connect()
             try:
                 row = connection.execute(
-                    "SELECT target_path FROM legacy_path_mappings "
-                    "WHERE vault_scope = ? AND source_path = ?",
+                    "SELECT target_path FROM legacy_path_mappings " "WHERE vault_scope = ? AND source_path = ?",
                     (self.vault_scope, source_path),
                 ).fetchone()
                 return None if row is None else str(row["target_path"])
@@ -474,8 +546,7 @@ class VaultWriteQueue:
                 if existing:
                     stored = {str(row["source_path"]): str(row["target_path"]) for row in existing}
                     if stored != mapping or any(
-                        str(row["memory_id"]) != memory or str(row["archive_target"]) != archive
-                        for row in existing
+                        str(row["memory_id"]) != memory or str(row["archive_target"]) != archive for row in existing
                     ):
                         raise RuntimeError("legacy migration mapping collision")
                     connection.execute(
@@ -506,9 +577,7 @@ class VaultWriteQueue:
                                 "session_id": str(row["session_id"]),
                                 "message_id": str(row["message_id"]),
                                 "legacy_paths": affected,
-                                "content_hash": hashlib.sha256(
-                                    str(row["content"]).encode("utf-8")
-                                ).hexdigest(),
+                                "content_hash": hashlib.sha256(str(row["content"]).encode("utf-8")).hexdigest(),
                             }
                         )
                 snapshot = {"sessions": sessions, "manifests": manifests}
@@ -584,23 +653,18 @@ class VaultWriteQueue:
         if hashlib.sha256(blob).hexdigest() != digest:
             raise ValueError("command_hash does not match command_blob")
         identity = (
-            self.stable_job_id(self.vault_scope, key)
-            if job_id is None
-            else _required_text(job_id, field_name="job_id")
+            self.stable_job_id(self.vault_scope, key) if job_id is None else _required_text(job_id, field_name="job_id")
         )
         if not _SAFE_JOB_ID.fullmatch(identity):
             raise ValueError("job_id must be safe for private Writer state")
-        created = time.time() if created_at is None else _finite_time(
-            created_at, field_name="created_at"
-        )
+        created = time.time() if created_at is None else _finite_time(created_at, field_name="created_at")
 
         with self._lock:
             connection = self._connect()
             try:
                 connection.execute("BEGIN IMMEDIATE")
                 existing = connection.execute(
-                    "SELECT * FROM vault_write_jobs "
-                    "WHERE vault_scope = ? AND idempotency_key = ?",
+                    "SELECT * FROM vault_write_jobs " "WHERE vault_scope = ? AND idempotency_key = ?",
                     (self.vault_scope, key),
                 ).fetchone()
                 if existing is not None:
@@ -619,8 +683,7 @@ class VaultWriteQueue:
                     return job
 
                 collision = connection.execute(
-                    "SELECT 1 FROM vault_write_jobs "
-                    "WHERE vault_scope = ? AND job_id = ?",
+                    "SELECT 1 FROM vault_write_jobs " "WHERE vault_scope = ? AND job_id = ?",
                     (self.vault_scope, identity),
                 ).fetchone()
                 if collision is not None:
@@ -648,8 +711,7 @@ class VaultWriteQueue:
                     ),
                 )
                 row = connection.execute(
-                    "SELECT * FROM vault_write_jobs "
-                    "WHERE vault_scope = ? AND job_id = ?",
+                    "SELECT * FROM vault_write_jobs " "WHERE vault_scope = ? AND job_id = ?",
                     (self.vault_scope, identity),
                 ).fetchone()
                 connection.commit()
@@ -668,8 +730,7 @@ class VaultWriteQueue:
             connection = self._connect()
             try:
                 row = connection.execute(
-                    "SELECT * FROM vault_write_jobs "
-                    "WHERE vault_scope = ? AND job_id = ?",
+                    "SELECT * FROM vault_write_jobs " "WHERE vault_scope = ? AND job_id = ?",
                     (self.vault_scope, identity),
                 ).fetchone()
                 return None if row is None else self._job(row)
@@ -682,8 +743,7 @@ class VaultWriteQueue:
             connection = self._connect()
             try:
                 row = connection.execute(
-                    "SELECT * FROM vault_write_jobs "
-                    "WHERE vault_scope = ? AND idempotency_key = ?",
+                    "SELECT * FROM vault_write_jobs " "WHERE vault_scope = ? AND idempotency_key = ?",
                     (self.vault_scope, key),
                 ).fetchone()
                 return None if row is None else self._job(row)
@@ -698,8 +758,7 @@ class VaultWriteQueue:
             try:
                 if status is None:
                     rows = connection.execute(
-                        "SELECT * FROM vault_write_jobs WHERE vault_scope = ? "
-                        "ORDER BY created_at, job_id",
+                        "SELECT * FROM vault_write_jobs WHERE vault_scope = ? " "ORDER BY created_at, job_id",
                         (self.vault_scope,),
                     ).fetchall()
                 else:
@@ -722,11 +781,7 @@ class VaultWriteQueue:
     ) -> VaultWriterLease | None:
         duration = _lease_duration(lease_seconds)
         current = time.time() if now is None else _finite_time(now, field_name="now")
-        writer = (
-            f"writer-{uuid.uuid4().hex}"
-            if owner is None
-            else _required_text(owner, field_name="owner")
-        )
+        writer = f"writer-{uuid.uuid4().hex}" if owner is None else _required_text(owner, field_name="owner")
         with self._lock:
             connection = self._connect()
             try:
@@ -842,8 +897,7 @@ class VaultWriteQueue:
     ) -> None:
         self._validate_lease_scope(lease)
         writer = connection.execute(
-            "SELECT lease_owner, lease_generation, lease_until "
-            "FROM vault_writer_lease WHERE vault_scope = ?",
+            "SELECT lease_owner, lease_generation, lease_until " "FROM vault_writer_lease WHERE vault_scope = ?",
             (self.vault_scope,),
         ).fetchone()
         if (
@@ -885,9 +939,7 @@ class VaultWriteQueue:
             connection = self._connect()
             try:
                 connection.execute("BEGIN IMMEDIATE")
-                self._assert_fence_connection(
-                    connection, lease, job_id=identity, now=current
-                )
+                self._assert_fence_connection(connection, lease, job_id=identity, now=current)
                 connection.commit()
             except Exception:
                 connection.rollback()
@@ -912,9 +964,7 @@ class VaultWriteQueue:
             connection = self._connect()
             try:
                 connection.execute("BEGIN IMMEDIATE")
-                self._assert_fence_connection(
-                    connection, lease, job_id=identity, now=current
-                )
+                self._assert_fence_connection(connection, lease, job_id=identity, now=current)
                 result = action()
                 connection.commit()
                 return result
@@ -932,18 +982,14 @@ class VaultWriteQueue:
         job_id: str | None = None,
         now: float | None = None,
     ) -> VaultWriteJob | None:
-        requested = (
-            None if job_id is None else _required_text(job_id, field_name="job_id")
-        )
+        requested = None if job_id is None else _required_text(job_id, field_name="job_id")
         duration = _lease_duration(lease_seconds)
         current = time.time() if now is None else _finite_time(now, field_name="now")
         with self._lock:
             connection = self._connect()
             try:
                 connection.execute("BEGIN IMMEDIATE")
-                self._assert_fence_connection(
-                    connection, lease, job_id=None, now=current
-                )
+                self._assert_fence_connection(connection, lease, job_id=None, now=current)
                 running = connection.execute(
                     "SELECT * FROM vault_write_jobs "
                     "WHERE vault_scope = ? AND status = 'running' "
@@ -992,8 +1038,7 @@ class VaultWriteQueue:
                     ),
                 )
                 claimed = connection.execute(
-                    "SELECT * FROM vault_write_jobs "
-                    "WHERE vault_scope = ? AND job_id = ?",
+                    "SELECT * FROM vault_write_jobs " "WHERE vault_scope = ? AND job_id = ?",
                     (self.vault_scope, identity),
                 ).fetchone()
                 connection.commit()
@@ -1020,9 +1065,7 @@ class VaultWriteQueue:
             connection = self._connect()
             try:
                 connection.execute("BEGIN IMMEDIATE")
-                self._assert_fence_connection(
-                    connection, lease, job_id=identity, now=current
-                )
+                self._assert_fence_connection(connection, lease, job_id=identity, now=current)
                 until = current + duration
                 connection.execute(
                     "UPDATE vault_writer_lease SET lease_until = ? "
@@ -1031,13 +1074,11 @@ class VaultWriteQueue:
                     (until, self.vault_scope, lease.owner, lease.generation),
                 )
                 connection.execute(
-                    "UPDATE vault_write_jobs SET lease_until = ? "
-                    "WHERE vault_scope = ? AND job_id = ?",
+                    "UPDATE vault_write_jobs SET lease_until = ? " "WHERE vault_scope = ? AND job_id = ?",
                     (until, self.vault_scope, identity),
                 )
                 row = connection.execute(
-                    "SELECT * FROM vault_write_jobs "
-                    "WHERE vault_scope = ? AND job_id = ?",
+                    "SELECT * FROM vault_write_jobs " "WHERE vault_scope = ? AND job_id = ?",
                     (self.vault_scope, identity),
                 ).fetchone()
                 connection.commit()
@@ -1069,14 +1110,11 @@ class VaultWriteQueue:
             try:
                 connection.execute("BEGIN IMMEDIATE")
                 existing = connection.execute(
-                    "SELECT * FROM vault_write_jobs "
-                    "WHERE vault_scope = ? AND job_id = ?",
+                    "SELECT * FROM vault_write_jobs " "WHERE vault_scope = ? AND job_id = ?",
                     (self.vault_scope, identity),
                 ).fetchone()
                 if existing is None:
-                    raise FileNotFoundError(
-                        f"Vault write job does not exist: {identity}"
-                    )
+                    raise FileNotFoundError(f"Vault write job does not exist: {identity}")
                 current_job = self._job(existing)
                 if current_job.terminal:
                     if (
@@ -1087,9 +1125,7 @@ class VaultWriteQueue:
                         raise ValueError("Vault write terminal result collision")
                     connection.commit()
                     return current_job
-                self._assert_fence_connection(
-                    connection, lease, job_id=identity, now=completed
-                )
+                self._assert_fence_connection(connection, lease, job_id=identity, now=completed)
                 connection.execute(
                     """
                     UPDATE vault_write_jobs
@@ -1108,8 +1144,7 @@ class VaultWriteQueue:
                     ),
                 )
                 row = connection.execute(
-                    "SELECT * FROM vault_write_jobs "
-                    "WHERE vault_scope = ? AND job_id = ?",
+                    "SELECT * FROM vault_write_jobs " "WHERE vault_scope = ? AND job_id = ?",
                     (self.vault_scope, identity),
                 ).fetchone()
                 connection.commit()
@@ -1192,8 +1227,10 @@ class VaultWriteQueue:
                 raise ValueError("timeout must be non-negative")
         else:
             limit = None
-        interval = self.poll_interval_seconds if poll_interval is None else _finite_time(
-            poll_interval, field_name="poll_interval"
+        interval = (
+            self.poll_interval_seconds
+            if poll_interval is None
+            else _finite_time(poll_interval, field_name="poll_interval")
         )
         if interval <= 0:
             raise ValueError("poll_interval must be positive")

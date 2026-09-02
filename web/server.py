@@ -1038,9 +1038,15 @@ def _research_task_result(
         ),
         "output_status": research_result.output_status.value,
         "stop_reason": research_result.stop_reason,
+        "tool_alerts": [asdict(item) for item in research_result.tool_alerts],
         "report_md": workflow_result.report_markdown,
         "evidence": [asdict(item) for item in research_result.evidence],
         "manifest": asdict(workflow_result.memory_manifest),
+        "research_architecture": workflow_result.research_architecture,
+        "challenges": list(workflow_result.challenges),
+        "citation_issues": list(workflow_result.citation_issues),
+        "supplemental_wave_count": workflow_result.supplemental_wave_count,
+        "finalization_token_reserve": workflow_result.finalization_token_reserve,
     }
 
 

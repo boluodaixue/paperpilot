@@ -31,6 +31,7 @@ from ..tools import (
     CalculatorTool,
     CodeSandboxTool,
     FileReaderTool,
+    EvidenceAcquisitionTool,
     MockBrowserTool,
     MockWebSearchTool,
     NotepadTool,
@@ -66,6 +67,8 @@ from .memory_workflows import (
     resume_memory_workflow,
 )
 from .retrieval import configure_persistent_retrieval
+from .research_blackboard import ResearchBlackboard
+from .research_control import HomogeneousForkConfig
 from .models import (
     AgentLimits,
     ExecutionIdentity,
@@ -83,6 +86,14 @@ from .workflow import (
     resume_research_workflow,
 )
 from .vault import LEGACY_MEMORY_ID, scan_legacy_memory_markdown
+from .v2_contracts import (
+    CoreQuestion,
+    ResearchArchitecture,
+    ResearchArchitectureSettings,
+    ResearchPlan,
+    SupervisorV2Config,
+)
+from ..tools.content_extraction import content_extraction_config_from_config
 
 from .vault_write_queue import VaultWriteQueue
 from .vault_write_service import VaultWriteService
@@ -129,8 +140,12 @@ __all__ = [
     "build_research_runtime",
     "build_research_tools",
     "limits_from_config",
+    "homogeneous_fork_config_from_config",
     "load_config",
     "open_research_runtime",
+    "research_architecture_settings_from_config",
+    "shared_comparison_plan_from_config",
+    "structured_report_enabled_from_config",
     "setup_logging",
     "vault_root_from_config",
 ]
@@ -177,24 +192,78 @@ def build_research_tools(config: dict[str, Any]) -> list[Any]:
     tools_config = config.get("tools", {})
     mock_mode = bool(tools_config.get("web_search", {}).get("mock_mode", False))
     enabled = tools_config.get("enabled")
+    extraction_config = content_extraction_config_from_config(config)
 
+    search_tool = MockWebSearchTool() if mock_mode else WebSearchTool()
+    browser_tool = (
+        MockBrowserTool()
+        if mock_mode
+        else BrowserTool(extraction_config=extraction_config)
+    )
+    acquisition_raw = tools_config.get("evidence_acquisition", {})
+    if not isinstance(acquisition_raw, Mapping):
+        raise ValueError("tools.evidence_acquisition must be a mapping")
+    acquisition_allowed = {
+        "default_candidates",
+        "default_sources",
+        "max_sources",
+        "max_chars_per_source",
+    }
+    acquisition_unknown = sorted(
+        str(key) for key in acquisition_raw if key not in acquisition_allowed
+    )
+    if acquisition_unknown:
+        raise ValueError(
+            "unknown tools.evidence_acquisition settings: "
+            + ", ".join(acquisition_unknown)
+        )
+    acquisition_tool = EvidenceAcquisitionTool(
+        search_tool,
+        browser_tool,
+        **{
+            key: acquisition_raw[key]
+            for key in acquisition_allowed
+            if key in acquisition_raw
+        },
+    )
     available: dict[str, Any] = {
-        "web_search": MockWebSearchTool() if mock_mode else WebSearchTool(),
-        "browser": MockBrowserTool() if mock_mode else BrowserTool(),
+        "web_search": search_tool,
+        "browser": browser_tool,
+        "acquire_evidence": acquisition_tool,
         "arxiv_reader": ArxivReaderTool(use_mock=mock_mode),
         "file_reader": FileReaderTool(),
         "code_sandbox": CodeSandboxTool(use_mock=mock_mode),
         "calculator": CalculatorTool(),
         "notepad": NotepadTool(),
     }
-    if enabled is None:
-        return list(available.values())
+    base_names = tuple(name for name in available if name != "acquire_evidence")
+    selected_names = list(base_names if enabled is None else enabled)
     if not isinstance(enabled, list):
-        raise ValueError("tools.enabled must be a list of tool names")
-    unknown = [name for name in enabled if name not in available]
+        if enabled is not None:
+            raise ValueError("tools.enabled must be a list of tool names")
+    unknown = [name for name in selected_names if name not in available]
     if unknown:
         raise ValueError(f"unknown research tools: {', '.join(unknown)}")
-    return [available[name] for name in enabled]
+    research = config.get("research", {})
+    supervisor = research.get("supervisor_v2", {}) if isinstance(research, Mapping) else {}
+    use_v2_acquisition = (
+        isinstance(research, Mapping)
+        and research.get("architecture") == ResearchArchitecture.SUPERVISOR_V2.value
+        and isinstance(supervisor, Mapping)
+        and bool(supervisor.get("enabled", False))
+        and "web_search" in selected_names
+        and "browser" in selected_names
+    )
+    if use_v2_acquisition:
+        first_low_level = min(
+            selected_names.index("web_search"),
+            selected_names.index("browser"),
+        )
+        selected_names = [
+            name for name in selected_names if name not in {"web_search", "browser"}
+        ]
+        selected_names.insert(first_low_level, "acquire_evidence")
+    return [available[name] for name in selected_names]
 
 
 def _research_config(config: dict[str, Any]) -> Mapping[str, Any]:
@@ -202,6 +271,141 @@ def _research_config(config: dict[str, Any]) -> Mapping[str, Any]:
     if not isinstance(research, Mapping):
         raise ValueError("research configuration must be a mapping")
     return research
+
+
+def research_architecture_settings_from_config(
+    config: dict[str, Any],
+) -> ResearchArchitectureSettings:
+    """Strictly parse the V1/V2 rollout switch and bounded V2 settings."""
+    research = _research_config(config)
+    architecture_value = research.get("architecture", ResearchArchitecture.LEGACY.value)
+    if not isinstance(architecture_value, str):
+        raise ValueError(
+            "research.architecture must be 'legacy' or 'supervisor_v2'"
+        )
+    try:
+        architecture = ResearchArchitecture(architecture_value)
+    except ValueError as exc:
+        raise ValueError(
+            "research.architecture must be 'legacy' or 'supervisor_v2'"
+        ) from exc
+
+    raw_supervisor = research.get("supervisor_v2", {})
+    if not isinstance(raw_supervisor, Mapping):
+        raise ValueError("research.supervisor_v2 must be a mapping")
+    allowed = SupervisorV2Config.__dataclass_fields__.keys()
+    unknown = sorted(str(key) for key in raw_supervisor if key not in allowed)
+    if unknown:
+        raise ValueError(
+            "unknown research.supervisor_v2 settings: " + ", ".join(unknown)
+        )
+    supervisor = SupervisorV2Config(
+        **{key: raw_supervisor[key] for key in allowed if key in raw_supervisor}
+    )
+    supervisor.validate()
+    return ResearchArchitectureSettings(
+        architecture=architecture,
+        supervisor_v2=supervisor,
+    )
+
+
+def shared_comparison_plan_from_config(
+    config: dict[str, Any],
+) -> ResearchPlan | None:
+    """Parse an opt-in fixed plan used only for architecture comparisons."""
+
+    research = _research_config(config)
+    raw = research.get("shared_comparison", {})
+    if raw in ({}, None):
+        return None
+    if not isinstance(raw, Mapping):
+        raise ValueError("research.shared_comparison must be a mapping")
+    allowed = {"enabled", "fixed_plan"}
+    unknown = sorted(str(key) for key in raw if key not in allowed)
+    if unknown:
+        raise ValueError(
+            "unknown research.shared_comparison settings: " + ", ".join(unknown)
+        )
+    enabled = raw.get("enabled", False)
+    if not isinstance(enabled, bool):
+        raise ValueError("research.shared_comparison.enabled must be a boolean")
+    if not enabled:
+        return None
+    fixed = raw.get("fixed_plan")
+    if not isinstance(fixed, Mapping):
+        raise ValueError(
+            "research.shared_comparison.fixed_plan must be a mapping when enabled"
+        )
+    allowed_plan = {
+        "brief_revision",
+        "core_questions",
+        "report_outline",
+        "source_guidance",
+        "work_hints",
+    }
+    unknown_plan = sorted(str(key) for key in fixed if key not in allowed_plan)
+    if unknown_plan:
+        raise ValueError(
+            "unknown fixed comparison plan settings: " + ", ".join(unknown_plan)
+        )
+    raw_questions = fixed.get("core_questions")
+    if not isinstance(raw_questions, list) or not raw_questions:
+        raise ValueError("fixed comparison plan requires core_questions")
+    questions: list[CoreQuestion] = []
+    allowed_question = {
+        "description", "required", "priority", "origin", "verification",
+        "requires_external_evidence",
+    }
+    for raw_question in raw_questions:
+        if not isinstance(raw_question, Mapping):
+            raise ValueError("fixed comparison core question must be a mapping")
+        unknown_question = sorted(
+            str(key) for key in raw_question if key not in allowed_question
+        )
+        if unknown_question:
+            raise ValueError(
+                "unknown fixed core question settings: "
+                + ", ".join(unknown_question)
+            )
+        questions.append(CoreQuestion.create(
+            str(raw_question.get("description") or ""),
+            required=raw_question.get("required", True),
+            priority=str(raw_question.get("priority") or "high"),
+            origin=str(raw_question.get("origin") or "fixed_comparison"),
+            verification=str(
+                raw_question.get("verification") or "source-locatable evidence"
+            ),
+            requires_external_evidence=bool(
+                raw_question.get("requires_external_evidence", True)
+            ),
+        ))
+    return ResearchPlan.create(
+        int(fixed.get("brief_revision", 0)),
+        tuple(questions),
+        report_outline=tuple(fixed.get("report_outline", ()) or ()),
+        source_guidance=tuple(fixed.get("source_guidance", ()) or ()),
+        work_hints=tuple(fixed.get("work_hints", ()) or ()),
+    )
+
+
+def homogeneous_fork_config_from_config(
+    config: dict[str, Any],
+) -> HomogeneousForkConfig:
+    research = _research_config(config)
+    raw = research.get("homogeneous_fork", {})
+    if not isinstance(raw, Mapping):
+        raise ValueError("research.homogeneous_fork must be a mapping")
+    allowed = HomogeneousForkConfig.__dataclass_fields__.keys()
+    unknown = sorted(str(key) for key in raw if key not in allowed)
+    if unknown:
+        raise ValueError(
+            "unknown research.homogeneous_fork settings: " + ", ".join(unknown)
+        )
+    settings = HomogeneousForkConfig(
+        **{key: raw[key] for key in allowed if key in raw}
+    )
+    settings.validate()
+    return settings
 
 
 def limits_from_config(config: dict[str, Any]) -> AgentLimits:
@@ -265,6 +469,19 @@ def _report_review_enabled(config: dict[str, Any]) -> bool:
     value = report_review.get("enabled", False)
     if not isinstance(value, bool):
         raise ValueError("research.report_review.enabled must be a boolean")
+    return value
+
+
+def structured_report_enabled_from_config(config: dict[str, Any]) -> bool:
+    """Return whether Legacy research should use the structured report path."""
+
+    research = _research_config(config)
+    structured = research.get("structured_report", {})
+    if not isinstance(structured, Mapping):
+        raise ValueError("research.structured_report must be a mapping")
+    value = structured.get("enabled", False)
+    if not isinstance(value, bool):
+        raise ValueError("research.structured_report.enabled must be a boolean")
     return value
 
 
@@ -335,6 +552,15 @@ def _vault_scope(root: Path) -> str:
     return f"vault-{digest}"
 
 
+def _research_blackboard_path(
+    write_db_path: str | os.PathLike[str],
+) -> Path:
+    """Keep concurrent blackboard writes outside the LangGraph checkpoint DB."""
+
+    path = Path(write_db_path)
+    return path.with_name(path.stem + ".blackboard.sqlite")
+
+
 def _build_vault_write_service(
     *,
     config: dict[str, Any],
@@ -388,9 +614,15 @@ class ResearchRuntime:
         checkpointer: BaseCheckpointSaver,
         limits: AgentLimits,
         report_review_enabled: bool = False,
+        research_architecture: ResearchArchitecture = ResearchArchitecture.LEGACY,
+        supervisor_v2_config: SupervisorV2Config | None = None,
         vault_write_service: VaultWriteService | None = None,
         write_db_path: str | os.PathLike[str] | None = None,
         write_queue: VaultWriteQueue | None = None,
+        research_blackboard: ResearchBlackboard | None = None,
+        shared_comparison_plan: ResearchPlan | None = None,
+        structured_report_enabled: bool = False,
+        homogeneous_fork_config: HomogeneousForkConfig | None = None,
     ) -> None:
         self.config = config
         self.policy = policy
@@ -399,6 +631,8 @@ class ResearchRuntime:
         self.checkpointer = checkpointer
         self.limits = limits
         self.report_review_enabled = report_review_enabled
+        self.research_architecture = research_architecture
+        self.supervisor_v2_config = supervisor_v2_config or SupervisorV2Config()
         (
             retrieval_db,
             reconciliation_seconds,
@@ -422,6 +656,19 @@ class ResearchRuntime:
         )
         if self.vault_write_service.memory_store is not memory_store:
             raise ValueError("Vault write service must share the Runtime Memory Store")
+        self.research_blackboard = research_blackboard or (
+            ResearchBlackboard(
+                _research_blackboard_path(write_db_path)
+            )
+            if write_db_path is not None else None
+        )
+        self.shared_comparison_plan = shared_comparison_plan
+        self.structured_report_enabled = bool(
+            structured_report_enabled or shared_comparison_plan is not None
+        )
+        self.homogeneous_fork_config = (
+            homogeneous_fork_config or HomogeneousForkConfig()
+        )
         self.proposal_ttl_seconds = _runtime_setting(
             config, "proposal_ttl_seconds", 86400
         )
@@ -438,7 +685,13 @@ class ResearchRuntime:
             memory_store,
             checkpointer=checkpointer,
             report_review_enabled=report_review_enabled,
+            research_architecture=research_architecture,
+            supervisor_v2_config=self.supervisor_v2_config,
             vault_write_service=self.vault_write_service,
+            research_blackboard=self.research_blackboard,
+            shared_comparison_plan=self.shared_comparison_plan,
+            structured_report_enabled=self.structured_report_enabled,
+            homogeneous_fork_config=self.homogeneous_fork_config,
         )
         self.memory_note_graph = build_memory_note_workflow(
             memory_store,
@@ -1200,13 +1453,41 @@ def build_research_runtime(
     write_db_path: str | os.PathLike[str] | None = None,
     write_queue: VaultWriteQueue | None = None,
     vault_write_service: VaultWriteService | None = None,
+    research_blackboard: ResearchBlackboard | None = None,
+    shared_comparison_plan: ResearchPlan | None = None,
+    structured_report_enabled: bool | None = None,
+    homogeneous_fork_config: HomogeneousForkConfig | None = None,
 ) -> ResearchRuntime:
     """Construct the single production Research Workflow dependency graph."""
     effective_config = config if config is not None else load_config(config_path)
+    architecture_settings = research_architecture_settings_from_config(effective_config)
+    if (
+        architecture_settings.architecture is ResearchArchitecture.SUPERVISOR_V2
+        and not architecture_settings.supervisor_v2.enabled
+    ):
+        raise ValueError(
+            "research.architecture=supervisor_v2 requires "
+            "research.supervisor_v2.enabled=true"
+        )
     effective_store = (
         memory_store
         if memory_store is not None
         else MarkdownMemoryStore(vault_root_from_config(effective_config))
+    )
+    effective_shared_plan = (
+        shared_comparison_plan
+        if shared_comparison_plan is not None
+        else shared_comparison_plan_from_config(effective_config)
+    )
+    effective_fork_config = (
+        homogeneous_fork_config
+        if homogeneous_fork_config is not None
+        else homogeneous_fork_config_from_config(effective_config)
+    )
+    effective_structured_report = (
+        structured_report_enabled
+        if structured_report_enabled is not None
+        else structured_report_enabled_from_config(effective_config)
     )
     return ResearchRuntime(
         config=effective_config,
@@ -1216,9 +1497,15 @@ def build_research_runtime(
         checkpointer=checkpointer if checkpointer is not None else InMemorySaver(),
         limits=limits_from_config(effective_config),
         report_review_enabled=_report_review_enabled(effective_config),
+        research_architecture=architecture_settings.architecture,
+        supervisor_v2_config=architecture_settings.supervisor_v2,
         vault_write_service=vault_write_service,
         write_db_path=write_db_path,
         write_queue=write_queue,
+        research_blackboard=research_blackboard,
+        shared_comparison_plan=effective_shared_plan,
+        structured_report_enabled=effective_structured_report,
+        homogeneous_fork_config=effective_fork_config,
     )
 
 

@@ -16,17 +16,30 @@
   - 自动截断超长页面（保留前 N 个段落，防止 token 爆炸）
   - 支持重试和错误降级
 """
+
 from __future__ import annotations
 
 import asyncio
+import io
 import re
 from abc import ABC, abstractmethod
+from dataclasses import dataclass
 from typing import Any
+from urllib.parse import urlparse
 
 import aiohttp
 
+from .http_client import trusted_connector
+from .content_extraction import (
+    ContentExtractionConfig,
+    UnsupportedScannedPdfError,
+    extract_html_document,
+    extract_markdown_document,
+    extract_pdf_document,
+    validate_content_extraction_dependencies,
+)
 
-__all__ = ["BrowserTool", "MockBrowserTool"]
+__all__ = ["BrowserTool", "MockBrowserTool", "FetchedContent"]
 
 # 默认保留的正文字数上限（防止超长网页占满上下文）
 _DEFAULT_MAX_CHARS = 8000
@@ -37,10 +50,21 @@ _CONTENT_TAGS = ["article", "main", "section", "div"]
 _NOISE_TAGS = ["script", "style", "nav", "header", "footer", "aside", "noscript", "iframe", "svg"]
 
 
+@dataclass(frozen=True)
+class FetchedContent:
+    """Bounded response body and the provenance needed by extractors."""
+
+    final_url: str
+    content_type: str
+    payload: bytes
+    charset: str = "utf-8"
+
+
 class BaseBrowserTool(ABC):
     """浏览器工具基类。"""
 
     name: str = "browser"
+    accepts_relevance_query: bool = True
     description: str = (
         "Open a URL and extract the main article text. "
         "Use this after web_search when you need to read the full content of a webpage. "
@@ -49,7 +73,12 @@ class BaseBrowserTool(ABC):
     )
 
     @abstractmethod
-    async def execute(self, url: str, max_chars: int = _DEFAULT_MAX_CHARS) -> str:
+    async def execute(
+        self,
+        url: str,
+        max_chars: int = _DEFAULT_MAX_CHARS,
+        query: str = "",
+    ) -> Any:
         """打开 URL，提取正文。
 
         Args:
@@ -80,6 +109,10 @@ class BaseBrowserTool(ABC):
                             "description": "Maximum characters to return (default: 8000)",
                             "default": 8000,
                         },
+                        "query": {
+                            "type": "string",
+                            "description": "Current research question used to rank relevant sections",
+                        },
                     },
                     "required": ["url"],
                 },
@@ -96,7 +129,12 @@ class BrowserTool(BaseBrowserTool):
       - BROWSER_USER_AGENT: 自定义 User-Agent
     """
 
-    def __init__(self, timeout: int | None = None, user_agent: str | None = None) -> None:
+    def __init__(
+        self,
+        timeout: int | None = None,
+        user_agent: str | None = None,
+        extraction_config: ContentExtractionConfig | None = None,
+    ) -> None:
         from ..utils.env_config import get_env, get_env_int
 
         self.timeout = timeout or get_env_int("BROWSER_TIMEOUT", 15)
@@ -105,10 +143,24 @@ class BrowserTool(BaseBrowserTool):
             "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
             "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
         )
+        self.extraction_config = extraction_config or ContentExtractionConfig()
+        validate_content_extraction_dependencies(self.extraction_config)
+        self.tavily_extract_key = get_env("TAVILY_API_KEY")
+        self.tavily_extract_endpoint = str(
+            get_env("TAVILY_EXTRACT_ENDPOINT", "https://api.tavily.com/extract") or "https://api.tavily.com/extract"
+        )
 
-    async def execute(self, url: str, max_chars: int = _DEFAULT_MAX_CHARS) -> str:
+    async def execute(
+        self,
+        url: str,
+        max_chars: int = _DEFAULT_MAX_CHARS,
+        query: str = "",
+    ) -> Any:
         if not url.startswith(("http://", "https://")):
             return f"[Browser Error] Invalid URL: {url}. URL must start with http:// or https://"
+
+        if self.extraction_config.mode == "structured":
+            return await self._execute_structured(url, query=query)
 
         try:
             html = await self._fetch(url)
@@ -120,22 +172,257 @@ class BrowserTool(BaseBrowserTool):
 
             return text if text else "[Browser Warning] No meaningful content extracted from the page."
 
+        except aiohttp.ClientResponseError as e:
+            if e.status == 403:
+                alternative = await self._fetch_safe_alternative(url, max_chars)
+                if alternative is not None:
+                    alternative_url, alternative_text = alternative
+                    return (
+                        f"[ALTERNATIVE_SOURCE: {alternative_url}]\n"
+                        f"[ORIGINAL_SOURCE_BLOCKED: {url}]\n\n"
+                        f"{alternative_text}"
+                    )
+            return f"[Browser Error] Network error: {type(e).__name__}: {e}"
         except aiohttp.ClientError as e:
             return f"[Browser Error] Network error: {type(e).__name__}: {e}"
         except Exception as e:
             return f"[Browser Error] Unexpected: {type(e).__name__}: {e}"
+
+    async def _execute_structured(self, url: str, *, query: str) -> dict[str, Any]:
+        try:
+            fetched = await self._fetch_payload(url)
+            return await self._extract_structured_payload(
+                fetched,
+                original_url=url,
+                query=query,
+            )
+        except UnsupportedScannedPdfError as exc:
+            return {
+                "status": "unsupported",
+                "error": str(exc),
+                "url": url,
+                "warnings": ["OCR is disabled; scanned PDFs are out of scope."],
+            }
+        except aiohttp.ClientResponseError as exc:
+            if exc.status == 403:
+                for alternative_url in self._alternative_urls(url):
+                    try:
+                        fetched = await self._fetch_payload(alternative_url)
+                        result = await self._extract_structured_payload(
+                            fetched,
+                            original_url=url,
+                            query=query,
+                        )
+                        result.setdefault("warnings", []).append(
+                            "Official alternative source used because the requested page was blocked."
+                        )
+                        return result
+                    except (aiohttp.ClientError, ValueError):
+                        continue
+            return {
+                "status": "error",
+                "error": f"Network error: {type(exc).__name__}: {exc}",
+                "url": url,
+            }
+        except aiohttp.ClientError as exc:
+            return {
+                "status": "error",
+                "error": f"Network error: {type(exc).__name__}: {exc}",
+                "url": url,
+            }
+        except Exception as exc:
+            return {
+                "status": "error",
+                "error": f"Extraction error: {type(exc).__name__}: {exc}",
+                "url": url,
+            }
+
+    async def _extract_structured_payload(
+        self,
+        fetched: FetchedContent,
+        *,
+        original_url: str,
+        query: str,
+    ) -> dict[str, Any]:
+        provenance_url = original_url if fetched.final_url != original_url else ""
+        if fetched.content_type.split(";", 1)[0].strip().lower() == "application/pdf" or urlparse(
+            fetched.final_url
+        ).path.lower().endswith(".pdf"):
+            document = extract_pdf_document(
+                fetched.payload,
+                url=fetched.final_url,
+                original_url=provenance_url,
+                query=query,
+                max_blocks=self.extraction_config.max_blocks,
+                max_output_chars=self.extraction_config.max_output_chars,
+                docling_enabled=self.extraction_config.docling_enabled,
+            )
+            return document.to_dict()
+        charset = fetched.charset or "utf-8"
+        html = fetched.payload.decode(charset, errors="replace")
+        document = None
+        local_error: ValueError | None = None
+        try:
+            document = extract_html_document(
+                html,
+                url=fetched.final_url,
+                original_url=provenance_url,
+                query=query,
+                max_blocks=self.extraction_config.max_blocks,
+                max_output_chars=self.extraction_config.max_output_chars,
+            )
+        except ValueError as exc:
+            local_error = exc
+        if self.extraction_config.tavily_extract_fallback and (
+            document is None or document.quality_score < 0.45
+        ):
+            fallback = await self._tavily_extract(fetched.final_url)
+            if fallback is not None:
+                fallback_title, fallback_markdown = fallback
+                fallback_document = extract_markdown_document(
+                    fallback_markdown,
+                    url=fetched.final_url,
+                    original_url=provenance_url,
+                    title=(
+                        fallback_title
+                        or (document.title if document is not None else fetched.final_url)
+                    ),
+                    query=query,
+                    extractor="tavily-extract",
+                    max_blocks=self.extraction_config.max_blocks,
+                    max_output_chars=self.extraction_config.max_output_chars,
+                    warnings=(
+                        "Local HTML extraction failed or had low quality; Tavily Extract fallback used.",
+                    ),
+                )
+                if (
+                    document is None
+                    or fallback_document.quality_score >= document.quality_score
+                ):
+                    document = fallback_document
+        if document is None:
+            raise local_error or ValueError("no meaningful source blocks extracted")
+        return document.to_dict()
+
+    async def _fetch_payload(self, url: str) -> FetchedContent:
+        """Fetch a response under a hard byte bound for structured extraction."""
+
+        async with aiohttp.ClientSession(
+            timeout=aiohttp.ClientTimeout(total=self.timeout),
+            headers={"User-Agent": self.user_agent},
+            connector=trusted_connector(),
+        ) as session:
+            async with session.get(url, allow_redirects=True) as resp:
+                resp.raise_for_status()
+                chunks: list[bytes] = []
+                total = 0
+                async for chunk in resp.content.iter_chunked(64 * 1024):
+                    total += len(chunk)
+                    if total > self.extraction_config.max_download_bytes:
+                        raise ValueError("response exceeds content_extraction.max_download_bytes")
+                    chunks.append(chunk)
+                return FetchedContent(
+                    final_url=str(resp.url),
+                    content_type=str(resp.headers.get("Content-Type") or resp.content_type or ""),
+                    payload=b"".join(chunks),
+                    charset=resp.charset or "utf-8",
+                )
+
+    async def _tavily_extract(self, url: str) -> tuple[str, str] | None:
+        """Use Tavily Extract once, only after poor local HTML extraction."""
+
+        if not self.tavily_extract_key:
+            return None
+        headers = {
+            "Authorization": f"Bearer {self.tavily_extract_key}",
+            "Content-Type": "application/json",
+        }
+        payload = {
+            "urls": [url],
+            "format": "markdown",
+            "include_images": False,
+        }
+        async with aiohttp.ClientSession(
+            timeout=aiohttp.ClientTimeout(total=self.timeout),
+            connector=trusted_connector(),
+        ) as session:
+            async with session.post(
+                self.tavily_extract_endpoint,
+                headers=headers,
+                json=payload,
+            ) as resp:
+                resp.raise_for_status()
+                data = await resp.json()
+        results = data.get("results", []) if isinstance(data, dict) else []
+        if not isinstance(results, list) or not results or not isinstance(results[0], dict):
+            return None
+        first = results[0]
+        content = first.get("raw_content") or first.get("content")
+        if not isinstance(content, str) or not content.strip():
+            return None
+        return str(first.get("title") or ""), content.strip()
 
     async def _fetch(self, url: str) -> str:
         """异步获取网页 HTML。"""
         async with aiohttp.ClientSession(
             timeout=aiohttp.ClientTimeout(total=self.timeout),
             headers={"User-Agent": self.user_agent},
+            connector=trusted_connector(),
         ) as session:
             async with session.get(url, allow_redirects=True) as resp:
                 resp.raise_for_status()
+                if resp.content_type == "application/pdf" or urlparse(str(resp.url)).path.lower().endswith(".pdf"):
+                    return self._extract_pdf_text(await resp.read())
                 # 尝试自动检测编码
                 charset = resp.charset or "utf-8"
                 return await resp.text(encoding=charset)
+
+    async def _fetch_safe_alternative(
+        self,
+        url: str,
+        max_chars: int,
+    ) -> tuple[str, str] | None:
+        for alternative_url in self._alternative_urls(url):
+            try:
+                content = await self._fetch(alternative_url)
+                text = self._clean_text(self._extract_text(content))
+                if not text:
+                    continue
+                if len(text) > max_chars:
+                    text = text[:max_chars] + (
+                        f"\n\n[CONTENT_TRUNCATED: {len(text)} chars total, " f"showing first {max_chars}]"
+                    )
+                return alternative_url, text
+            except (aiohttp.ClientError, ValueError):
+                continue
+        return None
+
+    @staticmethod
+    def _alternative_urls(url: str) -> tuple[str, ...]:
+        parsed = urlparse(url)
+        host = (parsed.hostname or "").lower()
+        path = parsed.path.rstrip("/")
+        if host in {"openai.com", "www.openai.com"}:
+            if path.lower() == "/index/hello-gpt-4o":
+                return ("https://cdn.openai.com/gpt-4o-system-card.pdf",)
+            match = re.fullmatch(r"/(?:index/)?([^/]*system-card[^/]*)", path, re.I)
+            if match:
+                return (f"https://cdn.openai.com/{match.group(1)}.pdf",)
+        if host in {"arxiv.org", "www.arxiv.org"}:
+            match = re.fullmatch(r"/abs/(.+)", path, re.I)
+            if match:
+                return (f"https://arxiv.org/pdf/{match.group(1)}.pdf",)
+        return ()
+
+    @staticmethod
+    def _extract_pdf_text(payload: bytes) -> str:
+        try:
+            from pypdf import PdfReader
+
+            reader = PdfReader(io.BytesIO(payload))
+            return "\n\n".join((page.extract_text() or "") for page in reader.pages)
+        except Exception as exc:
+            raise ValueError(f"unable to extract PDF text: {exc}") from exc
 
     def _extract_text(self, html: str) -> str:
         """从 HTML 中提取正文。"""
@@ -244,7 +531,12 @@ Google Quantum AI 团队实现了 surface code 纠错的关键里程碑，
         """.strip(),
     }
 
-    async def execute(self, url: str, max_chars: int = _DEFAULT_MAX_CHARS) -> str:
+    async def execute(
+        self,
+        url: str,
+        max_chars: int = _DEFAULT_MAX_CHARS,
+        query: str = "",
+    ) -> str:
         await asyncio.sleep(0.1)  # 模拟网络延迟
 
         # 精确匹配

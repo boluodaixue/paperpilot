@@ -26,6 +26,7 @@ from src.research import (
     create_research_agent_state,
     run_research_agent,
 )
+from src.research.research_blackboard import ResearchBlackboard
 from tests._research_assessment import assessment_response
 
 
@@ -308,6 +309,55 @@ async def test_default_depth_runs_root_child_grandchild_and_records_lineage() ->
 
 
 @pytest.mark.asyncio
+async def test_child_forks_two_distinct_grandchild_scopes_for_same_requirement(tmp_path) -> None:
+    tracker = _HierarchyTracker()
+    policy = _HierarchyPolicy(
+        tracker,
+        forks={
+            "root objective": ("investor protection",),
+            "investor protection": (
+                "default and acceleration clauses",
+                "investor remedies",
+            ),
+        },
+    )
+    identity = _root_identity("root-assignment-tree")
+    board = ResearchBlackboard(tmp_path / "blackboard.sqlite")
+    graph = build_research_agent_graph(policy, [], coordination_board=board)
+    final = await graph.ainvoke(
+        create_research_agent_state(
+            ResearchTask(
+                "root-task",
+                "root objective",
+                context={
+                    "research_plan_id": "assignment-tree-plan",
+                    "research_requirements": [
+                        {
+                            "requirement_id": "R1",
+                            "description": "Investor protection",
+                        }
+                    ],
+                },
+                require_evidence=False,
+            ),
+            identity,
+            AgentLimits(max_fork_depth=2, max_total_threads=6),
+        ),
+        config=_config(identity.thread_id),
+    )
+
+    assert final["result"].thread_count == 4
+    snapshot = board.snapshot(identity.root_thread_id, viewer_thread_id=identity.thread_id)
+    grandchildren = [
+        item for item in snapshot["assignment_tree"] if item["depth"] == 2
+    ]
+    assert len(grandchildren) == 2
+    assert {tuple(item["requirement_ids"]) for item in grandchildren} == {("R1",)}
+    assert len({item["scope_signature"] for item in grandchildren}) == 2
+    assert len({item["parent_assignment_id"] for item in grandchildren}) == 1
+
+
+@pytest.mark.asyncio
 async def test_total_thread_limit_stops_recursion_without_exceeding_budget() -> None:
     tracker = _HierarchyTracker()
     policy = _HierarchyPolicy(
@@ -334,7 +384,7 @@ async def test_total_thread_limit_stops_recursion_without_exceeding_budget() -> 
 
 
 @pytest.mark.asyncio
-async def test_child_cannot_fork_an_ancestor_objective() -> None:
+async def test_parent_agent_may_delegate_ancestor_wording_with_a_new_scope() -> None:
     tracker = _HierarchyTracker()
     policy = _HierarchyPolicy(
         tracker,
@@ -353,9 +403,9 @@ async def test_child_cannot_fork_an_ancestor_objective() -> None:
     )
 
     assert result.status == ResearchStatus.COMPLETED
-    assert result.thread_count == 2
-    assert tracker.policy_calls["root objective"] == 2
-    assert "duplicates an ancestor task" in tracker.fork_responses["child objective"]
+    assert result.thread_count == 3
+    assert tracker.policy_calls["root objective"] >= 3
+    assert '"accepted"' in tracker.fork_responses["child objective"]
 
 
 class _AlwaysToolPolicy:

@@ -1,4 +1,5 @@
 """Synchronous product facade for durable single-Writer Vault mutations."""
+
 from __future__ import annotations
 
 import hashlib
@@ -22,9 +23,11 @@ from .memory_write_plans import (
     build_memory_note_plan,
     build_report_review_plan,
     build_research_bundle_plan,
+    build_tool_artifact_plan,
     create_memory_request_hash,
     report_review_request_hash,
     research_bundle_request_hash,
+    tool_artifact_content,
 )
 from .models import (
     ExecutionIdentity,
@@ -38,7 +41,6 @@ from .models import (
 from .vault import LEGACY_MEMORY_ID, validate_memory_id
 from .vault_write_queue import VaultWriteJob, VaultWriteQueue, VaultWriterLease
 from .vault_writer import VaultWriter
-
 
 __all__ = ["VaultWriteService"]
 
@@ -158,9 +160,7 @@ class VaultWriteService:
     def _safe_archive_root(self) -> Path:
         root = self.legacy_archive_root
         if root is None:
-            raise ValueError(
-                "research.legacy_archive_root must be explicitly configured before legacy migration"
-            )
+            raise ValueError("research.legacy_archive_root must be explicitly configured before legacy migration")
         try:
             resolved = root.resolve(strict=True)
         except OSError as exc:
@@ -200,9 +200,7 @@ class VaultWriteService:
                     path = current / child
                     if path.is_symlink() or bool(getattr(path.lstat(), "st_file_attributes", 0) & 0x400):
                         raise ValueError("legacy archive cannot contain linked entries")
-                    inventory[path.relative_to(root).as_posix()] = hashlib.sha256(
-                        path.read_bytes()
-                    ).hexdigest()
+                    inventory[path.relative_to(root).as_posix()] = hashlib.sha256(path.read_bytes()).hexdigest()
         return dict(sorted(inventory.items()))
 
     def prepare_legacy_memory_migration(
@@ -218,9 +216,7 @@ class VaultWriteService:
         if not isinstance(files, tuple):
             raise ValueError("legacy migration proposal files are invalid")
         path_mapping = {
-            str(item["source_path"]): str(item["target_path"])
-            for item in files
-            if isinstance(item, Mapping)
+            str(item["source_path"]): str(item["target_path"]) for item in files if isinstance(item, Mapping)
         }
         dependencies = self.queue.legacy_dependencies(path_mapping)
         if self.legacy_archive_root is None:
@@ -229,18 +225,14 @@ class VaultWriteService:
                 "affected_manifests": dependencies["manifests"],
                 "archive_inventory": self._legacy_archive_inventory(),
                 "archive_target": None,
-                "blocked_reason": (
-                    "research.legacy_archive_root must be explicitly configured before confirmation"
-                ),
+                "blocked_reason": ("research.legacy_archive_root must be explicitly configured before confirmation"),
                 "dependency_hash": dependencies["dependency_hash"],
                 "path_mapping": path_mapping,
             }
             return proposal
         archive_root = self._safe_archive_root()
         archive_target = (
-            archive_root
-            / self.queue.vault_scope
-            / f"{proposal['target_memory_id']}-{proposal['proposal_id']}"
+            archive_root / self.queue.vault_scope / f"{proposal['target_memory_id']}-{proposal['proposal_id']}"
         )
         if archive_target.exists():
             raise FileExistsError(f"legacy archive target already exists: {archive_target}")
@@ -289,9 +281,7 @@ class VaultWriteService:
             "inventory": dict(sorted(inventory.items())),
             "migration_id": migration_id,
         }
-        token = hashlib.sha256(
-            json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
-        ).hexdigest()
+        token = hashlib.sha256(json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")).hexdigest()
         return {**payload, "confirmation_token": token}
 
     def delete_legacy_archive(
@@ -341,16 +331,12 @@ class VaultWriteService:
                         raise RuntimeError("Vault write job disappeared")
                     if current.terminal:
                         continue
-                    completed.extend(
-                        self.writer.recover(lease, job_ids=(job_id,))
-                    )
+                    completed.extend(self.writer.recover(lease, job_ids=(job_id,)))
                     heartbeat.verify()
         except TimeoutError:
             raise
         except Exception as exc:
-            raise RuntimeError(
-                "Vault Writer execution failed; durable command was retained"
-            ) from exc
+            raise RuntimeError("Vault Writer execution failed; durable command was retained") from exc
         return tuple(completed)
 
     def _try_drive(
@@ -362,9 +348,7 @@ class VaultWriteService:
     ) -> tuple[VaultWriteJob, ...] | None:
         if job_ids is None:
             if target_job_id is None:
-                job_ids = tuple(
-                    job.job_id for job in self.queue.list() if not job.terminal
-                )
+                job_ids = tuple(job.job_id for job in self.queue.list() if not job.terminal)
             else:
                 job_ids = self._target_prefix_snapshot(target_job_id)
         lease = self._claim_writer()
@@ -389,11 +373,7 @@ class VaultWriteService:
         """
         pending = tuple(job for job in self.queue.list() if not job.terminal)
         try:
-            target_index = next(
-                index
-                for index, job in enumerate(pending)
-                if job.job_id == target_job_id
-            )
+            target_index = next(index for index, job in enumerate(pending) if job.job_id == target_job_id)
         except StopIteration:
             target = self.queue.get(target_job_id)
             if target is None:
@@ -425,9 +405,7 @@ class VaultWriteService:
             if job.terminal:
                 return job
             if time.monotonic() >= deadline:
-                raise TimeoutError(
-                    f"Vault write did not converge before timeout: {job_id}"
-                )
+                raise TimeoutError(f"Vault write did not converge before timeout: {job_id}")
             self._try_drive(
                 target_job_id=job_id,
                 deadline=deadline,
@@ -435,9 +413,7 @@ class VaultWriteService:
             )
             remaining = deadline - time.monotonic()
             if remaining <= 0:
-                raise TimeoutError(
-                    f"Vault write did not converge before timeout: {job_id}"
-                )
+                raise TimeoutError(f"Vault write did not converge before timeout: {job_id}")
             try:
                 return self.queue.wait(
                     job_id,
@@ -455,9 +431,7 @@ class VaultWriteService:
     @staticmethod
     def _successful_result(job: VaultWriteJob) -> dict[str, object]:
         if job.status == "conflict":
-            raise MemoryWriteConflictError(
-                f"Vault write conflict: {job.error_code or 'vault_conflict'}"
-            )
+            raise MemoryWriteConflictError(f"Vault write conflict: {job.error_code or 'vault_conflict'}")
         if job.status == "failed":
             raise RuntimeError(f"Vault write failed: {job.error_code or 'writer_failure'}")
         if job.status != "succeeded" or job.result is None:
@@ -521,10 +495,7 @@ class VaultWriteService:
         try:
             job = self.queue.enqueue(**plan.enqueue_kwargs())
         except ValueError as exc:
-            if (
-                request_hash is None
-                or str(exc) != "Vault write idempotency key collision"
-            ):
+            if request_hash is None or str(exc) != "Vault write idempotency key collision":
                 raise
             job = self._existing_for_plan(plan, request_hash=request_hash)
         return self._successful_result(self._await_terminal(job.job_id))
@@ -577,9 +548,15 @@ class VaultWriteService:
         *,
         memory_id: str | None = None,
         created_at: str | None = None,
+        report_body_markdown: str | None = None,
+        report_architecture: str = "supervisor_v2",
     ) -> tuple[str, MemoryManifest]:
         if memory_id is None:
-            return self.memory_store.persist_research(brief, result, identity)
+            return self.memory_store.persist_research(
+                brief, result, identity,
+                report_body_markdown=report_body_markdown,
+                report_architecture=report_architecture,
+            )
         if memory_id == LEGACY_MEMORY_ID:
             raise ValueError("M-legacy is read-only and cannot accept research output")
         request_hash = research_bundle_request_hash(
@@ -587,6 +564,8 @@ class VaultWriteService:
             result,
             identity,
             memory_id=memory_id,
+            report_body_markdown=report_body_markdown,
+            report_architecture=report_architecture,
         )
         plan = build_research_bundle_plan(
             self.memory_store,
@@ -595,10 +574,53 @@ class VaultWriteService:
             identity,
             memory_id=memory_id,
             created_at=created_at or self.memory_store._timestamp(),
+            report_body_markdown=report_body_markdown,
+            report_architecture=report_architecture,
         )
         payload = self._submit(plan, request_hash=request_hash)
         manifest = self._manifest(payload)
         return self.memory_store.read_text(manifest.report_path), manifest
+
+    def persist_tool_artifact(
+        self,
+        artifact_id: str,
+        *,
+        tool_name: str,
+        arguments: Mapping[str, Any],
+        result: Any,
+        origin_thread_id: str,
+    ) -> dict[str, object]:
+        """Publish one full raw tool result through the fenced Vault Writer."""
+        plan = build_tool_artifact_plan(
+            artifact_id,
+            tool_name=tool_name,
+            arguments=arguments,
+            result=result,
+            origin_thread_id=origin_thread_id,
+        )
+        expected = tool_artifact_content(
+            artifact_id,
+            tool_name=tool_name,
+            arguments=arguments,
+            result=result,
+        )
+        expected_hash = hashlib.sha256(expected).hexdigest()
+        payload = self._submit(plan)
+        artifact_path = payload.get("artifact_path")
+        if (
+            payload.get("artifact_id") != artifact_id
+            or not isinstance(artifact_path, str)
+            or payload.get("content_hash") != expected_hash
+            or payload.get("size_bytes") != len(expected)
+        ):
+            raise RuntimeError("Vault Writer returned an invalid tool artifact receipt")
+        try:
+            published = self.memory_store.read_text(artifact_path).encode("utf-8")
+        except FileNotFoundError as exc:
+            raise RuntimeError("tool artifact disappeared after Writer success") from exc
+        if published != expected:
+            raise RuntimeError("tool artifact bytes failed post-write verification")
+        return dict(payload)
 
     def replace_report(
         self,
@@ -639,9 +661,7 @@ class VaultWriteService:
         )
         existing = self.queue.get_by_idempotency_key(plan.idempotency_key)
         if existing is None and actual != current:
-            raise MemoryWriteConflictError(
-                "report changed after review input was captured"
-            )
+            raise MemoryWriteConflictError("report changed after review input was captured")
         request_hash = report_review_request_hash(
             memory_id=selected_memory,
             report_path=report_path,
@@ -660,13 +680,9 @@ class VaultWriteService:
         try:
             published = self.memory_store.read_text(report_path)
         except FileNotFoundError as exc:
-            raise MemoryWriteConflictError(
-                "report review target disappeared after Writer success"
-            ) from exc
+            raise MemoryWriteConflictError("report review target disappeared after Writer success") from exc
         if published != markdown:
-            raise MemoryWriteConflictError(
-                "report changed after the report review was committed"
-            )
+            raise MemoryWriteConflictError("report changed after the report review was committed")
 
     def commit_memory_note(
         self,
@@ -754,9 +770,7 @@ class VaultWriteService:
         try:
             return self._drive_as_writer(
                 lease,
-                job_ids=tuple(
-                    job.job_id for job in self.queue.list() if not job.terminal
-                ),
+                job_ids=tuple(job.job_id for job in self.queue.list() if not job.terminal),
                 deadline=deadline,
             )
         finally:
@@ -776,9 +790,7 @@ class VaultWriteService:
         if limit <= 0:
             raise ValueError("startup timeout must be positive")
         # Later enqueues are intentionally absent from this finite selection.
-        initial_ids = tuple(
-            job.job_id for job in self.queue.list() if not job.terminal
-        )
+        initial_ids = tuple(job.job_id for job in self.queue.list() if not job.terminal)
         deadline = time.monotonic() + limit
         completed: list[VaultWriteJob] = []
         while True:
@@ -811,22 +823,21 @@ class VaultWriteService:
                     if not current.terminal:
                         unresolved.append(job_id)
                 if unresolved:
-                    raise RuntimeError(
-                        "startup Vault write jobs did not reach terminal state"
-                    )
+                    raise RuntimeError("startup Vault write jobs did not reach terminal state")
                 return tuple(completed)
             except Exception as exc:
                 if isinstance(exc, (RuntimeError, TimeoutError)):
                     raise
-                raise RuntimeError(
-                    "Vault Writer startup recovery failed; durable commands were retained"
-                ) from exc
+                raise RuntimeError("Vault Writer startup recovery failed; durable commands were retained") from exc
             finally:
                 self.queue.release_writer(lease)
 
     def drain(self) -> tuple[VaultWriteJob, ...]:
         """Drive every currently queued/recoverable job when leadership is free."""
-        return self._try_drive(
-            target_job_id=None,
-            deadline=time.monotonic() + self.wait_timeout_seconds,
-        ) or ()
+        return (
+            self._try_drive(
+                target_job_id=None,
+                deadline=time.monotonic() + self.wait_timeout_seconds,
+            )
+            or ()
+        )

@@ -1,9 +1,10 @@
-"""Pure S2 plans for the six product-level managed Vault mutations.
+"""Pure S2 plans for product-level managed Vault mutations and artifacts.
 
 Planners may read canonical bytes to capture optimistic hashes. They never
 write, rename, remove, or stage a Vault path. Command encoding has exactly one
 owner: :mod:`src.research.vault_writer`.
 """
+
 from __future__ import annotations
 
 import base64
@@ -29,6 +30,7 @@ from .rendering import (
     render_evidence_note,
     render_memory_home,
     render_report,
+    render_v2_report,
     render_source_note,
     report_note_id,
     source_note_id,
@@ -48,7 +50,6 @@ from .vault_writer import (
     canonical_command_hash,
 )
 
-
 WriteOperation = Literal[
     "create_memory",
     "research_bundle",
@@ -56,6 +57,7 @@ WriteOperation = Literal[
     "memory_note",
     "memory_import",
     "legacy_copy",
+    "tool_artifact",
 ]
 _MEMORY_DIRECTORIES = (
     "reports",
@@ -112,6 +114,8 @@ def research_bundle_request_hash(
     identity: ExecutionIdentity,
     *,
     memory_id: str,
+    report_body_markdown: str | None = None,
+    report_architecture: str = "supervisor_v2",
 ) -> str:
     """Return the timestamp-independent identity of one research publication."""
     selected = _managed_memory(memory_id)
@@ -126,6 +130,8 @@ def research_bundle_request_hash(
             "identity": identity,
             "memory_id": selected,
             "result": result,
+            "report_body_markdown": report_body_markdown,
+            "report_architecture": report_architecture,
         }
     )
 
@@ -147,6 +153,87 @@ def report_review_request_hash(
             "report_path": report_path,
             "revised_report": _sha256(revised_markdown.encode("utf-8")),
         }
+    )
+
+
+def tool_artifact_content(
+    artifact_id: str,
+    *,
+    tool_name: str,
+    arguments: Mapping[str, Any],
+    result: Any,
+) -> bytes:
+    """Encode the exact durable envelope used for one raw tool result."""
+    artifact = _required_text(artifact_id, field_name="artifact_id")
+    tool = _required_text(tool_name, field_name="tool_name")
+    if not isinstance(arguments, Mapping):
+        raise TypeError("tool artifact arguments must be a mapping")
+    return json.dumps(
+        {
+            "artifact_id": artifact,
+            "arguments": _jsonable(dict(arguments)),
+            "result": _jsonable(result),
+            "tool_name": tool,
+        },
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+
+
+def build_tool_artifact_plan(
+    artifact_id: str,
+    *,
+    tool_name: str,
+    arguments: Mapping[str, Any],
+    result: Any,
+    origin_thread_id: str,
+) -> MemoryWritePlan:
+    """Build a content-addressed raw tool-result publication command."""
+    thread = _required_text(origin_thread_id, field_name="origin_thread_id")
+    content = tool_artifact_content(
+        artifact_id,
+        tool_name=tool_name,
+        arguments=arguments,
+        result=result,
+    )
+    thread_scope = hashlib.sha256(thread.encode("utf-8")).hexdigest()[:20]
+    memory_id = f"M-artifacts-{thread_scope}"
+    artifact_path = f"Artifacts/{thread_scope}/{artifact_id}.json"
+    content_hash = _sha256(content)
+    request_hash = _value_hash(
+        {
+            "artifact_id": artifact_id,
+            "content_hash": content_hash,
+            "origin_thread_id": thread,
+        }
+    )
+    command = build_file_bundle_command(
+        operation_type="tool_artifact",
+        memory_id=memory_id,
+        anchor_path=artifact_path,
+        targets=(
+            _file(
+                artifact_path,
+                content,
+                expected_mode="reuse",
+            ),
+        ),
+        input_hashes={"request": request_hash},
+        result={
+            "artifact_id": artifact_id,
+            "artifact_path": artifact_path,
+            "content_hash": content_hash,
+            "request_hash": request_hash,
+            "size_bytes": len(content),
+        },
+    )
+    return _plan(
+        idempotency_key=f"tool-artifact:{thread_scope}:{artifact_id}",
+        operation_type="tool_artifact",
+        memory_id=memory_id,
+        origin_thread_id=thread,
+        command_blob=command,
     )
 
 
@@ -324,6 +411,8 @@ def build_research_bundle_plan(
     *,
     memory_id: str,
     created_at: str,
+    report_body_markdown: str | None = None,
+    report_architecture: str = "supervisor_v2",
 ) -> MemoryWritePlan:
     """Build a managed research command with the report as its only anchor."""
     memory_id = _managed_memory(memory_id)
@@ -333,14 +422,13 @@ def build_research_bundle_plan(
         result,
         identity,
         memory_id=memory_id,
+        report_body_markdown=report_body_markdown,
+        report_architecture=report_architecture,
     )
     created_at = _required_text(created_at, field_name="created_at")
 
     unique_evidence = list({item.evidence_id: item for item in result.evidence}.values())
-    evidence_notes = {
-        item.evidence_id: managed_note_id("Evidence", item.evidence_id)
-        for item in unique_evidence
-    }
+    evidence_notes = {item.evidence_id: managed_note_id("Evidence", item.evidence_id) for item in unique_evidence}
     source_notes: dict[str, str] = {}
     for item in unique_evidence:
         source_notes.setdefault(item.source_ref, source_note_id(item))
@@ -385,20 +473,27 @@ def build_research_bundle_plan(
         )
     report_id = report_note_id(identity.root_thread_id)
     report_path = f"{prefix}reports/{report_id}.md"
+    renderer = render_v2_report if report_body_markdown is not None else render_report
+    renderer_kwargs = dict(
+        report_note=report_id,
+        evidence_notes=evidence_notes,
+        root_thread_id=identity.root_thread_id,
+        memory_id=memory_id,
+        created_at=created_at,
+        updated_at=created_at,
+    )
+    if report_body_markdown is not None:
+        renderer_kwargs["architecture"] = report_architecture
+    report_markdown = (
+        renderer(brief, result, report_body_markdown, **renderer_kwargs)
+        if report_body_markdown is not None
+        else renderer(brief, result, **renderer_kwargs)
+    )
     targets.append(
         _snapshot_markdown(
             memory_store,
             report_path,
-            render_report(
-                brief,
-                result,
-                report_note=report_id,
-                evidence_notes=evidence_notes,
-                root_thread_id=identity.root_thread_id,
-                memory_id=memory_id,
-                created_at=created_at,
-                updated_at=created_at,
-            ),
+            report_markdown,
         )
     )
     idempotency_key = f"research-bundle:{memory_id}:{identity.root_thread_id}"
@@ -412,6 +507,8 @@ def build_research_bundle_plan(
             "identity": _value_hash(identity),
             "request": request_hash,
             "result": _value_hash(result),
+            "report_body_markdown": _value_hash(report_body_markdown),
+            "report_architecture": _value_hash(report_architecture),
         },
         result={
             "report_path": report_path,
@@ -645,9 +742,7 @@ def build_legacy_copy_plan(
             raise ValueError("legacy retirement preview fields do not match the contract")
         path_mapping = retirement.get("path_mapping")
         expected_mapping = {
-            str(item["source_path"]): str(item["target_path"])
-            for item in normalized_files
-            if isinstance(item, Mapping)
+            str(item["source_path"]): str(item["target_path"]) for item in normalized_files if isinstance(item, Mapping)
         }
         if not isinstance(path_mapping, Mapping) or dict(path_mapping) != expected_mapping:
             raise ValueError("legacy retirement path mapping differs from migration files")

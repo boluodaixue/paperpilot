@@ -144,7 +144,7 @@ def configured_local_tool_budget(config: dict[str, Any]) -> int:
 
 def configured_token_budget(config: dict[str, Any]) -> int:
     """Resolve the global token budget recorded in evaluation output."""
-    return int(config.get("research", {}).get("limits", {}).get("max_total_tokens", 120000))
+    return int(config.get("research", {}).get("limits", {}).get("max_total_tokens", 300000))
 
 
 def configured_elapsed_budget(config: dict[str, Any]) -> float:
@@ -264,7 +264,7 @@ def workflow_metrics(result: ResearchWorkflowResult) -> dict[str, Any]:
     research = result.research_result
     source_refs = {item.source_ref for item in research.evidence if item.source_ref}
     status = getattr(research.status, "value", research.status)
-    return {
+    metrics = {
         "research_brief": asdict(result.brief),
         "status": str(status),
         "research_status": str(status),
@@ -284,10 +284,190 @@ def workflow_metrics(result: ResearchWorkflowResult) -> dict[str, Any]:
         "retries_used": research.retries_used,
         "iterations": research.iterations,
         "unresolved_count": len(research.unresolved),
+        "repair_applied": research.repair_applied,
+        "repair_actions": list(research.repair_actions),
         "report_manifest": result.memory_manifest.report_path,
         "evidence_manifests": list(result.memory_manifest.evidence_paths),
         "source_manifests": list(result.memory_manifest.source_paths),
+        "shared_comparison": result.shared_comparison,
+        "structured_report": result.structured_report,
+        "root_agent_report": result.root_agent_report,
+        "shared_selected_evidence_count": result.shared_selected_evidence_count,
+        "coordination_metrics": dict(result.coordination_metrics),
     }
+    if result.research_architecture == "supervisor_v2":
+        metrics["v2"] = v2_structure_metrics(result)
+    if result.shared_comparison or (
+        result.structured_report and not result.root_agent_report
+    ):
+        metrics["shared_structure"] = v2_structure_metrics(result)
+    return metrics
+
+
+def v2_structure_metrics(result: ResearchWorkflowResult) -> dict[str, Any]:
+    """Expose deterministic V2 structure and citation gates."""
+    from evaluation.metrics.rule_based import RuleBasedMetrics
+
+    challenge_count = len(result.challenges)
+    accepted = sum(
+        item.get("status") in {"accepted", "resolved", "unresolved_disclosed"}
+        for item in result.challenges
+    )
+    resolved = sum(item.get("status") == "resolved" for item in result.challenges)
+    disclosed = sum(
+        item.get("status") == "unresolved_disclosed" for item in result.challenges
+    )
+    invalid_citations = sum(
+        item.get("category") in {"invalid", "locator"}
+        and item.get("status", "pending") not in {"repaired", "removed"}
+        for item in result.citation_issues
+    )
+    issue_spans = tuple(
+        (
+            str(item.get("claim_text") or "").strip(),
+            str(item.get("category") or ""),
+        )
+        for item in result.citation_issues
+        if str(item.get("claim_text") or "").strip()
+    )
+    citation_issue_conflicts = sum(
+        first_category != second_category
+        and {first_category, second_category} == {"invalid", "missing"}
+        and (first_text in second_text or second_text in first_text)
+        for index, (first_text, first_category) in enumerate(issue_spans)
+        for second_text, second_category in issue_spans[index + 1:]
+    )
+    raw_url_count = len(re.findall(r"https?://", result.report_markdown, re.IGNORECASE))
+    audit_log_leak_count = len(re.findall(
+        r"Citation audit removed or downgraded:",
+        result.report_markdown,
+        re.IGNORECASE,
+    ))
+    requirement_rows = tuple(result.evidence_requirement_coverage)
+    supported_requirements = sum(
+        item.get("status") == "supported" for item in requirement_rows
+    )
+    weighted_requirement_coverage = sum(
+        1.0 if item.get("status") == "supported"
+        else 0.5 if item.get("status") == "weak"
+        else 0.0
+        for item in requirement_rows
+    )
+    primary_requirements = tuple(
+        item for item in requirement_rows if item.get("primary_source_required")
+    )
+    supported_primary_requirements = sum(
+        item.get("status") == "supported" and item.get("primary_source_present")
+        for item in primary_requirements
+    )
+    audit_removed = sum(
+        item.get("status") in {"removed", "repaired"}
+        for item in result.citation_issues
+    )
+    return {
+        "core_question_assignment_rate": (
+            result.assigned_core_question_count / result.core_question_count
+            if result.core_question_count else 0.0
+        ),
+        "worker_duplicate_rate": (
+            1.0 - result.unique_worker_packet_count / result.worker_packet_count
+            if result.worker_packet_count else 0.0
+        ),
+        "source_open_ratio": (
+            result.source_open_count / result.source_candidate_count
+            if result.source_candidate_count else 0.0
+        ),
+        "search_to_open_rate": (
+            result.source_open_count / result.source_candidate_count
+            if result.source_candidate_count else 0.0
+        ),
+        "duplicate_source_rate": (
+            result.duplicate_source_count / result.source_candidate_count
+            if result.source_candidate_count else 0.0
+        ),
+        "acquisition_call_count": result.acquisition_call_count,
+        "evidence_per_acquisition": (
+            len(result.research_result.evidence) / result.acquisition_call_count
+            if result.acquisition_call_count else 0.0
+        ),
+        "challenge_acceptance_rate": accepted / challenge_count if challenge_count else 1.0,
+        "challenge_resolution_rate": resolved / accepted if accepted else 1.0,
+        "unresolved_challenge_disclosure_rate": (
+            disclosed / (accepted - resolved) if accepted > resolved else 1.0
+        ),
+        "material_claim_citation_coverage": RuleBasedMetrics.material_claim_citation_coverage(
+            result.report_markdown
+        ),
+        "invalid_citation_count": int(invalid_citations),
+        "raw_url_count_before_render": raw_url_count,
+        "citation_issue_conflict_count": citation_issue_conflicts,
+        "audit_log_leak_count": audit_log_leak_count,
+        "reportable_claim_rejection_count": result.reportable_claim_rejection_count,
+        "claim_entailment_pass_rate": (
+            result.entailed_assessment_count / result.support_assessment_count
+            if result.support_assessment_count else 0.0
+        ),
+        "verified_claim_yield": (
+            result.verified_claim_count / result.candidate_claim_count
+            if result.candidate_claim_count else 0.0
+        ),
+        "evidence_requirement_coverage_rate": (
+            supported_requirements / len(requirement_rows)
+            if requirement_rows else 0.0
+        ),
+        "weighted_evidence_requirement_coverage_rate": (
+            weighted_requirement_coverage / len(requirement_rows)
+            if requirement_rows else 0.0
+        ),
+        "primary_source_requirement_coverage_rate": (
+            supported_primary_requirements / len(primary_requirements)
+            if primary_requirements else 1.0
+        ),
+        "composer_claim_survival_rate": (
+            result.composer_claim_count / result.verified_claim_count
+            if result.verified_claim_count else 0.0
+        ),
+        "citation_audit_removal_rate": (
+            audit_removed / result.composer_claim_count
+            if result.composer_claim_count else 0.0
+        ),
+        "verified_claims_in_report": result.composer_claim_count,
+        "finalization_reserve_tokens": result.finalization_token_reserve,
+        "supplemental_wave_count": result.supplemental_wave_count,
+        "repair_applied": result.repair_applied,
+        "repair_actions": list(result.repair_actions),
+    }
+
+
+def v2_canary_gate(detail: dict[str, Any]) -> tuple[bool, tuple[str, ...]]:
+    """Apply the documented one-question gate before any sample expansion."""
+    failures: list[str] = []
+    metrics = detail.get("v2") if isinstance(detail.get("v2"), dict) else {}
+    if detail.get("output_status") != "valid":
+        failures.append("output_status_not_valid")
+    research_status = detail.get("research_status", detail.get("status"))
+    if research_status is not None and research_status != "completed":
+        failures.append("research_status_not_completed")
+    if detail.get("termination_reason") == "budget_forced":
+        failures.append("budget_forced")
+    if float(metrics.get("core_question_assignment_rate", 0.0)) < 1.0:
+        failures.append("core_question_assignment_below_100pct")
+    if float(metrics.get("material_claim_citation_coverage", 0.0)) < 0.8:
+        failures.append("material_claim_citation_coverage_below_80pct")
+    if int(metrics.get("invalid_citation_count", 0)) != 0:
+        failures.append("invalid_citations_present")
+    if int(metrics.get("raw_url_count_before_render", 0)) != 0:
+        failures.append("raw_urls_present")
+    if int(metrics.get("citation_issue_conflict_count", 0)) != 0:
+        failures.append("citation_issue_conflicts_present")
+    if int(metrics.get("audit_log_leak_count", 0)) != 0:
+        failures.append("citation_audit_log_leaked")
+    if int(metrics.get("finalization_reserve_tokens", 0)) <= 0:
+        failures.append("finalization_reserve_missing")
+    judge_average = detail.get("judge_average")
+    if not isinstance(judge_average, (int, float)) or float(judge_average) < 5.0:
+        failures.append("judge_average_below_5")
+    return not failures, tuple(failures)
 
 
 def research_completion_score(result: ResearchWorkflowResult) -> dict[str, float]:

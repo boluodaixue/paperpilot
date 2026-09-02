@@ -100,7 +100,12 @@ replacement. report_markdown must equal the exact result of those operations.
     ]
 
 
-def _json_object(response: dict[str, Any], *, role: str) -> dict[str, Any]:
+def parse_json_object(response: dict[str, Any], *, role: str) -> dict[str, Any]:
+    """Parse a policy response as one strict JSON object.
+
+    Kept public so V2 Red review and citation audit can share the proven JSON
+    fence/error behavior without sharing their separate schemas.
+    """
     candidate = str(response.get("content") or "").strip()
     fenced = _JSON_FENCE.search(candidate)
     if fenced:
@@ -112,6 +117,10 @@ def _json_object(response: dict[str, Any], *, role: str) -> dict[str, Any]:
     if not isinstance(value, dict):
         raise ValueError(f"{role} review must return a JSON object")
     return value
+
+
+# Legacy private name retained for compatibility with the existing review path.
+_json_object = parse_json_object
 
 
 def _parse_issues(

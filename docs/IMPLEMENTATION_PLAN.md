@@ -19,6 +19,8 @@ Web / CLI
 - 根、子、孙同质递归与全树硬预算；
 - 基于确认后 Research Brief 必要要求的 Continue / Replan / Stop Research；
 - checkpointed coverage、critical gaps、next actions 和真实 strategy attempts；
+- 原子 requirement 与非证据型 expected-output deliverable、requirement/action/artifact 三段 lineage；
+- 语义工具错误门、Single Writer 原始 artifact、L1–L5 有界 Working Context；
 - research status、termination reason、output status 三分状态与一次结构修复；
 - 仅用于离线最终评测的五维 RCS（不参与运行时停止）；
 - Research Brief 修改/确认和 checkpoint 恢复；
@@ -31,7 +33,7 @@ Web / CLI
 - SQLite FTS5 和可选本地多语言混合检索；
 - 默认关闭的单次 Red/Blue 报告复核。
 
-当前离线回归基线为 `747 passed, 2 skipped`；N1–N6 回归为 `122 passed`。
+当前回归基线以 CI/本地全量 `pytest -q` 的最新结果为准；真实 ResearchBench 只有在纯函数、Workflow、Writer/recovery、adversarial 和全量回归全部通过后才能启动。
 
 ## 2. 统一验收原则
 
@@ -50,6 +52,8 @@ Web / CLI
 研究终止机制的真实验收固定比较同一组 `tech_001`、`med_001`、`fin_001`：逐题和汇总记录研究工具调用数、估算 token、耗时、ResearchBench 规则分、五维 RCS、research status、termination reason、output status、轮次与未解决项。历史版本没有 RCS 或稳定停止分类时记为 `N/A`，不得补造。验收还必须确认任务没有因为来源数量或固定 ready 轮次在第 4 轮强制结束。
 
 本次最终真实验收使用每 Agent 84 次、全树 588 次工具调用和 1,000,000 token 的宽松预算。三题根轮次分别为 1、7、2，不再固定于第 4 轮；全部由真实墙钟边界停止并记录为 `time_budget_exhausted → budget_forced`。平均规则分从 0.581436 提高到 0.591106，但工具调用从 86 增至 104、估算 token 从 157,142 增至 578,771、耗时从约 365 秒增至约 981 秒；一题输出 `valid`、两题 `fallback`，五维 RCS 显示 objective coverage 与 evidence sufficiency 均为 0。该结果证明机械完成门已移除和状态分类生效，同时把语义收敛与递归最终综合稳定性保留为后续真实模型优化项。
+
+证据闭环与 L1–L5 实现后的分阶段 canary 使用新的隔离 checkpoint/Vault。首轮暴露出同一 requirement 细分抢占 fork 名额、多轮 fork 侵蚀父最终化预留、失败路径继续耗尽 token 三个问题；加入 requirement 广度优先、15% subtree 父级预留下限和三种策略族无进展熔断后，完整确定性回归为 `792 passed, 2 skipped`。第二轮 `tech_001` 将工具调用从 31 降至 12、估算 token 从 200,000 降至 56,248，输出由 `fallback` 改为 `valid`，LLM Judge 从 3.2 升至 5.8；但仍因 9 次外部检索失败在 600 秒墙钟边界 `budget_forced`，RCS 覆盖仍为 0，因此按门禁停止，未扩展到三题。
 
 ## 3. 作品集版交付
 
