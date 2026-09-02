@@ -438,7 +438,7 @@ def test_assignment_tree_allows_distinct_scopes_under_one_requirement(tmp_path) 
     }
 
 
-def test_assignment_tree_rejects_duplicate_scope_and_sibling_theft(tmp_path) -> None:
+def test_assignment_tree_rejects_exact_duplicate_but_accepts_new_scope(tmp_path) -> None:
     board = _board(tmp_path)
     board.ensure_root_assignment(
         "run-1",
@@ -469,7 +469,7 @@ def test_assignment_tree_rejects_duplicate_scope_and_sibling_theft(tmp_path) -> 
             "parent_assignment_id": "assignment-root",
             "owner_thread_id": "child-b",
             "requirement_ids": ("R1",),
-            "objective": "Repeat proceeds tracking",
+            "objective": "  INSPECT proceeds tracking ",
             "scope_signature": "proceeds-tracking",
         },),
         actor_thread_id="root",
@@ -509,7 +509,7 @@ def test_assignment_tree_rejects_duplicate_scope_and_sibling_theft(tmp_path) -> 
         lease_seconds=60,
         now=104.0,
     )
-    assert renamed_retry["assignment-renamed-retry"].reason == "duplicate_sibling_scope"
+    assert renamed_retry["assignment-renamed-retry"].acquired is True
 
 
 def test_child_can_delegate_multiple_grandchild_scopes_without_completing_requirement(tmp_path) -> None:

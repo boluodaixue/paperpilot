@@ -61,12 +61,15 @@ class RecordingPolicy:
 
 
 @pytest.mark.asyncio
-async def test_planner_preserves_every_required_direction_and_adds_only_questions() -> None:
+async def test_planner_uses_model_grouped_questions_as_the_dynamic_plan() -> None:
     policy = RecordingPolicy(
         [
             {
                 "core_questions": [
-                    "Which official disclosures are needed for comparability?",
+                    "Compare Chinese reasoning and code generation benchmarks.",
+                    "Compare long-context behavior and effective context length.",
+                    "Compare architecture and training-data routes.",
+                    "Summarize source-comparable model strengths and limitations.",
                 ],
                 "report_outline": ["Executive summary", "Comparison"],
                 "source_guidance": ["Prefer official reports"],
@@ -77,13 +80,14 @@ async def test_planner_preserves_every_required_direction_and_adds_only_question
 
     plan = await plan_research(_brief(), policy)
 
-    descriptions = {item.description for item in plan.core_questions}
-    assert "Compare Chinese reasoning" in descriptions
-    assert "compare code generation" in descriptions
-    assert "Compare long-context behavior" in descriptions
-    assert "Which official disclosures are needed for comparability?" in descriptions
-    assert all(item.required for item in plan.core_questions if item.origin == "brief_direction")
-    assert any(item.origin == "model" and not item.required for item in plan.core_questions)
+    assert [item.description for item in plan.core_questions] == [
+        "Compare Chinese reasoning and code generation benchmarks.",
+        "Compare long-context behavior and effective context length.",
+        "Compare architecture and training-data routes.",
+        "Summarize source-comparable model strengths and limitations.",
+    ]
+    assert all(item.required for item in plan.core_questions)
+    assert all(item.origin == "dynamic_plan" for item in plan.core_questions)
     assert policy.calls[0][1] == []
     assert plan.fallback_reason is None
 
@@ -100,6 +104,23 @@ async def test_same_brief_and_policy_output_produce_stable_plan_ids() -> None:
     second = await plan_research(_brief(), RecordingPolicy([response]))
 
     assert first == second
+
+
+@pytest.mark.asyncio
+async def test_dynamic_plan_caps_model_grouping_at_five_main_questions() -> None:
+    response = {
+        "core_questions": [f"Grouped direction {index}" for index in range(1, 8)],
+        "report_outline": ["Comparison", "Conclusion"],
+        "source_guidance": [],
+        "work_hints": [],
+    }
+
+    plan = await plan_research(_brief(), RecordingPolicy([response]))
+
+    assert [item.description for item in plan.core_questions] == [
+        f"Grouped direction {index}" for index in range(1, 6)
+    ]
+    assert all(item.required for item in plan.core_questions)
 
 
 @pytest.mark.asyncio
@@ -159,7 +180,8 @@ async def test_empty_model_question_array_still_returns_conservative_plan() -> N
 
     plan = await plan_research(_brief(), policy)
 
-    assert len(plan.core_questions) == 3
+    assert len(plan.core_questions) == 1
+    assert plan.core_questions[0].description == _brief().question
     assert plan.report_outline == ("Research findings", "Limitations", "Sources")
     assert plan.fallback_reason is None
 

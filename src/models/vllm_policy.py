@@ -52,6 +52,7 @@ class VLLMPolicy:
         temperature: float = 0.0,
         top_p: float = 1.0,
         max_tokens: int = 1024,
+        max_input_chars: int = 35000,
         tools: Optional[list[dict]] = None,
     ):
         # Langfuse 开启时使用其 OpenAI drop-in client；关闭或异常时使用原始客户端。
@@ -61,6 +62,9 @@ class VLLMPolicy:
         self.temperature = temperature
         self.top_p = top_p
         self.max_tokens = max_tokens
+        if max_input_chars < 1000:
+            raise ValueError("max_input_chars must be at least 1000")
+        self.max_input_chars = max_input_chars
         self.tools = deepcopy(tools) if tools is not None else None
         # 兼容旧调用方：仅表示最近一次调用，不再跨调用累计。
         self.was_truncated = False
@@ -77,6 +81,7 @@ class VLLMPolicy:
         forked.temperature = self.temperature
         forked.top_p = self.top_p
         forked.max_tokens = self.max_tokens
+        forked.max_input_chars = self.max_input_chars
         forked.tools = deepcopy(self.tools) if self.tools is not None else None
         forked.was_truncated = False
         return forked
@@ -202,10 +207,12 @@ class VLLMPolicy:
             else:
                 sanitized.append(new_msg)
 
-        # 2. 主动截断（16K 约束下的质量过滤器）
-        # 阈值 12-13K content tokens ≈ 40000 字符（ratio 2.8-3.2 + overhead）
+        # 2. 主动截断。默认保持旧阈值；长上下文研究任务可按后端配置放宽。
         before_truncate = sanitized
-        sanitized = self._truncate_messages(sanitized, max_chars=35000)
+        sanitized = self._truncate_messages(
+            sanitized,
+            max_chars=self.max_input_chars,
+        )
         was_truncated = sanitized is not before_truncate
 
         # 3. 发送请求
@@ -259,6 +266,7 @@ class VLLMPolicy:
                 content=content,
                 tool_calls=final_tool_calls,
                 was_truncated=was_truncated,
+                finish_reason=getattr(resp.choices[0], "finish_reason", None),
             )
             if getattr(resp, "usage", None) is not None:
                 result["usage"] = resp.usage
@@ -288,4 +296,5 @@ class VLLMPolicy:
                 content=f"Error: {err_str}",
                 tool_calls=[],
                 was_truncated=was_truncated,
+                finish_reason="error",
             )

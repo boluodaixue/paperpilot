@@ -26,12 +26,15 @@ _SPACE = re.compile(r"\s+")
 _ASSIGNMENT_STATUSES = {
     "unclaimed",
     "claimed",
+    "queued",
     "researching",
+    "waiting_children",
     "completed",
     "blocked",
     "failed",
+    "cancelled_due_to_budget",
 }
-_WORK_STATUSES = {"running", "completed", "failed"}
+_WORK_STATUSES = {"running", "waiting_children", "completed", "partial", "failed"}
 _SIGNAL_STATUSES = {"open", "consumed"}
 
 
@@ -66,30 +69,6 @@ def normalize_scope_signature(scope: str, objective: str = "") -> str:
     value = unicodedata.normalize("NFKC", str(scope or objective or ""))
     value = _SPACE.sub(" ", value.strip()).casefold()
     return value
-
-
-def _scope_features(value: str) -> set[str]:
-    normalized = normalize_scope_signature(value)
-    words = {item for item in re.findall(r"[\w-]+", normalized) if len(item) > 1}
-    compact = re.sub(r"\s+", "", normalized)
-    grams = {compact[index:index + 3] for index in range(max(0, len(compact) - 2))}
-    return words | grams
-
-
-def scope_overlap_score(left: str, right: str) -> float:
-    """Conservative lexical overlap used only to reject near-identical scopes."""
-
-    left_normalized = normalize_scope_signature(left)
-    right_normalized = normalize_scope_signature(right)
-    if not left_normalized or not right_normalized:
-        return 0.0
-    if left_normalized == right_normalized:
-        return 1.0
-    left_features = _scope_features(left_normalized)
-    right_features = _scope_features(right_normalized)
-    if not left_features or not right_features:
-        return 0.0
-    return len(left_features & right_features) / len(left_features | right_features)
 
 
 class ResearchBlackboard:
@@ -142,6 +121,7 @@ class ResearchBlackboard:
                     requirement_id TEXT NOT NULL,
                     description TEXT NOT NULL,
                     required INTEGER NOT NULL DEFAULT 1,
+                    requires_external_evidence INTEGER NOT NULL DEFAULT 1,
                     status TEXT NOT NULL DEFAULT 'unsupported',
                     evidence_ids_json TEXT NOT NULL DEFAULT '[]',
                     rationale TEXT NOT NULL DEFAULT '',
@@ -165,6 +145,7 @@ class ResearchBlackboard:
                     status TEXT NOT NULL,
                     lease_until REAL NOT NULL DEFAULT 0,
                     version INTEGER NOT NULL DEFAULT 1,
+                    created_at REAL NOT NULL DEFAULT 0,
                     updated_at REAL NOT NULL,
                     PRIMARY KEY (run_id, assignment_id),
                     FOREIGN KEY (run_id) REFERENCES research_board_runs(run_id)
@@ -287,6 +268,12 @@ class ResearchBlackboard:
                 ("research_board_sources", "parent_assignment_id", "TEXT NOT NULL DEFAULT ''"),
                 ("research_board_agents", "assignment_id", "TEXT NOT NULL DEFAULT ''"),
                 ("research_board_agents", "parent_assignment_id", "TEXT NOT NULL DEFAULT ''"),
+                ("research_board_assignment_nodes", "created_at", "REAL NOT NULL DEFAULT 0"),
+                (
+                    "research_board_requirements",
+                    "requires_external_evidence",
+                    "INTEGER NOT NULL DEFAULT 1",
+                ),
             ):
                 columns = {
                     row["name"]
@@ -677,12 +664,14 @@ class ResearchBlackboard:
                     connection.execute(
                         """
                         INSERT INTO research_board_requirements
-                            (run_id, requirement_id, description, required, status,
+                            (run_id, requirement_id, description, required,
+                             requires_external_evidence, status,
                              evidence_ids_json, rationale, remaining_gap, version, updated_at)
-                        VALUES (?, ?, ?, ?, 'unsupported', '[]', '', '', 1, ?)
+                        VALUES (?, ?, ?, ?, ?, 'unsupported', '[]', '', '', 1, ?)
                         ON CONFLICT(run_id, requirement_id) DO UPDATE SET
                             description = excluded.description,
                             required = excluded.required,
+                            requires_external_evidence = excluded.requires_external_evidence,
                             updated_at = excluded.updated_at
                         """,
                         (
@@ -690,6 +679,7 @@ class ResearchBlackboard:
                             requirement_id,
                             description,
                             1 if bool(requirement.get("required", True)) else 0,
+                            1 if bool(requirement.get("requires_external_evidence", True)) else 0,
                             timestamp,
                         ),
                     )
@@ -824,12 +814,12 @@ class ResearchBlackboard:
                         (run_id, assignment_id, parent_assignment_id, owner_thread_id,
                          parent_thread_id, requirement_ids_json, objective,
                          scope_signature, reasons_json, depth, status, lease_until,
-                         version, updated_at)
-                    VALUES (?, ?, '', ?, '', ?, ?, ?, '[]', 0, 'researching', 0, 1, ?)
+                         version, created_at, updated_at)
+                    VALUES (?, ?, '', ?, '', ?, ?, ?, '[]', 0, 'researching', 0, 1, ?, ?)
                     """,
                     (
                         run_id, assignment_id, owner_thread_id, _json(requirements),
-                        objective, scope, timestamp,
+                        objective, scope, timestamp, timestamp,
                     ),
                 )
                 self._event(
@@ -850,6 +840,8 @@ class ResearchBlackboard:
         actor_thread_id: str,
         lease_seconds: float,
         max_total_assignments: int | None = None,
+        max_children_per_parent: int | None = None,
+        max_depth: int | None = None,
         now: float | None = None,
     ) -> dict[str, BoardClaim]:
         """Register recursive child scopes while allowing distinct scopes per requirement."""
@@ -881,11 +873,11 @@ class ResearchBlackboard:
                     owner = str(item.get("owner_thread_id") or "").strip()
                     parent_thread = str(item.get("parent_thread_id") or actor_thread_id).strip()
                     objective = str(item.get("objective") or "").strip()
-                    requirement_ids = tuple(dict.fromkeys(
+                    requirement_ids = tuple(sorted(dict.fromkeys(
                         str(value).strip()
                         for value in item.get("requirement_ids", ())
                         if str(value).strip()
-                    ))
+                    )))
                     scope = normalize_scope_signature(
                         str(item.get("scope_signature") or ""), objective
                     )
@@ -922,6 +914,9 @@ class ResearchBlackboard:
                         outcomes[assignment_id] = BoardClaim(False, "outside_parent_requirements")
                         continue
                     depth = int(parent["depth"]) + 1
+                    if max_depth is not None and depth > max(0, int(max_depth)):
+                        outcomes[assignment_id] = BoardClaim(False, "fork_depth_limit_reached")
+                        continue
                     existing = connection.execute(
                         """
                         SELECT * FROM research_board_assignment_nodes
@@ -948,6 +943,22 @@ class ResearchBlackboard:
                         )
                         continue
 
+                    child_count = int(connection.execute(
+                        """
+                        SELECT COUNT(*) FROM research_board_assignment_nodes
+                        WHERE run_id = ? AND parent_assignment_id = ?
+                        """,
+                        (run_id, parent_assignment_id),
+                    ).fetchone()[0])
+                    if (
+                        max_children_per_parent is not None
+                        and child_count >= max(0, int(max_children_per_parent))
+                    ):
+                        outcomes[assignment_id] = BoardClaim(
+                            False, "parent_child_limit_reached"
+                        )
+                        continue
+
                     conflict_reason = ""
                     conflicts = connection.execute(
                         """
@@ -960,60 +971,34 @@ class ResearchBlackboard:
                     ).fetchall()
                     for sibling in conflicts:
                         sibling_requirements = set(json.loads(sibling["requirement_ids_json"] or "[]"))
-                        duplicate_score = max(
-                            scope_overlap_score(scope, sibling["scope_signature"]),
-                            scope_overlap_score(objective, sibling["objective"]),
-                        )
-                        if set(requirement_ids) & sibling_requirements and duplicate_score >= 0.92:
+                        if (
+                            set(requirement_ids) == sibling_requirements
+                            and scope == normalize_scope_signature(sibling["scope_signature"])
+                            and normalize_scope_signature(objective)
+                            == normalize_scope_signature(sibling["objective"])
+                        ):
                             conflict_reason = "duplicate_sibling_scope"
                             outcomes[assignment_id] = BoardClaim(
                                 False, conflict_reason, sibling["owner_thread_id"], sibling["status"]
                             )
                             break
-                    ancestor_id = parent_assignment_id
-                    while not conflict_reason and ancestor_id:
-                        ancestor = connection.execute(
-                            """
-                            SELECT parent_assignment_id, owner_thread_id,
-                                   requirement_ids_json, objective, scope_signature, status
-                            FROM research_board_assignment_nodes
-                            WHERE run_id = ? AND assignment_id = ?
-                            """,
-                            (run_id, ancestor_id),
-                        ).fetchone()
-                        if ancestor is None:
-                            break
-                        ancestor_requirements = set(json.loads(ancestor["requirement_ids_json"] or "[]"))
-                        if (
-                            ancestor_id != parent_assignment_id
-                            and set(requirement_ids) & ancestor_requirements
-                            and max(
-                                scope_overlap_score(scope, ancestor["scope_signature"]),
-                                scope_overlap_score(objective, ancestor["objective"]),
-                            ) >= 0.92
-                        ):
-                            conflict_reason = "duplicates_ancestor_scope"
-                            outcomes[assignment_id] = BoardClaim(
-                                False, conflict_reason, ancestor["owner_thread_id"], ancestor["status"]
-                            )
-                            break
-                        ancestor_id = str(ancestor["parent_assignment_id"] or "")
                     if conflict_reason:
                         continue
                     connection.execute(
                         """
                         INSERT INTO research_board_assignment_nodes
                             (run_id, assignment_id, parent_assignment_id, owner_thread_id,
-                             parent_thread_id, requirement_ids_json, objective,
-                             scope_signature, reasons_json, depth, status, lease_until,
-                             version, updated_at)
-                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?)
+                         parent_thread_id, requirement_ids_json, objective,
+                         scope_signature, reasons_json, depth, status, lease_until,
+                         version, created_at, updated_at)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?)
                         """,
                         (
                             run_id, assignment_id, parent_assignment_id, owner,
                             parent_thread, _json(requirement_ids), objective, scope,
                             _json(reasons), depth, status,
                             lease_until if status in {"claimed", "researching"} else 0.0,
+                            timestamp,
                             timestamp,
                         ),
                     )
@@ -1082,6 +1067,75 @@ class ResearchBlackboard:
                     {"assignment_id": assignment_id, "status": status}, timestamp,
                 )
                 connection.commit()
+            except Exception:
+                connection.rollback()
+                raise
+
+    def assignment_node(self, run_id: str, assignment_id: str) -> dict[str, Any] | None:
+        """Read one durable scheduler/ownership record."""
+
+        with self._connect() as connection:
+            row = connection.execute(
+                """
+                SELECT assignment_id, parent_assignment_id, owner_thread_id,
+                       parent_thread_id, requirement_ids_json, objective,
+                       scope_signature, reasons_json, depth, status, lease_until,
+                       version, created_at, updated_at
+                FROM research_board_assignment_nodes
+                WHERE run_id = ? AND assignment_id = ?
+                """,
+                (run_id, assignment_id),
+            ).fetchone()
+        if row is None:
+            return None
+        payload = dict(row)
+        payload["requirement_ids"] = json.loads(payload.pop("requirement_ids_json") or "[]")
+        payload["reasons"] = json.loads(payload.pop("reasons_json") or "[]")
+        return payload
+
+    def cancel_queued_assignments_due_to_budget(
+        self,
+        run_id: str,
+        *,
+        actor_thread_id: str,
+        now: float | None = None,
+    ) -> tuple[str, ...]:
+        """Cancel only never-started work when the shared safety boundary closes."""
+
+        timestamp = time.time() if now is None else float(now)
+        with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            try:
+                rows = connection.execute(
+                    """
+                    SELECT assignment_id FROM research_board_assignment_nodes
+                    WHERE run_id = ? AND status IN ('queued', 'claimed')
+                    ORDER BY created_at, assignment_id
+                    """,
+                    (run_id,),
+                ).fetchall()
+                assignment_ids = tuple(row["assignment_id"] for row in rows)
+                if assignment_ids:
+                    connection.execute(
+                        """
+                        UPDATE research_board_assignment_nodes
+                        SET status = 'cancelled_due_to_budget', lease_until = 0,
+                            version = version + 1, updated_at = ?
+                        WHERE run_id = ? AND status IN ('queued', 'claimed')
+                        """,
+                        (timestamp, run_id),
+                    )
+                    for assignment_id in assignment_ids:
+                        self._event(
+                            connection,
+                            run_id,
+                            "queued_assignment_cancelled",
+                            actor_thread_id,
+                            {"assignment_id": assignment_id, "reason": "budget_boundary"},
+                            timestamp,
+                        )
+                connection.commit()
+                return assignment_ids
             except Exception:
                 connection.rollback()
                 raise
@@ -1749,15 +1803,17 @@ class ResearchBlackboard:
                 """
                 SELECT assignment_id, parent_assignment_id, owner_thread_id,
                        parent_thread_id, requirement_ids_json, objective,
-                       scope_signature, reasons_json, depth, status, lease_until, version
+                       scope_signature, reasons_json, depth, status, lease_until,
+                       version, created_at, updated_at
                 FROM research_board_assignment_nodes
-                WHERE run_id = ? ORDER BY depth, updated_at, assignment_id
+                WHERE run_id = ? ORDER BY depth, created_at, assignment_id
                 """,
                 (run_id,),
             ).fetchall()
             requirement_rows = connection.execute(
                 """
-                SELECT requirement_id, description, required, status,
+                SELECT requirement_id, description, required,
+                       requires_external_evidence, status,
                        evidence_ids_json, rationale, remaining_gap, version
                 FROM research_board_requirements
                 WHERE run_id = ? ORDER BY requirement_id
@@ -1820,6 +1876,7 @@ class ResearchBlackboard:
             {
                 **dict(row),
                 "required": bool(row["required"]),
+                "requires_external_evidence": bool(row["requires_external_evidence"]),
                 "evidence_ids": json.loads(row["evidence_ids_json"] or "[]"),
             }
             for row in requirement_rows
@@ -1901,6 +1958,34 @@ class ResearchBlackboard:
                     "SELECT COUNT(*) FROM research_board_assignments WHERE run_id = ?",
                     (run_id,),
                 ).fetchone()[0],
+                "active_assignment_count": connection.execute(
+                    """
+                    SELECT COUNT(*) FROM research_board_assignment_nodes
+                    WHERE run_id = ? AND status = 'researching'
+                    """,
+                    (run_id,),
+                ).fetchone()[0],
+                "queued_assignment_count": connection.execute(
+                    """
+                    SELECT COUNT(*) FROM research_board_assignment_nodes
+                    WHERE run_id = ? AND status = 'queued'
+                    """,
+                    (run_id,),
+                ).fetchone()[0],
+                "waiting_assignment_count": connection.execute(
+                    """
+                    SELECT COUNT(*) FROM research_board_assignment_nodes
+                    WHERE run_id = ? AND status = 'waiting_children'
+                    """,
+                    (run_id,),
+                ).fetchone()[0],
+                "cancelled_due_to_budget_count": connection.execute(
+                    """
+                    SELECT COUNT(*) FROM research_board_assignment_nodes
+                    WHERE run_id = ? AND status = 'cancelled_due_to_budget'
+                    """,
+                    (run_id,),
+                ).fetchone()[0],
                 "requirement_count": connection.execute(
                     "SELECT COUNT(*) FROM research_board_requirements WHERE run_id = ?",
                     (run_id,),
@@ -1955,7 +2040,40 @@ class ResearchBlackboard:
                 """,
                 (run_id,),
             ).fetchall()
+            scheduler_rows = connection.execute(
+                """
+                SELECT kind, payload_json FROM research_board_events
+                WHERE run_id = ? AND kind IN (
+                    'scheduler_state', 'queued_assignment_started'
+                )
+                """,
+                (run_id,),
+            ).fetchall()
         counts.update({f"event_{row['kind']}": int(row["count"]) for row in event_rows})
+        scheduler_payloads = [
+            json.loads(row["payload_json"] or "{}") for row in scheduler_rows
+        ]
+        counts.update({
+            "active_agent_peak": max(
+                (int(item.get("active_peak", 0)) for item in scheduler_payloads),
+                default=0,
+            ),
+            "queued_assignment_peak": max(
+                (int(item.get("queued_peak", 0)) for item in scheduler_payloads),
+                default=0,
+            ),
+            "waiting_parent_peak": max(
+                (int(item.get("waiting_peak", 0)) for item in scheduler_payloads),
+                default=0,
+            ),
+            "queue_wait_milliseconds_peak": max(
+                (
+                    int(float(item.get("queue_wait_seconds", 0.0)) * 1000)
+                    for item in scheduler_payloads
+                ),
+                default=0,
+            ),
+        })
         return {key: int(value) for key, value in counts.items()}
 
 

@@ -2,8 +2,9 @@
 
 from __future__ import annotations
 
+import re
 from collections import defaultdict
-from collections.abc import Iterable
+from collections.abc import Iterable, Mapping
 from urllib.parse import urlparse
 
 from .models import EvidenceItem, RequirementCoverage
@@ -20,6 +21,9 @@ _PRIMARY_HOST_SUFFIXES = (
     "aclanthology.org",
     "swebench.com",
     "longbench2.github.io",
+    "icmagroup.org",
+    "ifc.org",
+    "nafmii.org.cn",
 )
 _SECONDARY_HOST_SUFFIXES = (
     "github.com",
@@ -42,7 +46,9 @@ _LOW_SIGNAL_HOST_SUFFIXES = (
     "substack.com",
     "llm-stats.com",
     "benchlm.ai",
+    "wikipedia.org",
 )
+_LOW_SIGNAL_HOST_TOKENS = ("forum.", "forums.", "discuss.", "answers.")
 
 
 def _host(source_ref: str) -> str:
@@ -53,7 +59,17 @@ def _host_matches(host: str, suffixes: tuple[str, ...]) -> bool:
     return any(host == suffix or host.endswith("." + suffix) for suffix in suffixes)
 
 
-def _quality_score(item: EvidenceItem) -> int:
+def _context_terms(value: str) -> set[str]:
+    terms = {
+        token.casefold()
+        for token in re.findall(r"[A-Za-z0-9][A-Za-z0-9.+-]{2,}", value)
+    }
+    for run in re.findall(r"[\u3400-\u9fff]{2,}", value):
+        terms.update(run[index:index + 2] for index in range(len(run) - 1))
+    return terms
+
+
+def _quality_score(item: EvidenceItem, requirement: str = "") -> int:
     host = _host(item.source_ref)
     score = 0
     if _host_matches(host, _INSTITUTIONAL_HOST_SUFFIXES):
@@ -66,12 +82,19 @@ def _quality_score(item: EvidenceItem) -> int:
         score += 1
     if _host_matches(host, _LOW_SIGNAL_HOST_SUFFIXES):
         score -= 4
+    if any(token in host for token in _LOW_SIGNAL_HOST_TOKENS):
+        score -= 4
     if item.source_type.lower() in {"paper", "official", "dataset"}:
         score += 3
     if item.locator and item.locator != item.source_ref:
         score += 1
     if item.excerpt:
         score += 1
+    if requirement:
+        evidence_terms = _context_terms(
+            " ".join((item.title, item.finding, item.excerpt[:1200]))
+        )
+        score += min(6, len(evidence_terms & _context_terms(requirement)))
     return score
 
 
@@ -92,6 +115,7 @@ def select_representative_evidence(
     max_per_requirement: int = 6,
     max_per_source: int = 2,
     max_per_primary_source: int | None = None,
+    requirement_descriptions: Mapping[str, str] | None = None,
 ) -> tuple[EvidenceItem, ...]:
     """Select a source-diverse, requirement-balanced evidence subset.
 
@@ -114,11 +138,18 @@ def select_representative_evidence(
     unique = {item.evidence_id: item for item in evidence}
 
     coverage = tuple(coverage)
+    ranked_ids: dict[str, dict[str, int]] = {}
+    for item in coverage:
+        ranked_ids[item.requirement_id] = {
+            evidence_id: index
+            for index, evidence_id in enumerate(item.evidence_ids)
+            if evidence_id in unique
+        }
+    agent_judged_requirements = set(ranked_ids)
     cited_ids = {
-        evidence_id
-        for item in coverage
-        for evidence_id in item.evidence_ids
+        evidence_id for values in ranked_ids.values() for evidence_id in values
     }
+    descriptions = dict(requirement_descriptions or {})
     requirement_order = [item.requirement_id for item in coverage]
     for item in unique.values():
         if item.requirement_id and item.requirement_id not in requirement_order:
@@ -128,12 +159,22 @@ def select_representative_evidence(
 
     grouped: dict[str, list[EvidenceItem]] = defaultdict(list)
     for item in unique.values():
-        grouped[item.requirement_id or ""].append(item)
-    for items in grouped.values():
+        requirement_id = item.requirement_id or ""
+        # Once an Agent has supplied an ordered shortlist for its Requirement,
+        # unlisted Evidence is an explicit non-selection rather than spare
+        # capacity for the deterministic selector to refill with.
+        if (
+            requirement_id in agent_judged_requirements
+            and item.evidence_id not in ranked_ids[requirement_id]
+        ):
+            continue
+        grouped[requirement_id].append(item)
+    for requirement_id, items in grouped.items():
         items.sort(
             key=lambda item: (
                 item.evidence_id in cited_ids,
-                _quality_score(item),
+                -ranked_ids.get(requirement_id, {}).get(item.evidence_id, 10**9),
+                _quality_score(item, descriptions.get(requirement_id, "")),
                 bool(item.requirement_id),
                 item.evidence_id,
             ),
@@ -173,10 +214,15 @@ def select_representative_evidence(
 
     # Fill unused capacity by global quality while retaining one item per source.
     ranked = sorted(
-        unique.values(),
+        (item for items in grouped.values() for item in items),
         key=lambda item: (
             item.evidence_id in cited_ids,
-            _quality_score(item),
+            -ranked_ids.get(item.requirement_id or "", {}).get(
+                item.evidence_id, 10**9
+            ),
+            _quality_score(
+                item, descriptions.get(item.requirement_id or "", "")
+            ),
             bool(item.requirement_id),
             item.evidence_id,
         ),

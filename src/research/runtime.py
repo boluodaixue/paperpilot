@@ -145,6 +145,7 @@ __all__ = [
     "open_research_runtime",
     "research_architecture_settings_from_config",
     "shared_comparison_plan_from_config",
+    "structured_report_enabled_from_config",
     "setup_logging",
     "vault_root_from_config",
 ]
@@ -352,7 +353,8 @@ def shared_comparison_plan_from_config(
         raise ValueError("fixed comparison plan requires core_questions")
     questions: list[CoreQuestion] = []
     allowed_question = {
-        "description", "required", "priority", "origin", "verification"
+        "description", "required", "priority", "origin", "verification",
+        "requires_external_evidence",
     }
     for raw_question in raw_questions:
         if not isinstance(raw_question, Mapping):
@@ -372,6 +374,9 @@ def shared_comparison_plan_from_config(
             origin=str(raw_question.get("origin") or "fixed_comparison"),
             verification=str(
                 raw_question.get("verification") or "source-locatable evidence"
+            ),
+            requires_external_evidence=bool(
+                raw_question.get("requires_external_evidence", True)
             ),
         ))
     return ResearchPlan.create(
@@ -464,6 +469,19 @@ def _report_review_enabled(config: dict[str, Any]) -> bool:
     value = report_review.get("enabled", False)
     if not isinstance(value, bool):
         raise ValueError("research.report_review.enabled must be a boolean")
+    return value
+
+
+def structured_report_enabled_from_config(config: dict[str, Any]) -> bool:
+    """Return whether Legacy research should use the structured report path."""
+
+    research = _research_config(config)
+    structured = research.get("structured_report", {})
+    if not isinstance(structured, Mapping):
+        raise ValueError("research.structured_report must be a mapping")
+    value = structured.get("enabled", False)
+    if not isinstance(value, bool):
+        raise ValueError("research.structured_report.enabled must be a boolean")
     return value
 
 
@@ -603,6 +621,7 @@ class ResearchRuntime:
         write_queue: VaultWriteQueue | None = None,
         research_blackboard: ResearchBlackboard | None = None,
         shared_comparison_plan: ResearchPlan | None = None,
+        structured_report_enabled: bool = False,
         homogeneous_fork_config: HomogeneousForkConfig | None = None,
     ) -> None:
         self.config = config
@@ -644,6 +663,9 @@ class ResearchRuntime:
             if write_db_path is not None else None
         )
         self.shared_comparison_plan = shared_comparison_plan
+        self.structured_report_enabled = bool(
+            structured_report_enabled or shared_comparison_plan is not None
+        )
         self.homogeneous_fork_config = (
             homogeneous_fork_config or HomogeneousForkConfig()
         )
@@ -668,6 +690,7 @@ class ResearchRuntime:
             vault_write_service=self.vault_write_service,
             research_blackboard=self.research_blackboard,
             shared_comparison_plan=self.shared_comparison_plan,
+            structured_report_enabled=self.structured_report_enabled,
             homogeneous_fork_config=self.homogeneous_fork_config,
         )
         self.memory_note_graph = build_memory_note_workflow(
@@ -1432,6 +1455,7 @@ def build_research_runtime(
     vault_write_service: VaultWriteService | None = None,
     research_blackboard: ResearchBlackboard | None = None,
     shared_comparison_plan: ResearchPlan | None = None,
+    structured_report_enabled: bool | None = None,
     homogeneous_fork_config: HomogeneousForkConfig | None = None,
 ) -> ResearchRuntime:
     """Construct the single production Research Workflow dependency graph."""
@@ -1460,6 +1484,11 @@ def build_research_runtime(
         if homogeneous_fork_config is not None
         else homogeneous_fork_config_from_config(effective_config)
     )
+    effective_structured_report = (
+        structured_report_enabled
+        if structured_report_enabled is not None
+        else structured_report_enabled_from_config(effective_config)
+    )
     return ResearchRuntime(
         config=effective_config,
         policy=policy if policy is not None else _build_policy(effective_config),
@@ -1475,6 +1504,7 @@ def build_research_runtime(
         write_queue=write_queue,
         research_blackboard=research_blackboard,
         shared_comparison_plan=effective_shared_plan,
+        structured_report_enabled=effective_structured_report,
         homogeneous_fork_config=effective_fork_config,
     )
 

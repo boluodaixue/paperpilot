@@ -888,6 +888,60 @@ async def test_final_synthesis_uses_a_bounded_checkpoint_snapshot_not_full_histo
 
 
 @pytest.mark.asyncio
+async def test_root_final_synthesis_returns_markdown_and_continues_on_length() -> None:
+    class MarkdownPolicy:
+        def __init__(self) -> None:
+            self.calls = 0
+            self.max_tokens = 4096
+
+        def __call__(self, messages, *, tools=None):
+            assert tools == []
+            self.calls += 1
+            if self.calls == 1:
+                assert "Return only the complete Markdown report" in messages[-1]["content"]
+                assert self.max_tokens == 32768
+                return {
+                    "content": "# Report\n\nFirst section.",
+                    "tool_calls": [],
+                    "finish_reason": "length",
+                }
+            assert "Continue immediately" in messages[-1]["content"]
+            return {
+                "content": "## Final section\n\nComplete.",
+                "tool_calls": [],
+                "finish_reason": "stop",
+            }
+
+    policy = MarkdownPolicy()
+    identity = _root_identity("root-direct-markdown-continuation")
+    state = _state(
+        ResearchTask(
+            "root-direct-markdown-continuation",
+            "Write the final report.",
+            require_evidence=False,
+        ),
+        identity,
+    )
+    state["finalization_requested"] = True
+    state["stop_reason"] = "token_budget_exhausted"
+    state["termination_reason"] = TerminationReason.BUDGET_FORCED
+
+    final = await build_research_agent_graph(policy, []).ainvoke(
+        state,
+        config=_config(identity.thread_id),
+    )
+
+    assert policy.calls == 2
+    assert "First section" in final["result"].report_markdown
+    assert "Final section" in final["result"].report_markdown
+    assert final["result"].output_status == OutputStatus.VALID
+    assert any(
+        event.get("kind") == "root_report_continued"
+        for event in final["execution_events"]
+    )
+
+
+@pytest.mark.asyncio
 async def test_hard_stop_replaces_an_invalid_candidate_with_fresh_final_synthesis() -> None:
     class FreshFinalPolicy:
         def __init__(self) -> None:
@@ -1347,7 +1401,7 @@ async def test_invalid_execution_identity_is_rejected(
 
 
 @pytest.mark.asyncio
-async def test_unstructured_final_response_repairs_once_without_changing_research_status() -> None:
+async def test_root_markdown_final_response_is_valid_without_json_repair() -> None:
     class PlainPolicy:
         def __call__(self, messages, *, tools=None):
             return {"content": "A plain final answer.", "tool_calls": []}
@@ -1363,8 +1417,8 @@ async def test_unstructured_final_response_repairs_once_without_changing_researc
     assert isinstance(result, ResearchResult)
     assert result.status == ResearchStatus.COMPLETED
     assert result.termination_reason == TerminationReason.COVERAGE_COMPLETE
-    assert result.output_status == OutputStatus.FALLBACK
-    assert any("fallback" in item.lower() for item in result.unresolved)
+    assert result.output_status == OutputStatus.VALID
+    assert result.report_markdown == "A plain final answer."
 
 
 @pytest.mark.asyncio
@@ -1490,7 +1544,7 @@ async def test_repeated_assessment_contract_failure_stops_without_a_synthetic_lo
 
 
 @pytest.mark.asyncio
-async def test_final_json_is_repaired_once_without_changing_coverage_decision() -> None:
+async def test_root_plain_markdown_does_not_require_json_repair() -> None:
     class RepairableFinalPolicy:
         def __call__(self, messages, *, tools=None):
             content = str(messages[-1].get("content") or "")
@@ -1512,7 +1566,8 @@ async def test_final_json_is_repaired_once_without_changing_coverage_decision() 
     )
     assert result.status == ResearchStatus.COMPLETED
     assert result.termination_reason == TerminationReason.COVERAGE_COMPLETE
-    assert result.output_status == OutputStatus.REPAIRED
+    assert result.output_status == OutputStatus.VALID
+    assert result.report_markdown == "plain final"
 
 
 @pytest.mark.asyncio

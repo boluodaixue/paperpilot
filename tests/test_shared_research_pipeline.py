@@ -2,9 +2,15 @@
 
 from __future__ import annotations
 
+import json
+
+import pytest
+
 from src.research.models import (
     EvidenceItem,
     OutputStatus,
+    RequirementCoverage,
+    RequirementStatus,
     ResearchResult,
     ResearchStatus,
     TerminationReason,
@@ -88,12 +94,14 @@ def _supervisor(plan: ResearchPlan, evidence: tuple[EvidenceItem, ...]) -> Super
 
 
 def test_dynamic_limit_is_shared_and_capped() -> None:
-    assert shared_evidence_limit(_plan(1)) == 12
-    assert shared_evidence_limit(_plan(6)) == 24
-    assert shared_evidence_limit(_plan(20)) == 36
+    assert shared_evidence_limit(_plan(1)) == 24
+    assert shared_evidence_limit(_plan(4)) == 32
+    assert shared_evidence_limit(_plan(6)) == 40
+    assert shared_evidence_limit(_plan(20)) == 40
 
 
-def test_legacy_and_supervisor_generate_the_same_claim_inventory() -> None:
+@pytest.mark.asyncio
+async def test_legacy_and_supervisor_generate_the_same_claim_inventory() -> None:
     plan = _plan()
     evidence = _evidence(plan)
     legacy = ResearchResult(
@@ -105,12 +113,12 @@ def test_legacy_and_supervisor_generate_the_same_claim_inventory() -> None:
         output_status=OutputStatus.VALID,
     )
 
-    legacy_package = package_legacy_result(
+    legacy_package = await package_legacy_result(
         plan,
         legacy,
         finalization_token_reserve=50000,
     )
-    supervisor_package = normalize_supervisor_outcome(
+    supervisor_package = await normalize_supervisor_outcome(
         plan,
         _supervisor(plan, evidence),
     )
@@ -129,13 +137,24 @@ def test_legacy_and_supervisor_generate_the_same_claim_inventory() -> None:
     assert {item.claim_id for item in legacy_claims} == {
         item.claim_id for item in supervisor_claims
     }
-    assert len(legacy_package.selected_evidence_ids) == shared_evidence_limit(plan)
+    assert len(legacy_package.selected_evidence_ids) <= shared_evidence_limit(plan)
+    assert set(legacy_package.selected_evidence_ids) == {
+        evidence_id
+        for claim in legacy_claims
+        for evidence_id in claim.evidence_ids
+    }
+    assert {
+        question_id
+        for claim in legacy_claims
+        for question_id in claim.question_ids
+    } == {item.question_id for item in plan.core_questions}
     assert len(
         legacy_package.challenge_outcome.supervisor_outcome.worker_results[0].evidence
     ) == len(evidence)
 
 
-def test_raw_page_shaped_claim_is_quarantined_before_both_composers() -> None:
+@pytest.mark.asyncio
+async def test_raw_page_shaped_claim_is_quarantined_before_both_composers() -> None:
     plan = _plan(1)
     valid = EvidenceItem(
         "valid", "Atomic supported claim", "official", "Official",
@@ -152,10 +171,168 @@ def test_raw_page_shaped_claim_is_quarantined_before_both_composers() -> None:
         "legacy", ResearchStatus.COMPLETED, "done", evidence=(valid, raw),
     )
 
-    package = package_legacy_result(plan, legacy, finalization_token_reserve=12000)
+    package = await package_legacy_result(
+        plan, legacy, finalization_token_reserve=12000
+    )
 
     assert package.selected_evidence_ids == ("valid",)
     assert package.quarantined_evidence_count == 1
+
+
+@pytest.mark.asyncio
+async def test_unclaimable_authority_pages_do_not_consume_shared_evidence_capacity() -> None:
+    plan = _plan(1)
+    question_id = plan.core_questions[0].question_id
+    navigation = EvidenceItem(
+        "official-navigation",
+        "Download PDF",
+        "official",
+        "Official navigation",
+        "https://regulator.gov/navigation",
+        "section:navigation",
+        "Download PDF",
+        requirement_id=question_id,
+        action_id="A-navigation",
+        artifact_id="artifact-navigation",
+    )
+    claimable = tuple(
+        EvidenceItem(
+            f"claimable-{index}",
+            f"The source states measured requirement {index}.",
+            "web",
+            f"Relevant source {index}",
+            f"https://relevant{index}.example/report",
+            f"section:{index}",
+            f"The source states measured requirement {index}.",
+            requirement_id=question_id,
+            action_id=f"A-{index}",
+            artifact_id=f"artifact-{index}",
+        )
+        for index in range(6)
+    )
+    result = ResearchResult(
+        "legacy",
+        ResearchStatus.COMPLETED,
+        "done",
+        evidence=(navigation, *claimable),
+    )
+
+    package = await package_legacy_result(
+        plan, result, finalization_token_reserve=12000
+    )
+
+    assert "official-navigation" not in package.selected_evidence_ids
+    assert set(package.selected_evidence_ids) == {
+        item.evidence_id for item in claimable
+    }
+
+
+@pytest.mark.asyncio
+async def test_legacy_package_uses_agent_ranked_coverage_shortlist() -> None:
+    plan = _plan(1)
+    question_id = plan.core_questions[0].question_id
+    preferred = EvidenceItem(
+        "preferred",
+        "The official source reports the measured requirement.",
+        "official",
+        "Agent-selected source",
+        "https://authority.gov/preferred",
+        "section:result",
+        "The official source reports the measured requirement.",
+        requirement_id=question_id,
+    )
+    unselected = EvidenceItem(
+        "unselected",
+        "The official source reports a different measured requirement.",
+        "official",
+        "Statically attractive but rejected source",
+        "https://regulator.gov/unselected",
+        "section:other",
+        "The official source reports a different measured requirement.",
+        requirement_id=question_id,
+    )
+    result = ResearchResult(
+        "legacy",
+        ResearchStatus.PARTIAL,
+        "Agent-ranked partial result",
+        evidence=(preferred, unselected),
+        coverage=(RequirementCoverage(
+            question_id,
+            RequirementStatus.WEAK,
+            (preferred.evidence_id,),
+        ),),
+    )
+
+    package = await package_legacy_result(
+        plan, result, finalization_token_reserve=12000
+    )
+
+    assert package.selected_evidence_ids == (preferred.evidence_id,)
+
+
+@pytest.mark.asyncio
+async def test_shared_package_uses_semantic_verifier_for_cross_language_relevance() -> None:
+    question = CoreQuestion.create("比较SLB的投资者保护机制。")
+    plan = ResearchPlan.create(0, (question,))
+    relevant = EvidenceItem(
+        "relevant",
+        "Failure to meet the target results in a coupon step-up penalty.",
+        "official",
+        "SLB principles",
+        "https://www.icmagroup.org/slb",
+        "section:bond-characteristics",
+        "Failure to meet the target results in a coupon step-up penalty.",
+        requirement_id=question.question_id,
+        action_id="A-relevant",
+        artifact_id="artifact-relevant",
+    )
+    irrelevant = EvidenceItem(
+        "irrelevant",
+        "Social bonds finance projects with positive social outcomes.",
+        "official",
+        "Social Bond Principles",
+        "https://www.icmagroup.org/social",
+        "section:introduction",
+        "Social bonds finance projects with positive social outcomes.",
+        requirement_id=question.question_id,
+        action_id="A-irrelevant",
+        artifact_id="artifact-irrelevant",
+    )
+    result = ResearchResult(
+        "legacy",
+        ResearchStatus.COMPLETED,
+        "done",
+        evidence=(relevant, irrelevant),
+    )
+
+    async def policy(messages, *, tools=None):
+        candidates = json.loads(messages[-1]["content"])["candidates"]
+        return {"content": json.dumps({
+            "assessments": [
+                {
+                    "candidate_id": item["candidate_id"],
+                    "verdict": (
+                        "entailed" if "coupon step-up" in item["text"] else "irrelevant"
+                    ),
+                    "confidence": 0.99,
+                    "supported_scope": (
+                        item["text"] if "coupon step-up" in item["text"] else ""
+                    ),
+                    "unsupported_scope": "",
+                    "reason": "Bounded semantic relevance check.",
+                }
+                for item in candidates
+            ]
+        })}
+
+    package = await package_legacy_result(
+        plan,
+        result,
+        finalization_token_reserve=12000,
+        policy=policy,
+    )
+
+    assert package.selected_evidence_ids == ("relevant",)
 
 
 def test_shared_mode_preserves_full_worker_evidence_until_common_selector() -> None:

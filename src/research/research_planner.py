@@ -20,7 +20,7 @@ from .v2_contracts import CoreQuestion, ResearchPlan
 
 _JSON_FENCE = re.compile(r"```(?:json)?\s*(.*?)\s*```", re.IGNORECASE | re.DOTALL)
 _DEFAULT_OUTLINE = ("Research findings", "Limitations", "Sources")
-_MAX_MODEL_SUPPLEMENTS = 4
+_MAX_DYNAMIC_QUESTIONS = 5
 
 
 def _unique_strings(values: list[str]) -> tuple[str, ...]:
@@ -106,11 +106,14 @@ def _planner_prompt(brief: ResearchBrief) -> list[dict[str, str]]:
             "role": "system",
             "content": (
                 "You are the PaperPilot Research Planner. Do not call tools and do "
-                "not research the topic. The confirmed directions are already required "
-                "Core Questions. Return one JSON object with optional truly necessary "
-                "supplemental core_questions plus report_outline, source_guidance, and "
-                "work_hints arrays. Do not create a Cartesian coverage matrix, assign "
-                "workers, or broaden the confirmed scope."
+                "not research the topic. Convert the confirmed ResearchBrief into four "
+                "or five main required Core Questions. Group closely related directions "
+                "into one coherent research direction; the assigned Research Agent may "
+                "Fork narrower subtopics later. Do not add a separate synthesis Core "
+                "Question because the Composer owns synthesis. Return one JSON object "
+                "with core_questions, report_outline, source_guidance, and work_hints "
+                "arrays. Do not create a Cartesian coverage matrix, assign workers, or "
+                "broaden the confirmed scope."
             ),
         },
         {
@@ -147,28 +150,19 @@ def _plan_from_response(
     if "core_questions" not in payload and "queries" not in payload:
         raise ValueError("planner response must include core_questions")
 
-    required = _required_questions(brief)
-    raw_supplements = payload.get("core_questions", payload.get("queries"))
-    if raw_supplements in (None, [], (), ""):
-        supplements: tuple[str, ...] = ()
-    else:
-        supplements = normalize_sub_queries(raw_supplements, brief.question)
-    seen = {item.description.casefold() for item in required}
-    model_questions: list[CoreQuestion] = []
-    for description in supplements:
-        if description.casefold() in seen:
-            continue
-        seen.add(description.casefold())
-        model_questions.append(
-            CoreQuestion.create(
-                description,
-                required=False,
-                priority="medium",
-                origin="model",
-            )
+    descriptions = normalize_sub_queries(
+        payload.get("core_questions", payload.get("queries")),
+        brief.question,
+    )[:_MAX_DYNAMIC_QUESTIONS]
+    questions = tuple(
+        CoreQuestion.create(
+            description,
+            required=True,
+            priority="high",
+            origin="dynamic_plan",
         )
-        if len(model_questions) >= _MAX_MODEL_SUPPLEMENTS:
-            break
+        for description in descriptions
+    )
 
     outline = _string_tuple(payload.get("report_outline")) or _DEFAULT_OUTLINE
     source_guidance = _unique_strings([
@@ -179,10 +173,9 @@ def _plan_from_response(
         "Reject sources that do not directly mention or support the assigned topic; generic title matches are noise.",
     ])
     work_hints = _string_tuple(payload.get("work_hints"))
-    all_questions = (*required, *model_questions)
     return ResearchPlan.create(
         brief_revision=brief.revision,
-        core_questions=all_questions,
+        core_questions=questions,
         report_outline=outline,
         source_guidance=source_guidance,
         work_hints=work_hints,

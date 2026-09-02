@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+from dataclasses import replace
 
 import pytest
 
@@ -98,6 +99,60 @@ async def test_composer_renders_citations_from_claim_lineage() -> None:
     assert draft.evidence_ids == ("evidence-1",)
     assert "[[EVIDENCE:evidence-1]]" in draft.markdown
     assert draft.sections[0].assertions[0].claim_ids
+
+
+@pytest.mark.asyncio
+async def test_synthesis_requirement_needs_its_cited_report_structure() -> None:
+    base_plan, base_outcome = _research_package()
+    research_question = base_plan.core_questions[0]
+    synthesis_question = CoreQuestion.create(
+        "Form the comparison and disclose evidence gaps",
+        requires_external_evidence=False,
+    )
+    plan = ResearchPlan.create(
+        0,
+        (research_question, synthesis_question),
+        report_outline=("Answer", "Comparison conclusion"),
+    )
+    outcome = replace(base_outcome, plan_id=plan.plan_id)
+    claim = outcome.worker_results[0].claims[0]
+
+    async def complete_policy(messages, *, tools=None):
+        return {"content": json.dumps({
+            "sections": [
+                {
+                    "heading": "Answer",
+                    "assertions": [{
+                        "text": "The measured value was 42%.",
+                        "claim_ids": [claim.claim_id],
+                    }],
+                },
+                {
+                    "heading": "Comparison conclusion",
+                    "assertions": [{
+                        "text": "The available comparison is limited to the verified measurement.",
+                        "claim_ids": [claim.claim_id],
+                    }],
+                },
+            ],
+            "unresolved": ["No second comparable measurement was verified."],
+        })}
+
+    complete = await compose_report(complete_policy, plan, outcome)
+    assert complete.incomplete_synthesis_requirement_ids == ()
+    assert "[[EVIDENCE:evidence-1]]" in complete.markdown
+
+    async def missing_policy(messages, *, tools=None):
+        return {"content": json.dumps(_payload(
+            outcome,
+            "The measured value was 42%.",
+        ))}
+
+    missing = await compose_report(missing_policy, plan, outcome)
+    assert missing.incomplete_synthesis_requirement_ids == (
+        synthesis_question.question_id,
+    )
+    assert any("lacks its report structure" in item for item in missing.unresolved)
 
 
 @pytest.mark.asyncio
@@ -269,6 +324,45 @@ async def test_composer_falls_back_to_clean_claims_when_repair_is_invalid() -> N
 
 
 @pytest.mark.asyncio
+async def test_deterministic_fallback_preserves_plan_sections_and_synthesis_gap() -> None:
+    base_plan, base_outcome = _research_package()
+    first = base_plan.core_questions[0]
+    second = CoreQuestion.create("Verify disclosure requirements")
+    synthesis = CoreQuestion.create(
+        "Form the structured comparison and disclose gaps",
+        requires_external_evidence=False,
+    )
+    plan = ResearchPlan.create(
+        0,
+        (first, second, synthesis),
+        report_outline=("Answer", "Disclosure", "Comparison conclusion"),
+    )
+    outcome = replace(
+        base_outcome,
+        plan_id=plan.plan_id,
+        assigned_question_ids=(first.question_id, second.question_id),
+        resolved_question_ids=(first.question_id,),
+        unresolved_question_ids=(second.question_id,),
+    )
+
+    async def invalid_policy(messages, *, tools=None):
+        return {"content": "not valid JSON"}
+
+    draft = await compose_report(invalid_policy, plan, outcome)
+
+    assert [section.heading for section in draft.sections[:3]] == [
+        "Answer",
+        "Disclosure",
+        "Comparison conclusion",
+    ]
+    assert "The official report gives a measured value of 42%." in draft.markdown
+    assert "该部分缺少可报告的已验证 Claim" in draft.markdown
+    assert "未形成经验证的综合结论" in draft.markdown
+    assert draft.incomplete_synthesis_requirement_ids == ()
+    assert draft.output_status is OutputStatus.REPAIRED
+
+
+@pytest.mark.asyncio
 async def test_raw_page_shaped_claim_is_quarantined_before_policy_call() -> None:
     raw = "| Navigation | Value |\n|---|---|\n| Privacy policy | https://example.com |"
     plan, outcome = _research_package(claim_text=raw)
@@ -305,6 +399,30 @@ def test_bounded_claims_covers_each_question_before_second_claims() -> None:
     covered = {item for claim in selected for item in claim.question_ids}
     assert covered == {item.question_id for item in questions}
     assert len(selected) == 12
+
+
+def test_default_claim_budget_scales_beyond_twelve_for_multi_question_report() -> None:
+    questions = tuple(CoreQuestion.create(f"Question {index}") for index in range(4))
+    plan = ResearchPlan.create(0, questions)
+    claims = tuple(
+        EvidenceClaim.create(
+            f"Supported concise claim {question_index}-{claim_index}.",
+            (question.question_id,),
+            (f"evidence-{question_index}-{claim_index}",),
+            f"https://authority.gov/{question_index}/{claim_index}",
+            "section:1",
+            "A grounded excerpt.",
+        )
+        for question_index, question in enumerate(questions)
+        for claim_index in range(8)
+    )
+
+    selected = _bounded_claims(plan, claims)
+
+    assert 12 < len(selected) <= 32
+    assert {item for claim in selected for item in claim.question_ids} == {
+        item.question_id for item in questions
+    }
 
 
 def test_bounded_claims_covers_each_evidence_requirement_before_duplicates() -> None:

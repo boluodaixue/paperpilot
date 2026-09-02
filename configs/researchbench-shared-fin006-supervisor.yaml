@@ -39,6 +39,7 @@ research:
           required: true
         - description: "基于一手来源形成结构化对照和结论，明确国际原则、中国实践及尚未解决的证据缺口。"
           required: true
+          requires_external_evidence: false
       report_outline:
         - "定义与规则框架"
         - "募集资金用途"
@@ -66,9 +67,10 @@ research:
     max_iterations: 18
     max_tool_calls: 30
     max_tool_output_chars: 24000
-    max_children: 4
+    max_children_per_agent: 5
     max_fork_depth: 2
-    max_total_threads: 10
+    max_concurrent_agents: 10
+    max_total_agents: 24
     max_total_tool_calls: 96
     max_elapsed_seconds: 1200.0
     max_total_tokens: 500000

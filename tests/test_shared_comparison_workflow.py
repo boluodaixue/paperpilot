@@ -8,7 +8,15 @@ import pytest
 from langgraph.checkpoint.memory import InMemorySaver
 
 from src.research.memory import MarkdownMemoryStore
-from src.research.models import AgentLimits, ExecutionIdentity
+from src.research.models import (
+    AgentLimits,
+    EvidenceItem,
+    ExecutionIdentity,
+    OutputStatus,
+    ResearchResult,
+    ResearchStatus,
+    TerminationReason,
+)
 from src.research.research_blackboard import ResearchBlackboard
 from src.research.v2_contracts import (
     CoreQuestion,
@@ -17,6 +25,8 @@ from src.research.v2_contracts import (
     SupervisorV2Config,
 )
 from src.research.workflow import (
+    _drop_unknown_root_evidence_markers,
+    _preserve_legacy_research_state,
     build_research_workflow,
     create_research_workflow_state,
     resume_research_workflow,
@@ -76,6 +86,7 @@ class FixedAcquireTool:
 class SharedPolicy:
     def __init__(self) -> None:
         self.audit_evidence_counts: list[int] = []
+        self.composer_calls = 0
 
     def __call__(self, messages, *, tools=None):
         content = str(messages[-1].get("content") or "")
@@ -88,17 +99,51 @@ class SharedPolicy:
                 "constraints": ["Use primary sources"],
                 "expected_output": "Evidence-backed answer",
             })}
+        if "PaperPilot Research Planner" in system:
+            return {"content": json.dumps({
+                "core_questions": ["Verify the official measured result"],
+                "report_outline": ["Result"],
+                "source_guidance": ["Use primary sources"],
+                "work_hints": [],
+            })}
+        if "independent evidence-support verifier" in system:
+            payload = json.loads(content)
+            return {"content": json.dumps({
+                "assessments": [
+                    {
+                        "candidate_id": item["candidate_id"],
+                        "verdict": "entailed",
+                        "confidence": 0.99,
+                        "supported_scope": item["text"],
+                        "unsupported_scope": "",
+                        "reason": "The official Passage directly supports the Claim.",
+                    }
+                    for item in payload["candidates"]
+                ]
+            })}
         assessment = assessment_response(messages)
         if assessment is not None:
             return assessment
         if content.startswith("FINAL_SYNTHESIS_SNAPSHOT"):
+            state = json.loads(content.split("STATE:\n", 1)[1])
+            marker = (
+                f" [[EVIDENCE:{state['evidence'][0]['evidence_id']}]]"
+                if state.get("evidence") else ""
+            )
             return {"content": json.dumps({
                 "status": "completed",
                 "summary": "The official result is verified.",
                 "findings": ["The official measured result is 42 percent."],
                 "unresolved": [],
+                "research_memo": "",
+                "report_markdown": (
+                    "# Root report\n\n## Result\n\n"
+                    "The official measured result is 42 percent."
+                    + marker
+                ),
             })}
         if "Lead Researcher composing" in system:
+            self.composer_calls += 1
             payload = json.loads(content)
             claim = payload["selected_claims"][0]
             return {"content": json.dumps({
@@ -210,3 +255,97 @@ async def test_legacy_and_supervisor_share_plan_composer_and_citation_path(tmp_p
     legacy_nodes = set(legacy.keys())
     supervisor_nodes = set(supervisor.keys())
     assert "v2_citation_audit" in legacy_nodes & supervisor_nodes
+
+
+@pytest.mark.asyncio
+async def test_dynamic_legacy_plan_uses_root_agent_report_path(tmp_path) -> None:
+    identity = ExecutionIdentity("root-dynamic-structured", None, "root-dynamic-structured", 0)
+    policy = SharedPolicy()
+    graph = build_research_workflow(
+        policy,
+        (FixedAcquireTool(),),
+        MarkdownMemoryStore(tmp_path / "dynamic" / "vault"),
+        checkpointer=InMemorySaver(),
+        research_architecture=ResearchArchitecture.LEGACY,
+        research_blackboard=ResearchBlackboard(
+            tmp_path / "dynamic" / "checkpoint.sqlite"
+        ),
+        structured_report_enabled=True,
+    )
+    config = {"configurable": {"thread_id": identity.thread_id}}
+    await graph.ainvoke(
+        create_research_workflow_state(
+            "What is the official measured result?",
+            identity,
+            AgentLimits(max_elapsed_seconds=1200.0),
+        ),
+        config=config,
+    )
+    final = await resume_research_workflow(
+        graph,
+        thread_id=identity.thread_id,
+        action="confirm",
+    )
+
+    assert len(final["v2_plan"].core_questions) == 1
+    assert final["v2_plan"].core_questions[0].origin == "dynamic_plan"
+    assert final["workflow_result"].structured_report is True
+    assert final["workflow_result"].root_agent_report is True
+    assert final["workflow_result"].shared_comparison is False
+    assert final["result"].report_markdown
+    assert "# Root report" in final["result"].report_markdown
+    assert "## References" in final["report_markdown"]
+    assert "## Evidence-backed Details" not in final["report_markdown"]
+    assert "shared_selected_evidence_ids" not in final
+    assert final.get("v2_citation_audit") is None
+    assert policy.audit_evidence_counts == []
+    assert policy.composer_calls == 0
+    assert final["workflow_result"].coordination_metrics[
+        "evidence_lineage_count"
+    ] == 0
+
+
+def test_root_report_drops_only_unknown_evidence_markers() -> None:
+    item = EvidenceItem(
+        evidence_id="known-id",
+        finding="The official measured result is 42 percent.",
+        source_type="primary",
+        title="Official report",
+        source_ref="https://authority.gov/report",
+        locator="section:result",
+    )
+    markdown = (
+        "Supported [[EVIDENCE:known-id]]. "
+        "Uncited statement [[EVIDENCE:missing-id]]."
+    )
+
+    cleaned = _drop_unknown_root_evidence_markers(markdown, (item,))
+
+    assert "[[EVIDENCE:known-id]]" in cleaned
+    assert "missing-id" not in cleaned
+    assert "Uncited statement" in cleaned
+
+
+def test_structured_report_cannot_upgrade_budget_forced_legacy_result() -> None:
+    structured = ResearchResult(
+        "structured",
+        ResearchStatus.COMPLETED,
+        "Valid cited report",
+        termination_reason=TerminationReason.BUDGET_FORCED,
+        output_status=OutputStatus.VALID,
+    )
+    legacy = ResearchResult(
+        "legacy",
+        ResearchStatus.PARTIAL,
+        "Useful partial research",
+        stop_reason="token_budget_exhausted",
+        termination_reason=TerminationReason.BUDGET_FORCED,
+        thread_count=6,
+    )
+
+    preserved = _preserve_legacy_research_state(structured, legacy)
+
+    assert preserved.status is ResearchStatus.PARTIAL
+    assert preserved.stop_reason == "token_budget_exhausted"
+    assert preserved.termination_reason is TerminationReason.BUDGET_FORCED
+    assert preserved.thread_count == 6

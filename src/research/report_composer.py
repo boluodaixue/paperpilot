@@ -185,26 +185,33 @@ def _bounded_claims(
     plan: ResearchPlan,
     claims: tuple[EvidenceClaim, ...],
     *,
-    per_question: int = 2,
-    total_limit: int = 12,
+    per_question: int = 8,
+    total_limit: int | None = None,
+    claim_context_char_budget: int = 18000,
 ) -> tuple[EvidenceClaim, ...]:
-    """Keep context bounded while preserving every verified proof obligation."""
+    """Pack Agent-ranked Claims into a context budget, not a tiny fixed count."""
     confidence_rank = {"high": 0, "medium": 1, "low": 2}
+    claim_order = {item.claim_id: index for index, item in enumerate(claims)}
 
     def rank(item: EvidenceClaim) -> tuple[Any, ...]:
         return (
             confidence_rank.get(item.confidence, 3),
             bool(item.limitations),
             not bool(item.comparability_notes),
-            item.claim_id,
+            claim_order[item.claim_id],
         )
 
     required_requirements = tuple(
         item for item in plan.evidence_requirements if item.required
     ) or tuple(plan.evidence_requirements)
-    total_limit = max(total_limit, len(required_requirements))
+    dynamic_limit = min(40, max(24, len(required_requirements) * 8))
+    total_limit = max(
+        dynamic_limit if total_limit is None else total_limit,
+        len(required_requirements),
+    )
     selected: list[EvidenceClaim] = []
     selected_ids: set[str] = set()
+    selected_chars = 0
     known_question_ids = {item.question_id for item in plan.core_questions}
     candidates_by_requirement = {
         requirement.requirement_id: sorted(
@@ -221,27 +228,45 @@ def _bounded_claims(
         )
         for requirement in required_requirements
     }
-    # Round-robin guarantees one Claim per proof obligation before adding a second.
+    def add(item: EvidenceClaim, *, required_slot: bool = False) -> bool:
+        nonlocal selected_chars
+        if item.claim_id in selected_ids:
+            return False
+        estimated_chars = sum((
+            len(item.claim),
+            len(item.locator),
+            len(item.limitations),
+            len(item.comparability_notes),
+            240,
+        ))
+        if (
+            selected
+            and not required_slot
+            and selected_chars + estimated_chars > claim_context_char_budget
+        ):
+            return False
+        selected.append(item)
+        selected_ids.add(item.claim_id)
+        selected_chars += estimated_chars
+        return True
+
+    # Round-robin guarantees one Claim per proof obligation before adding more.
     for position in range(per_question):
         for requirement in required_requirements:
             candidates = candidates_by_requirement[requirement.requirement_id]
             if position >= len(candidates):
                 continue
             item = candidates[position]
-            if item.claim_id not in selected_ids:
-                selected.append(item)
-                selected_ids.add(item.claim_id)
-                if len(selected) >= total_limit:
-                    return tuple(selected)
+            add(item, required_slot=(position == 0))
+            if len(selected) >= total_limit:
+                return tuple(selected)
     for item in sorted(
         (claim for claim in claims if set(claim.question_ids) & known_question_ids),
         key=rank,
     ):
-        if item.claim_id not in selected_ids:
-            selected.append(item)
-            selected_ids.add(item.claim_id)
-            if len(selected) >= total_limit:
-                break
+        add(item)
+        if len(selected) >= total_limit:
+            break
     return tuple(selected)
 
 
@@ -266,12 +291,13 @@ def _drop_false_challenge_assertions(
 
 
 def _deterministic_sections(
+    plan: ResearchPlan,
     claims: tuple[EvidenceClaim, ...],
 ) -> tuple[ReportSection, ...]:
-    """Build a minimal structured report from already-validated Claims."""
+    """Build a plan-shaped report from already-validated immutable Claims."""
 
-    findings = tuple(
-        ReportAssertion(text=clean, claim_ids=(claim.claim_id,))
+    clean_claims = tuple(
+        (claim, clean)
         for claim in claims
         if (clean := reportable_claim_text(claim.claim)) is not None
     )
@@ -282,10 +308,46 @@ def _deterministic_sections(
         and (clean := reportable_claim_text(claim.limitations, limit=500)) is not None
     )
     sections: list[ReportSection] = []
-    if findings:
-        sections.append(ReportSection("Findings", findings))
+    assigned_claim_ids: set[str] = set()
+    for index, question in enumerate(plan.core_questions):
+        heading = (
+            plan.report_outline[index]
+            if index < len(plan.report_outline)
+            else question.description
+        )
+        assertions = tuple(
+            ReportAssertion(text=clean, claim_ids=(claim.claim_id,))
+            for claim, clean in clean_claims
+            if question.question_id in claim.question_ids
+            and claim.claim_id not in assigned_claim_ids
+        )
+        assigned_claim_ids.update(
+            claim_id
+            for assertion in assertions
+            for claim_id in assertion.claim_ids
+        )
+        if assertions:
+            sections.append(ReportSection(heading, assertions))
+        elif question.required:
+            disclosure = (
+                "未形成经验证的综合结论；本节仅披露现有证据边界。"
+                if not question.requires_external_evidence
+                else "该部分缺少可报告的已验证 Claim，保留为未解决证据缺口。"
+            )
+            sections.append(ReportSection(
+                heading,
+                (ReportAssertion(text=disclosure, claim_ids=()),),
+            ))
+
+    remaining = tuple(
+        ReportAssertion(text=clean, claim_ids=(claim.claim_id,))
+        for claim, clean in clean_claims
+        if claim.claim_id not in assigned_claim_ids
+    )
+    if remaining:
+        sections.append(ReportSection("其他已验证发现", remaining))
     if limitations:
-        sections.append(ReportSection("Limitations", limitations))
+        sections.append(ReportSection("证据限制", limitations))
     return tuple(sections)
 
 
@@ -419,6 +481,7 @@ def _composer_prompt(
                     "description": item.description[:800],
                     "required": item.required,
                     "priority": item.priority,
+                    "requires_external_evidence": item.requires_external_evidence,
                 }
                 for item in plan.core_questions
             ],
@@ -426,7 +489,6 @@ def _composer_prompt(
                 asdict(item) for item in plan.evidence_requirements
             ],
             "report_outline": [item[:500] for item in plan.report_outline[:12]],
-            "source_guidance": [item[:600] for item in plan.source_guidance[:10]],
         },
         "selected_claims": [
             {
@@ -434,20 +496,11 @@ def _composer_prompt(
                 "claim": reportable_claim_text(item.claim),
                 "question_ids": list(item.question_ids),
                 "requirement_ids": list(item.requirement_ids),
-                "evidence_ids": list(item.evidence_ids),
-                "passage_ids": list(item.passage_ids),
-                "support_assessment_ids": list(item.support_assessment_ids),
-                "verification_status": item.verification_status,
-                "locator": item.locator,
-                "sources": [
-                    {
-                        "evidence_id": evidence_id,
-                        "title": evidence_by_id[evidence_id].title[:300],
-                        "source_type": evidence_by_id[evidence_id].source_type,
-                        "locator": evidence_by_id[evidence_id].locator[:300],
-                    }
-                    for evidence_id in item.evidence_ids
-                ],
+                "source": {
+                    "title": evidence_by_id[item.evidence_ids[0]].title[:300],
+                    "source_type": evidence_by_id[item.evidence_ids[0]].source_type,
+                    "locator": evidence_by_id[item.evidence_ids[0]].locator[:300],
+                },
                 "limitations": safe_disclosure_text(item.limitations, limit=400),
                 "confidence": item.confidence,
                 "comparability_notes": safe_disclosure_text(
@@ -458,7 +511,13 @@ def _composer_prompt(
         ],
         "unresolved_question_ids": list(outcome.unresolved_question_ids),
         "requirement_coverage": [
-            asdict(item) for item in outcome.requirement_coverage
+            {
+                "requirement_id": item.requirement_id,
+                "question_id": item.question_id,
+                "status": item.status,
+                "reason": item.reason,
+            }
+            for item in outcome.requirement_coverage
         ],
         "research_challenges": [
             {
@@ -495,6 +554,10 @@ plain report prose plus one or more exact claim_ids from selected_claims. Never
 write Evidence markers, URLs, Markdown links, images, HTML, navigation text, or
 raw source excerpts; the application renders citations from claim_ids. If the
 Claims do not support a statement, omit it or put a concise note in unresolved.
+Core Questions with requires_external_evidence=false are synthesis requirements:
+do not create standalone evidence for them. Integrate already verified Claims
+into the corresponding report_outline section, use report_outline headings
+verbatim, cite every material conclusion through claim_ids, and disclose gaps.
 An accepted, deferred, pending, or unresolved_disclosed challenge with
 blocks_claim=true is a hard exclusion: do not use its targeted Claim. For
 blocks_claim=false, you may state only the narrow verified Claim, must not make
@@ -549,8 +612,19 @@ async def compose_report(
     quarantined_claim_count = max(0, unblocked_claim_count - len(reportable_claims))
     claims = _bounded_claims(plan, reportable_claims)
     required_question_ids = tuple(
-        item.question_id for item in plan.core_questions if item.required
-    ) or tuple(item.question_id for item in plan.core_questions)
+        item.question_id
+        for item in plan.core_questions
+        if item.required and item.requires_external_evidence
+    ) or tuple(
+        item.question_id
+        for item in plan.core_questions
+        if item.requires_external_evidence
+    )
+    synthesis_questions = tuple(
+        item
+        for item in plan.core_questions
+        if item.required and not item.requires_external_evidence
+    )
     reportable_question_ids = {
         question_id for claim in reportable_claims for question_id in claim.question_ids
     }
@@ -596,6 +670,9 @@ async def compose_report(
             sections=(),
             quarantined_claim_count=quarantined_claim_count,
             uncovered_question_ids=uncovered_question_ids,
+            incomplete_synthesis_requirement_ids=tuple(
+                item.question_id for item in synthesis_questions
+            ),
         )
     messages = _composer_prompt(plan, outcome, claims, challenges, adjudications)
     response = await call_policy(policy, messages, [])
@@ -636,7 +713,7 @@ async def compose_report(
             )
             composition_repair_applied = True
         except ValueError:
-            sections = _deterministic_sections(claims)
+            sections = _deterministic_sections(plan, claims)
             unresolved = [
                 "Lead report composer returned invalid structured output twice; used a "
                 "deterministic Evidence Claim report."
@@ -659,10 +736,28 @@ async def compose_report(
             "Removed draft statement contradicting supplied Red challenges."
         )
     if not sections:
-        sections = _deterministic_sections(claims)
+        sections = _deterministic_sections(plan, claims)
         composition_fallback_applied = True
         safety_repairs.append("Replaced an empty structured draft with validated Claims.")
     markdown, used_ids = render_structured_report(sections, claims)
+    synthesis_targets = (
+        tuple(plan.report_outline[-len(synthesis_questions):])
+        if synthesis_questions
+        else ()
+    )
+    normalized_headings = {
+        " ".join(section.heading.casefold().split()) for section in sections
+    }
+    incomplete_synthesis = tuple(
+        question.question_id
+        for question, target in zip(synthesis_questions, synthesis_targets)
+        if " ".join(target.casefold().split()) not in normalized_headings
+    )
+    if len(synthesis_targets) < len(synthesis_questions):
+        incomplete_synthesis = tuple(dict.fromkeys((
+            *incomplete_synthesis,
+            *(item.question_id for item in synthesis_questions[len(synthesis_targets):]),
+        )))
     return ReportDraft(
         plan_id=plan.plan_id,
         markdown=markdown,
@@ -676,6 +771,10 @@ async def compose_report(
             *(item.strip() for item in unresolved if item.strip()),
             *outcome.unresolved_question_ids,
             *uncovered_question_ids,
+            *(
+                f"Synthesis requirement {item} lacks its report structure."
+                for item in incomplete_synthesis
+            ),
             *challenge_unresolved,
             *safety_repairs,
         ))),
@@ -687,4 +786,5 @@ async def compose_report(
         sections=sections,
         quarantined_claim_count=quarantined_claim_count,
         uncovered_question_ids=uncovered_question_ids,
+        incomplete_synthesis_requirement_ids=incomplete_synthesis,
     )

@@ -15,8 +15,9 @@ model:
       top_p: 1.0
     modules:
       research:
-        temperature: 0.7
+        temperature: 0.3
         max_tokens: 4096
+        max_input_chars: 60000
       judge:
         temperature: 0.1
         max_tokens: 2048
@@ -28,6 +29,8 @@ research:
   # V2 remains opt-in: the isolated single-question gate improved after targeted
   # fixes but still did not meet the publication-quality threshold.
   architecture: "legacy"
+  structured_report:
+    enabled: false
   supervisor_v2:
     enabled: false
     max_initial_workers: 4
@@ -47,9 +50,10 @@ research:
     max_iterations: 18
     max_tool_calls: 30
     max_tool_output_chars: 24000
-    max_children: 4
+    max_children_per_agent: 5
     max_fork_depth: 2
-    max_total_threads: 10
+    max_concurrent_agents: 10
+    max_total_agents: 24
     max_total_tool_calls: 96
     max_elapsed_seconds: 900.0
     max_total_tokens: 500000

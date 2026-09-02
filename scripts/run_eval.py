@@ -290,12 +290,16 @@ def workflow_metrics(result: ResearchWorkflowResult) -> dict[str, Any]:
         "evidence_manifests": list(result.memory_manifest.evidence_paths),
         "source_manifests": list(result.memory_manifest.source_paths),
         "shared_comparison": result.shared_comparison,
+        "structured_report": result.structured_report,
+        "root_agent_report": result.root_agent_report,
         "shared_selected_evidence_count": result.shared_selected_evidence_count,
         "coordination_metrics": dict(result.coordination_metrics),
     }
     if result.research_architecture == "supervisor_v2":
         metrics["v2"] = v2_structure_metrics(result)
-    if result.shared_comparison:
+    if result.shared_comparison or (
+        result.structured_report and not result.root_agent_report
+    ):
         metrics["shared_structure"] = v2_structure_metrics(result)
     return metrics
 

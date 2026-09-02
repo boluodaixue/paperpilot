@@ -182,6 +182,18 @@ class ResearchWorkflowState(TypedDict, total=False):
 _JSON_FENCE = re.compile(r"```(?:json)?\s*(.*?)\s*```", re.IGNORECASE | re.DOTALL)
 
 
+def _drop_unknown_root_evidence_markers(
+    markdown: str,
+    evidence: Iterable[EvidenceItem],
+) -> str:
+    """Keep Root prose but never render a citation to unknown Evidence."""
+    known_ids = {item.evidence_id for item in evidence}
+    return EVIDENCE_MARKER.sub(
+        lambda match: match.group(0) if match.group(1) in known_ids else "",
+        str(markdown or ""),
+    )
+
+
 def _managed_research_timestamp(
     report_markdown: str,
     *,
@@ -758,6 +770,7 @@ def _v2_research_result(
     critical_incomplete = bool(
         supervisor.unresolved_question_ids
         or draft.uncovered_question_ids
+        or draft.incomplete_synthesis_requirement_ids
         or draft.output_status is OutputStatus.FALLBACK
         or audit.status == "partial"
     )
@@ -811,6 +824,35 @@ def _v2_research_result(
         ),
         repair_applied=bool(repair_actions),
         repair_actions=repair_actions,
+    )
+
+
+def _preserve_legacy_research_state(
+    structured: ResearchResult,
+    legacy: ResearchResult,
+) -> ResearchResult:
+    """A valid structured report cannot upgrade incomplete research state."""
+
+    status = structured.status
+    if legacy.status is ResearchStatus.FAILED:
+        status = ResearchStatus.FAILED
+    elif (
+        legacy.status is ResearchStatus.PARTIAL
+        or legacy.termination_reason
+        in {
+            TerminationReason.BUDGET_FORCED,
+            TerminationReason.EVIDENCE_EXHAUSTED,
+            TerminationReason.TOOL_FAILURE,
+            TerminationReason.USER_CANCELLED,
+        }
+    ):
+        status = ResearchStatus.PARTIAL
+    return replace(
+        structured,
+        status=status,
+        thread_count=legacy.thread_count,
+        termination_reason=(legacy.termination_reason or structured.termination_reason),
+        stop_reason=(legacy.stop_reason or structured.stop_reason),
     )
 
 
@@ -885,6 +927,7 @@ def build_research_workflow(
     vault_write_service: VaultWriteService | None = None,
     research_blackboard: ResearchBlackboard | None = None,
     shared_comparison_plan: ResearchPlan | None = None,
+    structured_report_enabled: bool = False,
     homogeneous_fork_config: HomogeneousForkConfig | None = None,
 ) -> Any:
     """Build the root workflow around the same homogeneous Research AgentGraph."""
@@ -892,10 +935,18 @@ def build_research_workflow(
     effective_checkpointer = checkpointer if checkpointer is not None else InMemorySaver()
     v2_settings = supervisor_v2_config or SupervisorV2Config()
     shared_comparison_enabled = shared_comparison_plan is not None
+    use_structured_report = bool(
+        structured_report_enabled or shared_comparison_enabled
+    )
     fork_settings = homogeneous_fork_config or HomogeneousForkConfig()
     fork_settings.validate()
     if not isinstance(research_architecture, ResearchArchitecture):
         research_architecture = ResearchArchitecture(str(research_architecture))
+    use_root_agent_report = bool(
+        structured_report_enabled
+        and not shared_comparison_enabled
+        and research_architecture is ResearchArchitecture.LEGACY
+    )
     if research_architecture is ResearchArchitecture.SUPERVISOR_V2:
         v2_settings.validate()
         if not v2_settings.enabled:
@@ -920,10 +971,14 @@ def build_research_workflow(
             raise ValueError(
                 "shared architecture comparison requires Red review disabled for both arms"
             )
-        if report_review_enabled:
-            raise ValueError(
-                "shared architecture comparison conflicts with legacy report review"
-            )
+    if (
+        use_structured_report
+        and research_architecture is ResearchArchitecture.LEGACY
+        and report_review_enabled
+    ):
+        raise ValueError(
+            "structured Legacy reports conflict with legacy report review"
+        )
     memory_index = MarkdownMemoryIndex(memory_store)
 
     def validate_workflow_state(
@@ -1132,6 +1187,7 @@ def build_research_workflow(
                         "requirement_id": item.question_id,
                         "description": item.description,
                         "required": item.required,
+                        "requires_external_evidence": item.requires_external_evidence,
                     }
                     for item in plan.core_questions
                 ),
@@ -1162,15 +1218,18 @@ def build_research_workflow(
             ],
         }
         if (
-            shared_comparison_enabled
+            use_structured_report
             and research_architecture is ResearchArchitecture.LEGACY
         ):
+            task_objective = (
+                state["question"] if shared_comparison_enabled else brief.objective
+            )
             task = ResearchTask(
                 task_id=f"root-task-{state['identity'].root_thread_id}",
-                objective=state["question"],
+                objective=task_objective,
                 context={
                     "original_question": state["question"],
-                    "global_objective": state["question"],
+                    "global_objective": task_objective,
                     "research_plan_id": plan.plan_id,
                     "report_outline": list(plan.report_outline),
                     "source_guidance": list(plan.source_guidance),
@@ -1183,6 +1242,7 @@ def build_research_workflow(
                             "requirement_id": item.question_id,
                             "description": item.description,
                             "required": item.required,
+                            "requires_external_evidence": item.requires_external_evidence,
                         }
                         for item in plan.core_questions
                     ],
@@ -1191,6 +1251,7 @@ def build_research_workflow(
                             "requirement_id": item.question_id,
                             "description": item.description,
                             "required": item.required,
+                            "requires_external_evidence": item.requires_external_evidence,
                         }
                         for item in plan.core_questions
                     ],
@@ -1234,7 +1295,7 @@ def build_research_workflow(
             tool_artifact_store=vault_write_service,
             checkpoint_thread_id=f"{state['identity'].thread_id}.v2-supervisor",
             coordination_board=research_blackboard,
-            preserve_full_worker_evidence=shared_comparison_enabled,
+            preserve_full_worker_evidence=use_structured_report,
         )
         return {
             "v2_supervisor_outcome": outcome,
@@ -1247,7 +1308,7 @@ def build_research_workflow(
             ],
         }
 
-    def normalize_shared_research(
+    async def normalize_shared_research(
         state: ResearchWorkflowState,
         config: RunnableConfig,
     ) -> dict[str, Any]:
@@ -1256,24 +1317,29 @@ def build_research_workflow(
         validate_workflow_state(state, config)
         plan = state.get("v2_plan")
         if not isinstance(plan, ResearchPlan):
-            raise TypeError("shared comparison requires the fixed ResearchPlan")
+            raise TypeError("structured research requires a ResearchPlan")
         if research_architecture is ResearchArchitecture.LEGACY:
             result = state.get("result")
             if not isinstance(result, ResearchResult):
-                raise TypeError("shared comparison requires the Legacy ResearchResult")
-            package = package_legacy_result(
+                raise TypeError("structured research requires the Legacy ResearchResult")
+            package = await package_legacy_result(
                 plan,
                 result,
                 finalization_token_reserve=lead_finalization_reserve(
                     state["limits"].max_total_tokens,
                     len(tuple(item for item in plan.core_questions if item.required)),
                 ),
+                policy=policy,
             )
         else:
             outcome = state.get("v2_supervisor_outcome")
             if not isinstance(outcome, SupervisorOutcome):
-                raise TypeError("shared comparison requires the Supervisor outcome")
-            package = normalize_supervisor_outcome(plan, outcome)
+                raise TypeError("structured research requires the Supervisor outcome")
+            package = await normalize_supervisor_outcome(
+                plan,
+                outcome,
+                policy=policy,
+            )
         normalized = package.challenge_outcome.supervisor_outcome
         return {
             "v2_supervisor_outcome": normalized,
@@ -1360,7 +1426,7 @@ def build_research_workflow(
         selected_ids = set(state.get("shared_selected_evidence_ids", []))
         evidence = (
             tuple(item for item in all_evidence if item.evidence_id in selected_ids)
-            if shared_comparison_enabled
+            if use_structured_report
             else all_evidence
         )
         body = draft.markdown
@@ -1438,17 +1504,17 @@ def build_research_workflow(
                         tuple(item.claim_text for item in audit.issues),
                         blocked_claim_ids,
                     )
-        if not shared_comparison_enabled:
+        if not use_structured_report:
             body = _append_v2_disclosures(body, challenge, audit)
         result = _v2_research_result(challenge, draft, audit)
         if (
-            shared_comparison_enabled
+            use_structured_report
             and research_architecture is ResearchArchitecture.LEGACY
             and isinstance(state.get("result"), ResearchResult)
         ):
-            result = replace(
+            result = _preserve_legacy_research_state(
                 result,
-                thread_count=state["result"].thread_count,
+                state["result"],
             )
         return {
             "v2_citation_audit": audit,
@@ -1583,8 +1649,19 @@ def build_research_workflow(
         if not isinstance(result, ResearchResult):
             raise TypeError("Research AgentGraph completed without a ResearchResult")
         is_v2 = research_architecture is ResearchArchitecture.SUPERVISOR_V2
-        is_structured_report = is_v2 or shared_comparison_enabled
-        report_body = state.get("v2_report_body") if is_structured_report else None
+        is_structured_report = is_v2 or use_structured_report
+        report_body = (
+            result.report_markdown
+            if use_root_agent_report
+            else state.get("v2_report_body") if is_structured_report else None
+        )
+        if use_root_agent_report and isinstance(report_body, str):
+            report_body = _drop_unknown_root_evidence_markers(
+                report_body,
+                result.evidence,
+            )
+            if report_body != result.report_markdown:
+                result = replace(result, report_markdown=report_body)
         if is_structured_report and (
             not isinstance(report_body, str) or not report_body.strip()
         ):
@@ -1761,6 +1838,8 @@ def build_research_workflow(
                     else 0
                 ),
                 shared_comparison=shared_comparison_enabled,
+                structured_report=is_structured_report,
+                root_agent_report=use_root_agent_report,
                 shared_selected_evidence_count=len(
                     state.get("shared_selected_evidence_ids", [])
                 ),
@@ -1780,6 +1859,7 @@ def build_research_workflow(
                 }
             )
         return {
+            "result": result,
             "report_markdown": report_markdown,
             "memory_manifest": manifest,
             "workflow_result": workflow_result,
@@ -1800,7 +1880,7 @@ def build_research_workflow(
         validate_workflow_state(state, config)
         if (
             research_architecture is ResearchArchitecture.SUPERVISOR_V2
-            or shared_comparison_enabled
+            or use_structured_report
         ):
             return {"report_review": None}
         if not report_review_enabled:
@@ -1866,7 +1946,7 @@ def build_research_workflow(
         validate_workflow_state(state, config)
         if (
             research_architecture is ResearchArchitecture.SUPERVISOR_V2
-            or shared_comparison_enabled
+            or use_structured_report
         ):
             persisted = state.get("workflow_result")
             if not isinstance(persisted, ResearchWorkflowResult):
@@ -1988,7 +2068,14 @@ def build_research_workflow(
         },
     )
     builder.add_edge("revise_brief", "review_brief")
-    if shared_comparison_enabled:
+    if use_root_agent_report:
+        builder.add_node("planning", planning)
+        builder.add_node("research_agent", research_agent_graph)
+        builder.add_edge("prepare_research", "planning")
+        builder.add_edge("planning", "research_agent")
+        builder.add_edge("research_agent", "persist_result")
+        builder.add_edge("persist_result", "postprocess_report")
+    elif use_structured_report:
         builder.add_node("planning", planning)
         builder.add_node("normalize_shared_research", normalize_shared_research)
         builder.add_node("drafting", drafting_v2)

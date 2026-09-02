@@ -9,6 +9,7 @@ import pytest
 
 from src.research.evidence_claim_pipeline import (
     claim_has_verified_lineage,
+    deterministic_verify_candidate_claims,
     extract_candidate_claims,
     verified_evidence_claims,
     verify_candidate_claims,
@@ -17,8 +18,10 @@ from src.research.models import EvidenceItem, ResearchResult, ResearchStatus
 from src.research.research_supervisor import _requirement_coverage
 from src.research.research_worker import _verified_worker_result
 from src.research.v2_contracts import (
+    CandidateClaim,
     CoreQuestion,
     BlueWorkerResult,
+    EvidencePassage,
     EvidenceRequirement,
     ResearchPlan,
     SupportAssessment,
@@ -95,6 +98,28 @@ def test_passage_can_emit_two_bounded_atomic_candidates() -> None:
     assert {item.text for item in candidates} == {first, second}
 
 
+def test_candidate_extraction_covers_distinct_evidence_before_second_claims() -> None:
+    plan, packet, base = _package()
+    evidence = tuple(
+        EvidenceItem(**{
+            **base.__dict__,
+            "evidence_id": f"E{index}",
+            "source_ref": f"https://journal.example/trial-{index}",
+            "locator": f"Results {index}",
+            "excerpt": (
+                f"The pivotal trial reported measured endpoint {index}. "
+                f"Median follow-up was {20 + index} months."
+            ),
+        })
+        for index in range(8)
+    )
+
+    _, _, candidates = extract_candidate_claims(packet, plan, evidence)
+
+    assert len(candidates) == 12
+    assert len({item.passage_ids[0] for item in candidates[:8]}) == 8
+
+
 @pytest.mark.asyncio
 async def test_independent_verifier_creates_report_claim_only_after_entailment() -> None:
     plan, packet, evidence = _package()
@@ -126,6 +151,29 @@ async def test_independent_verifier_creates_report_claim_only_after_entailment()
     assert claims[0].passage_ids == (passages[0].passage_id,)
 
 
+@pytest.mark.asyncio
+async def test_verifier_accepts_common_confidence_labels() -> None:
+    plan, packet, evidence = _package()
+    _, passages, candidates = extract_candidate_claims(packet, plan, (evidence,))
+
+    async def policy(messages, *, tools=None):
+        return {"content": json.dumps({
+            "assessments": [{
+                "candidate_id": candidates[0].candidate_id,
+                "verdict": "entailed",
+                "confidence": "high",
+                "supported_scope": candidates[0].text,
+                "unsupported_scope": "",
+                "reason": "Direct support.",
+            }]
+        })}
+
+    assessments = await verify_candidate_claims(policy, candidates, passages)
+
+    assert assessments[0].method == "semantic_verifier"
+    assert assessments[0].confidence == 0.9
+
+
 def test_rejected_candidate_cannot_enter_verified_claim_inventory() -> None:
     plan, packet, evidence = _package()
     documents, passages, candidates = extract_candidate_claims(packet, plan, (evidence,))
@@ -144,8 +192,60 @@ def test_rejected_candidate_cannot_enter_verified_claim_inventory() -> None:
     assert claims == ()
 
 
+def test_deterministic_verifier_does_not_infer_cross_language_relevance() -> None:
+    question = CoreQuestion.create("比较绿色债券与SLB的投资者保护机制。")
+    requirement = EvidenceRequirement.create(
+        question.question_id,
+        "比较资金追踪、票息调整、违约风险和救济边界。",
+    )
+    plan = ResearchPlan.create(
+        0,
+        (question,),
+        evidence_requirements=(requirement,),
+    )
+    packet = WorkPacket.create(
+        question.description,
+        (question.question_id,),
+        "Verified Claim",
+        (),
+        1,
+        1000,
+        9999999999.0,
+    )
+    excerpt = (
+        "Failure to meet the sustainability target may result in a coupon "
+        "step-up penalty for the issuer."
+    )
+    evidence = EvidenceItem(
+        "cross-language",
+        excerpt,
+        "official",
+        "SLB principles",
+        "https://www.icmagroup.org/slb",
+        "section:bond-characteristics",
+        excerpt,
+        requirement_id=requirement.requirement_id,
+        action_id="A1",
+        artifact_id="artifact-1",
+    )
+    documents, passages, candidates = extract_candidate_claims(
+        packet, plan, (evidence,)
+    )
+
+    assessments = deterministic_verify_candidate_claims(
+        candidates, passages, plan.evidence_requirements
+    )
+    claims = verified_evidence_claims(
+        (evidence,), documents, passages, candidates, assessments
+    )
+
+    assert assessments[0].verdict == "partially_entailed"
+    assert assessments[0].confidence == 0.5
+    assert claims == ()
+
+
 @pytest.mark.asyncio
-async def test_invalid_verifier_output_falls_back_only_for_exact_quote_claim() -> None:
+async def test_invalid_verifier_output_does_not_publish_an_unverified_claim() -> None:
     plan, packet, evidence = _package()
     _, passages, candidates = extract_candidate_claims(packet, plan, (evidence,))
 
@@ -154,8 +254,117 @@ async def test_invalid_verifier_output_falls_back_only_for_exact_quote_claim() -
 
     assessments = await verify_candidate_claims(policy, candidates, passages)
 
+    assert assessments[0].verdict == "irrelevant"
+    assert assessments[0].confidence == 0.0
+    assert assessments[0].method == "semantic_verifier_unavailable"
+
+
+@pytest.mark.asyncio
+async def test_agent_ranked_exact_quote_does_not_repeat_semantic_review() -> None:
+    plan, packet, evidence = _package()
+    documents, passages, candidates = extract_candidate_claims(
+        packet, plan, (evidence,)
+    )
+
+    async def policy(messages, *, tools=None):
+        raise AssertionError("Agent-ranked exact quotes do not need semantic re-review")
+
+    assessments = await verify_candidate_claims(
+        policy,
+        candidates,
+        passages,
+        trusted_candidate_ids=(candidates[0].candidate_id,),
+    )
+    claims = verified_evidence_claims(
+        (evidence,), documents, passages, candidates, assessments
+    )
+
     assert assessments[0].verdict == "entailed"
-    assert assessments[0].method == "deterministic_exact_quote"
+    assert assessments[0].confidence == 0.75
+    assert assessments[0].method == "agent_ranked_exact_quote"
+    assert len(claims) == 1
+
+
+@pytest.mark.asyncio
+async def test_incomplete_verifier_response_rejects_only_omitted_candidates() -> None:
+    plan, packet, evidence = _package()
+    _, passages, candidates = extract_candidate_claims(packet, plan, (evidence,))
+
+    async def policy(messages, *, tools=None):
+        return {"content": json.dumps({
+            "assessments": [{
+                "candidate_id": candidates[0].candidate_id,
+                "verdict": "entailed",
+                "confidence": 0.98,
+                "supported_scope": candidates[0].text,
+                "unsupported_scope": "",
+                "reason": "Directly supported.",
+            }]
+        })}
+
+    assessments = await verify_candidate_claims(policy, candidates, passages)
+
+    assert assessments[0].verdict == "entailed"
+    assert assessments[0].method == "semantic_verifier"
+    assert all(
+        item.method == "semantic_verifier_unavailable"
+        and item.verdict == "irrelevant"
+        for item in assessments[1:]
+    )
+
+
+@pytest.mark.asyncio
+async def test_verifier_batches_large_inventory_without_truncating_candidates() -> None:
+    requirement = EvidenceRequirement.create("Q1", "Verify the measured result.")
+    passages = tuple(
+        EvidencePassage.create(
+            f"document-{index}",
+            f"evidence-{index}",
+            requirement.requirement_id,
+            "Measured result " + ("x" * 760) + f" {index}.",
+            f"section:{index}",
+        )
+        for index in range(40)
+    )
+    candidates = tuple(
+        CandidateClaim.create(
+            passage.exact_text,
+            ("Q1",),
+            (requirement.requirement_id,),
+            (passage.passage_id,),
+            passage.exact_text,
+        )
+        for passage in passages
+    )
+    prompt_sizes: list[int] = []
+    seen: list[str] = []
+
+    async def policy(messages, *, tools=None):
+        prompt_sizes.append(sum(len(item["content"]) for item in messages))
+        payload = json.loads(messages[-1]["content"])
+        seen.extend(item["candidate_id"] for item in payload["candidates"])
+        return {"content": json.dumps({
+            "assessments": [
+                {
+                    "candidate_id": item["candidate_id"],
+                    "verdict": "entailed",
+                    "confidence": 0.99,
+                    "supported_scope": item["text"],
+                    "unsupported_scope": "",
+                    "reason": "Direct support.",
+                }
+                for item in payload["candidates"]
+            ]
+        })}
+
+    assessments = await verify_candidate_claims(
+        policy, candidates, passages, (requirement,)
+    )
+
+    assert len(prompt_sizes) > 1
+    assert max(prompt_sizes) <= 28000
+    assert seen == [item.candidate_id for item in candidates]
+    assert all(item.method == "semantic_verifier" for item in assessments)
 
 
 def test_requirement_coverage_requires_verified_claim_and_primary_source() -> None:

@@ -31,7 +31,11 @@ from .context_compaction import (
     semantic_compaction_messages,
     snip_consumed_tool_artifacts,
 )
-from .evidence_selection import select_representative_evidence
+from .agent_scheduler import (
+    FairAgentScheduler,
+    ScheduledAgent,
+    ScheduledAgentCancelled,
+)
 from .fork_policy import (
     FORK_TOOL_NAME,
     candidate_fingerprint,
@@ -62,9 +66,12 @@ from .research_blackboard import ResearchBlackboard, normalize_scope_signature
 from .research_control import (
     HomogeneousForkConfig,
     ResearchControlAction,
+    ResearchControlDecision,
     decision_as_fork_tool_call,
+    initial_root_requirement_decision,
     parse_research_control_decision,
     research_control_prompt,
+    should_scout_before_fork,
 )
 from .research_sufficiency import (
     AssessmentValidationError,
@@ -96,6 +103,7 @@ from .tool_availability import (
 _TOOL_ARTIFACT_OFFLOAD_CHARS = 4000
 _CROSS_SCOPE_SIGNAL_TOOL_NAME = "signal_cross_scope"
 _BLACKBOARD_LEASE_SECONDS = 300.0
+_EVIDENCE_MARKER = re.compile(r"\[\[EVIDENCE:([A-Za-z0-9._-]+)\]\]")
 
 
 __all__ = [
@@ -203,6 +211,30 @@ def _parent_assignment_id(state: ResearchAgentState) -> str:
     return str(context.get("parent_assignment_id") or "").strip()
 
 
+def _has_owned_research_basis(
+    state: ResearchAgentState,
+    board_view: dict[str, Any] | None,
+) -> bool:
+    """Return whether this Assignment has observed a concrete research signal."""
+
+    if state.get("observed_evidence"):
+        return True
+    if not board_view:
+        return int(state.get("tool_calls_used", 0)) > 0
+    thread_id = state["identity"].thread_id
+    assignment_id = _own_assignment_id(state)
+    for key in ("recent_queries", "recent_sources", "recent_evidence"):
+        for item in board_view.get(key, []):
+            if not isinstance(item, dict):
+                continue
+            if (
+                item.get("owner_thread_id") == thread_id
+                or item.get("assignment_id") == assignment_id
+            ):
+                return True
+    return False
+
+
 def _candidate_scope_signature(candidate: ForkCandidate) -> str:
     return normalize_scope_signature(candidate.scope_signature, candidate.objective)
 
@@ -215,6 +247,7 @@ def _candidate_assignment_id(
         {
             "parent_assignment_id": parent_assignment_id,
             "requirement_ids": sorted(candidate.requirement_ids),
+            "objective": normalize_scope_signature(candidate.objective),
             "scope_signature": _candidate_scope_signature(candidate),
         },
         ensure_ascii=False,
@@ -366,6 +399,22 @@ def _estimate_tokens(messages: list[dict[str, Any]], response: dict[str, Any]) -
     return max(1, (input_chars + output_chars + 3) // 4)
 
 
+def _completion_tokens(response: dict[str, Any]) -> int:
+    usage = response.get("usage")
+    if hasattr(usage, "model_dump"):
+        usage = usage.model_dump()
+    if isinstance(usage, dict):
+        raw_completion = usage.get("completion_tokens")
+        try:
+            completion = int(raw_completion)
+        except (TypeError, ValueError):
+            completion = 0
+        if completion > 0:
+            return completion
+    content = str(response.get("content") or "")
+    return max(1, (len(content) + 1) // 2)
+
+
 def _identity_metadata(identity: ExecutionIdentity) -> dict[str, Any]:
     return {
         "thread_id": identity.thread_id,
@@ -413,8 +462,30 @@ def _system_prompt(identity: ExecutionIdentity, limits: AgentLimits) -> str:
     fork_instruction = (
         "You may call fork_research when at least one approved fork condition is "
         "satisfied and the child tasks are explicitly scoped."
-        if identity.depth < limits.max_fork_depth and limits.max_children > 0
+        if identity.depth < limits.max_fork_depth and limits.effective_max_children_per_agent > 0
         else "The fork depth or child budget is closed; continue locally and do not fork."
+    )
+    final_contract = (
+        "When final synthesis is requested, return only the complete Markdown "
+        "report, not JSON and not a fenced code block. Synthesize the Child "
+        "research memos, preserve important gaps, and cite only known sources "
+        "with [[EVIDENCE:evidence-id]] markers. Do not write a References section; "
+        "the runtime renders it."
+        if identity.depth == 0
+        else
+        "When the task is complete, stop calling tools and return one JSON object:\n"
+        "{\n"
+        '  "status": "completed" | "partial" | "failed",\n'
+        '  "summary": "concise synthesis",\n'
+        '  "findings": ["atomic finding"],\n'
+        '  "unresolved": ["remaining uncertainty"],\n'
+        '  "research_memo": "Child-only Markdown memo",\n'
+        '  "report_markdown": ""\n'
+        "}\n"
+        "Write a concise report only about your assigned direction in "
+        "research_memo. Select the material you judge useful and cite it with "
+        "[[EVIDENCE:evidence-id]] markers. Do not attempt the global report or "
+        "wrap the final JSON in commentary."
     )
     return f"""You are a PaperPilot Research Agent at depth {identity.depth}.
 Every Research Agent uses this same research loop. {fork_instruction}
@@ -429,18 +500,11 @@ Work on only the scoped task. Use tools when evidence is required. Search
 snippets are leads, not complete proof; preserve source identifiers and
 locators. Never invent a source.
 
-When the task is complete, stop calling tools and return one JSON object:
-{{
-  "status": "completed" | "partial" | "failed",
-  "summary": "concise synthesis",
-  "findings": ["atomic finding"],
-  "unresolved": ["remaining uncertainty"]
-}}
+{final_contract}
 After tool or child results, the same policy performs a checkpointed structured
 research-state assessment. Continue and Replan instructions keep tools available
 and identify requirement-scoped gaps. Stop Research alone enters final synthesis.
-Do not wrap the final JSON in commentary. There is no separate Planner,
-Manager, or Summarizer Agent.
+There is no separate Planner, Manager, or Summarizer Agent.
 """
 
 
@@ -589,7 +653,7 @@ def _initial_research_actions(
             )
         )
         for requirement in requirements
-        if requirement.required
+        if requirement.required and requirement.requires_external_evidence
     )
 
 
@@ -660,6 +724,11 @@ def _parse_final_draft(content: str) -> dict[str, Any]:
         value = payload.get(field)
         if not isinstance(value, list) or any(not isinstance(item, str) for item in value):
             raise AssessmentValidationError(f"final {field} must be an array of strings")
+    for field in ("research_memo", "report_markdown"):
+        value = payload.get(field, "")
+        if not isinstance(value, str):
+            raise AssessmentValidationError(f"final {field} must be a string")
+        payload[field] = value.strip()
     return payload
 
 
@@ -670,15 +739,85 @@ def _try_parse_final_draft(content: str) -> dict[str, Any] | None:
         return None
 
 
+def _root_markdown_draft(
+    state: ResearchAgentState,
+    content: str,
+) -> dict[str, Any] | None:
+    """Accept Root Markdown directly while preserving legacy JSON test policies."""
+    parsed = _try_parse_final_draft(content)
+    if parsed is not None:
+        return parsed
+    body = str(content or "").strip()
+    if not body or body.startswith("Error:"):
+        return None
+    fenced = re.fullmatch(r"```(?:markdown|md)?\s*(.*?)\s*```", body, re.IGNORECASE | re.DOTALL)
+    if fenced is not None:
+        body = fenced.group(1).strip()
+    summary = next(
+        (
+            block.strip()[:1200]
+            for block in re.split(r"\n\s*\n", body)
+            if block.strip() and not block.lstrip().startswith(("#", "|", "- ", "* "))
+        ),
+        "Root completed the final Markdown synthesis.",
+    )
+    unresolved = [
+        item.reason
+        for item in state.get("critical_gaps", [])
+        if item.reason
+    ]
+    status = (
+        ResearchStatus.PARTIAL.value
+        if state.get("stop_reason") or unresolved
+        else ResearchStatus.COMPLETED.value
+    )
+    return {
+        "status": status,
+        "summary": summary,
+        "findings": [],
+        "unresolved": unresolved,
+        "research_memo": "",
+        "report_markdown": body,
+    }
+
+
 def _bounded_finalization_messages(
     state: ResearchAgentState,
 ) -> list[dict[str, Any]]:
     """Build a compact same-policy snapshot instead of replaying long history."""
-    evidence = select_representative_evidence(
-        _deduplicate_evidence(state["observed_evidence"]),
-        state.get("coverage", []),
-        limit=24 if state["identity"].depth == 0 else 12,
-    )
+    inventory = _deduplicate_evidence(state["observed_evidence"])
+    by_id = {item.evidence_id: item for item in inventory}
+    preferred_ids: list[str] = []
+    for child in state.get("child_results", []):
+        preferred_ids.extend(_EVIDENCE_MARKER.findall(child.research_memo))
+    for coverage in state.get("coverage", []):
+        preferred_ids.extend(coverage.evidence_ids)
+    ordered_ids = tuple(dict.fromkeys((
+        *(item for item in preferred_ids if item in by_id),
+        *(item.evidence_id for item in inventory),
+    )))
+    evidence: list[EvidenceItem] = []
+    evidence_chars = 0
+    evidence_char_budget = 6000 if state["identity"].depth == 0 else 14000
+    for evidence_id in ordered_ids:
+        item = by_id[evidence_id]
+        estimated = min(500, len(item.finding)) + min(300, len(item.title)) + 180
+        if evidence and evidence_chars + estimated > evidence_char_budget:
+            break
+        evidence.append(item)
+        evidence_chars += estimated
+    child_results = tuple(state.get("child_results", []))
+    memo_limit = max(800, 16000 // max(1, len(child_results)))
+    child_memos = [
+        {
+            "task_id": item.task_id,
+            "status": item.status.value,
+            "summary": item.summary[:800],
+            "research_memo": item.research_memo[:memo_limit],
+            "unresolved": list(item.unresolved[:6]),
+        }
+        for item in child_results
+    ]
     payload = {
         "objective": state["task"].objective,
         "expected_output": state["task"].expected_output,
@@ -708,19 +847,12 @@ def _bounded_finalization_messages(
                 "finding": item.finding[:500],
                 "title": item.title[:300],
                 "source_ref": item.source_ref,
+                "locator": item.locator,
                 "limitations": item.limitations[:300],
             }
             for item in evidence
         ],
-        "child_results": [
-            {
-                "task_id": item.task_id,
-                "status": item.status.value,
-                "summary": item.summary[:1000],
-                "unresolved": list(item.unresolved[:8]),
-            }
-            for item in state.get("child_results", [])
-        ],
+        "child_results": child_memos,
         "tool_outcomes": [
             {
                 "name": message.get("name"),
@@ -738,15 +870,26 @@ def _bounded_finalization_messages(
         },
         {"role": "user", "content": _task_prompt(state["task"])},
     ]
+    output_instruction = (
+        "Return only the complete Markdown report, with no JSON wrapper and no "
+        "fenced code block. Use the Child research_memo fields as the primary "
+        "research input. Resolve overlaps, cover every required direction, "
+        "disclose material gaps, and reuse only the supplied "
+        "[[EVIDENCE:id]] markers. Do not write a References section."
+        if state["identity"].depth == 0
+        else
+        "Return one JSON object with status, summary, findings, unresolved, a "
+        "concise research_memo about only this assigned direction, and an empty "
+        "report_markdown. In the memo, choose and cite the Evidence you judge "
+        "useful with supplied [[EVIDENCE:id]] markers; disclose remaining gaps."
+    )
     return [
         *identity_messages,
         {
             "role": "user",
             "content": (
-                "FINAL_SYNTHESIS_SNAPSHOT\nReturn one JSON object with status "
-                "(completed|partial|failed), summary, findings (array of strings), "
-                "and unresolved (array of strings). Preserve uncertainty and do not "
-                "invent evidence. The runtime will independently enforce research "
+                "FINAL_SYNTHESIS_SNAPSHOT\n" + output_instruction + " Preserve "
+                "uncertainty and do not invent evidence. The runtime will independently enforce research "
                 "status and termination reason.\n\nSTATE:\n" + json.dumps(payload, ensure_ascii=False, default=str)
             ),
         },
@@ -1067,6 +1210,57 @@ def _coerce_strings(value: Any) -> list[str]:
     return [str(item).strip() for item in value if str(item).strip()]
 
 
+_UNRESOLVED_SCOPE = re.compile(
+    r"^\[requirements=(?P<requirements>[^;\]]*);scope=(?P<scope>[^\]]*)\]\s*(?P<text>.*)$"
+)
+
+
+def _scoped_unresolved(
+    values: Iterable[str],
+    candidate: ForkCandidate,
+) -> tuple[str, ...]:
+    prefix = (
+        "[requirements="
+        + ",".join(sorted(candidate.requirement_ids))
+        + ";scope="
+        + _candidate_scope_signature(candidate)
+        + "] "
+    )
+    return tuple(
+        value if _UNRESOLVED_SCOPE.match(value) else prefix + value
+        for value in (str(item).strip() for item in values)
+        if value
+    )
+
+
+def _aggregate_unresolved(values: Iterable[str]) -> tuple[str, ...]:
+    scoped: dict[tuple[str, str], list[str]] = {}
+    unscoped: dict[str, str] = {}
+    for raw in values:
+        value = str(raw).strip()
+        if not value:
+            continue
+        match = _UNRESOLVED_SCOPE.match(value)
+        if match is None:
+            unscoped.setdefault(" ".join(value.casefold().split()), value)
+            continue
+        key = (
+            " ".join(match.group("requirements").casefold().split()),
+            " ".join(match.group("scope").casefold().split()),
+        )
+        text = match.group("text").strip()
+        bucket = scoped.setdefault(key, [])
+        normalized = " ".join(text.casefold().split())
+        if text and all(" ".join(item.casefold().split()) != normalized for item in bucket):
+            bucket.append(text)
+    aggregated = [
+        f"[requirements={requirements};scope={scope}] " + " | ".join(texts)
+        for (requirements, scope), texts in scoped.items()
+        if texts
+    ]
+    return tuple((*aggregated, *unscoped.values()))
+
+
 def _fork_policy_instance(policy: Any) -> Any:
     fork = getattr(policy, "fork", None)
     if callable(fork):
@@ -1075,6 +1269,19 @@ def _fork_policy_instance(policy: Any) -> Any:
         return copy.deepcopy(policy)
     except Exception as exc:
         raise RuntimeError("policy cannot be isolated for a child Research Agent") from exc
+
+
+def _root_final_policy_instance(policy: Any, max_tokens: int) -> Any:
+    """Fork configurable production policies without cloning simple test policies."""
+    fork = getattr(policy, "fork", None)
+    final_policy = (
+        fork()
+        if callable(fork) and hasattr(policy, "max_tokens")
+        else policy
+    )
+    if hasattr(final_policy, "max_tokens"):
+        final_policy.max_tokens = max_tokens
+    return final_policy
 
 
 def _fork_tool_instances(tools: Iterable[Any]) -> list[Any]:
@@ -1119,6 +1326,7 @@ def _child_task(
                 "requirement_id": item.requirement_id,
                 "description": item.description,
                 "required": item.required,
+                "requires_external_evidence": item.requires_external_evidence,
             }
             for item in selected_requirements
         ]
@@ -1205,7 +1413,7 @@ def create_research_agent_state(
         observed_evidence=[],
         deadline_at=(deadline_at if deadline_at is not None else time.time() + limits.max_elapsed_seconds),
         subtree_thread_budget=(
-            subtree_thread_budget if subtree_thread_budget is not None else limits.max_total_threads
+            subtree_thread_budget if subtree_thread_budget is not None else limits.effective_max_total_agents
         ),
         subtree_tool_budget=(subtree_tool_budget if subtree_tool_budget is not None else limits.max_total_tool_calls),
         subtree_token_budget=(subtree_token_budget if subtree_token_budget is not None else limits.max_total_tokens),
@@ -1255,6 +1463,7 @@ def _fallback_assessment(
     attempts: tuple[StrategyAttempt, ...],
     hard_reason: TerminationReason | None = None,
     has_research_tools: bool,
+    assessment_error: str | None = None,
 ) -> ResearchAssessment:
     """Conservative deterministic routing after one failed structure repair."""
     requirements = tuple(state["research_requirements"])
@@ -1356,6 +1565,31 @@ def _fallback_assessment(
             next_actions=pending_actions,
             output_status=OutputStatus.FALLBACK,
         )
+    incomplete_children = tuple(
+        child
+        for child in state.get("child_results", [])
+        if child.status != ResearchStatus.COMPLETED
+    )
+    exhausted_child_paths = bool(incomplete_children) and all(
+        child.termination_reason in {
+            TerminationReason.BUDGET_FORCED,
+            TerminationReason.EVIDENCE_EXHAUSTED,
+        }
+        for child in incomplete_children
+    )
+    if evidence and assessment_error and exhausted_child_paths:
+        return ResearchAssessment(
+            decision=ResearchDecision.STOP_RESEARCH,
+            coverage=existing,
+            critical_gaps=gaps,
+            termination_reason=TerminationReason.EVIDENCE_EXHAUSTED,
+            exhaustion_reason=(
+                "Child research paths reached real local budget or evidence "
+                "boundaries, usable Evidence was retained, and no unattempted "
+                "root action remained after assessment repair failed."
+            ),
+            output_status=OutputStatus.FALLBACK,
+        )
     return ResearchAssessment(
         decision=ResearchDecision.STOP_RESEARCH,
         coverage=existing,
@@ -1376,7 +1610,9 @@ def _runtime_exhaustion_assessment(
     otherwise burns the whole token budget while cycling across tool families.
     """
     required_ids = {
-        requirement.requirement_id for requirement in state["research_requirements"] if requirement.required
+        requirement.requirement_id
+        for requirement in state["research_requirements"]
+        if requirement.required and requirement.requires_external_evidence
     }
     open_coverage = tuple(
         item
@@ -1429,6 +1665,7 @@ def build_research_agent_graph(
     tool_artifact_store: Any | None = None,
     coordination_board: ResearchBlackboard | None = None,
     homogeneous_fork_config: HomogeneousForkConfig | None = None,
+    agent_scheduler: FairAgentScheduler | None = None,
     state_schema: Any = ResearchAgentState,
     allow_fork_tool: bool = True,
 ) -> Any:
@@ -1447,6 +1684,7 @@ def build_research_agent_graph(
         None if inherit_checkpointer else checkpointer if checkpointer is not None else InMemorySaver()
     )
     descendant_checkpointer = child_checkpointer if child_checkpointer is not None else effective_checkpointer
+    live_scheduler = agent_scheduler
 
     def prepare(
         state: ResearchAgentState,
@@ -1477,6 +1715,7 @@ def build_research_agent_graph(
                                 "requirement_id": item.requirement_id,
                                 "description": item.description,
                                 "required": item.required,
+                                "requires_external_evidence": item.requires_external_evidence,
                             }
                             for item in requirements
                         ]
@@ -1785,150 +2024,169 @@ def build_research_agent_graph(
         control_error: str | None = None
         control_repair_applied = False
         control_event: dict[str, Any] | None = None
-        recursive_recon_required = (
-            fork_settings.enabled
-            and fork_settings.explicit_control_decision
-            and state["identity"].depth > 0
-            and bool(tool_list)
-            and int(state.get("tool_calls_used", 0))
-            < fork_settings.recursive_fork_min_local_tool_calls
-        )
-        if recursive_recon_required:
-            control_action_value = ResearchControlAction.LOCAL_RESEARCH.value
-            control_rationale = (
-                "Recursive Fork is deferred until this assignment performs "
-                f"at least {fork_settings.recursive_fork_min_local_tool_calls} "
-                "local research tool call(s) and identifies concrete evidence gaps."
-            )
-            control_event = _event(
-                "research_control_decided",
-                state["identity"],
-                action=control_action_value,
-                rationale=control_rationale,
-                target_requirement_ids=[],
-                error=None,
-                repair_applied=False,
-                recursive_recon_required=True,
-            )
-            if coordination_board is not None:
-                try:
-                    coordination_board.record_event(
-                        state["identity"].root_thread_id,
-                        "fork_not_called",
-                        actor_thread_id=state["identity"].thread_id,
-                        payload={
-                            "iteration": state["iteration"],
-                            "control_action": control_action_value,
-                            "rationale": control_rationale,
-                            "recursive_recon_required": True,
-                        },
-                    )
-                except Exception:
-                    pass
         if (
             fork_settings.enabled
             and fork_settings.explicit_control_decision
             and allow_fork_tool
             and not finalization_requested
-            and not recursive_recon_required
         ):
-            control_messages = research_control_prompt(
-                objective=state["task"].objective,
-                requirements=tuple(state["research_requirements"]),
-                coverage=(
-                    {
-                        **asdict(item),
-                        "status": item.status.value,
-                    }
-                    for item in state.get("coverage", [])
-                ),
-                child_summaries=(
-                    {
-                        "task_id": item.task_id,
-                        "status": item.status.value,
-                        "summary": item.summary[:500],
-                        "unresolved": list(item.unresolved[:4]),
-                    }
-                    for item in state.get("child_results", [])
-                ),
-                board_view=board_view,
-                depth=state["identity"].depth,
-                max_fork_depth=state["limits"].max_fork_depth,
-                max_children=max(
-                    0,
-                    state["limits"].max_children
-                    - len(set(state["completed_fork_fingerprints"])),
-                ),
-                local_rounds_since_fork=int(
-                    state.get("local_rounds_since_fork", 0)
-                ),
-                reconsider_after_local_rounds=(
-                    fork_settings.reconsider_after_local_rounds
-                ),
+            remaining_child_slots = max(
+                0,
+                state["limits"].effective_max_children_per_agent
+                - len(set(state["completed_fork_fingerprints"])),
             )
-            try:
-                control_response = await asyncio.wait_for(
-                    call_policy(policy, control_messages, []),
-                    timeout=max(0.001, available_seconds),
+            remaining_total_slots = (
+                max(
+                    0,
+                    state["limits"].effective_max_total_agents
+                    - len(board_view.get("assignment_tree", [])),
                 )
-                control_charge = _estimate_tokens(
-                    control_messages,
-                    control_response,
+                if board_view
+                else max(
+                    0,
+                    state["subtree_thread_budget"] - state["total_threads_used"],
                 )
-                compaction_token_charge += control_charge
-                remaining_tokens = max(0, remaining_tokens - control_charge)
-                raw_control = str(control_response.get("content") or "")
-                valid_control_ids = tuple(
-                    item.requirement_id for item in state["research_requirements"]
+            )
+            has_research_basis = _has_owned_research_basis(state, board_view)
+            decision: ResearchControlDecision | None = None
+            root_baseline_decision: ResearchControlDecision | None = None
+            if (
+                state["identity"].depth == 0
+                and not state.get("child_results")
+                and not state.get("completed_fork_fingerprints")
+                and not has_research_basis
+            ):
+                root_baseline_decision = initial_root_requirement_decision(
+                    state["research_requirements"],
+                    max_children=remaining_child_slots,
+                    remaining_total_agent_slots=remaining_total_slots,
+                )
+            if decision is None:
+                control_messages = research_control_prompt(
+                    objective=state["task"].objective,
+                    requirements=tuple(state["research_requirements"]),
+                    coverage=(
+                        {
+                            **asdict(item),
+                            "status": item.status.value,
+                        }
+                        for item in state.get("coverage", [])
+                    ),
+                    child_summaries=(
+                        {
+                            "task_id": item.task_id,
+                            "status": item.status.value,
+                            "summary": item.summary[:500],
+                            "research_memo": item.research_memo[:1500],
+                            "unresolved": list(item.unresolved[:4]),
+                        }
+                        for item in state.get("child_results", [])
+                    ),
+                    board_view=board_view,
+                    depth=state["identity"].depth,
+                    max_fork_depth=state["limits"].max_fork_depth,
+                    max_children=remaining_child_slots,
+                    local_rounds_since_fork=int(
+                        state.get("local_rounds_since_fork", 0)
+                    ),
+                    reconsider_after_local_rounds=(
+                        fork_settings.reconsider_after_local_rounds
+                    ),
+                    remaining_total_agent_slots=remaining_total_slots,
+                    delegable_token_budget=_delegable_token_budget(state),
+                    fork_evidence_basis=has_research_basis,
                 )
                 try:
-                    decision = parse_research_control_decision(
-                        raw_control,
-                        valid_requirement_ids=valid_control_ids,
+                    control_response = await asyncio.wait_for(
+                        call_policy(policy, control_messages, []),
+                        timeout=max(0.001, available_seconds),
                     )
-                except ValueError as first_error:
-                    repair_messages = [
-                        *control_messages,
-                        {"role": "assistant", "content": raw_control[:12000]},
-                        {
-                            "role": "user",
-                            "content": (
-                                "REPAIR_CONTROL_STRUCTURE_ONLY\n"
-                                f"Validation error: {first_error}\n"
-                                "Return the same semantic decision as valid JSON. "
-                                "Do not change fork to local_research or vice versa. "
-                                "Allowed Fork reasons are exactly: parallel, "
-                                "context_isolation, deep_tool_chain. Every candidate "
-                                "needs requirement_ids and at least one exact reason."
-                            ),
-                        },
-                    ]
-                    repaired_control = await asyncio.wait_for(
-                        call_policy(policy, repair_messages, []),
-                        timeout=max(0.001, _remaining_research_seconds(state)),
+                    control_charge = _estimate_tokens(
+                        control_messages,
+                        control_response,
                     )
-                    repair_charge = _estimate_tokens(
-                        repair_messages,
-                        repaired_control,
+                    compaction_token_charge += control_charge
+                    remaining_tokens = max(0, remaining_tokens - control_charge)
+                    raw_control = str(control_response.get("content") or "")
+                    valid_control_ids = tuple(
+                        item.requirement_id for item in state["research_requirements"]
                     )
-                    compaction_token_charge += repair_charge
-                    remaining_tokens = max(0, remaining_tokens - repair_charge)
-                    decision = parse_research_control_decision(
-                        str(repaired_control.get("content") or ""),
-                        valid_requirement_ids=valid_control_ids,
+                    try:
+                        decision = parse_research_control_decision(
+                            raw_control,
+                            valid_requirement_ids=valid_control_ids,
+                        )
+                    except ValueError as first_error:
+                        repair_messages = [
+                            *control_messages,
+                            {"role": "assistant", "content": raw_control[:12000]},
+                            {
+                                "role": "user",
+                                "content": (
+                                    "REPAIR_CONTROL_STRUCTURE_ONLY\n"
+                                    f"Validation error: {first_error}\n"
+                                    "Return the same semantic decision as valid JSON. "
+                                    "Do not change fork to local_research or vice versa. "
+                                    "Allowed Fork reasons are exactly: parallel, "
+                                    "context_isolation, deep_tool_chain. Every candidate "
+                                    "needs requirement_ids and at least one exact reason."
+                                ),
+                            },
+                        ]
+                        repaired_control = await asyncio.wait_for(
+                            call_policy(policy, repair_messages, []),
+                            timeout=max(0.001, _remaining_research_seconds(state)),
+                        )
+                        repair_charge = _estimate_tokens(
+                            repair_messages,
+                            repaired_control,
+                        )
+                        compaction_token_charge += repair_charge
+                        remaining_tokens = max(0, remaining_tokens - repair_charge)
+                        decision = parse_research_control_decision(
+                            str(repaired_control.get("content") or ""),
+                            valid_requirement_ids=valid_control_ids,
+                        )
+                        control_repair_applied = True
+                except asyncio.CancelledError:
+                    raise
+                except Exception as exc:
+                    decision = None
+                    control_error = f"{type(exc).__name__}: {exc}"
+                    control_action_value = ResearchControlAction.LOCAL_RESEARCH.value
+                    control_rationale = (
+                        "Control decision was invalid or unavailable; continue one "
+                        "bounded local round without forcing Fork."
                     )
-                    control_repair_applied = True
-            except asyncio.CancelledError:
-                raise
-            except Exception as exc:
-                decision = None
-                control_error = f"{type(exc).__name__}: {exc}"
-                control_action_value = ResearchControlAction.LOCAL_RESEARCH.value
-                control_rationale = (
-                    "Control decision was invalid or unavailable; continue one "
-                    "bounded local round without forcing Fork."
+            if root_baseline_decision is not None:
+                decision = ResearchControlDecision(
+                    ResearchControlAction.FORK,
+                    (
+                        decision.rationale
+                        if decision is not None
+                        else root_baseline_decision.rationale
+                    ),
+                    root_baseline_decision.target_requirement_ids,
+                    root_baseline_decision.fork_candidates,
                 )
-            else:
+            if (
+                decision is not None
+                and should_scout_before_fork(
+                    decision,
+                    depth=state["identity"].depth,
+                    has_research_basis=has_research_basis,
+                )
+            ):
+                decision = ResearchControlDecision(
+                    ResearchControlAction.LOCAL_RESEARCH,
+                    (
+                        "Recursive Fork deferred until this Assignment observes a "
+                        "query, source, or Evidence signal; scout locally first."
+                    ),
+                    decision.target_requirement_ids,
+                    (),
+                )
+            if decision is not None:
                 control_action_value = decision.action.value
                 control_rationale = decision.rationale
                 control_targets = list(decision.target_requirement_ids)
@@ -2074,11 +2332,20 @@ def build_research_agent_graph(
                     *([_cross_scope_signal_schema()] if coordination_board is not None else []),
                 ]
             )
+            invocation_policy = policy
+            root_direct_final = bool(
+                finalization_requested and state["identity"].depth == 0
+            )
+            if root_direct_final:
+                invocation_policy = _root_final_policy_instance(
+                    policy,
+                    fork_settings.root_final_max_tokens,
+                )
             action_retries = 0
             while True:
                 try:
                     response = await asyncio.wait_for(
-                        call_policy(policy, policy_messages, schemas),
+                        call_policy(invocation_policy, policy_messages, schemas),
                         timeout=max(0.001, available_seconds),
                     )
                     break
@@ -2117,8 +2384,72 @@ def build_research_agent_graph(
                         return update
                     action_retries += 1
 
+            continuation_charge = 0
+            continuation_count = 0
+            if root_direct_final:
+                combined_content = str(response.get("content") or "")
+                finish_reason = str(response.get("finish_reason") or "")
+                output_tokens_used = _completion_tokens(response)
+                while (
+                    finish_reason == "length"
+                    and output_tokens_used < fork_settings.root_final_output_token_budget
+                    and _remaining_seconds(state) > 0
+                ):
+                    remaining_output = (
+                        fork_settings.root_final_output_token_budget
+                        - output_tokens_used
+                    )
+                    continuation_policy = _root_final_policy_instance(
+                        policy,
+                        min(
+                            fork_settings.root_final_max_tokens,
+                            remaining_output,
+                        ),
+                    )
+                    continuation_messages = [
+                        {
+                            "role": "system",
+                            "content": (
+                                "Continue an incomplete Markdown research report. "
+                                "Return only the continuation, without repeating prior "
+                                "text, without JSON, and without a References section."
+                            ),
+                        },
+                        {
+                            "role": "user",
+                            "content": (
+                                f"OBJECTIVE:\n{state['task'].objective}\n\n"
+                                "Continue immediately after this report tail and finish "
+                                "all remaining sections:\n\n"
+                                + combined_content[-12000:]
+                            ),
+                        },
+                    ]
+                    next_response = await asyncio.wait_for(
+                        call_policy(continuation_policy, continuation_messages, []),
+                        timeout=max(0.001, _remaining_seconds(state)),
+                    )
+                    next_content = str(next_response.get("content") or "").strip()
+                    if not next_content:
+                        break
+                    combined_content = (
+                        combined_content.rstrip() + "\n\n" + next_content
+                    )
+                    continuation_charge += _estimate_tokens(
+                        continuation_messages,
+                        next_response,
+                    )
+                    output_tokens_used += _completion_tokens(next_response)
+                    finish_reason = str(next_response.get("finish_reason") or "")
+                    continuation_count += 1
+                response = {
+                    **response,
+                    "content": combined_content,
+                    "finish_reason": finish_reason or response.get("finish_reason"),
+                }
+
             token_charge = min(
-                _estimate_tokens(policy_messages, response),
+                _estimate_tokens(policy_messages, response) + continuation_charge,
                 remaining_tokens,
             )
             token_exhausted = token_charge >= remaining_tokens
@@ -2181,17 +2512,36 @@ def build_research_agent_graph(
                         else int(state.get("local_rounds_since_fork", 0))
                     ),
                 })
-            if compaction_event is not None or control_event is not None:
+            if (
+                compaction_event is not None
+                or control_event is not None
+                or continuation_count
+            ):
                 update["execution_events"] = [
                     *state["execution_events"],
                     *([compaction_event] if compaction_event is not None else []),
                     *([control_event] if control_event is not None else []),
+                    *(
+                        [
+                            _event(
+                                "root_report_continued",
+                                state["identity"],
+                                continuation_count=continuation_count,
+                                finish_reason=response.get("finish_reason"),
+                            )
+                        ]
+                        if continuation_count else []
+                    ),
                 ]
             if token_exhausted:
                 update["pending_tool_calls"] = []
                 update["pending_fork_calls"] = []
                 update["draft_raw"] = content
-                update["draft"] = _try_parse_final_draft(content)
+                update["draft"] = (
+                    _root_markdown_draft(state, content)
+                    if root_direct_final
+                    else _try_parse_final_draft(content)
+                )
                 update["stop_reason"] = "token_budget_exhausted"
                 update["termination_reason"] = TerminationReason.BUDGET_FORCED
                 observation.add_output({"action": "stop", "reason": "token_budget"})
@@ -2200,7 +2550,11 @@ def build_research_agent_graph(
                 update["pending_tool_calls"] = []
                 update["pending_fork_calls"] = []
                 update["draft_raw"] = content
-                update["draft"] = _try_parse_final_draft(content)
+                update["draft"] = (
+                    _root_markdown_draft(state, content)
+                    if root_direct_final
+                    else _try_parse_final_draft(content)
+                )
                 observation.add_output({"action": "finalize_output"})
                 return update
             if not calls:
@@ -2289,7 +2643,7 @@ def build_research_agent_graph(
                 hard_reason=hard_reason,
                 has_research_tools=bool(tool_list),
             )
-        elif runtime_exhaustion := _runtime_exhaustion_assessment(state, attempts):
+        elif (runtime_exhaustion := _runtime_exhaustion_assessment(state, attempts)):
             assessment = runtime_exhaustion
         else:
             prompt = assessment_schema_prompt(
@@ -2386,6 +2740,7 @@ def build_research_agent_graph(
                         state,
                         attempts=attempts,
                         has_research_tools=bool(tool_list),
+                        assessment_error=assessment_error,
                     )
 
         reconciled_attempts = (
@@ -2608,7 +2963,9 @@ def build_research_agent_graph(
                             if isinstance(value, (str, int, float)) and str(value).strip()
                         )
                     bootstrap_requirements = tuple(
-                        requirement for requirement in state["research_requirements"] if requirement.required
+                        requirement
+                        for requirement in state["research_requirements"]
+                        if requirement.required and requirement.requires_external_evidence
                     )
                     if not argument_query and bootstrap_requirements and _tool_accepts_empty_arguments(tool):
                         argument_query = bootstrap_requirements[0].description
@@ -3008,28 +3365,6 @@ def build_research_agent_graph(
                             artifact_id=artifact_id,
                         )
                     ]
-                    if coordination_board is not None:
-                        for item in extracted:
-                            try:
-                                coordination_board.register_evidence(
-                                    state["identity"].root_thread_id,
-                                    evidence_id=item.evidence_id,
-                                    assignment_id=item.assignment_id,
-                                    parent_assignment_id=item.parent_assignment_id,
-                                    requirement_id=item.requirement_id,
-                                    owner_thread_id=state["identity"].thread_id,
-                                    source_ref=item.source_ref,
-                                    locator=item.locator,
-                                )
-                            except Exception as exc:
-                                events.append(
-                                    _event(
-                                        "blackboard_evidence_lineage_failed",
-                                        state["identity"],
-                                        evidence_id=item.evidence_id,
-                                        error=f"{type(exc).__name__}: {exc}",
-                                    )
-                                )
                     known_ids = {item.evidence_id for item in collected}
                     new_ids = tuple(item.evidence_id for item in extracted if item.evidence_id not in known_ids)
                     collected.extend(extracted)
@@ -3258,6 +3593,7 @@ def build_research_agent_graph(
                 tool_artifact_store=tool_artifact_store,
                 coordination_board=coordination_board,
                 homogeneous_fork_config=fork_settings,
+                agent_scheduler=live_scheduler,
                 deadline_at=state["deadline_at"],
                 subtree_thread_budget=thread_budget,
                 subtree_tool_budget=tool_budget,
@@ -3289,6 +3625,10 @@ def build_research_agent_graph(
                     error=str(exc),
                 )
             ]
+        result = replace(
+            result,
+            unresolved=_scoped_unresolved(result.unresolved, candidate),
+        )
         if coordination_board is not None:
             assignment_status = (
                 "completed"
@@ -3321,7 +3661,16 @@ def build_research_agent_graph(
         state: ResearchAgentState,
         config: RunnableConfig,
     ) -> dict[str, Any]:
+        nonlocal live_scheduler
         _validate_invocation(state, config)
+        if live_scheduler is None:
+            live_scheduler = FairAgentScheduler(
+                run_id=state["identity"].root_thread_id,
+                max_concurrent_agents=state["limits"].effective_max_concurrent_agents,
+                max_total_agents=state["limits"].effective_max_total_agents,
+                board=coordination_board,
+            )
+            await live_scheduler.activate_root(state["identity"].thread_id)
         candidates: list[ForkCandidate] = []
         for call in state["pending_fork_calls"]:
             candidates.extend(parse_fork_candidates(call["function"].get("arguments", "{}")))
@@ -3329,7 +3678,7 @@ def build_research_agent_graph(
         if coordination_board is not None:
             remaining_thread_slots = max(
                 0,
-                state["limits"].max_total_threads
+                state["limits"].effective_max_total_agents
                 - coordination_board.metrics(state["identity"].root_thread_id).get(
                     "assignment_count", 0
                 ),
@@ -3337,15 +3686,27 @@ def build_research_agent_graph(
         else:
             remaining_thread_slots = max(
                 0,
-                state["subtree_thread_budget"] - state["total_threads_used"],
+                min(
+                    state["subtree_thread_budget"] - state["total_threads_used"],
+                    live_scheduler.remaining_total_capacity(),
+                ),
             )
         remaining_children = max(
             0,
             min(
-                state["limits"].max_children - len(set(state["completed_fork_fingerprints"])),
+                state["limits"].effective_max_children_per_agent
+                - len(set(state["completed_fork_fingerprints"])),
                 remaining_thread_slots,
             ),
         )
+        terminal_rejected_fingerprints: list[str] = []
+        if (
+            state["identity"].depth >= state["limits"].max_fork_depth
+            or remaining_children <= 0
+        ):
+            terminal_rejected_fingerprints.extend(
+                candidate_fingerprint(candidate) for candidate in candidates
+            )
         accepted, rejected = evaluate_fork_candidates(
             candidates,
             parent_task=state["task"],
@@ -3379,14 +3740,16 @@ def build_research_agent_graph(
                     "objective": candidate.objective,
                     "scope_signature": _candidate_scope_signature(candidate),
                     "reasons": tuple(reason.value for reason in candidate.reasons),
-                    "status": "claimed",
+                    "status": "queued",
                 })
             outcomes = coordination_board.register_assignment_nodes(
                 state["identity"].root_thread_id,
                 rows,
                 actor_thread_id=state["identity"].thread_id,
                 lease_seconds=_BLACKBOARD_LEASE_SECONDS,
-                max_total_assignments=state["limits"].max_total_threads,
+                max_total_assignments=state["limits"].effective_max_total_agents,
+                max_children_per_parent=state["limits"].effective_max_children_per_agent,
+                max_depth=state["limits"].max_fork_depth,
             )
             scoped_candidates: list[ForkCandidate] = []
             scoped_assignment_ids: list[str] = []
@@ -3396,6 +3759,15 @@ def build_research_agent_graph(
                     rejected.append(
                         f"{candidate.objective}: assignment rejected ({claim.reason})"
                     )
+                    if claim.reason in {
+                        "global_thread_limit_reached",
+                        "parent_child_limit_reached",
+                        "fork_depth_limit_reached",
+                        "duplicate_sibling_scope",
+                    }:
+                        terminal_rejected_fingerprints.append(
+                            candidate_fingerprint(candidate)
+                        )
                     continue
                 scoped_candidates.append(candidate)
                 scoped_assignment_ids.append(assignment_id)
@@ -3443,7 +3815,7 @@ def build_research_agent_graph(
             )
 
         thread_budgets = (
-            [state["limits"].max_total_threads] * len(accepted)
+            [state["limits"].effective_max_total_agents] * len(accepted)
             if coordination_board is not None
             else _split_budget(
                 remaining_thread_slots,
@@ -3472,9 +3844,24 @@ def build_research_agent_graph(
             )
 
         with _node_trace("fork_children", state) as observation:
-            completed = await asyncio.gather(
-                *(
-                    _run_child(
+            scheduling_rows = list(zip(
+                accepted,
+                assignment_ids,
+                thread_budgets,
+                tool_budgets,
+                token_budgets,
+                retry_budgets,
+            ))
+            scheduled: list[ScheduledAgent[tuple[str, str, ResearchResult, list[dict[str, Any]]]]] = []
+            for candidate, assignment_id, thread_budget, tool_budget, token_budget, retry_budget in scheduling_rows:
+                child_identity = _child_identity(state["identity"], candidate)
+                scheduled.append(ScheduledAgent(
+                    assignment_id=assignment_id,
+                    thread_id=child_identity.thread_id,
+                    parent_assignment_id=_own_assignment_id(state),
+                    runner=lambda candidate=candidate, assignment_id=assignment_id,
+                    thread_budget=thread_budget, tool_budget=tool_budget,
+                    token_budget=token_budget, retry_budget=retry_budget: _run_child(
                         state,
                         candidate,
                         assignment_id=assignment_id,
@@ -3482,17 +3869,52 @@ def build_research_agent_graph(
                         tool_budget=tool_budget,
                         token_budget=token_budget,
                         retry_budget=retry_budget,
-                    )
-                    for candidate, assignment_id, thread_budget, tool_budget, token_budget, retry_budget in zip(
-                        accepted,
-                        assignment_ids,
-                        thread_budgets,
-                        tool_budgets,
-                        token_budgets,
-                        retry_budgets,
-                    )
+                    ),
+                    can_start=lambda token_budget=token_budget: (
+                        time.time() < state["deadline_at"] and token_budget > 0
+                    ),
+                ))
+            raw_completed = await live_scheduler.run_children(
+                parent_thread_id=state["identity"].thread_id,
+                parent_assignment_id=_own_assignment_id(state),
+                children=scheduled,
+            ) if scheduled else []
+            completed: list[tuple[str, str, ResearchResult, list[dict[str, Any]]]] = []
+            for (candidate, assignment_id, *_), outcome in zip(scheduling_rows, raw_completed):
+                if isinstance(outcome, tuple):
+                    completed.append(outcome)
+                    continue
+                child_identity = _child_identity(state["identity"], candidate)
+                cancelled = isinstance(outcome, ScheduledAgentCancelled)
+                reason = (
+                    "queued assignment cancelled due to time/token safety boundary"
+                    if cancelled
+                    else f"queued child execution failed: {outcome}"
                 )
-            )
+                completed.append((
+                    candidate_fingerprint(candidate),
+                    child_identity.thread_id,
+                    ResearchResult(
+                        task_id=_child_task(state["task"], candidate).task_id,
+                        status=ResearchStatus.FAILED,
+                        summary="",
+                        unresolved=_scoped_unresolved((reason,), candidate),
+                        stop_reason=(
+                            "queued_cancelled_due_to_budget"
+                            if cancelled else "child_execution_error"
+                        ),
+                        termination_reason=(
+                            TerminationReason.BUDGET_FORCED
+                            if cancelled else TerminationReason.TOOL_FAILURE
+                        ),
+                    ),
+                    [_event(
+                        "queued_assignment_cancelled" if cancelled else "agent_failed",
+                        child_identity,
+                        assignment_id=assignment_id,
+                        error=reason,
+                    )],
+                ))
             fingerprints = [item[0] for item in completed]
             child_thread_ids = [item[1] for item in completed]
             new_results = [item[2] for item in completed]
@@ -3517,7 +3939,24 @@ def build_research_agent_graph(
                     )
                 ],
                 "rejected": rejected,
-                "results": [asdict(result) for result in new_results],
+                "results": [
+                    {
+                        "task_id": result.task_id,
+                        "status": result.status.value,
+                        "summary": result.summary[:1000],
+                        "research_memo": result.research_memo[:3500],
+                        "unresolved": list(result.unresolved[:8]),
+                        "coverage": [
+                            {
+                                "requirement_id": item.requirement_id,
+                                "status": item.status.value,
+                                "remaining_gap": item.remaining_gap,
+                            }
+                            for item in result.coverage
+                        ],
+                    }
+                    for result in new_results
+                ],
             }
             response_content = _serialize_tool_result(
                 response_payload,
@@ -3546,6 +3985,7 @@ def build_research_agent_graph(
             "completed_fork_fingerprints": [
                 *state["completed_fork_fingerprints"],
                 *fingerprints,
+                *terminal_rejected_fingerprints,
             ],
             "child_thread_ids": [*state["child_thread_ids"], *child_thread_ids],
             "child_results": all_results,
@@ -3607,14 +4047,62 @@ def build_research_agent_graph(
         state: ResearchAgentState,
         config: RunnableConfig,
     ) -> dict[str, Any]:
-        """Validate the final JSON, repair once without tools, then fall back safely."""
+        """Accept Root Markdown or validate a Child JSON memo, then fall back safely."""
         _validate_invocation(state, config)
         raw = state.get("draft_raw", "")
         draft = state.get("draft")
         output_status = OutputStatus.VALID
         error: str | None = None
         token_charge = 0
-        if draft is None:
+        if draft is None and state["identity"].depth == 0:
+            draft = _root_markdown_draft(state, raw)
+            if draft is None:
+                error = "final Root Markdown is empty"
+                retry_messages = [
+                    *_bounded_finalization_messages(state),
+                    {
+                        "role": "user",
+                        "content": (
+                            "FINAL_OUTPUT_RETRY\nReturn only the complete Markdown "
+                            "report now. Do not return JSON or a fenced code block."
+                        ),
+                    },
+                ]
+                remaining_tokens = (
+                    state["subtree_token_budget"] - state["estimated_tokens_used"]
+                )
+                retry_input_tokens = max(
+                    1,
+                    sum(
+                        len(str(item.get("content") or ""))
+                        for item in retry_messages
+                    ) // 4,
+                )
+                if _remaining_seconds(state) > 0 and remaining_tokens > retry_input_tokens:
+                    try:
+                        retry_policy = _root_final_policy_instance(
+                            policy,
+                            fork_settings.root_final_max_tokens,
+                        )
+                        response = await asyncio.wait_for(
+                            call_policy(retry_policy, retry_messages, []),
+                            timeout=max(0.001, _remaining_seconds(state)),
+                        )
+                        token_charge = _estimate_tokens(retry_messages, response)
+                        draft = _root_markdown_draft(
+                            state,
+                            str(response.get("content") or ""),
+                        )
+                        if draft is not None:
+                            output_status = OutputStatus.REPAIRED
+                    except asyncio.CancelledError:
+                        raise
+                    except Exception as retry_exc:
+                        error = (
+                            f"{error}; retry failed: "
+                            f"{type(retry_exc).__name__}: {retry_exc}"
+                        )
+        if draft is None and state["identity"].depth > 0:
             try:
                 if not raw.strip():
                     raise AssessmentValidationError("final response is empty")
@@ -3640,8 +4128,8 @@ def build_research_agent_graph(
                             "content": (
                                 "FINAL_OUTPUT_RETRY\nThe prior final response contained no "
                                 "answer text. Answer now without analysis or tool calls. Return "
-                                "exactly one JSON object with status, summary, findings, and "
-                                "unresolved."
+                                "exactly one JSON object with status, summary, findings, "
+                                "unresolved, research_memo, and report_markdown."
                             ),
                         },
                     ]
@@ -3663,16 +4151,18 @@ def build_research_agent_graph(
                         raise
                     except Exception as repair_exc:
                         error = f"{error}; repair failed: {type(repair_exc).__name__}: {repair_exc}"
-            if draft is None:
-                evidence = _deduplicate_evidence(state["observed_evidence"])
-                plain = raw.strip()
-                draft = {
-                    "status": "partial" if plain or evidence else "failed",
-                    "summary": plain or ("Research stopped before a structured synthesis was available."),
-                    "findings": [item.finding for item in evidence[:12]],
-                    "unresolved": ["Final output used a deterministic fallback after one structure repair."],
-                }
-                output_status = OutputStatus.FALLBACK
+        if draft is None:
+            evidence = _deduplicate_evidence(state["observed_evidence"])
+            plain = raw.strip()
+            draft = {
+                "status": "partial" if plain or evidence else "failed",
+                "summary": plain or ("Research stopped before a structured synthesis was available."),
+                "findings": [item.finding for item in evidence[:12]],
+                "unresolved": ["Final output used a deterministic fallback after one structure repair."],
+                "research_memo": "",
+                "report_markdown": "",
+            }
+            output_status = OutputStatus.FALLBACK
 
         with _node_trace("finalize_output", state) as observation:
             observation.add_output(
@@ -3710,6 +4200,36 @@ def build_research_agent_graph(
             findings = _coerce_strings(draft.get("findings"))
             unresolved = _coerce_strings(draft.get("unresolved"))
             evidence = _deduplicate_evidence(state["observed_evidence"])
+            research_memo = str(draft.get("research_memo") or "").strip()
+            report_markdown = str(draft.get("report_markdown") or "").strip()
+            if state["identity"].depth > 0 and not research_memo:
+                memo_lines = ["## Direction summary", "", summary or "No summary available."]
+                if findings:
+                    memo_lines.extend(("", "## Findings", ""))
+                    for index, finding in enumerate(findings):
+                        marker = (
+                            f" [[EVIDENCE:{evidence[index].evidence_id}]]"
+                            if index < len(evidence) else ""
+                        )
+                        memo_lines.append(f"- {finding}{marker}")
+                if unresolved:
+                    memo_lines.extend(("", "## Remaining gaps", ""))
+                    memo_lines.extend(f"- {item}" for item in unresolved)
+                research_memo = "\n".join(memo_lines).strip()
+            if state["identity"].depth == 0 and not report_markdown:
+                report_lines = ["# Research result", "", "## Summary", "", summary or "No summary available."]
+                if findings:
+                    report_lines.extend(("", "## Findings", ""))
+                    for index, finding in enumerate(findings):
+                        marker = (
+                            f" [[EVIDENCE:{evidence[index].evidence_id}]]"
+                            if index < len(evidence) else ""
+                        )
+                        report_lines.append(f"- {finding}{marker}")
+                if unresolved:
+                    report_lines.extend(("", "## Remaining gaps", ""))
+                    report_lines.extend(f"- {item}" for item in unresolved)
+                report_markdown = "\n".join(report_lines).strip()
             stop_reason = state["stop_reason"]
             child_results = tuple(state.get("child_results", []))
             incomplete_children = [
@@ -3782,7 +4302,7 @@ def build_research_agent_graph(
                 summary=summary,
                 findings=tuple(findings),
                 evidence=tuple(evidence),
-                unresolved=tuple(dict.fromkeys(unresolved)),
+                unresolved=_aggregate_unresolved(unresolved),
                 tool_alerts=tool_alerts,
                 child_result_refs=tuple(
                     child.task_id for child in state.get("child_results", [])
@@ -3803,9 +4323,23 @@ def build_research_agent_graph(
                 source_open_count=int(state.get("source_open_count", 0)),
                 duplicate_source_count=int(state.get("duplicate_source_count", 0)),
                 acquisition_call_count=int(state.get("acquisition_call_count", 0)),
+                research_memo=research_memo,
+                report_markdown=report_markdown,
             )
             if coordination_board is not None:
                 try:
+                    coordination_board.update_assignment_node(
+                        state["identity"].root_thread_id,
+                        _own_assignment_id(state),
+                        owner_thread_id=state["identity"].thread_id,
+                        status=(
+                            "completed"
+                            if result.status == ResearchStatus.COMPLETED
+                            else "failed"
+                            if result.status == ResearchStatus.FAILED
+                            else "blocked"
+                        ),
+                    )
                     coordination_board.update_agent(
                         state["identity"].root_thread_id,
                         thread_id=state["identity"].thread_id,
@@ -3948,6 +4482,7 @@ async def _run_research_agent_state(
     tool_artifact_store: Any | None = None,
     coordination_board: ResearchBlackboard | None = None,
     homogeneous_fork_config: HomogeneousForkConfig | None = None,
+    agent_scheduler: FairAgentScheduler | None = None,
 ) -> ResearchAgentState:
     """Start or resume one deterministic Agent thread and return its final state."""
     effective_limits = limits or AgentLimits()
@@ -3959,6 +4494,7 @@ async def _run_research_agent_state(
         tool_artifact_store=tool_artifact_store,
         coordination_board=coordination_board,
         homogeneous_fork_config=homogeneous_fork_config,
+        agent_scheduler=agent_scheduler,
     )
     config = {"configurable": {"thread_id": identity.thread_id}}
     snapshot = await graph.aget_state(config)

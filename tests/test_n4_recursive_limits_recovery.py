@@ -384,7 +384,7 @@ async def test_total_thread_limit_stops_recursion_without_exceeding_budget() -> 
 
 
 @pytest.mark.asyncio
-async def test_child_cannot_fork_an_ancestor_objective() -> None:
+async def test_parent_agent_may_delegate_ancestor_wording_with_a_new_scope() -> None:
     tracker = _HierarchyTracker()
     policy = _HierarchyPolicy(
         tracker,
@@ -403,9 +403,9 @@ async def test_child_cannot_fork_an_ancestor_objective() -> None:
     )
 
     assert result.status == ResearchStatus.COMPLETED
-    assert result.thread_count == 2
-    assert tracker.policy_calls["root objective"] == 2
-    assert "duplicates an ancestor task" in tracker.fork_responses["child objective"]
+    assert result.thread_count == 3
+    assert tracker.policy_calls["root objective"] >= 3
+    assert '"accepted"' in tracker.fork_responses["child objective"]
 
 
 class _AlwaysToolPolicy:

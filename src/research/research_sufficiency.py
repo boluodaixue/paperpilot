@@ -77,32 +77,46 @@ def build_research_requirements(task: ResearchTask) -> tuple[ResearchRequirement
     """Create stable R1..Rn requirements from the confirmed Brief task context."""
     context = task.context if isinstance(task.context, dict) else {}
     explicit = context.get("research_requirements")
-    explicit_requirements: list[tuple[str | None, str, bool]] = []
+    explicit_requirements: list[tuple[str | None, str, bool, bool]] = []
     if isinstance(explicit, (list, tuple)):
         for item in explicit:
             if isinstance(item, dict):
                 description = str(item.get("description") or "").strip()
                 requirement_id = str(item.get("requirement_id") or "").strip() or None
                 required = bool(item.get("required", True))
+                requires_external_evidence = bool(
+                    item.get("requires_external_evidence", True)
+                )
             else:
                 description = str(item).strip()
                 requirement_id = None
                 required = True
+                requires_external_evidence = True
             parts = atomic_requirement_descriptions([description])
             for index, part in enumerate(parts):
-                explicit_requirements.append((requirement_id if index == 0 else None, part, required))
+                explicit_requirements.append((
+                    requirement_id if index == 0 else None,
+                    part,
+                    required,
+                    requires_external_evidence,
+                ))
     if explicit_requirements:
         requirements: list[ResearchRequirement] = []
         used_ids: set[str] = set()
         next_index = 1
-        for requirement_id, description, required in explicit_requirements:
+        for requirement_id, description, required, requires_external_evidence in explicit_requirements:
             while f"R{next_index}" in used_ids:
                 next_index += 1
             if not requirement_id or requirement_id in used_ids:
                 requirement_id = f"R{next_index}"
                 next_index += 1
             used_ids.add(requirement_id)
-            requirements.append(ResearchRequirement(requirement_id, description, required))
+            requirements.append(ResearchRequirement(
+                requirement_id,
+                description,
+                required,
+                requires_external_evidence,
+            ))
         return tuple(requirements)
 
     descriptions: list[str] = []
@@ -142,7 +156,7 @@ def initial_coverage(
             remaining_gap=requirement.description,
         )
         for requirement in requirements
-        if requirement.required
+        if requirement.required and requirement.requires_external_evidence
     )
 
 
@@ -150,32 +164,26 @@ def merge_child_coverage_evidence(
     parent_coverage: Iterable[RequirementCoverage],
     child_results: Iterable[ResearchResult],
 ) -> tuple[RequirementCoverage, ...]:
-    """Attach child evidence to parent requirements without inheriting child status."""
+    """Attach child support references without inheriting child status."""
     parent_coverage = tuple(parent_coverage)
     valid_parent_ids = {item.requirement_id for item in parent_coverage}
-    evidence_by_requirement: dict[str, set[str]] = {
-        item.requirement_id: set(item.evidence_ids) for item in parent_coverage
+    evidence_by_requirement: dict[str, list[str]] = {
+        item.requirement_id: list(item.evidence_ids) for item in parent_coverage
     }
     for result in child_results:
         child_evidence_ids = {item.evidence_id for item in result.evidence}
         for item in result.coverage:
             if item.requirement_id not in valid_parent_ids:
                 continue
-            evidence_by_requirement[item.requirement_id].update(
-                evidence_id for evidence_id in item.evidence_ids if evidence_id in child_evidence_ids
-            )
+            ranked = evidence_by_requirement[item.requirement_id]
+            for evidence_id in item.evidence_ids:
+                if evidence_id in child_evidence_ids and evidence_id not in ranked:
+                    ranked.append(evidence_id)
     return tuple(
         RequirementCoverage(
             requirement_id=item.requirement_id,
             status=item.status,
-            evidence_ids=tuple(
-                dict.fromkeys(
-                    [
-                        *item.evidence_ids,
-                        *sorted(evidence_by_requirement[item.requirement_id]),
-                    ]
-                )
-            ),
+            evidence_ids=tuple(evidence_by_requirement[item.requirement_id]),
             rationale=item.rationale,
             remaining_gap=item.remaining_gap,
         )
@@ -216,7 +224,11 @@ def _parse_coverage(
 ) -> tuple[RequirementCoverage, ...]:
     if not isinstance(raw, list):
         raise AssessmentValidationError("coverage must be an array")
-    expected_ids = [item.requirement_id for item in requirements if item.required]
+    expected_ids = [
+        item.requirement_id
+        for item in requirements
+        if item.required and item.requires_external_evidence
+    ]
     parsed: list[RequirementCoverage] = []
     seen: set[str] = set()
     for item in raw:
@@ -384,7 +396,11 @@ def parse_research_assessment(
     payload = parse_json_object(content)
     decision = _enum_value(ResearchDecision, payload.get("decision"), "decision")
     evidence_by_id = {item.evidence_id: item for item in evidence}
-    requirement_ids = {item.requirement_id for item in requirements if item.required}
+    requirement_ids = {
+        item.requirement_id
+        for item in requirements
+        if item.required and item.requires_external_evidence
+    }
     coverage = _parse_coverage(
         payload.get("coverage"),
         requirements=requirements,
@@ -567,6 +583,7 @@ def _child_result_projection(
             "status": result.status.value,
             "termination_reason": (result.termination_reason.value if result.termination_reason is not None else None),
             "summary": result.summary[:800],
+            "research_memo": result.research_memo[:3500],
             "coverage": [
                 {
                     "requirement_id": item.requirement_id,
@@ -629,7 +646,16 @@ def build_assessment_projection(
         "require_evidence": task.require_evidence,
         "expected_output": task.expected_output,
         "constraints": list(task.constraints),
-        "requirements": [item.__dict__ for item in requirements if item.required],
+        "requirements": [
+            item.__dict__
+            for item in requirements
+            if item.required and item.requires_external_evidence
+        ],
+        "synthesis_requirements": [
+            item.__dict__
+            for item in requirements
+            if item.required and not item.requires_external_evidence
+        ],
         "previous_coverage": [
             {
                 "requirement_id": item.requirement_id,
@@ -737,6 +763,9 @@ def assessment_schema_prompt(
         "materially different executable path remains, choose evidence_exhausted. "
         "Return JSON only with: decision; coverage entries for "
         "every requirement (requirement_id,status,evidence_ids,rationale,remaining_gap); "
+        "Coverage evidence_ids only justify the coverage decision; they are not a "
+        "final-report whitelist or ranking. Select and explain report-worthy material "
+        "later in the scoped Child research memo or Root report. "
         "critical_gaps (requirement_id,reason,impact where impact is exactly high, "
         "medium, or low); next_actions (requirement_id,strategy,query,expected_value,"
         "expected_improvement). "

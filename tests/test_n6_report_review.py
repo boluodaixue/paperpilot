@@ -334,6 +334,43 @@ def test_runtime_parses_report_review_enabled(
     assert runtime.report_review_enabled is expected
 
 
+@pytest.mark.parametrize(
+    ("config", "expected"),
+    [
+        ({}, False),
+        ({"research": {}}, False),
+        ({"research": {"structured_report": {}}}, False),
+        ({"research": {"structured_report": {"enabled": True}}}, True),
+    ],
+)
+def test_runtime_parses_structured_report_enabled(
+    tmp_path, config: dict[str, Any], expected: bool
+) -> None:
+    runtime = build_research_runtime(
+        config,
+        policy=lambda *args, **kwargs: None,
+        tools=[],
+        memory_store=MarkdownMemoryStore(tmp_path),
+        checkpointer=InMemorySaver(),
+    )
+
+    assert runtime.structured_report_enabled is expected
+
+
+@pytest.mark.parametrize("value", [None, "true", 1, 0, []])
+def test_runtime_rejects_non_boolean_structured_report_enabled(
+    tmp_path, value: Any
+) -> None:
+    with pytest.raises(ValueError, match="structured_report.enabled must be a boolean"):
+        build_research_runtime(
+            {"research": {"structured_report": {"enabled": value}}},
+            policy=lambda *args, **kwargs: None,
+            tools=[],
+            memory_store=MarkdownMemoryStore(tmp_path),
+            checkpointer=InMemorySaver(),
+        )
+
+
 @pytest.mark.parametrize("value", [None, "true", 1, 0, []])
 def test_runtime_rejects_non_boolean_report_review_enabled(tmp_path, value: Any) -> None:
     with pytest.raises(ValueError, match="enabled must be a boolean"):

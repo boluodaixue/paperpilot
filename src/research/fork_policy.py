@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import unicodedata
 from dataclasses import replace
 from typing import Any, Iterable
 
@@ -97,13 +98,17 @@ def parse_fork_candidates(arguments: Any) -> list[ForkCandidate]:
         if not isinstance(raw, dict):
             continue
         reasons: list[ForkReason] = []
+        invalid_reason = False
         for value in raw.get("reasons", []):
             try:
                 reason = ForkReason(str(value))
             except ValueError:
+                invalid_reason = True
                 continue
             if reason not in reasons:
                 reasons.append(reason)
+        if invalid_reason:
+            reasons = []
         context = raw.get("context", {})
         requirement_ids = tuple(
             dict.fromkeys(str(value).strip() for value in raw.get("requirement_ids", []) if str(value).strip())
@@ -128,12 +133,20 @@ def parse_fork_candidates(arguments: Any) -> list[ForkCandidate]:
 
 
 def candidate_fingerprint(candidate: ForkCandidate) -> str:
+    """Exact deterministic assignment identity within one parent Agent.
+
+    This deliberately avoids fuzzy/semantic similarity.  The parent Agent owns
+    the judgment that two scopes are meaningfully distinct; code rejects only
+    the same normalized objective/scope/requirement tuple.
+    """
+    def normalize(value: str) -> str:
+        return " ".join(
+            unicodedata.normalize("NFKC", str(value or "")).casefold().split()
+        )
     normalized = {
-        "objective": " ".join(candidate.objective.lower().split()),
-        "expected_output": " ".join(candidate.expected_output.lower().split()),
-        "requirement_ids": candidate.requirement_ids,
-        "scope_signature": " ".join(candidate.scope_signature.casefold().split()),
-        "context": candidate.context,
+        "objective": normalize(candidate.objective),
+        "requirement_ids": sorted(candidate.requirement_ids),
+        "scope_signature": normalize(candidate.scope_signature),
     }
     encoded = json.dumps(normalized, ensure_ascii=False, sort_keys=True, default=str)
     return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
@@ -187,17 +200,11 @@ def evaluate_fork_candidates(
     proposals = bound_proposals
 
     seen = set(completed_fingerprints)
-    parent_objective = " ".join(parent_task.objective.lower().split())
-    blocked_objectives = {
-        " ".join(str(objective).lower().split()) for objective in ancestor_objectives if str(objective).strip()
-    }
-    blocked_objectives.add(parent_objective)
     parallel_fingerprints = {
         candidate_fingerprint(item)
         for item in proposals
         if item.objective
         and item.expected_output
-        and " ".join(item.objective.lower().split()) not in blocked_objectives
         and candidate_fingerprint(item) not in seen
         and ForkReason.PARALLEL in item.reasons
         and item.independent
@@ -210,9 +217,6 @@ def evaluate_fork_candidates(
         label = candidate.objective or "<empty objective>"
         if not candidate.objective or not candidate.expected_output:
             rejected.append(f"{label}: task scope is incomplete")
-            continue
-        if " ".join(candidate.objective.lower().split()) in blocked_objectives:
-            rejected.append(f"{label}: duplicates an ancestor task")
             continue
         fingerprint = candidate_fingerprint(candidate)
         if fingerprint in eligible_seen:

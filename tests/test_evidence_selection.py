@@ -50,6 +50,45 @@ def test_selection_balances_requirements_and_prefers_primary_sources() -> None:
     ]
 
 
+def test_selection_respects_agent_ranked_shortlist_without_refilling() -> None:
+    evidence = (
+        _evidence("agent-first", "R1", "https://example.com/direct"),
+        _evidence("static-primary", "R1", "https://regulator.gov/report"),
+        _evidence("agent-second", "R1", "https://example.org/support"),
+    )
+    coverage = (
+        RequirementCoverage(
+            "R1",
+            RequirementStatus.WEAK,
+            ("agent-first", "agent-second"),
+            rationale="Agent-ranked directly useful evidence.",
+        ),
+    )
+
+    selected = select_representative_evidence(evidence, coverage, limit=3)
+
+    assert [item.evidence_id for item in selected] == [
+        "agent-first",
+        "agent-second",
+    ]
+
+
+def test_empty_agent_shortlist_is_not_refilled_by_static_ranking() -> None:
+    evidence = (
+        _evidence("unselected", "R1", "https://regulator.gov/report"),
+    )
+    coverage = (
+        RequirementCoverage(
+            "R1",
+            RequirementStatus.UNSUPPORTED,
+            (),
+            rationale="Agent found no directly useful evidence.",
+        ),
+    )
+
+    assert select_representative_evidence(evidence, coverage, limit=3) == ()
+
+
 def test_selection_uses_one_item_per_source_before_duplicates() -> None:
     evidence = (
         _evidence("same-a", "R1", "https://arxiv.org/abs/shared"),

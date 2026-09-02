@@ -28,7 +28,6 @@ research:
     enabled: true
     explicit_control_decision: true
     budget_leases_enabled: false
-    recursive_fork_min_local_tool_calls: 1
     reconsider_after_local_rounds: 2
     parent_merge_reserve_tokens: 50000
     initial_child_lease_tokens: 60000
@@ -49,6 +48,7 @@ research:
           required: true
         - description: "基于一手来源形成结构化对照和结论，明确国际原则、中国实践及尚未解决的证据缺口。"
           required: true
+          requires_external_evidence: false
       report_outline:
         - "定义与规则框架"
         - "募集资金用途"
@@ -68,17 +68,18 @@ research:
     red_review_enabled: false
     max_red_review_rounds: 0
     max_citation_repair_rounds: 1
-  vault_root: "outputs/evaluation/researchbench-shared-fin006-legacy-r9b-recon-gate/vault"
-  legacy_archive_root: "outputs/evaluation/researchbench-shared-fin006-legacy-r9b-recon-gate/legacy-archives"
+  vault_root: "outputs/evaluation/researchbench-shared-fin006-r9b-behavior-r9/vault"
+  legacy_archive_root: "outputs/evaluation/researchbench-shared-fin006-r9b-behavior-r9/legacy-archives"
   report_review:
     enabled: false
   limits:
     max_iterations: 18
     max_tool_calls: 30
     max_tool_output_chars: 24000
-    max_children: 4
+    max_children_per_agent: 5
     max_fork_depth: 2
-    max_total_threads: 10
+    max_concurrent_agents: 10
+    max_total_agents: 10
     max_total_tool_calls: 96
     max_elapsed_seconds: 1200.0
     max_total_tokens: 500000
@@ -103,7 +104,7 @@ runtime:
   lease_seconds: 60
   sweep_interval_seconds: 5
   writer_coordination_interval_seconds: 0.1
-  retrieval_db_path: "outputs/evaluation/researchbench-shared-fin006-legacy-r9b-recon-gate/retrieval.db"
+  retrieval_db_path: "outputs/evaluation/researchbench-shared-fin006-r9b-behavior-r9/retrieval.db"
   retrieval_reconciliation_seconds: 300
   semantic_retrieval_enabled: false
   semantic_embedding_model: "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2"

@@ -31,9 +31,13 @@ class HomogeneousForkConfig:
     enabled: bool = False
     explicit_control_decision: bool = False
     budget_leases_enabled: bool = False
-    recursive_fork_min_local_tool_calls: int = 1
+    # Deprecated compatibility field.  Recursive Fork no longer has a local
+    # tool-call prerequisite; a restored non-zero value is intentionally ignored.
+    recursive_fork_min_local_tool_calls: int = 0
     reconsider_after_local_rounds: int = 2
     parent_merge_reserve_tokens: int = 50000
+    root_final_max_tokens: int = 32768
+    root_final_output_token_budget: int = 50000
     initial_child_lease_tokens: int = 60000
     child_topup_tokens: int = 25000
     max_child_lease_tokens: int = 125000
@@ -46,6 +50,8 @@ class HomogeneousForkConfig:
             "reconsider_after_local_rounds",
             "recursive_fork_min_local_tool_calls",
             "parent_merge_reserve_tokens",
+            "root_final_max_tokens",
+            "root_final_output_token_budget",
             "initial_child_lease_tokens",
             "child_topup_tokens",
             "max_child_lease_tokens",
@@ -58,6 +64,14 @@ class HomogeneousForkConfig:
         if self.reconsider_after_local_rounds < 1:
             raise ValueError(
                 "research.homogeneous_fork.reconsider_after_local_rounds must be at least 1"
+            )
+        if self.root_final_max_tokens < 1024:
+            raise ValueError(
+                "research.homogeneous_fork.root_final_max_tokens must be at least 1024"
+            )
+        if self.root_final_output_token_budget < self.root_final_max_tokens:
+            raise ValueError(
+                "root_final_output_token_budget cannot be smaller than root_final_max_tokens"
             )
         if self.enabled and not self.explicit_control_decision:
             raise ValueError(
@@ -79,6 +93,75 @@ class ResearchControlDecision:
     rationale: str
     target_requirement_ids: tuple[str, ...] = ()
     fork_candidates: tuple[ForkCandidate, ...] = ()
+
+
+def initial_root_requirement_decision(
+    requirements: Iterable[ResearchRequirement],
+    *,
+    max_children: int,
+    remaining_total_agent_slots: int | None,
+) -> ResearchControlDecision | None:
+    """Build the stable one-owner-per-requirement r9b coverage wave."""
+
+    external = tuple(
+        item
+        for item in requirements
+        if item.required and item.requires_external_evidence
+    )
+    available = max_children
+    if remaining_total_agent_slots is not None:
+        available = min(available, max(0, int(remaining_total_agent_slots)))
+    if len(external) < 2 or available < len(external):
+        return None
+    candidates = tuple(
+        ForkCandidate(
+            objective=item.description,
+            expected_output=(
+                "Opened, source-locatable Evidence and verified findings for "
+                f"requirement {item.requirement_id}."
+            ),
+            requirement_ids=(item.requirement_id,),
+            scope_signature=f"requirement:{item.requirement_id}",
+            context={
+                "coverage_unit": item.requirement_id,
+                "initial_root_wave": True,
+            },
+            reasons=(ForkReason.PARALLEL,),
+            estimated_tool_calls=2,
+            independent=True,
+        )
+        for item in external
+    )
+    return ResearchControlDecision(
+        ResearchControlAction.FORK,
+        (
+            "Initial root coverage wave assigns every independent external-"
+            "evidence Requirement to one homogeneous Child."
+        ),
+        tuple(item.requirement_id for item in external),
+        candidates,
+    )
+
+
+def should_scout_before_fork(
+    decision: ResearchControlDecision,
+    *,
+    depth: int,
+    has_research_basis: bool,
+) -> bool:
+    """Require evidence-aware recursive Fork without a tool-count gate."""
+
+    if (
+        decision.action is not ResearchControlAction.FORK
+        or depth <= 0
+        or has_research_basis
+    ):
+        return False
+    return not all(
+        ForkReason.DEEP_TOOL_CHAIN in item.reasons
+        and item.estimated_tool_calls >= 3
+        for item in decision.fork_candidates
+    )
 
 
 def _json_object(content: str) -> dict[str, Any]:
@@ -169,6 +252,9 @@ def research_control_prompt(
     max_children: int,
     local_rounds_since_fork: int,
     reconsider_after_local_rounds: int = 2,
+    remaining_total_agent_slots: int | None = None,
+    delegable_token_budget: int | None = None,
+    fork_evidence_basis: bool = False,
 ) -> list[dict[str, str]]:
     """Ask the same Agent to explicitly consider Fork before using tools."""
 
@@ -179,6 +265,7 @@ def research_control_prompt(
                 "requirement_id": item.requirement_id,
                 "description": item.description,
                 "required": item.required,
+                "requires_external_evidence": item.requires_external_evidence,
             }
             for item in requirements
         ],
@@ -188,6 +275,9 @@ def research_control_prompt(
         "depth": depth,
         "max_fork_depth": max_fork_depth,
         "remaining_child_slots": max_children,
+        "remaining_total_agent_slots": remaining_total_agent_slots,
+        "delegable_token_budget": delegable_token_budget,
+        "fork_evidence_basis": bool(fork_evidence_basis),
         "local_rounds_since_fork": local_rounds_since_fork,
         "fork_reconsideration_due": (
             local_rounds_since_fork >= reconsider_after_local_rounds
@@ -200,6 +290,29 @@ def research_control_prompt(
                 "Choose the next control action for this homogeneous Research Agent. "
                 "This does not force Fork, but you must explicitly decide before research. "
                 "Allowed actions: fork, local_research, merge, complete.\n\n"
+                "You own the semantic Fork decision: inspect the plan, your assignment, "
+                "sibling assignments, existing queries/sources/Evidence, current gaps, "
+                "and queue capacity. Decide whether scopes are meaningfully distinct; "
+                "the runtime only enforces exact fingerprints and hard limits. At depth "
+                "0, independent required external-evidence Requirements must retain "
+                "separate Child ownership when capacity permits; you must not combine "
+                "independent external-evidence Requirements into a smaller batch. "
+                "Requirements with "
+                "requires_external_evidence=false are synthesis work for the Root "
+                "and must not be delegated as external evidence research.\n\n"
+                "A Requirement is a coverage unit, not the smallest execution unit. "
+                "One Requirement may own several semantically distinct Child or "
+                "Grandchild Assignments, so 'single requirement', 'focused requirement', "
+                "or depth alone is not a sufficient reason to avoid Fork. At depth 1, "
+                "parallel or context-isolation Fork requires an observed research basis: "
+                "a completed/failed query, opened/failed source, or collected Evidence "
+                "owned by this Assignment. Without that basis, scout locally first. A "
+                "concrete deep_tool_chain of at least three calls may Fork immediately. "
+                "Every Grandchild must stay within one Requirement and name a concrete "
+                "clause, jurisdiction, primary document, or tool chain with a precise "
+                "non-overlapping scope_signature. Never Fork when remaining "
+                "total-agent or delegable-token capacity is insufficient, and never "
+                "repeat a sibling's queued, active, or completed scope.\n\n"
                 "Fork retains exactly three approved strategies:\n"
                 f"- {ForkReason.PARALLEL.value}: at least two independent tasks can run in parallel;\n"
                 f"- {ForkReason.CONTEXT_ISOLATION.value}: substantial intermediate material needs isolation;\n"
@@ -256,6 +369,8 @@ __all__ = [
     "ResearchControlAction",
     "ResearchControlDecision",
     "decision_as_fork_tool_call",
+    "initial_root_requirement_decision",
     "parse_research_control_decision",
     "research_control_prompt",
+    "should_scout_before_fork",
 ]

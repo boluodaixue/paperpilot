@@ -48,7 +48,8 @@ def source_authority_tier(item: EvidenceItem) -> str:
     source_type = item.source_type.casefold()
     title = item.title.casefold()
     if source_type in {"official", "dataset"} or host.endswith((
-        ".gov", ".gov.cn", ".europa.eu", ".int"
+        ".gov", ".gov.cn", ".europa.eu", ".int", "icmagroup.org",
+        "ifc.org", "nafmii.org.cn",
     )):
         return "primary"
     if source_type == "paper" and not re.search(
@@ -159,6 +160,11 @@ def extract_candidate_claims(
     documents_by_source: dict[str, SourceDocument] = {}
     passages: list[EvidencePassage] = []
     candidates: list[CandidateClaim] = []
+    candidate_counts: dict[str, int] = {}
+    question_count = max(1, len(packet.question_ids))
+    candidate_limit = min(40, max(12, question_count * 8))
+    candidate_quota = max(2, candidate_limit // question_count)
+    extractable: list[tuple[Any, Any, EvidencePassage, tuple[tuple[str, str], ...]]] = []
     for item in evidence:
         requirement = requirements_by_id.get(item.requirement_id)
         if requirement is None and item.requirement_id in packet.question_ids:
@@ -182,16 +188,26 @@ def extract_candidate_claims(
             item.locator,
         )
         passages.append(passage)
-        if len(candidates) >= 24:
-            continue
         question = questions[requirement.question_id]
         extracted = _best_exact_sentences(
             passage.exact_text,
             " ".join((packet.objective, question.description, *packet.source_guidance)),
         )
-        if not extracted:
-            continue
-        for claim_text, exact_quote in extracted:
+        if extracted:
+            extractable.append((requirement, question, passage, extracted))
+
+    # Give every Agent-ranked Evidence item one opportunity before taking a
+    # second Claim from any item. This preserves source breadth and prevents
+    # the first long page from exhausting a Requirement's Candidate capacity.
+    for position in range(2):
+        for requirement, question, passage, extracted in extractable:
+            if position >= len(extracted):
+                continue
+            if len(candidates) >= candidate_limit:
+                break
+            if candidate_counts.get(requirement.requirement_id, 0) >= candidate_quota:
+                continue
+            claim_text, exact_quote = extracted[position]
             candidates.append(CandidateClaim.create(
                 claim_text,
                 (question.question_id,),
@@ -199,8 +215,11 @@ def extract_candidate_claims(
                 (passage.passage_id,),
                 exact_quote,
             ))
-            if len(candidates) >= 24:
-                break
+            candidate_counts[requirement.requirement_id] = (
+                candidate_counts.get(requirement.requirement_id, 0) + 1
+            )
+        if len(candidates) >= candidate_limit:
+            break
     return tuple(documents_by_source.values()), tuple(passages), tuple(candidates)
 
 
@@ -262,6 +281,12 @@ def _verification_prompt(
 ) -> list[dict[str, str]]:
     passage_by_id = {item.passage_id: item for item in passages}
     requirement_by_id = {item.requirement_id: item for item in requirements}
+    used_requirement_ids = tuple(dict.fromkeys(
+        requirement_id
+        for item in candidates
+        for requirement_id in item.requirement_ids
+        if requirement_id in requirement_by_id
+    ))
     return [
         {
             "role": "system",
@@ -273,23 +298,29 @@ Return exactly {"assessments":[...]} with candidate_id, verdict, confidence,
 supported_scope, unsupported_scope, reason. verdict must be entailed,
 partially_entailed, contradicted, or irrelevant. Be strict about quantities,
 denominators, dates, jurisdictions, causality, scope, source role, and relevance.
-Use irrelevant when the quotation is real but does not answer the Requirement.""",
+Use entailed when the Passage fully supports the complete atomic Claim and the
+Claim materially contributes to the Requirement; one atomic Claim does not need
+to answer the entire broad Requirement by itself. Use partially_entailed only
+when the Passage supports only part of the Claim. Use irrelevant when the
+quotation is real but does not contribute to the Requirement. confidence must
+be a JSON number from 0.0 to 1.0, never a label such as high or medium.""",
         },
         {
             "role": "user",
             "content": json.dumps({
+                "requirements": [
+                    asdict(requirement_by_id[item])
+                    for item in used_requirement_ids
+                ],
                 "candidates": [
                     {
-                        **asdict(item),
-                        "passages": [
-                            asdict(passage_by_id[passage_id])
-                            for passage_id in item.passage_ids
-                        ],
-                        "requirements": [
-                            asdict(requirement_by_id[requirement_id])
-                            for requirement_id in item.requirement_ids
-                            if requirement_id in requirement_by_id
-                        ],
+                        "candidate_id": item.candidate_id,
+                        "text": item.text,
+                        "question_ids": list(item.question_ids),
+                        "requirement_ids": list(item.requirement_ids),
+                        "passage_ids": list(item.passage_ids),
+                        "passage_quote": item.exact_quote,
+                        "locator": passage_by_id[item.passage_ids[0]].locator,
                     }
                     for item in candidates
                 ]
@@ -298,63 +329,174 @@ Use irrelevant when the quotation is real but does not answer the Requirement.""
     ]
 
 
+_VERIFIER_INPUT_CHAR_BUDGET = 28000
+
+
+def _verification_batches(
+    candidates: tuple[CandidateClaim, ...],
+    passages: tuple[EvidencePassage, ...],
+    requirements: tuple[EvidenceRequirement, ...],
+) -> tuple[tuple[CandidateClaim, ...], ...]:
+    """Keep every Candidate while preventing transport-level truncation."""
+
+    batches: list[tuple[CandidateClaim, ...]] = []
+    current: list[CandidateClaim] = []
+    for candidate in candidates:
+        trial = (*current, candidate)
+        messages = _verification_prompt(trial, passages, requirements)
+        size = sum(len(str(item.get("content") or "")) for item in messages)
+        if current and size > _VERIFIER_INPUT_CHAR_BUDGET:
+            batches.append(tuple(current))
+            current = [candidate]
+        else:
+            current.append(candidate)
+    if current:
+        batches.append(tuple(current))
+    return tuple(batches)
+
+
+def _unverified_assessment(
+    candidate: CandidateClaim,
+    *,
+    reason: str,
+) -> SupportAssessment:
+    return SupportAssessment.create(
+        candidate.candidate_id,
+        candidate.passage_ids,
+        "irrelevant",
+        0.0,
+        unsupported_scope="Semantic support was not verified.",
+        reason=reason,
+        method="semantic_verifier_unavailable",
+    )
+
+
+def _agent_ranked_assessment(
+    candidate: CandidateClaim,
+    passage: EvidencePassage,
+) -> SupportAssessment:
+    """Trust Agent relevance only after deterministic quote-lineage checks."""
+
+    exact = (
+        candidate.exact_quote in passage.exact_text
+        and normalize_report_text(candidate.exact_quote, limit=700) == candidate.text
+    )
+    return SupportAssessment.create(
+        candidate.candidate_id,
+        candidate.passage_ids,
+        "entailed" if exact else "irrelevant",
+        0.75 if exact else 0.0,
+        supported_scope=(candidate.text if exact else ""),
+        unsupported_scope=("" if exact else "Exact quote lineage failed."),
+        reason=(
+            "Agent-ranked Evidence with deterministic exact-quote lineage."
+            if exact
+            else "Agent-ranked Evidence failed exact-quote lineage."
+        ),
+        method="agent_ranked_exact_quote",
+    )
+
+
+def _confidence_value(value: Any) -> float:
+    if isinstance(value, str):
+        label = value.strip().casefold()
+        if label in {"high", "strong"}:
+            return 0.9
+        if label in {"medium", "moderate"}:
+            return 0.75
+        if label in {"low", "weak"}:
+            return 0.5
+    return float(value)
+
+
 async def verify_candidate_claims(
     policy: Any,
     candidates: Iterable[CandidateClaim],
     passages: Iterable[EvidencePassage],
     requirements: Iterable[EvidenceRequirement] = (),
+    *,
+    trusted_candidate_ids: Iterable[str] = (),
 ) -> tuple[SupportAssessment, ...]:
     """Run one tool-free independent verification pass with safe fallback."""
 
     candidate_items = tuple(candidates)
     passage_items = tuple(passages)
     requirement_items = tuple(requirements)
+    trusted = set(trusted_candidate_ids)
     if not candidate_items:
         return ()
-    candidate_by_id = {item.candidate_id: item for item in candidate_items}
     passage_by_id = {item.passage_id: item for item in passage_items}
-    fallback = {
-        item.candidate_id: _deterministic_assessment(
+    assessments: dict[str, SupportAssessment] = {
+        item.candidate_id: _agent_ranked_assessment(
             item,
             passage_by_id[item.passage_ids[0]],
-            requirement_items,
         )
         for item in candidate_items
+        if item.candidate_id in trusted
     }
-    try:
-        response = await call_policy(
-            policy,
-            _verification_prompt(
-                candidate_items,
-                passage_items,
-                requirement_items,
-            ),
-            [],
-        )
-        payload = parse_json_object(response, role="Evidence support verifier")
-        raw = payload.get("assessments")
-        if set(payload) != {"assessments"} or not isinstance(raw, list):
-            raise ValueError("support verifier requires assessments")
-        parsed: dict[str, SupportAssessment] = {}
-        for item in raw:
-            if not isinstance(item, dict):
-                raise ValueError("support assessment must be an object")
-            candidate_id = str(item.get("candidate_id") or "").strip()
-            candidate = candidate_by_id.get(candidate_id)
-            if candidate is None or candidate_id in parsed:
-                raise ValueError("support verifier returned unknown/duplicate candidate")
-            parsed[candidate_id] = SupportAssessment.create(
-                candidate_id,
-                candidate.passage_ids,
-                item.get("verdict"),
-                item.get("confidence", 0.0),
-                supported_scope=item.get("supported_scope", ""),
-                unsupported_scope=item.get("unsupported_scope", ""),
-                reason=item.get("reason", ""),
+
+    def unavailable(candidate: CandidateClaim, reason: str) -> SupportAssessment:
+        if candidate.candidate_id in trusted:
+            return _agent_ranked_assessment(
+                candidate,
+                passage_by_id[candidate.passage_ids[0]],
             )
-        return tuple(parsed.get(item.candidate_id, fallback[item.candidate_id]) for item in candidate_items)
-    except Exception:
-        return tuple(fallback[item.candidate_id] for item in candidate_items)
+        return _unverified_assessment(candidate, reason=reason)
+
+    unranked_candidates = tuple(
+        item for item in candidate_items if item.candidate_id not in trusted
+    )
+    for batch in _verification_batches(
+        unranked_candidates, passage_items, requirement_items
+    ):
+        candidate_by_id = {item.candidate_id: item for item in batch}
+        try:
+            response = await call_policy(
+                policy,
+                _verification_prompt(batch, passage_items, requirement_items),
+                [],
+            )
+            payload = parse_json_object(response, role="Evidence support verifier")
+            raw = payload.get("assessments")
+            if set(payload) != {"assessments"} or not isinstance(raw, list):
+                raise ValueError("support verifier requires assessments")
+            parsed: dict[str, SupportAssessment] = {}
+            for item in raw:
+                if not isinstance(item, dict):
+                    raise ValueError("support assessment must be an object")
+                candidate_id = str(item.get("candidate_id") or "").strip()
+                candidate = candidate_by_id.get(candidate_id)
+                if candidate is None or candidate_id in parsed:
+                    raise ValueError(
+                        "support verifier returned unknown/duplicate candidate"
+                    )
+                parsed[candidate_id] = SupportAssessment.create(
+                    candidate_id,
+                    candidate.passage_ids,
+                    item.get("verdict"),
+                    _confidence_value(item.get("confidence", 0.0)),
+                    supported_scope=item.get("supported_scope", ""),
+                    unsupported_scope=item.get("unsupported_scope", ""),
+                    reason=item.get("reason", ""),
+                )
+            for candidate in batch:
+                assessments[candidate.candidate_id] = parsed.get(
+                    candidate.candidate_id,
+                    unavailable(
+                        candidate,
+                        "Evidence support verifier omitted this Candidate.",
+                    ),
+                )
+        except Exception as exc:
+            for candidate in batch:
+                assessments[candidate.candidate_id] = unavailable(
+                    candidate,
+                    (
+                        "Evidence support verifier failed: "
+                        + type(exc).__name__
+                    ),
+                )
+    return tuple(assessments[item.candidate_id] for item in candidate_items)
 
 
 def narrow_partially_entailed_candidates(

@@ -21,6 +21,8 @@ def test_homogeneous_fork_control_strictly_parses_leases() -> None:
                 "budget_leases_enabled": True,
                 "reconsider_after_local_rounds": 2,
                 "parent_merge_reserve_tokens": 50000,
+                "root_final_max_tokens": 32768,
+                "root_final_output_token_budget": 50000,
                 "initial_child_lease_tokens": 60000,
                 "child_topup_tokens": 25000,
                 "max_child_lease_tokens": 125000,
@@ -32,6 +34,8 @@ def test_homogeneous_fork_control_strictly_parses_leases() -> None:
     assert settings.budget_leases_enabled is True
     assert settings.initial_child_lease_tokens == 60000
     assert settings.child_topup_tokens == 25000
+    assert settings.root_final_max_tokens == 32768
+    assert settings.root_final_output_token_budget == 50000
 
 
 def test_enabled_control_requires_explicit_decision() -> None:

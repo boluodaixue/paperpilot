@@ -150,6 +150,7 @@ class CoreQuestion:
     priority: str = "high"
     origin: str = "brief_direction"
     verification: str = "source-locatable evidence"
+    requires_external_evidence: bool = True
 
     @classmethod
     def create(
@@ -159,17 +160,22 @@ class CoreQuestion:
         priority: str = "high",
         origin: str = "brief_direction",
         verification: str = "source-locatable evidence",
+        requires_external_evidence: bool = True,
     ) -> "CoreQuestion":
         description = str(description).strip()
         if not description:
             raise ValueError("CoreQuestion description cannot be empty")
-        payload = {
+        payload: dict[str, Any] = {
             "description": description,
             "required": bool(required),
             "priority": str(priority).strip() or "medium",
             "origin": str(origin).strip() or "model",
             "verification": str(verification).strip() or "source-locatable evidence",
         }
+        # Preserve existing IDs/checkpoints for the historical default.  Only
+        # synthesis questions add a new identity-bearing field.
+        if not requires_external_evidence:
+            payload["requires_external_evidence"] = False
         return cls(stable_content_id("question", payload), **payload)
 
 
@@ -257,10 +263,18 @@ class ResearchPlan:
                 required=item.required,
             )
             for item in questions
+            if item.requires_external_evidence
         )
         known_question_ids = set(question_ids)
         if any(item.question_id not in known_question_ids for item in requirements):
             raise ValueError("EvidenceRequirement references unknown CoreQuestion")
+        evidence_question_ids = {
+            item.question_id for item in questions if item.requires_external_evidence
+        }
+        if any(item.question_id not in evidence_question_ids for item in requirements):
+            raise ValueError(
+                "Synthesis CoreQuestions cannot own external EvidenceRequirements"
+            )
         requirement_ids = [item.requirement_id for item in requirements]
         if len(requirement_ids) != len(set(requirement_ids)):
             raise ValueError("EvidenceRequirement IDs must be unique")
@@ -691,6 +705,7 @@ class ReportDraft:
     sections: tuple[ReportSection, ...] = ()
     quarantined_claim_count: int = 0
     uncovered_question_ids: tuple[str, ...] = ()
+    incomplete_synthesis_requirement_ids: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)

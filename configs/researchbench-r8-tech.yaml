@@ -13,8 +13,9 @@ model:
       top_p: 1.0
     modules:
       research:
-        temperature: 0.7
+        temperature: 0.3
         max_tokens: 4096
+        max_input_chars: 60000
       judge:
         temperature: 0.1
         max_tokens: 2048
@@ -23,16 +24,31 @@ model:
     judge: "deepseek"
 
 research:
-  architecture: "supervisor_v2"
-  supervisor_v2:
+  architecture: "legacy"
+  structured_report:
     enabled: true
+  homogeneous_fork:
+    enabled: true
+    explicit_control_decision: true
+    budget_leases_enabled: false
+    reconsider_after_local_rounds: 2
+    parent_merge_reserve_tokens: 50000
+    root_final_max_tokens: 32768
+    root_final_output_token_budget: 50000
+    initial_child_lease_tokens: 60000
+    child_topup_tokens: 25000
+    max_child_lease_tokens: 125000
+  shared_comparison:
+    enabled: false
+  supervisor_v2:
+    enabled: false
     max_initial_workers: 4
-    max_research_waves: 3
-    red_review_enabled: true
-    max_red_review_rounds: 1
+    max_research_waves: 1
+    red_review_enabled: false
+    max_red_review_rounds: 0
     max_citation_repair_rounds: 1
-  vault_root: "memory"
-  legacy_archive_root: "legacy-archives"
+  vault_root: "outputs/evaluation/researchbench-root-agent-tech-two-r4/vault"
+  legacy_archive_root: "outputs/evaluation/researchbench-root-agent-tech-two-r4/legacy-archives"
   report_review:
     enabled: false
   limits:
@@ -42,9 +58,9 @@ research:
     max_children_per_agent: 5
     max_fork_depth: 2
     max_concurrent_agents: 10
-    max_total_agents: 24
+    max_total_agents: 10
     max_total_tool_calls: 96
-    max_elapsed_seconds: 900.0
+    max_elapsed_seconds: 1200.0
     max_total_tokens: 500000
     max_retries_per_action: 2
     max_total_retries: 12
@@ -67,7 +83,7 @@ runtime:
   lease_seconds: 60
   sweep_interval_seconds: 5
   writer_coordination_interval_seconds: 0.1
-  retrieval_db_path: "data/retrieval.db"
+  retrieval_db_path: "outputs/evaluation/researchbench-root-agent-tech-two-r4/retrieval.db"
   retrieval_reconciliation_seconds: 300
   semantic_retrieval_enabled: false
   semantic_embedding_model: "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2"
@@ -75,8 +91,7 @@ runtime:
 
 tools:
   enabled:
-    - web_search
-    - browser
+    - acquire_evidence
     - arxiv_reader
     - file_reader
     - calculator

@@ -17,7 +17,9 @@ class _Recorder:
     def create(self, **kwargs):
         self.calls.append(deepcopy(kwargs))
         message = SimpleNamespace(content="ok", tool_calls=None, reasoning_content=None)
-        return SimpleNamespace(choices=[SimpleNamespace(message=message)])
+        return SimpleNamespace(
+            choices=[SimpleNamespace(message=message, finish_reason="stop")]
+        )
 
 
 def _policy() -> tuple[VLLMPolicy, _Recorder]:
@@ -32,13 +34,16 @@ def _tools(name: str) -> list[dict]:
 
 
 def test_forks_have_independent_identity_and_share_client():
-    template, recorder = _policy()
+    template = VLLMPolicy(max_input_chars=55000)
+    recorder = _Recorder()
+    template.client = recorder
     template.set_tools(_tools("default"))
 
     forks = [template.fork() for _ in range(3)]
 
     assert len({id(policy) for policy in forks}) == 3
     assert all(policy.client is recorder for policy in forks)
+    assert all(policy.max_input_chars == 55000 for policy in forks)
     forks[0].tools[0]["function"]["name"] = "changed"
     assert forks[1].tools[0]["function"]["name"] == "default"
     assert template.tools[0]["function"]["name"] == "default"
@@ -93,7 +98,22 @@ def test_truncation_is_reported_per_call_and_does_not_leak():
 
     assert truncated["was_truncated"] is True
     assert clean["was_truncated"] is False
+    assert clean["finish_reason"] == "stop"
     assert policy.was_truncated is False
+
+
+def test_configured_input_limit_allows_root_synthesis_payload():
+    policy = VLLMPolicy(max_input_chars=55000)
+    recorder = _Recorder()
+    policy.client = recorder
+
+    result = policy([
+        {"role": "system", "content": "system"},
+        {"role": "user", "content": "x" * 47300},
+    ])
+
+    assert result["was_truncated"] is False
+    assert len(recorder.calls[0]["messages"][1]["content"]) == 47300
 
 
 def test_call_does_not_mutate_input_messages_or_tools():
