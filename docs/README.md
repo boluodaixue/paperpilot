@@ -5,14 +5,15 @@
 ## 当前文档
 
 1. [CURRENT_STATUS.md](CURRENT_STATUS.md)：当前分支、已实现能力、真实验证、迁移边界与已知问题；
-2. [ARCHITECTURE.md](ARCHITECTURE.md)：系统边界、核心组件、状态归属和数据流；
-3. [UNIFIED_CONVERSATION_ARCHITECTURE.md](UNIFIED_CONVERSATION_ARCHITECTURE.md)：统一对话与 Headless Core 的目标边界和分阶段迁移状态；
-4. [IMPLEMENTATION_PLAN.md](IMPLEMENTATION_PLAN.md)：当前实现的验收方法与近期作品集交付计划；
-5. [ROADMAP.md](ROADMAP.md)：现状、真实演示和后续优先级；
-6. [W0_MEMORY_VAULT_CONTRACT.md](W0_MEMORY_VAULT_CONTRACT.md)：稳定 `memory_id`、Markdown/frontmatter/WikiLink 与路径契约；
-7. [S1_PERSISTENT_WORKFLOW_STATE.md](S1_PERSISTENT_WORKFLOW_STATE.md)：AsyncSqliteSaver、LangGraph State 和恢复边界；
-8. [S2_SINGLE_VAULT_WRITER.md](S2_SINGLE_VAULT_WRITER.md)：持久队列、单一 Writer、journal 和崩溃一致性；
-9. [S5_OPTIONAL_SEMANTIC_HYBRID_RETRIEVAL.md](S5_OPTIONAL_SEMANTIC_HYBRID_RETRIEVAL.md)：FTS、语义与 WikiLink 的可选混合检索。
+2. [BRANCH_HISTORY.md](BRANCH_HISTORY.md)：五月至九月完整主线、架构分叉、clean baseline 与旧/新提交映射；
+3. [ARCHITECTURE.md](ARCHITECTURE.md)：系统边界、核心组件、状态归属和数据流；
+4. [UNIFIED_CONVERSATION_ARCHITECTURE.md](UNIFIED_CONVERSATION_ARCHITECTURE.md)：统一对话与 Headless Core 的目标边界和分阶段迁移状态；
+5. [IMPLEMENTATION_PLAN.md](IMPLEMENTATION_PLAN.md)：当前实现的验收方法与近期作品集交付计划；
+6. [ROADMAP.md](ROADMAP.md)：现状、真实演示和后续优先级；
+7. [W0_MEMORY_VAULT_CONTRACT.md](W0_MEMORY_VAULT_CONTRACT.md)：稳定 `memory_id`、Markdown/frontmatter/WikiLink 与路径契约；
+8. [S1_PERSISTENT_WORKFLOW_STATE.md](S1_PERSISTENT_WORKFLOW_STATE.md)：AsyncSqliteSaver、LangGraph State 和恢复边界；
+9. [S2_SINGLE_VAULT_WRITER.md](S2_SINGLE_VAULT_WRITER.md)：持久队列、单一 Writer、journal 和崩溃一致性；
+10. [S5_OPTIONAL_SEMANTIC_HYBRID_RETRIEVAL.md](S5_OPTIONAL_SEMANTIC_HYBRID_RETRIEVAL.md)：FTS、语义与 WikiLink 的可选混合检索。
 
 ## 待实施架构
 

@@ -1,9 +1,11 @@
 # PaperPilot Current Status
 
-Last updated: 2026-09-03  
-Active development branch: `codex/unified-conversation-orchestrator`  
-Frozen product/research baseline: `195f258` on
-`codex/paperpilot-baseline-2026-09-03`
+Last updated: 2026-09-04
+
+Active development branch: `codex/unified-conversation-orchestrator`
+
+Clean frozen product/research baseline: `4cbbb8f` on
+`codex/paperpilot-baseline-clean-2026-09-04`
 
 This document is the concise source of truth for what is implemented, what has
 been validated, and what is still transitional. Detailed design documents remain
@@ -107,14 +109,12 @@ The current project configuration was verified without printing secrets:
   regression: `31 passed`;
 - conversation routing and Web regression after continuation fixes: `30 passed`;
 - project-env isolation plus router regression: `13 passed`;
-- latest full-run raw result before the final focused fixes:
-  `1135 passed, 3 skipped, 3 failed`.
+- full run on the reparented zero-difference tree:
+  `1142 passed, 3 skipped, 1 failed`.
 
-Of the three full-run failures, two were obsolete expectations that required a
-Memory before proposal creation; both were updated and passed focused reruns. The
-remaining failure is the pre-existing Windows-only `60ms` Vault Writer heartbeat
-timing case. It must remain visible as a flaky timing test rather than be reported
-as a product-path failure or silently removed.
+The one remaining failure is the pre-existing Windows-only `60ms` Vault Writer
+heartbeat timing case. It must remain visible as a flaky timing test rather than
+be reported as a product-path failure or silently removed.
 
 ## 6. Known limitations and next gates
 
@@ -132,9 +132,17 @@ as a product-path failure or silently removed.
 
 ## 7. Git state
 
-- frozen baseline is pushed to `origin/codex/paperpilot-baseline-2026-09-03`;
-- the unified-conversation branch contains the current product work;
-- the branch is intentionally separate from `main` and is not described as
-  published until it is explicitly pushed;
+- the complete May-August history remains unchanged through `main@7ecebd6`;
+- `codex/supervisor-worker-v2@510ea9d` and
+  `codex/homogeneous-recursive-fork@00c331b` are sibling architecture branches;
+- clean baseline `4cbbb8f` and the unified-conversation commits now descend from
+  the pure homogeneous branch;
+- old mis-parented head `726281c` remains protected by an archive branch and
+  backup tag;
+- the existing pushed baseline
+  `origin/codex/paperpilot-baseline-2026-09-03@195f258` is retained and will not
+  be deleted during publication;
+- detailed topology and old/new commit mapping are recorded in
+  [`BRANCH_HISTORY.md`](BRANCH_HISTORY.md);
 - the external Obsidian interview-study vault is not part of this repository or
   this commit.

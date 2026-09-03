@@ -1,5 +1,11 @@
 # Research Agent 底座设计与状态（2026-09-03）
 
+> 2026-09-04 topology note：本文件在 `195f258` 中记录的是原错误祖先下的历史冻结点。
+> 文件树等价的 clean baseline 现为
+> `codex/paperpilot-baseline-clean-2026-09-04@4cbbb8f`，并正确继承
+> `codex/homogeneous-recursive-fork@00c331b`。以下 2026-09-03 内容作为当时运行记录保留；
+> 当前分支关系见 [`BRANCH_HISTORY.md`](BRANCH_HISTORY.md)。
+
 ## 冻结点
 
 - 架构提交：`9fa07c1`（`feat: freeze dynamic root-agent research baseline`）
