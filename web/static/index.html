@@ -1400,7 +1400,7 @@ async function sendMessage() {
     await sendQuickQuestion();
     return;
   }
-  if (mode === 'research' || currentProposal) {
+  if (mode === 'research') {
     await sendResearchRequest();
     return;
   }
@@ -1448,11 +1448,11 @@ async function sendAutomaticMessage() {
       return;
     }
     if (decision.action === 'propose_research') {
-      await sendResearchRequest(text, false);
+      await sendResearchRequest(decision.query || text, false);
       return;
     }
     if (decision.action === 'quick_search') {
-      await sendQuickQuestion(text, false);
+      await sendQuickQuestion(decision.query || text, false);
       return;
     }
     appendBubble('assistant', '请在需要保存的回答卡片上选择“保存回答为笔记”。');
