@@ -5,6 +5,13 @@ from .agent_graph import (
     create_research_agent_state,
     run_research_agent,
 )
+from .core import (
+    CoreResearchRequest,
+    CoreResearchResult,
+    PriorEvidence,
+    PriorEvidenceBundle,
+    run_core_research,
+)
 from .memory import (
     MarkdownMemoryStore,
     MemoryWriteConflictError,
@@ -155,6 +162,8 @@ __all__ = [
     "CitationAuditOutcome",
     "CitationIssue",
     "CoreQuestion",
+    "CoreResearchRequest",
+    "CoreResearchResult",
     "EvidenceItem",
     "EvidenceClaim",
     "ExecutionIdentity",
@@ -172,6 +181,8 @@ __all__ = [
     "MemoryNoteProposal",
     "NextResearchAction",
     "OutputStatus",
+    "PriorEvidence",
+    "PriorEvidenceBundle",
     "MemorySearchHit",
     "MemoryWriteConflictError",
     "MarkdownMemoryIndex",
@@ -252,6 +263,7 @@ __all__ = [
     "resolve_memory_attachment_path",
     "resume_research_workflow",
     "run_research_agent",
+    "run_core_research",
     "run_research_worker",
     "run_research_supervisor",
     "run_research_challenge_loop",

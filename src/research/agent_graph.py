@@ -1540,6 +1540,7 @@ def create_research_agent_state(
     subtree_token_budget: int | None = None,
     subtree_retry_budget: int | None = None,
     lineage_objectives: list[str] | None = None,
+    initial_evidence: Iterable[EvidenceItem] = (),
 ) -> ResearchAgentState:
     limits.validate()
     requirements = build_research_requirements(task)
@@ -1562,7 +1563,7 @@ def create_research_agent_state(
         completed_fork_fingerprints=[],
         child_thread_ids=[],
         child_results=[],
-        observed_evidence=[],
+        observed_evidence=_deduplicate_evidence(initial_evidence),
         deadline_at=(deadline_at if deadline_at is not None else time.time() + limits.max_elapsed_seconds),
         subtree_thread_budget=(
             subtree_thread_budget if subtree_thread_budget is not None else limits.effective_max_total_agents
@@ -4722,6 +4723,7 @@ async def _run_research_agent_state(
     coordination_board: ResearchBlackboard | None = None,
     homogeneous_fork_config: HomogeneousForkConfig | None = None,
     agent_scheduler: FairAgentScheduler | None = None,
+    initial_evidence: Iterable[EvidenceItem] = (),
 ) -> ResearchAgentState:
     """Start or resume one deterministic Agent thread and return its final state."""
     effective_limits = limits or AgentLimits()
@@ -4758,6 +4760,7 @@ async def _run_research_agent_state(
                 subtree_token_budget=subtree_token_budget,
                 subtree_retry_budget=subtree_retry_budget,
                 lineage_objectives=lineage_objectives,
+                initial_evidence=initial_evidence,
             ),
             config=config,
         )
@@ -4775,6 +4778,7 @@ async def run_research_agent(
     tool_artifact_store: Any | None = None,
     coordination_board: ResearchBlackboard | None = None,
     homogeneous_fork_config: HomogeneousForkConfig | None = None,
+    initial_evidence: Iterable[EvidenceItem] = (),
 ) -> ResearchResult:
     """Run one scoped task through the shared homogeneous AgentGraph."""
     final_state = await _run_research_agent_state(
@@ -4787,6 +4791,7 @@ async def run_research_agent(
         tool_artifact_store=tool_artifact_store,
         coordination_board=coordination_board,
         homogeneous_fork_config=homogeneous_fork_config,
+        initial_evidence=initial_evidence,
     )
     result = final_state.get("result")
     if not isinstance(result, ResearchResult):

@@ -1,6 +1,20 @@
 # Unified Conversation Architecture
 
-Status: Proposed on top of frozen baseline `195f258`.
+Status: In progress on top of frozen baseline `195f258`.
+
+Implemented in the first vertical slice:
+
+- persistence-neutral `CoreResearchRequest` / `CoreResearchResult` contracts;
+- generic prior-Evidence injection into the homogeneous AgentGraph;
+- side-effect-free Conversation Orchestrator with explicit action overrides;
+- `/api/conversation/route`, which cannot create research tasks or write Memory;
+- Web default mode changed to automatic routing while preserving explicit
+  Memory-only and deep-research overrides;
+- dependency-boundary and compatibility tests.
+
+Still pending: bounded Quick Answer Service, direct Rubric/CLI migration to the
+Headless Core entry, and removal of compatibility-layer product identities from
+the existing full Research Workflow.
 
 ## 1. Decision
 

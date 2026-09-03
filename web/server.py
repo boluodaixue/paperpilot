@@ -33,6 +33,13 @@ for _stream in (sys.stdout, sys.stderr):
         pass
 
 from src.memory.chat_store import KIND_PROPOSAL, KIND_REPORT, ChatStore  # noqa: E402
+from src.conversation import (  # noqa: E402
+    ActionOverride,
+    ConversationMessage,
+    ConversationRequest,
+    MemorySelection,
+    route_conversation,
+)
 from src.research.memory import MemoryWriteConflictError  # noqa: E402
 from src.research.memory_import import MemoryImportLimitError  # noqa: E402
 from src.research.models import (  # noqa: E402
@@ -221,6 +228,15 @@ class AlignmentRequest(BaseModel):
     task_id: str | None = None
     memory_id: str | None = None
     message: str
+
+
+class ConversationRouteRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    session_id: str | None = None
+    memory_id: str | None = None
+    message: str
+    explicit_action: ActionOverride = ActionOverride.AUTO
 
 
 class ResearchRequest(BaseModel):
@@ -437,6 +453,31 @@ def _session_memory(
         return None
     if requested_memory_id is not None:
         _validate_memory_option(requested_memory_id)
+    try:
+        return store.bind_memory(session_id, requested_memory_id)
+    except ValueError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+
+def _optional_session_memory(
+    session_id: str,
+    requested_memory_id: str | None,
+) -> str | None:
+    """Allow casual chat unbound while preserving one-Memory session identity."""
+
+    store = get_chat_store()
+    existing = store.get_memory_binding(session_id)
+    if existing is not None:
+        if requested_memory_id is not None and requested_memory_id != existing:
+            raise HTTPException(
+                status_code=409,
+                detail="该会话已绑定到另一个 Memory",
+            )
+        _validate_memory_option(existing)
+        return existing
+    if requested_memory_id is None:
+        return None
+    _validate_memory_option(requested_memory_id)
     try:
         return store.bind_memory(session_id, requested_memory_id)
     except ValueError as exc:
@@ -1416,6 +1457,66 @@ async def index() -> str:
     if not path.exists():
         raise HTTPException(status_code=500, detail="前端页面缺失")
     return path.read_text(encoding="utf-8")
+
+
+@app.post("/api/conversation/route")
+async def route_product_conversation(
+    req: ConversationRouteRequest,
+) -> dict[str, Any]:
+    """Route one product message without starting research or writing Memory."""
+
+    message = (req.message or "").strip()
+    if not message:
+        raise HTTPException(status_code=400, detail="消息不能为空")
+    session_id = _session_id(req.session_id)
+    memory_id = _optional_session_memory(session_id, req.memory_id)
+    runtime = get_research_runtime()
+    selection = None
+    if memory_id is not None:
+        option = runtime.get_memory_option(memory_id)
+        selection = MemorySelection(
+            memory_id=memory_id,
+            title=str(option.get("title") or memory_id),
+            read_only=bool(option.get("read_only", False)),
+        )
+    recent_messages = tuple(
+        ConversationMessage(
+            role=str(item["role"]),
+            content=str(item["content"]),
+        )
+        for item in get_chat_store().get_messages(session_id)[-8:]
+        if item.get("kind") == "chat"
+        and item.get("role") in {"user", "assistant"}
+        and str(item.get("content") or "").strip()
+    )
+    try:
+        decision = await route_conversation(
+            ConversationRequest(
+                message=message,
+                recent_messages=recent_messages,
+                selected_memory=selection,
+                explicit_action=req.explicit_action,
+            ),
+            runtime.policy,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=502, detail=f"对话路由失败: {exc}") from exc
+
+    if decision.action.value in {"reply", "clarify"}:
+        store = get_chat_store()
+        store.add(session_id, "user", "chat", message)
+        store.add(session_id, "assistant", "chat", decision.response)
+    return {
+        "session_id": session_id,
+        "memory_id": memory_id,
+        "action": decision.action.value,
+        "confidence": decision.confidence,
+        "response": decision.response,
+        "query": decision.query,
+        "reason_code": decision.reason_code,
+        "requires_memory": decision.requires_memory,
+        "requires_confirmation": decision.requires_confirmation,
+    }
 
 
 @app.post("/api/alignment")

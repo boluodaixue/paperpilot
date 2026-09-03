@@ -221,8 +221,9 @@
       <div>会话<span class="sub" id="chatHeaderSub">输入问题开始</span></div>
       <div id="memoryControls">
         <select id="interactionMode" aria-label="选择工作模式">
-          <option value="research">基于此 Memory 研究</option>
-          <option value="memory-answer">Memory 问答</option>
+          <option value="auto">自动判断</option>
+          <option value="memory-answer">只查当前 Memory</option>
+          <option value="research">深度研究</option>
         </select>
         <select id="memorySelect" aria-label="选择 Memory"></select>
         <span id="memoryIdBadge">尚未选择 Memory</span>
@@ -236,8 +237,8 @@
     <div id="messages" role="log" aria-live="polite">
       <div id="emptyState">
         <h2>从一个长期 Memory 开始</h2>
-        <p>选择已有 Memory，或者新建一个研究空间，然后选择“研究”或“Memory 问答”。</p>
-        <p class="hint">研究前会先展示方案；确认后才会检索并写入知识库。</p>
+        <p>直接聊天、询问已有知识，或者提出一个需要深入调查的问题。</p>
+        <p class="hint">系统会自动判断；深度研究和 Memory 写入始终需要确认。</p>
       </div>
     </div>
 
@@ -333,7 +334,7 @@
     </div>
 
     <div id="inputBar">
-      <input type="text" id="msgInput" placeholder="输入研究问题，或说明如何修改研究方向…" autocomplete="off">
+      <input type="text" id="msgInput" placeholder="聊天、询问 Memory，或提出研究问题…" autocomplete="off">
       <button class="btn btn-primary" id="sendBtn" onclick="sendMessage()">发送</button>
     </div>
   </main>
@@ -379,8 +380,8 @@ function resetMessages() {
   $('messages').innerHTML = `
     <div id="emptyState">
       <h2>从一个长期 Memory 开始</h2>
-      <p>选择已有 Memory，或者新建一个研究空间，然后选择“研究”或“Memory 问答”。</p>
-      <p class="hint">研究前会先展示方案；确认后才会检索并写入知识库。</p>
+      <p>直接聊天、询问已有知识，或者提出一个需要深入调查的问题。</p>
+      <p class="hint">系统会自动判断；深度研究和 Memory 写入始终需要确认。</p>
     </div>`;
 }
 
@@ -625,8 +626,10 @@ function updateInputMode() {
     input.placeholder = selectedMemoryId
       ? '询问当前 Memory 中已有的内容…'
       : '请先选择一个 Memory';
-  } else {
+  } else if ($('interactionMode').value === 'research') {
     input.placeholder = '输入研究问题，例如：transformer 的来历与发展';
+  } else {
+    input.placeholder = '聊天、询问 Memory，或提出研究问题…';
   }
 }
 
@@ -760,6 +763,7 @@ function newSession() {
   currentMemoryNoteProposal = null;
   $('noteProposalCard').hidden = true;
   $('chatHeaderSub').textContent = '输入问题开始';
+  $('interactionMode').value = 'auto';
   updateInputMode();
   $('msgInput').focus();
   loadSessions();
@@ -835,6 +839,7 @@ async function selectSession(sid, memoryBound = false, memoryId = null) {
   currentSessionId = sid; currentProposal = null; currentReportData = null;
   sessionMemoryBound = memoryBound; sessionMemoryId = memoryId;
   selectedMemoryId = memoryBound ? memoryId : null;
+  $('interactionMode').value = 'auto';
   if (eventSource) { eventSource.close(); eventSource = null; }
   memorySelectionLocked = true;
   renderMemoryControls();
@@ -927,9 +932,11 @@ function scrollToBottom() {
 // ------------------------------------------------------------------
 // Memory 问答与受控保存
 // ------------------------------------------------------------------
-async function sendMemoryQuestion() {
+async function sendMemoryQuestion(questionOverride = null) {
   const input = $('msgInput');
-  const question = input.value.trim();
+  const question = (
+    questionOverride === null ? input.value : String(questionOverride)
+  ).trim();
   if (!question || sendLock) return;
   if (!selectedMemoryId) {
     appendBubble('assistant', '请先选择一个 Memory。');
@@ -1375,30 +1382,85 @@ async function confirmMemoryImport() {
 // ------------------------------------------------------------------
 // 发送消息 → 用户对齐
 // ------------------------------------------------------------------
-function productHelpResponse(text) {
-  const normalized = String(text || '').trim().replace(/[!！。.？?]+$/g, '').toLowerCase();
-  const greeting = /^(你好|您好|嗨|哈喽|hello|hi|hey)$/.test(normalized);
-  const capability = /^(你是谁|你是做什么的|你能做什么|这是做什么的|这是什么)$/.test(normalized) ||
-    /^(who are you|what (can|do) you do|what is this)$/.test(normalized);
-  if (!greeting && !capability) return null;
-  return '我是 PaperPilot，一个深度研究与长期知识库助手。选择或新建一个 Memory 后，输入明确的研究主题；我会先生成可编辑的研究方案，经你确认后再检索、写报告并保存证据。已有资料的问题可切换到“Memory 问答”。';
-}
-
 async function sendMessage() {
-  if ($('interactionMode').value === 'memory-answer') {
+  const mode = $('interactionMode').value;
+  if (mode === 'memory-answer') {
     await sendMemoryQuestion();
     return;
   }
+  if (mode === 'research' || currentProposal) {
+    await sendResearchRequest();
+    return;
+  }
+  await sendAutomaticMessage();
+}
+
+async function sendAutomaticMessage() {
   const input = $('msgInput');
   const text = input.value.trim();
   if (!text || sendLock) return;
-  const help = productHelpResponse(text);
-  if (help) {
+  const thinking = document.createElement('div');
+  thinking.className = 'msg thinking';
+  thinking.textContent = '正在理解你的需求…';
+  $('messages').appendChild(thinking);
+  scrollToBottom();
+
+  sendLock = true;
+  try {
+    const response = await fetch('/api/conversation/route', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        session_id: currentSessionId,
+        memory_id: selectedMemoryId,
+        message: text,
+        explicit_action: 'auto',
+      }),
+    });
+    const decision = await response.json();
+    thinking.remove();
+    if (!response.ok) {
+      appendBubble('assistant', decision.detail || '暂时无法理解这条消息');
+      return;
+    }
+    bindCurrentSession(decision.session_id, decision.memory_id);
     input.value = '';
+    if (decision.action === 'reply' || decision.action === 'clarify') {
+      appendBubble('user', text);
+      appendBubble('assistant', decision.response || '请再补充一点信息。');
+      loadSessions();
+      return;
+    }
+    sendLock = false;
+    if (decision.action === 'memory_answer') {
+      await sendMemoryQuestion(decision.query || text);
+      return;
+    }
+    if (decision.action === 'propose_research') {
+      await sendResearchRequest(decision.query || text);
+      return;
+    }
+    if (decision.action === 'quick_search') {
+      showNotice('快速联网回答将在下一阶段接入；当前已转为需要确认的深度研究提案。');
+      await sendResearchRequest(decision.query || text);
+      return;
+    }
     appendBubble('user', text);
-    appendBubble('assistant', help);
-    return;
+    appendBubble('assistant', '请在需要保存的回答卡片上选择“保存回答为笔记”。');
+    loadSessions();
+  } catch (e) {
+    thinking.remove();
+    appendBubble('assistant', '请求失败，请重试');
+  } finally {
+    sendLock = false;
   }
+}
+
+async function sendResearchRequest(textOverride = null) {
+  const input = $('msgInput');
+  const text = (
+    textOverride === null ? input.value : String(textOverride)
+  ).trim();
+  if (!text || sendLock) return;
   if (!selectedMemoryId) {
     appendBubble('assistant', '请先明确选择一个 managed Memory。');
     return;
