@@ -4,6 +4,7 @@ import asyncio
 import json
 import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
@@ -274,6 +275,60 @@ def test_research_rejects_same_thread_key_with_different_inputs(
         )
 
     assert [job.operation_type for job in queue.list()].count("research_bundle") == 1
+
+
+def test_research_bundle_updates_home_and_preserves_prior_obsidian_edits(
+    tmp_path: Path,
+) -> None:
+    store, _queue, service = _service(tmp_path)
+    service.create_memory("Long-lived", "M-long-lived")
+    _, first = service.persist_research(
+        _brief("M-long-lived"),
+        _research_result(),
+        _identity("long-lived-first"),
+        memory_id="M-long-lived",
+    )
+    evidence = store.root / first.evidence_paths[0]
+    source = store.root / first.source_paths[0]
+    edited_evidence = evidence.read_text(encoding="utf-8") + "\nObsidian evidence edit.\n"
+    edited_source = source.read_text(encoding="utf-8") + "\nObsidian source edit.\n"
+    evidence.write_text(edited_evidence, encoding="utf-8")
+    source.write_text(edited_source, encoding="utf-8")
+
+    _, second = service.persist_research(
+        _brief("M-long-lived"),
+        _research_result(),
+        _identity("long-lived-second"),
+        memory_id="M-long-lived",
+    )
+
+    assert evidence.read_text(encoding="utf-8") == edited_evidence
+    assert source.read_text(encoding="utf-8") == edited_source
+    home = store.read_text("Memories/M-long-lived/Home.md")
+    assert f"[[{first.report_path[:-3]}]]" in home
+    assert f"[[{second.report_path[:-3]}]]" in home
+
+
+def test_concurrent_research_serializes_home_planning_under_writer_lease(
+    tmp_path: Path,
+) -> None:
+    store, _queue, service = _service(tmp_path)
+    service.create_memory("Concurrent", "M-concurrent-research")
+
+    def publish(index: int):
+        return service.persist_research(
+            _brief("M-concurrent-research"),
+            _research_result(),
+            _identity(f"concurrent-research-{index}"),
+            memory_id="M-concurrent-research",
+        )[1]
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        manifests = list(executor.map(publish, (1, 2)))
+
+    assert len({item.report_path for item in manifests}) == 2
+    home = store.read_text("Memories/M-concurrent-research/Home.md")
+    assert all(f"[[{item.report_path[:-3]}]]" in home for item in manifests)
 
 
 def test_report_review_exact_replay_requires_receipt_and_preserves_external_edit(

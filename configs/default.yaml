@@ -26,17 +26,29 @@ model:
     judge: "deepseek"
 
 research:
-  # V2 remains opt-in: the isolated single-question gate improved after targeted
-  # fixes but still did not meet the publication-quality threshold.
+  # Keep the accepted dynamic Root/Child baseline as the product research core.
+  # Memory/Vault remains an outer read-before-research and persist-after-research
+  # layer; it does not change the homogeneous AgentGraph responsibilities.
   architecture: "legacy"
   structured_report:
-    enabled: false
+    enabled: true
+  homogeneous_fork:
+    enabled: true
+    explicit_control_decision: true
+    budget_leases_enabled: true
+    reconsider_after_local_rounds: 2
+    parent_merge_reserve_tokens: 50000
+    root_final_max_tokens: 32768
+    root_final_output_token_budget: 50000
+    initial_child_lease_tokens: 60000
+    child_topup_tokens: 25000
+    max_child_lease_tokens: 125000
   supervisor_v2:
     enabled: false
     max_initial_workers: 4
     max_research_waves: 3
-    red_review_enabled: true
-    max_red_review_rounds: 1
+    red_review_enabled: false
+    max_red_review_rounds: 0
     max_citation_repair_rounds: 1
   vault_root: "memory"
   # S3 requires an explicit recoverable archive outside the active Vault.
@@ -53,18 +65,18 @@ research:
     max_children_per_agent: 5
     max_fork_depth: 2
     max_concurrent_agents: 10
-    max_total_agents: 24
+    max_total_agents: 10
     max_total_tool_calls: 96
-    max_elapsed_seconds: 900.0
-    max_total_tokens: 500000
+    max_elapsed_seconds: 1200.0
+    root_finalization_grace_seconds: 300.0
+    max_total_tokens: 700000
     max_retries_per_action: 2
     max_total_retries: 12
 
-# Full-content extraction is an independent opt-in rollout. Legacy behavior is
-# retained until the isolated canary demonstrates a measurable evidence gain.
+# Reuse the accepted structured acquisition settings from the online baseline.
 content_extraction:
-  mode: "legacy"
-  tavily_extract_fallback: false
+  mode: "structured"
+  tavily_extract_fallback: true
   docling_enabled: false
   # Scanned-document OCR is intentionally out of scope for this personal project.
   ocr_enabled: false
@@ -95,8 +107,7 @@ runtime:
 
 tools:
   enabled:
-    - web_search
-    - browser
+    - acquire_evidence
     - arxiv_reader
     - file_reader
     - calculator

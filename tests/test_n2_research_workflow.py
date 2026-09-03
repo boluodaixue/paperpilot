@@ -204,6 +204,46 @@ def _interrupt_value(state: dict[str, Any]) -> dict[str, Any]:
 
 
 @pytest.mark.asyncio
+async def test_alignment_repairs_a_non_json_transport_once(tmp_path) -> None:
+    class RepairingPolicy:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def __call__(self, messages, *, tools=None):
+            self.calls += 1
+            if self.calls == 1:
+                return {"content": "I will prepare the research plan.", "tool_calls": []}
+            assert "ALIGNMENT_FORMAT_REPAIR" in str(messages[-1].get("content") or "")
+            return {
+                "content": json.dumps({
+                    "objective": "Trace Transformer development",
+                    "scope": ["architecture history"],
+                    "directions": ["foundational paper", "later variants"],
+                    "constraints": ["cite primary sources"],
+                    "expected_output": "An evidence-backed report",
+                }),
+                "tool_calls": [],
+            }
+
+    policy = RepairingPolicy()
+    identity = _identity("root-alignment-repair")
+    graph = build_research_workflow(
+        policy,
+        [],
+        MarkdownMemoryStore(tmp_path),
+        checkpointer=InMemorySaver(),
+    )
+
+    paused = await graph.ainvoke(
+        create_research_workflow_state("Research Transformer development", identity),
+        config=_config(identity.thread_id),
+    )
+
+    assert _interrupt_value(paused)["brief"]["objective"] == "Trace Transformer development"
+    assert policy.calls == 2
+
+
+@pytest.mark.asyncio
 async def test_first_run_stops_for_user_without_running_research_tools(tmp_path) -> None:
     policy = WorkflowPolicy()
     tool = FixedWebTool()

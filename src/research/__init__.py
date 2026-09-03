@@ -10,6 +10,7 @@ from .memory import (
     MemoryWriteConflictError,
     update_memory_home_with_import,
     update_memory_home_with_note,
+    update_memory_home_with_report,
 )
 from .memory_dialogue import answer_memory, propose_memory_note
 from .memory_import import (
@@ -258,6 +259,7 @@ __all__ = [
     "setup_logging",
     "update_memory_home_with_note",
     "update_memory_home_with_import",
+    "update_memory_home_with_report",
     "validate_frontmatter",
     "validate_memory_descriptor",
     "validate_memory_id",

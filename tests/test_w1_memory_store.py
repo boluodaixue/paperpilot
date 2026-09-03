@@ -217,10 +217,54 @@ def test_managed_research_isolated_with_full_frontmatter_and_full_wikilinks(
     assert "unsafe | [source]" not in evidence.split("## Source", 1)[1].splitlines()[2]
     report = (tmp_path / alpha_first.report_path).read_text(encoding="utf-8")
     assert f"[[Memories/M-alpha/evidence/{evidence_path.stem}|Evidence]]" in report
+    alpha_home = (tmp_path / "Memories" / "M-alpha" / "Home.md").read_text(
+        encoding="utf-8"
+    )
+    assert f"[[{alpha_first.report_path[:-3]}]]" in alpha_home
+    assert f"[[{alpha_second.report_path[:-3]}]]" in alpha_home
+    assert "## Reports\n\n- None yet." not in alpha_home
+    home_updated_at = _frontmatter(
+        tmp_path / "Memories" / "M-alpha" / "Home.md"
+    )["updated_at"]
+    assert f"## Last updated\n\n{home_updated_at}" in alpha_home
     validate_revised_report(report, report, alpha_first)
     assert not (tmp_path / "reports").exists()
     assert not (tmp_path / "evidence").exists()
     assert not (tmp_path / "sources").exists()
+
+
+def test_later_research_preserves_existing_managed_evidence_and_source_edits(
+    tmp_path: Path,
+) -> None:
+    store = MarkdownMemoryStore(tmp_path)
+    store.create_memory("Editable", "M-editable")
+    _, first = store.persist_research(
+        _brief("First"),
+        _result(),
+        _identity("editable-first"),
+        memory_id="M-editable",
+    )
+    evidence_path = tmp_path / first.evidence_paths[0]
+    source_path = tmp_path / first.source_paths[0]
+    edited_evidence = evidence_path.read_text(encoding="utf-8") + "\nObsidian evidence note.\n"
+    edited_source = source_path.read_text(encoding="utf-8") + "\nObsidian source note.\n"
+    evidence_path.write_text(edited_evidence, encoding="utf-8")
+    source_path.write_text(edited_source, encoding="utf-8")
+
+    _, second = store.persist_research(
+        _brief("Second"),
+        _result(),
+        _identity("editable-second"),
+        memory_id="M-editable",
+    )
+
+    assert second.evidence_paths == first.evidence_paths
+    assert second.source_paths == first.source_paths
+    assert evidence_path.read_text(encoding="utf-8") == edited_evidence
+    assert source_path.read_text(encoding="utf-8") == edited_source
+    home = store.read_text("Memories/M-editable/Home.md")
+    assert f"[[{first.report_path[:-3]}]]" in home
+    assert f"[[{second.report_path[:-3]}]]" in home
 
 
 def test_legacy_persistence_remains_on_root_with_legacy_markdown(tmp_path: Path) -> None:

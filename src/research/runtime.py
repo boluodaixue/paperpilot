@@ -20,7 +20,6 @@ from typing import Any, AsyncIterator, Iterable
 
 import yaml
 from langgraph.checkpoint.base import BaseCheckpointSaver
-from langgraph.checkpoint.memory import InMemorySaver
 from langgraph.checkpoint.sqlite.aio import AsyncSqliteSaver
 from langgraph.types import Command
 
@@ -43,6 +42,10 @@ from ..utils.tracing import (
     shutdown_tracing,
     trace_block,
     trace_context,
+)
+from .checkpoint_serde import (
+    paperpilot_checkpoint_serializer,
+    paperpilot_in_memory_saver,
 )
 from .memory import MarkdownMemoryStore
 from .memory_dialogue import (
@@ -1494,7 +1497,9 @@ def build_research_runtime(
         policy=policy if policy is not None else _build_policy(effective_config),
         tools=list(tools) if tools is not None else build_research_tools(effective_config),
         memory_store=effective_store,
-        checkpointer=checkpointer if checkpointer is not None else InMemorySaver(),
+        checkpointer=(
+            checkpointer if checkpointer is not None else paperpilot_in_memory_saver()
+        ),
         limits=limits_from_config(effective_config),
         report_review_enabled=_report_review_enabled(effective_config),
         research_architecture=architecture_settings.architecture,
@@ -1523,6 +1528,7 @@ async def open_research_runtime(
     path = Path(checkpoint_db_path)
     path.parent.mkdir(parents=True, exist_ok=True)
     async with AsyncSqliteSaver.from_conn_string(os.fspath(path)) as saver:
+        saver.serde = paperpilot_checkpoint_serializer()
         await saver.setup()
         runtime = build_research_runtime(
             config,

@@ -30,7 +30,7 @@ research:
   homogeneous_fork:
     enabled: true
     explicit_control_decision: true
-    budget_leases_enabled: false
+    budget_leases_enabled: true
     reconsider_after_local_rounds: 2
     parent_merge_reserve_tokens: 50000
     root_final_max_tokens: 32768
@@ -61,7 +61,8 @@ research:
     max_total_agents: 10
     max_total_tool_calls: 96
     max_elapsed_seconds: 1200.0
-    max_total_tokens: 500000
+    root_finalization_grace_seconds: 300.0
+    max_total_tokens: 700000
     max_retries_per_action: 2
     max_total_retries: 12
 

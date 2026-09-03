@@ -267,6 +267,7 @@ def test_researchbench_summary_is_comparison_ready_and_excludes_failed_rcs() -> 
         local_budget=12,
         token_budget=120000,
         elapsed_budget=1800.0,
+        finalization_grace=300.0,
     )
     assert summary["elapsed_seconds"] == 14.0
     assert summary["research_elapsed_seconds"] == 11.0
@@ -281,6 +282,7 @@ def test_researchbench_summary_is_comparison_ready_and_excludes_failed_rcs() -> 
     }
     assert summary["average_rcs"]["objective_coverage"] == 0.5
     assert summary["elapsed_budget_seconds"] == 1800.0
+    assert summary["root_finalization_grace_seconds"] == 300.0
     assert summary["judge_success"] == 1
     assert summary["judge_failed"] == 0
     assert summary["average_judge"] == 8.0

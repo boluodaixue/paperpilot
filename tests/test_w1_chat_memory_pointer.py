@@ -127,12 +127,18 @@ def test_selected_memory_flows_to_chat_pointer_without_report_copy(web_client):
     assert raw["kind"] == "report"
     assert pointer["memory_id"] == descriptor.memory_id
     assert pointer["manifest"] == manifest
+    assert pointer["research_status"] == result["research_status"]
+    assert pointer["termination_reason"] == result["termination_reason"]
+    assert pointer["output_status"] == result["output_status"]
     assert "report_md" not in pointer
     assert "Fixed W1 summary" not in raw["content"]
 
     expanded = client.get("/api/sessions/selected-memory/messages").json()[-1]
     assert expanded["memory_id"] == descriptor.memory_id
     assert expanded["manifest"] == manifest
+    assert expanded["research_status"] == result["research_status"]
+    assert expanded["termination_reason"] == result["termination_reason"]
+    assert expanded["output_status"] == result["output_status"]
     assert "Fixed W1 summary" in expanded["content"]
 
 

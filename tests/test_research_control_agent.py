@@ -175,6 +175,47 @@ async def test_invalid_control_decision_falls_back_to_one_local_round(tmp_path) 
 
 
 @pytest.mark.asyncio
+async def test_zero_fundable_capacity_skips_fork_control_and_stays_local(tmp_path) -> None:
+    class LocalOnlyPolicy:
+        def __init__(self) -> None:
+            self.control_calls = 0
+
+        def __call__(self, messages, *, tools=None):
+            assessment = assessment_response(messages)
+            if assessment is not None:
+                return assessment
+            if "Choose the next control action" in str(messages[0].get("content") or ""):
+                self.control_calls += 1
+                raise AssertionError("zero capacity must bypass model Fork control")
+            return _final("The current Agent retained the work locally.")
+
+    policy = LocalOnlyPolicy()
+    identity = ExecutionIdentity("root-no-fork-capacity", None, "root-no-fork-capacity", 0)
+    graph = build_research_agent_graph(
+        policy,
+        [],
+        coordination_board=ResearchBlackboard(tmp_path / "board.sqlite"),
+        homogeneous_fork_config=HomogeneousForkConfig(
+            enabled=True,
+            explicit_control_decision=True,
+        ),
+    )
+
+    final = await graph.ainvoke(
+        create_research_agent_state(
+            ResearchTask("local-capacity", "Stay local", require_evidence=False),
+            identity,
+            AgentLimits(max_total_tool_calls=1),
+        ),
+        config={"configurable": {"thread_id": identity.thread_id}},
+    )
+
+    assert policy.control_calls == 0
+    assert final["control_action"] == "local_research"
+    assert final["result"].thread_count == 1
+
+
+@pytest.mark.asyncio
 async def test_child_can_top_up_soft_lease_before_finalization(tmp_path) -> None:
     class HeavyChildPolicy:
         def __call__(self, messages, *, tools=None):
@@ -241,6 +282,68 @@ async def test_child_can_top_up_soft_lease_before_finalization(tmp_path) -> None
     assert final["result"].thread_count == 3
     metrics = board.metrics(identity.root_thread_id)
     assert metrics["event_budget_lease_topped_up"] == 2
+    assert metrics["event_budget_lease_released"] == 2
+    assert metrics["active_budget_lease_count"] == 0
+
+
+@pytest.mark.asyncio
+async def test_global_leases_fund_one_complete_grandchild_loop(tmp_path) -> None:
+    class RecursiveLeasePolicy:
+        def fork(self):
+            return type(self)()
+
+        def __call__(self, messages, *, tools=None):
+            assessment = assessment_response(messages)
+            if assessment is not None:
+                return assessment
+            system = str(messages[0].get("content") or "")
+            if "Choose the next control action" in system:
+                state = json.loads(messages[-1]["content"])
+                requirement_id = state["requirements"][0]["requirement_id"]
+                depth = int(state["depth"])
+                return {"content": json.dumps({
+                    "action": "fork" if depth < 2 else "complete",
+                    "rationale": "Use the shared lease for one complete scoped loop.",
+                    "target_requirement_ids": [requirement_id] if depth < 2 else [],
+                    "fork_candidates": ([{
+                        "objective": f"leased depth {depth + 1}",
+                        "expected_output": "A scoped memo",
+                        "requirement_ids": [requirement_id],
+                        "scope_signature": f"leased-depth-{depth + 1}",
+                        "reasons": ["deep_tool_chain"],
+                        "estimated_tool_calls": 3,
+                        "independent": True,
+                    }] if depth < 2 else []),
+                })}
+            return _final("Completed the leased scope.")
+
+    board = ResearchBlackboard(tmp_path / "board.sqlite")
+    identity = ExecutionIdentity("root-recursive-lease", None, "root-recursive-lease", 0)
+    graph = build_research_agent_graph(
+        RecursiveLeasePolicy(),
+        [],
+        coordination_board=board,
+        homogeneous_fork_config=HomogeneousForkConfig(
+            enabled=True,
+            explicit_control_decision=True,
+            budget_leases_enabled=True,
+        ),
+    )
+
+    final = await graph.ainvoke(
+        create_research_agent_state(
+            ResearchTask("recursive-lease", "Use a recursive lease", require_evidence=False),
+            identity,
+            AgentLimits(max_children=2, max_total_threads=4),
+        ),
+        config={"configurable": {"thread_id": identity.thread_id}},
+    )
+
+    assert final["result"].thread_count == 3
+    snapshot = board.snapshot(identity.root_thread_id, viewer_thread_id=identity.thread_id)
+    assert [item["depth"] for item in snapshot["assignment_tree"]] == [0, 1, 2]
+    metrics = board.metrics(identity.root_thread_id)
+    assert metrics["event_budget_lease_granted"] == 2
     assert metrics["event_budget_lease_released"] == 2
     assert metrics["active_budget_lease_count"] == 0
 

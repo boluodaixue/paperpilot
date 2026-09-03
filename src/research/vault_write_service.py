@@ -12,7 +12,7 @@ import time
 import uuid
 from collections.abc import Mapping
 from pathlib import Path, PurePosixPath
-from typing import Any
+from typing import Any, Callable
 
 from .memory import MarkdownMemoryStore, MemoryWriteConflictError
 from .memory_write_plans import (
@@ -500,6 +500,68 @@ class VaultWriteService:
             job = self._existing_for_plan(plan, request_hash=request_hash)
         return self._successful_result(self._await_terminal(job.job_id))
 
+    def _submit_research_plan(
+        self,
+        plan_factory: Callable[[], MemoryWritePlan],
+        *,
+        request_hash: str,
+    ) -> dict[str, object]:
+        """Plan managed research only after earlier Vault writes are settled.
+
+        Research publication also updates Memory Home.  Taking the persistent
+        Writer lease before reading Home prevents two processes from building
+        different valid bundles from the same stale Home snapshot.
+        """
+
+        deadline = time.monotonic() + self.wait_timeout_seconds
+        while True:
+            lease = self._claim_writer()
+            if lease is None:
+                if time.monotonic() >= deadline:
+                    raise TimeoutError("Vault Writer planning lease timed out")
+                time.sleep(self.coordination_interval_seconds)
+                continue
+            try:
+                pending = tuple(
+                    job.job_id for job in self.queue.list() if not job.terminal
+                )
+                if pending:
+                    self._drive_as_writer(
+                        lease,
+                        job_ids=pending,
+                        deadline=deadline,
+                    )
+                plan = plan_factory()
+                renewed = self.queue.renew_writer(
+                    lease,
+                    lease_seconds=self.lease_seconds,
+                )
+                if renewed is None:
+                    raise RuntimeError("Vault Writer planning lease was lost")
+                lease = renewed
+                try:
+                    job = self.queue.enqueue(**plan.enqueue_kwargs())
+                except ValueError as exc:
+                    if str(exc) != "Vault write idempotency key collision":
+                        raise
+                    job = self._existing_for_plan(
+                        plan,
+                        request_hash=request_hash,
+                    )
+                if not job.terminal:
+                    self._drive_as_writer(
+                        lease,
+                        job_ids=(job.job_id,),
+                        deadline=deadline,
+                    )
+                    refreshed = self.queue.get(job.job_id)
+                    if refreshed is None:
+                        raise RuntimeError("Vault write job disappeared")
+                    job = refreshed
+                return self._successful_result(job)
+            finally:
+                self.queue.release_writer(lease)
+
     @staticmethod
     def _manifest(value: Mapping[str, object]) -> MemoryManifest:
         report_path = value.get("report_path")
@@ -567,17 +629,20 @@ class VaultWriteService:
             report_body_markdown=report_body_markdown,
             report_architecture=report_architecture,
         )
-        plan = build_research_bundle_plan(
-            self.memory_store,
-            brief,
-            result,
-            identity,
-            memory_id=memory_id,
-            created_at=created_at or self.memory_store._timestamp(),
-            report_body_markdown=report_body_markdown,
-            report_architecture=report_architecture,
+        timestamp = created_at or self.memory_store._timestamp()
+        payload = self._submit_research_plan(
+            lambda: build_research_bundle_plan(
+                self.memory_store,
+                brief,
+                result,
+                identity,
+                memory_id=memory_id,
+                created_at=timestamp,
+                report_body_markdown=report_body_markdown,
+                report_architecture=report_architecture,
+            ),
+            request_hash=request_hash,
         )
-        payload = self._submit(plan, request_hash=request_hash)
         manifest = self._manifest(payload)
         return self.memory_store.read_text(manifest.report_path), manifest
 

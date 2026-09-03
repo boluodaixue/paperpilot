@@ -8,7 +8,7 @@
 
 [![Python](https://img.shields.io/badge/Python-3.10%2B-blue.svg)](https://python.org)
 [![LangGraph](https://img.shields.io/badge/Orchestration-LangGraph-1f6feb.svg)](https://www.langchain.com/langgraph)
-[![Tests](https://img.shields.io/badge/tests-747%20passed-brightgreen.svg)](#测试)
+[![Tests](https://img.shields.io/badge/tests-1112%20passed-brightgreen.svg)](#测试)
 [![License](https://img.shields.io/badge/license-MIT-green.svg)](LICENSE)
 
 </div>
@@ -40,7 +40,7 @@
 - 根 Agent、子 Agent 和孙 Agent 运行同一个 AgentGraph，只在身份、深度和预算上不同；
 - Agent 根据证据缺口决定继续调用工具、停止或 fork，整棵执行树共享递归、线程、工具和时间预算；
 - 搜索、论文、网页、文件和计算结果最终汇聚为带来源的 Markdown 报告；
-- 可选 Red/Blue 审查用于报告质量复核，不改变主研究架构。
+- Red/Blue 审查保留为关闭的实验路径，不接入当前产品基线。
 
 ### 2. LLM Wiki：让研究成为长期记忆
 

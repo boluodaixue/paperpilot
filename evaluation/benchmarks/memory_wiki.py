@@ -8,9 +8,8 @@ import tempfile
 from pathlib import Path
 from typing import Any, Awaitable, Callable
 
-from langgraph.checkpoint.memory import InMemorySaver
-
 from evaluation.report import EvaluationReport
+from src.research.checkpoint_serde import paperpilot_in_memory_saver
 from src.research.memory import MarkdownMemoryStore, MemoryWriteConflictError
 from src.research.memory_dialogue import answer_memory, propose_memory_note
 from src.research.models import AgentLimits, ExecutionIdentity, ResearchWorkflowResult
@@ -332,7 +331,7 @@ async def _unsupported_refusal_case() -> dict[str, bool]:
             "policy_not_called": policy.calls == 0,
             "no_citations": answer.citations == (),
             "explicit_refusal": bool(answer.insufficient_evidence)
-            and "Insufficient evidence" in answer.markdown,
+            and "证据不足" in answer.markdown,
             "vault_unchanged": _vault_files(root) == before,
         }
 
@@ -399,7 +398,7 @@ async def _continued_research_case() -> dict[str, bool]:
             policy,
             [tool],
             store,
-            checkpointer=InMemorySaver(),
+            checkpointer=paperpilot_in_memory_saver(),
         )
         thread_id = "memory-wiki-offline"
         identity = ExecutionIdentity(thread_id, None, thread_id, 0)

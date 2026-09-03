@@ -85,7 +85,10 @@ def render_evidence_references(
             link = f"[[evidence/{note}|[{number}]]]"
         else:
             path = f"Memories/{memory_id}/evidence/{note}.md"
-            link = build_wikilink(path, f"[{number}]")
+            # Managed Vault aliases follow the strict W0 contract and cannot
+            # contain WikiLink syntax characters such as ``[`` or ``]``.
+            # The report body already carries the visible ``[n]`` marker.
+            link = build_wikilink(path, f"Evidence {number}")
         references.append(
             f"{number}. {link} — {item.title or item.source_ref}; {item.locator or item.source_ref}"
         )

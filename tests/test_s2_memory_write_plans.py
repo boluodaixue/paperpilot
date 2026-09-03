@@ -318,7 +318,7 @@ def test_plan_metadata_enqueues_the_same_opaque_canonical_command(
     assert job.command_hash == plan.command_hash
 
 
-def test_research_plan_uses_report_anchor_and_never_updates_home(tmp_path: Path) -> None:
+def test_research_plan_uses_report_anchor_and_updates_home(tmp_path: Path) -> None:
     store = _store(tmp_path)
     before = _files(store.root)
 
@@ -338,10 +338,16 @@ def test_research_plan_uses_report_anchor_and_never_updates_home(tmp_path: Path)
     assert payload["anchor"].startswith("Memories/M-plan/reports/Report-")
     assert payload["anchor"].endswith(".md")
     targets = _targets(command)
-    assert "Memories/M-plan/Home.md" not in targets
+    home = targets["Memories/M-plan/Home.md"]
+    assert home["expected_mode"] == "hash"
+    assert "## Reports" in base64.b64decode(home["content_b64"]).decode("utf-8")
+    assert payload["anchor"][:-3] in base64.b64decode(home["content_b64"]).decode(
+        "utf-8"
+    )
     assert payload["anchor"] in targets
     assert payload["result"]["request_hash"] == payload["input_hashes"]["request"]
-    assert {PurePosixPath(path).parts[2] for path in targets} == {
+    non_home = [path for path in targets if not path.endswith("/Home.md")]
+    assert {PurePosixPath(path).parts[2] for path in non_home} == {
         "sources",
         "evidence",
         "reports",
@@ -354,8 +360,12 @@ def test_research_plan_captures_reuse_and_expected_old_hashes(tmp_path: Path) ->
         store, _brief(), _result(), _identity(), memory_id="M-plan", created_at=STAMP
     )
     first_targets = _targets(first)
-    first_paths = sorted(first_targets)
-    reusable_path_value, changed_path_value = first_paths[0], first_paths[1]
+    immutable_paths = sorted(
+        path
+        for path in first_targets
+        if "/evidence/" in path or "/sources/" in path
+    )
+    reusable_path_value, changed_path_value = immutable_paths
     reusable_path = store.root / reusable_path_value
     reusable_path.write_bytes(base64.b64decode(first_targets[reusable_path_value]["content_b64"]))
     changed_path = store.root / changed_path_value
@@ -368,10 +378,9 @@ def test_research_plan_captures_reuse_and_expected_old_hashes(tmp_path: Path) ->
 
     assert targets[reusable_path_value]["expected_mode"] == "reuse"
     assert targets[reusable_path_value]["expected_hash"] is None
-    assert targets[changed_path_value]["expected_mode"] == "hash"
-    assert targets[changed_path_value]["expected_hash"] == hashlib.sha256(
-        b"external edit"
-    ).hexdigest()
+    assert targets[changed_path_value]["expected_mode"] == "reuse"
+    assert targets[changed_path_value]["expected_hash"] is None
+    assert base64.b64decode(targets[changed_path_value]["content_b64"]) == b"external edit"
 
 
 def test_report_review_plan_uses_explicit_original_hash_and_is_read_only(

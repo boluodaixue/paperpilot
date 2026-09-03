@@ -244,4 +244,8 @@ pip-target-*/
 pip-unpack-*/
 tmp*/
 pytest-of-*/
+pytest-cache-files-*/
 torchinductor_*/
+
+# 本地产品设计审查截图与笔记
+outputs/design-audit/

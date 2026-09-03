@@ -22,6 +22,7 @@ from src.research import (
 from src.research.agent_graph import _child_task
 from src.research.fork_policy import evaluate_fork_candidates, fork_tool_schema
 from src.research.models import ForkCandidate, ResearchRequirement
+from src.research.research_blackboard import ResearchBlackboard
 from src.research.research_sufficiency import build_research_requirements
 from tests._research_assessment import assessment_response
 
@@ -276,6 +277,79 @@ class ForkingPolicy:
             "The parent gathered and synthesized child research.",
             "The child directions produced evidence-backed findings.",
         )
+
+
+class PreflightRetainingPolicy:
+    """Keep a resource-rejected direction in the parent execution loop."""
+
+    def __init__(self, tracker: ForkTracker) -> None:
+        self.tracker = tracker
+
+    def fork(self):
+        return ChildPolicy(self.tracker, None)
+
+    def __call__(self, messages, *, tools=None):
+        content = str(messages[-1].get("content") or "")
+        if content.startswith("ASSESS_RESEARCH_STATE"):
+            state = json.loads(content.split("STATE:\n", 1)[1])
+            if not state["evidence"] and "resource preflight failed" in content:
+                requirement_id = state["requirements"][0]["requirement_id"]
+                return {
+                    "content": json.dumps({
+                        "decision": "continue",
+                        "coverage": [{
+                            "requirement_id": requirement_id,
+                            "status": "unsupported",
+                            "evidence_ids": [],
+                            "rationale": "The rejected child scope remains local.",
+                            "remaining_gap": "Research it in the parent Agent.",
+                        }],
+                        "critical_gaps": [{
+                            "requirement_id": requirement_id,
+                            "reason": "The child was not funded.",
+                            "impact": "high",
+                        }],
+                        "next_actions": [{
+                            "requirement_id": requirement_id,
+                            "strategy": "query_rewrite",
+                            "query": "parent retained direction",
+                            "expected_value": "high",
+                            "expected_improvement": "Research the direction locally.",
+                        }],
+                        "termination_reason": None,
+                        "replan_reason": "Retain the unfunded direction locally.",
+                        "exhaustion_reason": None,
+                    }),
+                    "tool_calls": [],
+                }
+            return assessment_response(messages)
+        if tools == [] and content.startswith("FINAL_SYNTHESIS_SNAPSHOT"):
+            return _final("Preflight completed.", "The scoped direction was covered.")
+        fork_messages = [
+            message
+            for message in messages
+            if message.get("role") == "tool"
+            and message.get("name") == "fork_research"
+        ]
+        search_messages = [
+            message
+            for message in messages
+            if message.get("role") == "tool"
+            and message.get("name") == "web_search"
+        ]
+        if not fork_messages:
+            return {
+                "content": "",
+                "tool_calls": [_fork_call([
+                    _candidate("delegated direction", "context_isolation")
+                ])],
+            }
+        if not search_messages:
+            return {
+                "content": "",
+                "tool_calls": [_search_call("parent retained direction")],
+            }
+        return _final("Preflight completed.", "The scoped direction was covered.")
 
 
 def _root_identity(thread_id: str = "root-fork") -> ExecutionIdentity:
@@ -535,3 +609,72 @@ async def test_child_budget_limits_total_accepted_candidates() -> None:
 
     assert len(result.child_result_refs) == 1
     assert len(tracker.tool_queries) == 1
+
+
+@pytest.mark.asyncio
+async def test_insufficient_fork_budget_creates_no_assignment_and_parent_keeps_work(
+    tmp_path,
+) -> None:
+    tracker = ForkTracker()
+    identity = _root_identity("root-preflight-insufficient")
+    board = ResearchBlackboard(tmp_path / "board.sqlite")
+    graph = build_research_agent_graph(
+        PreflightRetainingPolicy(tracker),
+        [ConcurrentWebTool(tracker)],
+        coordination_board=board,
+    )
+
+    final = await graph.ainvoke(
+        create_research_agent_state(
+            ResearchTask("preflight-low", "Cover one evidence direction."),
+            identity,
+            AgentLimits(max_total_tool_calls=1),
+        ),
+        config={"configurable": {"thread_id": identity.thread_id}},
+    )
+
+    snapshot = board.snapshot(
+        identity.root_thread_id,
+        viewer_thread_id=identity.thread_id,
+    )
+    assert [item["depth"] for item in snapshot["assignment_tree"]] == [0]
+    assert final["result"].thread_count == 1
+    assert final["child_thread_ids"] == []
+    assert tracker.child_policy_ids == []
+    assert tracker.tool_queries == ["parent retained direction"]
+    fork_message = next(
+        message for message in final["messages"] if message.get("name") == "fork_research"
+    )
+    assert "resource preflight failed" in fork_message["content"]
+    assert "retain this task locally" in fork_message["content"]
+
+
+@pytest.mark.asyncio
+async def test_sufficient_fork_budget_preserves_existing_child_dispatch(tmp_path) -> None:
+    tracker = ForkTracker()
+    identity = _root_identity("root-preflight-sufficient")
+    board = ResearchBlackboard(tmp_path / "board.sqlite")
+    graph = build_research_agent_graph(
+        PreflightRetainingPolicy(tracker),
+        [ConcurrentWebTool(tracker)],
+        coordination_board=board,
+    )
+
+    final = await graph.ainvoke(
+        create_research_agent_state(
+            ResearchTask("preflight-enough", "Cover one evidence direction."),
+            identity,
+            AgentLimits(max_total_tool_calls=4),
+        ),
+        config={"configurable": {"thread_id": identity.thread_id}},
+    )
+
+    snapshot = board.snapshot(
+        identity.root_thread_id,
+        viewer_thread_id=identity.thread_id,
+    )
+    assert [item["depth"] for item in snapshot["assignment_tree"]] == [0, 1]
+    assert final["result"].thread_count == 2
+    assert len(final["child_thread_ids"]) == 1
+    assert len(tracker.child_policy_ids) == 1
+    assert tracker.tool_queries == ["delegated direction"]
