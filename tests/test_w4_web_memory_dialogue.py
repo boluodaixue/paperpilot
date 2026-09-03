@@ -196,6 +196,8 @@ def test_static_page_requires_explicit_mode_preview_and_confirmation():
         'value="research">深度研究',
         'value="memory-answer">只查当前 Memory',
         'value="quick-search">联网查一下',
+        "sendQuickQuestion(decision.query || text, false)",
+        "sendResearchRequest(decision.query || text, false)",
         "/api/conversation/route",
         "/api/conversation/quick-answer",
         "renderQuickAnswer(answer)",
@@ -238,7 +240,8 @@ def test_static_page_requires_explicit_mode_preview_and_confirmation():
         "fetch('/api/conversation/route'"
     )
     assert "sendMemoryQuestion(text, false)" in automatic
-    assert "sendResearchRequest(text, false)" in automatic
+    assert "sendResearchRequest(decision.query || text, false)" in automatic
+    assert "sendQuickQuestion(decision.query || text, false)" in automatic
     for forbidden in (
         "/api/import",
         "/api/memories/tree",

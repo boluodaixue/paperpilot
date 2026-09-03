@@ -171,6 +171,63 @@ async def test_topic_only_research_request_asks_for_scope() -> None:
     assert decision.reason_code == "research_request_needs_scope"
 
 
+@pytest.mark.asyncio
+async def test_narrowing_answer_is_exposed_as_conversation_continuation() -> None:
+    class InspectContinuationPolicy:
+        def __call__(self, messages, *, tools=None):
+            payload = json.loads(messages[-1]["content"])
+            assert payload["conversation_continuation"] == {
+                "latest_assistant_question": "你想重点了解哪个方向？",
+                "prior_user_goal": "先帮我查一下最新技术",
+                "newest_answer": "记忆机制",
+            }
+            return {
+                "content": _payload(
+                    "propose_research",
+                    query="Agent 长程任务中的最新记忆机制技术",
+                    research_ready=True,
+                ),
+                "tool_calls": [],
+            }
+
+    decision = await route_conversation(
+        ConversationRequest(
+            "记忆机制",
+            recent_messages=(
+                ConversationMessage("user", "先帮我查一下最新技术"),
+                ConversationMessage("assistant", "你想重点了解哪个方向？"),
+            ),
+        ),
+        InspectContinuationPolicy(),
+    )
+
+    assert decision.action is ConversationAction.PROPOSE_RESEARCH
+    assert decision.query == "Agent 长程任务中的最新记忆机制技术"
+
+
+@pytest.mark.asyncio
+async def test_quick_search_mode_command_reconstructs_prior_topic() -> None:
+    policy = QueuePolicy(_payload(
+        "quick_search",
+        query="Agent 长程任务中的最新记忆机制技术",
+    ))
+
+    decision = await route_conversation(
+        ConversationRequest(
+            "快速联网查",
+            recent_messages=(
+                ConversationMessage("user", "帮我查 Agent 长程任务"),
+                ConversationMessage("assistant", "你想重点了解哪个方向？"),
+                ConversationMessage("user", "记忆机制"),
+            ),
+        ),
+        policy,
+    )
+
+    assert decision.action is ConversationAction.QUICK_SEARCH
+    assert decision.query == "Agent 长程任务中的最新记忆机制技术"
+
+
 def test_orchestrator_has_no_research_or_persistence_imports() -> None:
     source = (ROOT / "src/conversation/orchestrator.py").read_text(encoding="utf-8")
     tree = ast.parse(source)
