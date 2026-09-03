@@ -8,7 +8,7 @@
 
 [![Python](https://img.shields.io/badge/Python-3.10%2B-blue.svg)](https://python.org)
 [![LangGraph](https://img.shields.io/badge/Orchestration-LangGraph-1f6feb.svg)](https://www.langchain.com/langgraph)
-[![Tests](https://img.shields.io/badge/tests-1000%2B-brightgreen.svg)](#测试)
+[![Tests](https://img.shields.io/badge/tests-1142%20passed%20%7C%201%20known%20flaky-yellow.svg)](#测试)
 [![License](https://img.shields.io/badge/license-MIT-green.svg)](LICENSE)
 
 </div>
@@ -36,16 +36,22 @@
 | 🧠 **LLM Wiki** | 将报告、证据、来源和笔记组织为长期 Memory，支持检索问答与基于旧知识继续研究 | 研究结束后知识无法复用 |
 | 🗂️ **Obsidian 原生工作流** | 使用 Markdown、frontmatter 和 WikiLink 落盘，可直接在 Obsidian 中阅读、编辑和浏览双链 | 知识被锁在聊天界面或专有数据库中 |
 
-### 1. 递归 Deep Research
+### 1. 统一对话编排
+
+- Web 默认入口会区分普通聊天、当前 Memory 问答、快速联网和深度研究提案；
+- 用户也可以显式指定模式，跳过自动意图判断；
+- 普通聊天、Memory 问答和快速联网不会启动 Research AgentGraph；
+- CLI 与 Rubric 评测保持为独立研究入口，不依赖 Web 对话编排层。
+
+### 2. 递归 Deep Research
 
 - 用户可以修改并确认 Research Brief，确认前不会启动正式研究；
 - 未选择 Memory 也能先审阅 Brief；确认启动时自动创建并绑定 managed Memory；
 - 根 Agent、子 Agent 和孙 Agent 运行同一个 AgentGraph，只在身份、深度和预算上不同；
 - Agent 根据证据缺口决定继续调用工具、停止或 fork，整棵执行树共享递归、线程、工具和时间预算；
 - 搜索、论文、网页、文件和计算结果最终汇聚为带来源的 Markdown 报告；
-- Red/Blue 审查保留为关闭的实验路径，不接入当前产品基线。
 
-### 2. LLM Wiki：让研究成为长期记忆
+### 3. LLM Wiki：让研究成为长期记忆
 
 PaperPilot 的 LLM Wiki 不是另一个 Markdown 编辑器，而是建立在 Markdown Vault 之上的智能层：
 
@@ -56,7 +62,7 @@ PaperPilot 的 LLM Wiki 不是另一个 Markdown 编辑器，而是建立在 Mar
 - 新研究会读取已有结论与知识缺口，在同一 Memory 中继续扩展；
 - SQLite FTS5、可选本地语义召回和 WikiLink 邻居组成混合检索，索引可随时从 Markdown 重建。
 
-### 3. Obsidian 原生，而不是自建编辑器
+### 4. Obsidian 原生，而不是自建编辑器
 
 PaperPilot 负责研究、检索、引用和受控写入；Obsidian 负责阅读、手工编辑、backlinks 与知识图谱。Vault 中的 Markdown 是唯一知识真相源，PaperPilot 不要求安装 Obsidian 插件，也不会改写 `.obsidian/`。
 
@@ -77,14 +83,17 @@ memory/
 
 ```mermaid
 flowchart LR
-    A[统一对话入口] --> B{能力路由}
+    A[Web 统一对话入口] --> B{Conversation Orchestrator}
     B -->|普通聊天| C1[直接回答]
     B -->|快速联网| C2[最多 3 个来源]
     B -->|Memory 问答| C3[当前 Memory 检索]
     B -->|深度研究| C[修改并确认计划]
     C --> C4[未绑定则自动创建 Memory]
-    C4 --> D[Research Agent 递归研究]
-    D --> E[汇聚证据与来源]
+    CLI[CLI: run_repl / run_single] --> D[Research Runtime]
+    EVAL[Rubric Eval] --> D
+    C4 --> D
+    D --> D1[Research Agent 递归研究]
+    D1 --> E[汇聚证据与来源]
     E --> F[生成 Markdown 报告]
     F --> G[Obsidian 阅读与双链]
     F --> H[LLM Wiki 问答]
@@ -99,12 +108,20 @@ flowchart LR
 
 ```mermaid
 flowchart TB
-    UI[Web / CLI] --> RT[Research Runtime]
+    WEB[Web] --> ORCH[Conversation Orchestrator]
+    ORCH --> CHAT[普通聊天]
+    ORCH --> MQA[Memory 问答]
+    ORCH --> QUICK[Quick Web]
+    ORCH --> PROPOSAL[确认后的深度研究]
+    PROPOSAL --> RT[Research Runtime]
+    CLI[CLI: run_repl / run_single] --> RT
+    EVAL[Rubric Eval] --> RT
     RT --> WF[LangGraph Research Workflow]
     WF --> CP[(SQLite Checkpointer)]
     WF --> AG[Homogeneous Research AgentGraph]
     AG -->|按需 fork| AG
     AG --> TOOLS[Search / Paper / Web / File / Compute]
+    QUICK --> TOOLS
     WF --> WRITER[Durable Queue + Single Vault Writer]
     WRITER --> VAULT[(Markdown Vault)]
     VAULT --> OBS[Obsidian]
@@ -130,6 +147,7 @@ flowchart TB
 ```bash
 git clone https://github.com/boluodaixue/paperpilot.git
 cd paperpilot
+git switch codex/unified-conversation-orchestrator
 
 python -m venv .venv
 source .venv/bin/activate
@@ -148,7 +166,7 @@ Copy-Item .env.template .env
 
 在 `.env` 中填写模型和检索服务所需的 API Key。项目支持 DeepSeek、OpenAI、MiMo 和本地 OpenAI-compatible vLLM。
 
-网页搜索默认使用 `Tavily → 秘塔 → Exa → 博查 → SerpAPI` 回退链，只调用已配置 Key 的备用源，无需部署 SearXNG 或其他常驻服务。首选源故障时会自动切换，但仍向界面发送明确的来源不可用告警；所有已配置来源都失败时才暂停整个网页搜索工具。
+网页搜索默认使用 `Tavily → 秘塔 → Exa → 博查 → SerpAPI` 回退链，只调用已配置 Key 的备用源，无需部署 SearXNG 或其他常驻服务。Quick Web 最多打开三个可读来源；没有获得可用文档时返回证据不足，不会转入深度研究或写入 Memory。
 
 论文检索把 `ARXIV_READER_BACKEND` 作为首选项，并在失败或空结果时自动在 arXiv、Semantic Scholar 和 OpenAlex 之间回退。裸 arXiv ID 会先按 arXiv 标识符查询，不会再误拼为 OpenAlex Work ID。外部 HTTPS 工具统一使用平台信任库与 Mozilla CA；网页返回 403 时，只会尝试同一发布方可验证的官方 PDF，不关闭证书校验或绕过访问控制。
 
@@ -168,16 +186,27 @@ python web/run.py
 
 ### CLI
 
+交互式入口可以直接创建并选择 Memory，然后输入研究问题：
+
+```text
+python scripts/run_repl.py
+> new-memory Agent长程任务
+> 研究 Agent 长程任务的记忆机制
+```
+
+后续也可以选择已有 Memory，或只针对该 Memory 提问：
+
+```text
+> use M-your-memory
+> ask 已有研究中总结了哪些记忆机制？
+```
+
+单次自动化入口要求显式传入一个已经存在的 managed Memory：
+
 ```bash
 python scripts/run_single.py \
   --memory-id M-your-memory \
   --query "分析 AI Agent Memory 的演进、评测方法与关键证据"
-```
-
-交互式入口：
-
-```bash
-python scripts/run_repl.py
 ```
 
 ## 🧭 项目演进
@@ -197,8 +226,12 @@ PaperPilot 保留了从原型到当前架构的完整 Git 提交历史，方便�
 ## 🧪 测试
 
 ```bash
+python -m pip install -e ".[dev]"
 pytest -q
 ```
+
+最近一次完整验证结果为 `1142 passed, 3 skipped, 1 failed`。唯一失败项是
+Windows 下 Vault Writer 的 `60ms` heartbeat 时序用例，当前作为已知 flaky 测试保留。
 
 当前确定性测试覆盖：
 
