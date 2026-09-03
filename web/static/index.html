@@ -932,7 +932,7 @@ function scrollToBottom() {
 // ------------------------------------------------------------------
 // Memory 问答与受控保存
 // ------------------------------------------------------------------
-async function sendMemoryQuestion(questionOverride = null) {
+async function sendMemoryQuestion(questionOverride = null, renderUser = true) {
   const input = $('msgInput');
   const question = (
     questionOverride === null ? input.value : String(questionOverride)
@@ -960,7 +960,7 @@ async function sendMemoryQuestion(questionOverride = null) {
   }
   const memoryId = selectedMemoryId;
   input.value = '';
-  appendBubble('user', question);
+  if (renderUser) appendBubble('user', question);
   const thinking = document.createElement('div');
   thinking.className = 'msg thinking';
   thinking.textContent = '正在查找当前 Memory…';
@@ -1399,6 +1399,8 @@ async function sendAutomaticMessage() {
   const input = $('msgInput');
   const text = input.value.trim();
   if (!text || sendLock) return;
+  input.value = '';
+  appendBubble('user', text);
   const thinking = document.createElement('div');
   thinking.className = 'msg thinking';
   thinking.textContent = '正在理解你的需求…';
@@ -1423,28 +1425,25 @@ async function sendAutomaticMessage() {
       return;
     }
     bindCurrentSession(decision.session_id, decision.memory_id);
-    input.value = '';
     if (decision.action === 'reply' || decision.action === 'clarify') {
-      appendBubble('user', text);
       appendBubble('assistant', decision.response || '请再补充一点信息。');
       loadSessions();
       return;
     }
     sendLock = false;
     if (decision.action === 'memory_answer') {
-      await sendMemoryQuestion(decision.query || text);
+      await sendMemoryQuestion(text, false);
       return;
     }
     if (decision.action === 'propose_research') {
-      await sendResearchRequest(decision.query || text);
+      await sendResearchRequest(text, false);
       return;
     }
     if (decision.action === 'quick_search') {
       showNotice('快速联网回答将在下一阶段接入；当前已转为需要确认的深度研究提案。');
-      await sendResearchRequest(decision.query || text);
+      await sendResearchRequest(text, false);
       return;
     }
-    appendBubble('user', text);
     appendBubble('assistant', '请在需要保存的回答卡片上选择“保存回答为笔记”。');
     loadSessions();
   } catch (e) {
@@ -1455,7 +1454,7 @@ async function sendAutomaticMessage() {
   }
 }
 
-async function sendResearchRequest(textOverride = null) {
+async function sendResearchRequest(textOverride = null, renderUser = true) {
   const input = $('msgInput');
   const text = (
     textOverride === null ? input.value : String(textOverride)
@@ -1471,7 +1470,7 @@ async function sendResearchRequest(textOverride = null) {
     return;
   }
   input.value = '';
-  appendBubble('user', text);
+  if (renderUser) appendBubble('user', text);
 
   const el = document.createElement('div');
   el.className = 'msg thinking'; el.textContent = '正在思考…';

@@ -226,6 +226,15 @@ def test_static_page_requires_explicit_mode_preview_and_confirmation():
         "confirmMemoryNoteProposal",
     ):
         assert required in source
+    automatic = source[
+        source.index("async function sendAutomaticMessage"):
+        source.index("async function sendResearchRequest")
+    ]
+    assert automatic.index("appendBubble('user', text)") < automatic.index(
+        "fetch('/api/conversation/route'"
+    )
+    assert "sendMemoryQuestion(text, false)" in automatic
+    assert "sendResearchRequest(text, false)" in automatic
     for forbidden in (
         "/api/import",
         "/api/memories/tree",
