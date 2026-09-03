@@ -38,6 +38,8 @@ def _payload(action: str, **overrides) -> str:
         "response": "",
         "query": "",
         "reason_code": "fixture",
+        "research_ready": True,
+        "clarifying_question": "",
     }
     payload.update(overrides)
     return json.dumps(payload)
@@ -131,6 +133,42 @@ async def test_invalid_router_transport_is_repaired_once() -> None:
 
     assert policy.calls == 2
     assert decision.action is ConversationAction.CLARIFY
+
+
+@pytest.mark.asyncio
+async def test_research_proposal_with_a_question_is_downgraded_to_clarification() -> None:
+    policy = QueuePolicy(_payload(
+        "propose_research",
+        query="Agent long-horizon tasks",
+        response="你希望重点研究可靠性还是规划能力？",
+    ))
+
+    decision = await route_conversation(
+        ConversationRequest("帮查一些关于 Agent 长程任务的问题"),
+        policy,
+    )
+
+    assert decision.action is ConversationAction.CLARIFY
+    assert decision.reason_code == "service_action_still_needs_clarification"
+    assert decision.requires_confirmation is False
+
+
+@pytest.mark.asyncio
+async def test_topic_only_research_request_asks_for_scope() -> None:
+    policy = QueuePolicy(_payload(
+        "propose_research",
+        query="Agent long-horizon tasks",
+        research_ready=False,
+        clarifying_question="你更关注规划、记忆还是长期执行可靠性？",
+    ))
+
+    decision = await route_conversation(
+        ConversationRequest("帮查一些关于 Agent 长程任务的问题"),
+        policy,
+    )
+
+    assert decision.action is ConversationAction.CLARIFY
+    assert decision.reason_code == "research_request_needs_scope"
 
 
 def test_orchestrator_has_no_research_or_persistence_imports() -> None:
