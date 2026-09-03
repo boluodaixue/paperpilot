@@ -41,7 +41,7 @@ class WorkflowRecord:
     task_id: str
     thread_id: str
     session_id: str
-    memory_id: str
+    memory_id: str | None
     workflow_type: str
     created_at: float
     expires_at: float | None
@@ -150,7 +150,7 @@ class RuntimeRegistry:
                         task_id TEXT PRIMARY KEY,
                         thread_id TEXT NOT NULL UNIQUE,
                         session_id TEXT NOT NULL,
-                        memory_id TEXT NOT NULL,
+                        memory_id TEXT,
                         workflow_type TEXT NOT NULL CHECK (
                             workflow_type IN (
                                 'research', 'memory_note',
@@ -162,6 +162,7 @@ class RuntimeRegistry:
                         lease_owner TEXT,
                         lease_until REAL,
                         CHECK ((lease_owner IS NULL) = (lease_until IS NULL)),
+                        CHECK (workflow_type = 'research' OR memory_id IS NOT NULL),
                         FOREIGN KEY (session_id)
                             REFERENCES session_meta(session_id) ON DELETE CASCADE
                     );
@@ -191,9 +192,97 @@ class RuntimeRegistry:
                         ON runtime_outbox(thread_id, sequence);
                     """
                 )
+                columns = connection.execute(
+                    "PRAGMA table_info(runtime_workflows)"
+                ).fetchall()
+                memory_column = next(
+                    (row for row in columns if row[1] == "memory_id"),
+                    None,
+                )
+                if memory_column is not None and int(memory_column[3]) == 1:
+                    connection.commit()
+                    self._migrate_nullable_research_memory(connection)
                 connection.commit()
             finally:
                 connection.close()
+
+    @staticmethod
+    def _migrate_nullable_research_memory(connection: sqlite3.Connection) -> None:
+        """Widen only the research locator identity from Memory-required to optional."""
+
+        connection.execute("PRAGMA foreign_keys = OFF")
+        try:
+            connection.executescript(
+                """
+                BEGIN IMMEDIATE;
+                DROP INDEX IF EXISTS idx_runtime_outbox_thread;
+                DROP INDEX IF EXISTS idx_runtime_workflows_session;
+                DROP INDEX IF EXISTS idx_runtime_workflows_expiry;
+                DROP INDEX IF EXISTS idx_runtime_workflows_lease;
+
+                ALTER TABLE runtime_outbox RENAME TO runtime_outbox_notnull_memory;
+                ALTER TABLE runtime_workflows RENAME TO runtime_workflows_notnull_memory;
+
+                CREATE TABLE runtime_workflows (
+                    task_id TEXT PRIMARY KEY,
+                    thread_id TEXT NOT NULL UNIQUE,
+                    session_id TEXT NOT NULL,
+                    memory_id TEXT,
+                    workflow_type TEXT NOT NULL CHECK (
+                        workflow_type IN (
+                            'research', 'memory_note',
+                            'memory_import', 'legacy_migration'
+                        )
+                    ),
+                    created_at REAL NOT NULL,
+                    expires_at REAL,
+                    lease_owner TEXT,
+                    lease_until REAL,
+                    CHECK ((lease_owner IS NULL) = (lease_until IS NULL)),
+                    CHECK (workflow_type = 'research' OR memory_id IS NOT NULL),
+                    FOREIGN KEY (session_id)
+                        REFERENCES session_meta(session_id) ON DELETE CASCADE
+                );
+                INSERT INTO runtime_workflows
+                SELECT * FROM runtime_workflows_notnull_memory;
+
+                CREATE TABLE runtime_outbox (
+                    event_id TEXT PRIMARY KEY,
+                    thread_id TEXT NOT NULL,
+                    sequence INTEGER NOT NULL CHECK (sequence > 0),
+                    event_type TEXT NOT NULL CHECK (
+                        event_type IN (
+                            'confirmed', 'completed', 'failed',
+                            'cancelled', 'expired'
+                        )
+                    ),
+                    payload_json TEXT NOT NULL,
+                    UNIQUE (thread_id, sequence),
+                    FOREIGN KEY (thread_id)
+                        REFERENCES runtime_workflows(thread_id) ON DELETE CASCADE
+                );
+                INSERT INTO runtime_outbox
+                SELECT * FROM runtime_outbox_notnull_memory;
+
+                DROP TABLE runtime_outbox_notnull_memory;
+                DROP TABLE runtime_workflows_notnull_memory;
+
+                CREATE INDEX idx_runtime_workflows_session
+                    ON runtime_workflows(session_id, created_at);
+                CREATE INDEX idx_runtime_workflows_expiry
+                    ON runtime_workflows(expires_at);
+                CREATE INDEX idx_runtime_workflows_lease
+                    ON runtime_workflows(lease_until);
+                CREATE INDEX idx_runtime_outbox_thread
+                    ON runtime_outbox(thread_id, sequence);
+                COMMIT;
+                """
+            )
+        except Exception:
+            connection.rollback()
+            raise
+        finally:
+            connection.execute("PRAGMA foreign_keys = ON")
 
     @staticmethod
     def _workflow(row: sqlite3.Row) -> WorkflowRecord:
@@ -209,7 +298,7 @@ class RuntimeRegistry:
         task_id: str,
         thread_id: str,
         session_id: str,
-        memory_id: str,
+        memory_id: str | None,
         workflow_type: str,
         created_at: float | None = None,
         expires_at: float | None = None,
@@ -217,10 +306,13 @@ class RuntimeRegistry:
         task_id = _required_text(task_id, field_name="task_id")
         thread_id = _required_text(thread_id, field_name="thread_id")
         session_id = _required_text(session_id, field_name="session_id")
-        memory_id = _required_text(memory_id, field_name="memory_id")
         workflow_type = _required_text(workflow_type, field_name="workflow_type")
         if workflow_type not in _WORKFLOW_TYPES:
             raise ValueError(f"unsupported workflow_type: {workflow_type}")
+        if memory_id is not None:
+            memory_id = _required_text(memory_id, field_name="memory_id")
+        elif workflow_type != "research":
+            raise ValueError("memory_id is required for non-research workflows")
         created = time.time() if created_at is None else _finite_time(
             created_at, field_name="created_at"
         )
@@ -240,7 +332,7 @@ class RuntimeRegistry:
                 if session is None:
                     raise ValueError(f"session does not exist: {session_id}")
                 bound_memory = session["memory_id"]
-                if bound_memory is not None and bound_memory != memory_id:
+                if bound_memory != memory_id and bound_memory is not None:
                     raise ValueError("workflow memory does not match the session binding")
 
                 existing = connection.execute(
@@ -280,6 +372,73 @@ class RuntimeRegistry:
                 if row is None:  # pragma: no cover - SQLite insert invariant
                     raise RuntimeError("registered workflow could not be read")
                 return self._workflow(row)
+            except Exception:
+                connection.rollback()
+                raise
+            finally:
+                connection.close()
+
+    def bind_memory(
+        self,
+        task_id: str,
+        memory_id: str,
+        *,
+        lease_token: str | None = None,
+    ) -> WorkflowRecord:
+        """Atomically bind one unbound research locator and its session."""
+
+        task_id = _required_text(task_id, field_name="task_id")
+        memory_id = _required_text(memory_id, field_name="memory_id")
+        if lease_token is not None:
+            lease_token = _required_text(lease_token, field_name="lease_token")
+        with self._lock:
+            connection = self._connect()
+            try:
+                connection.execute("BEGIN IMMEDIATE")
+                row = connection.execute(
+                    "SELECT * FROM runtime_workflows WHERE task_id = ?",
+                    (task_id,),
+                ).fetchone()
+                if row is None:
+                    raise ValueError(f"runtime workflow does not exist: {task_id}")
+                record = self._workflow(row)
+                if record.workflow_type != "research":
+                    raise ValueError("only research workflows may bind Memory late")
+                if lease_token is not None and record.lease_owner != lease_token:
+                    raise ValueError("workflow lease does not authorize Memory binding")
+                if record.memory_id is not None:
+                    if record.memory_id != memory_id:
+                        raise ValueError("workflow is already bound to a different Memory")
+                    connection.commit()
+                    return record
+
+                session = connection.execute(
+                    "SELECT memory_id FROM session_meta WHERE session_id = ?",
+                    (record.session_id,),
+                ).fetchone()
+                if session is None:
+                    raise ValueError(f"session does not exist: {record.session_id}")
+                bound_memory = session["memory_id"]
+                if bound_memory is not None and bound_memory != memory_id:
+                    raise ValueError("workflow memory does not match the session binding")
+                if bound_memory is None:
+                    connection.execute(
+                        "UPDATE session_meta SET memory_id = ?, updated_at = ? "
+                        "WHERE session_id = ?",
+                        (memory_id, time.time(), record.session_id),
+                    )
+                connection.execute(
+                    "UPDATE runtime_workflows SET memory_id = ? WHERE task_id = ?",
+                    (memory_id, task_id),
+                )
+                updated = connection.execute(
+                    "SELECT * FROM runtime_workflows WHERE task_id = ?",
+                    (task_id,),
+                ).fetchone()
+                connection.commit()
+                if updated is None:  # pragma: no cover - SQLite update invariant
+                    raise RuntimeError("bound workflow could not be read")
+                return self._workflow(updated)
             except Exception:
                 connection.rollback()
                 raise

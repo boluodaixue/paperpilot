@@ -15,6 +15,7 @@ import time
 import uuid
 from collections.abc import Mapping
 from contextlib import asynccontextmanager, contextmanager
+from dataclasses import replace
 from pathlib import Path
 from typing import Any, AsyncIterator, Iterable
 
@@ -880,6 +881,70 @@ class ResearchRuntime:
                 }
             )
             return result
+
+    async def bind_research_memory(
+        self,
+        thread_id: str,
+        memory_id: str,
+        *,
+        session_id: str | None = None,
+    ) -> dict[str, Any]:
+        """Attach a newly created empty Memory to one paused research proposal."""
+
+        descriptor = self.get_memory(memory_id)
+        snapshot = await self.get_snapshot(thread_id)
+        state = dict(snapshot.values)
+        if session_id is not None and state.get("session_id") != session_id:
+            raise ValueError("research workflow does not belong to this session")
+        current_memory_id = state.get("memory_id")
+        if current_memory_id is not None:
+            if current_memory_id != descriptor.memory_id:
+                raise ValueError("research workflow is already bound to another Memory")
+            return state
+        if state.get("workflow_status") != "waiting_confirmation":
+            raise ValueError("research Memory can only be bound while awaiting confirmation")
+        if len(getattr(snapshot, "interrupts", ())) != 1:
+            raise ValueError("research workflow is not paused for confirmation")
+        brief = state.get("brief")
+        if not isinstance(brief, ResearchBrief):
+            raise TypeError("research workflow has no bindable brief")
+
+        rebound_brief = replace(
+            brief,
+            memory_id=descriptor.memory_id,
+            memory_paths=(),
+            known_information=(),
+            research_gaps=brief.directions,
+        )
+        config = {"configurable": {"thread_id": thread_id}}
+        with _memory_trace(
+            "paperpilot.research.bind_memory", descriptor.memory_id
+        ) as observation:
+            await self.graph.aupdate_state(
+                config,
+                {
+                    "memory_id": descriptor.memory_id,
+                    "brief": rebound_brief,
+                    "retrieved_memory": [],
+                },
+                as_node="draft_brief",
+            )
+            with self._research_file_scope(descriptor.memory_id):
+                await self.graph.ainvoke(None, config=config)
+            rebound = await self.get_snapshot(thread_id)
+            values = dict(rebound.values)
+            if (
+                values.get("memory_id") != descriptor.memory_id
+                or len(getattr(rebound, "interrupts", ())) != 1
+            ):
+                raise RuntimeError("research Memory binding did not preserve confirmation")
+            observation.add_output(
+                {
+                    "memory_id": descriptor.memory_id,
+                    "thread_id": thread_id,
+                }
+            )
+            return values
 
     async def stream_confirm(self, thread_id: str) -> AsyncIterator[Any]:
         """Confirm one paused run while preserving its scoped FileReader context."""

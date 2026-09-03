@@ -259,6 +259,51 @@ async def test_runtime_creates_lists_gets_and_selects_memory(tmp_path: Path) -> 
     assert (tmp_path / result.memory_manifest.report_path).is_file()
 
 
+@pytest.mark.asyncio
+async def test_runtime_binds_new_memory_without_regenerating_paused_brief(
+    tmp_path: Path,
+) -> None:
+    store = MarkdownMemoryStore(tmp_path)
+    policy = _Policy()
+    runtime = build_research_runtime(
+        {}, policy=policy, tools=[_Tool()], memory_store=store
+    )
+    thread_id = "w1-late-memory"
+    paused = await runtime.start(
+        "Question",
+        thread_id=thread_id,
+        memory_id=None,
+        session_id="session-late",
+    )
+    original_brief = paused["brief"]
+    runtime.create_memory("Late Memory", memory_id="M-late")
+
+    rebound = await runtime.bind_research_memory(
+        thread_id,
+        "M-late",
+        session_id="session-late",
+    )
+    snapshot = await runtime.get_snapshot(thread_id)
+
+    assert policy.alignment_calls == 1
+    assert rebound["memory_id"] == "M-late"
+    assert rebound["brief"].objective == original_brief.objective
+    assert rebound["brief"].memory_id == "M-late"
+    assert tuple(rebound["brief"].research_gaps) == tuple(original_brief.directions)
+    assert len(snapshot.interrupts) == 1
+
+    final = await runtime.review(
+        thread_id,
+        "confirm",
+        session_id="session-late",
+        memory_id="M-late",
+    )
+    assert final["workflow_result"].memory_id == "M-late"
+    assert final["workflow_result"].memory_manifest.report_path.startswith(
+        "Memories/M-late/"
+    )
+
+
 def test_legacy_result_construction_keeps_memory_optional() -> None:
     result = ResearchWorkflowResult(
         brief=ResearchBrief(

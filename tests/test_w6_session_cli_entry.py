@@ -127,7 +127,7 @@ def test_web_session_binding_covers_answer_import_note_and_research(
     assert restored["fixed"]["memory_id"] == "M-alpha"
 
 
-def test_w6_web_runtime_rejects_missing_memory_before_creating_legacy_work(
+def test_w6_web_runtime_keeps_unbound_proposal_out_of_legacy_memory(
     bound_web_client,
 ) -> None:
     client, _ = bound_web_client
@@ -137,11 +137,14 @@ def test_w6_web_runtime_rejects_missing_memory_before_creating_legacy_work(
         json={"session_id": "missing-memory", "message": "Research"},
     )
 
-    assert response.status_code == 400
-    assert "managed Memory" in response.json()["detail"]
-    assert "missing-memory" not in {
+    assert response.status_code == 200
+    assert response.json()["status"] == "waiting_confirmation"
+    assert response.json()["memory_id"] is None
+    sessions = {
         item["session_id"] for item in client.get("/api/sessions").json()
     }
+    assert "missing-memory" in sessions
+    assert server.get_chat_store().get_memory_binding("missing-memory") is None
 
 
 def test_static_web_uses_session_binding_instead_of_last_report() -> None:

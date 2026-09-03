@@ -38,6 +38,7 @@ from src.conversation import (  # noqa: E402
     ConversationMessage,
     ConversationRequest,
     MemorySelection,
+    answer_quick_search,
     route_conversation,
 )
 from src.research.memory import MemoryWriteConflictError  # noqa: E402
@@ -237,6 +238,14 @@ class ConversationRouteRequest(BaseModel):
     memory_id: str | None = None
     message: str
     explicit_action: ActionOverride = ActionOverride.AUTO
+
+
+class QuickAnswerRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    session_id: str | None = None
+    memory_id: str | None = None
+    question: str
 
 
 class ResearchRequest(BaseModel):
@@ -476,6 +485,7 @@ def _optional_session_memory(
         _validate_memory_option(existing)
         return existing
     if requested_memory_id is None:
+        store.ensure_session(session_id)
         return None
     _validate_memory_option(requested_memory_id)
     try:
@@ -528,6 +538,49 @@ def _proposal_pointer(task: ResearchTask, brief: dict[str, Any]) -> str:
         },
         ensure_ascii=False,
     )
+
+
+def _automatic_memory_title(task: ResearchTask, state: Mapping[str, Any]) -> str:
+    brief = state.get("brief")
+    objective = getattr(brief, "objective", "")
+    title = " ".join(str(objective or task.query or "新研究").split())
+    return title[:120] or "新研究"
+
+
+async def _ensure_research_memory(
+    task: ResearchTask,
+    lease_token: str,
+) -> tuple[MemoryDescriptor, bool]:
+    """Create and bind the deterministic managed Memory for an unbound proposal."""
+
+    runtime = get_research_runtime()
+    registry = get_runtime_registry()
+    if task.memory_id is not None:
+        return runtime.get_memory(task.memory_id), False
+
+    state = await runtime.get_state(task.thread_id)
+    suffix = task.task_id.rsplit("-", 1)[-1]
+    memory_id = f"M-{suffix}"
+    title = _automatic_memory_title(task, state)
+    try:
+        descriptor = runtime.create_memory(title, memory_id=memory_id)
+        created = True
+    except FileExistsError:
+        descriptor = runtime.get_memory(memory_id)
+        created = False
+
+    await runtime.bind_research_memory(
+        task.thread_id,
+        descriptor.memory_id,
+        session_id=task.session_id,
+    )
+    record = registry.bind_memory(
+        task.task_id,
+        descriptor.memory_id,
+        lease_token=lease_token,
+    )
+    task.memory_id = record.memory_id
+    return descriptor, created
 
 
 def _report_pointer(task: ResearchTask, result: ResearchWorkflowResult) -> dict[str, Any]:
@@ -1519,6 +1572,48 @@ async def route_product_conversation(
     }
 
 
+@app.post("/api/conversation/quick-answer")
+async def answer_product_quick_search(
+    req: QuickAnswerRequest,
+) -> dict[str, Any]:
+    """Return one bounded cited Web answer without starting Research Core."""
+
+    question = (req.question or "").strip()
+    if not question:
+        raise HTTPException(status_code=400, detail="联网问题不能为空")
+    session_id = _session_id(req.session_id)
+    memory_id = _optional_session_memory(session_id, req.memory_id)
+    runtime = get_research_runtime()
+    acquisition = next(
+        (
+            tool
+            for tool in runtime.tools
+            if str(getattr(tool, "name", "")) == "acquire_evidence"
+        ),
+        None,
+    )
+    if acquisition is None:
+        raise HTTPException(status_code=503, detail="快速联网能力当前不可用")
+    try:
+        answer = await answer_quick_search(acquisition, runtime.policy, question)
+    except ValueError as exc:
+        raise HTTPException(status_code=502, detail=f"快速联网回答失败: {exc}") from exc
+
+    store = get_chat_store()
+    store.add(session_id, "user", "chat", question)
+    store.add(session_id, "assistant", "chat", answer.markdown)
+    return {
+        "session_id": session_id,
+        "memory_id": memory_id,
+        "answer_id": answer.answer_id,
+        "question": answer.question,
+        "markdown": answer.markdown,
+        "citations": [asdict(item) for item in answer.citations],
+        "insufficient_evidence": list(answer.insufficient_evidence),
+        "source_count": len(answer.citations),
+    }
+
+
 @app.post("/api/alignment")
 async def align_research(req: AlignmentRequest) -> dict[str, Any]:
     message = (req.message or "").strip()
@@ -1535,7 +1630,7 @@ async def align_research(req: AlignmentRequest) -> dict[str, Any]:
             raise HTTPException(status_code=409, detail="任务当前不等待方案修改")
         if task.memory_id is not None:
             _require_writable_memory(task.memory_id)
-        bound_memory_id = _session_memory(task.session_id, task.memory_id)
+        bound_memory_id = _optional_session_memory(task.session_id, task.memory_id)
         if bound_memory_id != task.memory_id:
             raise HTTPException(status_code=409, detail="task 与 session Memory 不匹配")
         store.add(task.session_id, "user", "chat", message)
@@ -1575,7 +1670,7 @@ async def align_research(req: AlignmentRequest) -> dict[str, Any]:
         session_id = _session_id(req.session_id)
         if await _session_research_task(session_id, active_only=True):
             raise HTTPException(status_code=409, detail="该会话已有待确认或运行中的研究")
-        memory_id = _session_memory(session_id, req.memory_id)
+        memory_id = _optional_session_memory(session_id, req.memory_id)
         if memory_id is not None:
             _require_writable_memory(memory_id)
         thread_id = runtime.new_thread_id()
@@ -1629,7 +1724,7 @@ async def start_research(req: ResearchRequest) -> dict[str, Any]:
         raise HTTPException(status_code=409, detail="任务当前不能确认启动")
     if task.memory_id is not None:
         _require_writable_memory(task.memory_id)
-    if _session_memory(task.session_id, task.memory_id) != task.memory_id:
+    if _optional_session_memory(task.session_id, task.memory_id) != task.memory_id:
         raise HTTPException(status_code=409, detail="task 与 session Memory 不匹配")
     lease = get_runtime_registry().claim_lease(
         task.task_id,
@@ -1658,7 +1753,12 @@ async def start_research(req: ResearchRequest) -> dict[str, Any]:
             task.status = "error"
             task.error = "confirmation expired"
         raise HTTPException(status_code=410, detail="研究确认已过期")
+    auto_created_memory = False
+    memory_descriptor: MemoryDescriptor | None = None
     try:
+        memory_descriptor, auto_created_memory = await _ensure_research_memory(
+            task, lease
+        )
         state = await get_research_runtime().confirm_research_start(
             task.thread_id,
             session_id=task.session_id,
@@ -1691,6 +1791,10 @@ async def start_research(req: ResearchRequest) -> dict[str, Any]:
     )
     return {"task_id": task.task_id, "thread_id": task.thread_id,
             "session_id": task.session_id, "memory_id": task.memory_id,
+            "memory_title": (
+                memory_descriptor.title if memory_descriptor is not None else None
+            ),
+            "auto_created_memory": auto_created_memory,
             "status": task.status}
 
 
