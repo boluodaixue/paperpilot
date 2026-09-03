@@ -109,11 +109,17 @@ Full test run on the zero-difference clean tree:
 The only failure was the already tracked Windows-only `60ms` Vault Writer
 heartbeat timing case. There were no new failures.
 
-## Remote publication policy
+## Remote publication result
 
-- update `origin/main` only by normal fast-forward;
-- push active architecture, clean baseline, current product, archive branch, and
-  backup tags as new refs;
-- never use force push;
-- do not delete `origin/codex/paperpilot-baseline-2026-09-03` or any other existing
-  remote ref during this cleanup.
+Published on 2026-09-04 without force push:
+
+- `origin/main`: normal fast-forward `22dcba5 -> 7ecebd6`;
+- `origin/codex/supervisor-worker-v2@510ea9d`;
+- `origin/codex/homogeneous-recursive-fork@00c331b`;
+- `origin/codex/paperpilot-baseline-clean-2026-09-04@4cbbb8f`;
+- `origin/codex/unified-conversation-orchestrator`;
+- `origin/archive/unified-on-supervisor-2026-09-04@726281c`;
+- backup tags for old `main@7ecebd6` and old unified head `726281c`.
+
+The existing `origin/codex/paperpilot-baseline-2026-09-03@195f258`, portfolio,
+and full-history archive branches were retained. No remote ref was deleted.

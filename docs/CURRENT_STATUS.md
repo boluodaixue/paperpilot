@@ -142,6 +142,9 @@ be reported as a product-path failure or silently removed.
 - the existing pushed baseline
   `origin/codex/paperpilot-baseline-2026-09-03@195f258` is retained and will not
   be deleted during publication;
+- `origin/main` was normally fast-forwarded to `7ecebd6`; the Supervisor,
+  homogeneous-recursive, clean-baseline, unified-conversation, and wrong-parent
+  archive branches plus both backup tags are now published without force push;
 - detailed topology and old/new commit mapping are recorded in
   [`BRANCH_HISTORY.md`](BRANCH_HISTORY.md);
 - the external Obsidian interview-study vault is not part of this repository or
