@@ -1,8 +1,10 @@
 # Unified Conversation Architecture
 
-Status: In progress on top of frozen baseline `195f258`.
+Status: First product slice implemented on top of frozen baseline `195f258`.
+See [`CURRENT_STATUS.md`](CURRENT_STATUS.md) for the authoritative implementation
+and verification snapshot.
 
-Implemented in the first vertical slice:
+Implemented:
 
 - persistence-neutral `CoreResearchRequest` / `CoreResearchResult` contracts;
 - generic prior-Evidence injection into the homogeneous AgentGraph;
@@ -10,11 +12,21 @@ Implemented in the first vertical slice:
 - `/api/conversation/route`, which cannot create research tasks or write Memory;
 - Web default mode changed to automatic routing while preserving explicit
   Memory-only and deep-research overrides;
+- deterministic continuation handling for answered scope questions and
+  prior-topic reconstruction when the user selects quick Web search;
+- bounded Quick Answer Service using at most three readable sources and validated
+  source handles, without Research Core or Memory writes;
+- product-side Memory hit to opaque `PriorEvidenceBundle` projection;
+- research proposal creation without Memory and managed-Memory creation/binding
+  at confirmation time;
+- nullable research-locator migration plus atomic session/Registry binding;
+- project-only provider configuration with shared-checkout `.env` discovery for
+  Git worktrees;
 - dependency-boundary and compatibility tests.
 
-Still pending: bounded Quick Answer Service, direct Rubric/CLI migration to the
-Headless Core entry, and removal of compatibility-layer product identities from
-the existing full Research Workflow.
+Still pending: direct Rubric/CLI migration to the Headless Core entry, Web Wrapper
+migration after those quality gates pass, and removal of compatibility-layer
+product identities from the existing full Research Workflow.
 
 ## 1. Decision
 
@@ -97,8 +109,8 @@ propose_research
 propose_memory_write
 ```
 
-Explicit UI actions or CLI commands bypass model routing. Low-confidence routing
-returns `clarify`; it never guesses a side-effecting action.
+Explicit UI actions or CLI commands bypass model routing. Ambiguous requests return
+`clarify`; the router never directly performs a side effect.
 
 ### 3.3 Answer Service
 
@@ -184,23 +196,28 @@ but the bundle contains no Memory implementation identity.
 CoreResearchRequest
   objective: string
   scope: string[]
+  directions: string[]
   constraints: string[]
   expected_output: string
   prior_evidence: PriorEvidenceBundle
-  limits: AgentLimits
-  tool_profile: ResearchToolProfile
+  require_evidence: boolean
+  run_id: string
 ```
 
 ### 4.5 Core research result
 
 ```text
 CoreResearchResult
+  run_id: string
   report_markdown: string
   evidence: EvidenceItem[]
-  sources: SourceRecord[]
   status: ResearchStatus
   termination_reason: TerminationReason | null
-  execution_metrics: ResearchMetrics
+  output_status: OutputStatus
+  unresolved: string[]
+  thread_count: number
+  tool_calls_used: number
+  estimated_tokens_used: number
 ```
 
 The result contains no persistence manifest. Web, CLI, and evaluation decide how
@@ -225,7 +242,7 @@ Only Memory Writer may turn a confirmed proposal into durable files.
 | --- | --- | ---: | ---: |
 | Greeting, product help, ordinary chat | `reply` | No | No |
 | “What is in this Memory?” | `memory_answer` | Yes | No |
-| Narrow current fact explicitly asking to check online | `quick_search` | No | No |
+| Narrow current fact or focused topic asking to check online | `quick_search` | No | No |
 | Comparison, investigation, multi-source report | `propose_research` | Optional | Yes |
 | Ambiguous continuation | `clarify` | No | No |
 | “Save this answer” | `propose_memory_write` | Yes | Yes |
@@ -247,13 +264,14 @@ idle
           -> confirmed -> researching -> optional_report_write -> idle
 ```
 
-One session may bind to one Memory, but casual conversation is allowed before a
-Memory is selected. Memory-dependent actions ask for selection only after intent
-has been established.
+One session may bind to one Memory, but casual conversation, Quick Answer, and
+Research Brief review are allowed before a Memory is selected. Memory-dependent
+answers ask for selection only after intent has been established. A confirmed
+research proposal creates and binds a managed Memory when the session is unbound.
 
 ## 7. User interface
 
-- Remove “Research / Memory Answer” as mandatory top-level modes.
+- Do not require “Research / Memory Answer” as mandatory top-level modes.
 - Default composer behavior is automatic routing.
 - Keep explicit composer actions: `Only search this Memory`, `Check online`, and
   `Deep research`.
@@ -295,15 +313,15 @@ Only a confirmed Research Proposal invokes Research Core.
 
 ## 9. Migration sequence
 
-1. Add contracts and dependency-boundary tests without changing runtime behavior.
-2. Add the headless Research Core entry point and move Rubric/CLI to it.
-3. Add Conversation Orchestrator and retain existing endpoints as compatibility
-   adapters.
-4. Add bounded Answer Service profiles for Memory and quick Web answers.
-5. Replace the UI mode selector with automatic routing plus explicit overrides.
-6. Move persistence after `CoreResearchResult`; remove Memory identities from the
-   core request path.
-7. Delete compatibility routing only after product, CLI, and Rubric regression
+1. [x] Add contracts and dependency-boundary tests without changing runtime behavior.
+2. [x] Add the headless Research Core entry point and generic prior Evidence injection.
+3. [x] Add Conversation Orchestrator and retain existing endpoints as compatibility adapters.
+4. [x] Add bounded Answer Service profiles for Memory and quick Web answers.
+5. [x] Make automatic routing the default while retaining explicit overrides.
+6. [ ] Move Rubric/CLI to the Headless Core and compare quality/budget results.
+7. [ ] Move Web persistence after `CoreResearchResult`; remove Memory identities
+   from the core request path.
+8. [ ] Delete compatibility routing only after product, CLI, and Rubric regression
    gates pass independently.
 
 ## 10. Acceptance gates

@@ -2,7 +2,7 @@
 
 ## 当前状态
 
-核心研究与长期 Memory 链路已经完成：
+核心研究、长期 Memory 和统一对话的最小产品链路已经完成。精确实现/迁移状态以 [CURRENT_STATUS.md](CURRENT_STATUS.md) 为准：
 
 | 能力 | 状态 | 结果 |
 |---|---|---|
@@ -17,9 +17,25 @@
 | 单一 Vault Writer | ✅ | 持久队列、lease、staging/journal、幂等和崩溃恢复 |
 | 持久化检索 | ✅ | FTS5 增量索引、最终哈希复核和可删除重建 |
 | 可选混合检索 | ✅ | 本地多语言语义 + FTS + WikiLink，失败降级 |
+| Conversation Orchestrator | ✅ | 普通聊天、一次澄清、Memory、快速联网与研究提案分流；显式模式优先 |
+| Quick Answer | ✅ | Tavily/acquire_evidence，最多 3 个来源，引用句柄校验，不启动研究或写 Memory |
+| 无 Memory 研究提案 | ✅ | 可先审阅 Brief，确认时确定性创建并绑定 managed Memory |
+| Headless Research Core 合同 | 🟡 | Core/PriorEvidence 边界已实现；Web、CLI、Rubric 尚未全面迁移 |
+| Provider 配置隔离 | ✅ | worktree 读取项目 `.env`，系统 Provider Key/Base URL/model 不再兜底 |
 | 离线自动化验收 | ✅ | 全量确定性、故障注入、恢复和 Web/CLI 回归持续作为真实评测前置门禁 |
 
 ## 当前优先级
+
+### 0.5 统一对话与 Headless Core
+
+- [x] 增加无副作用 Conversation Orchestrator 和显式模式覆盖；
+- [x] 接通普通聊天、Memory 问答和最多三来源 Quick Answer；
+- [x] 修复连续澄清与模式命令丢失前文 query；
+- [x] 支持无 Memory 提案、确认时自动创建与 Registry schema 迁移；
+- [x] 抽出 `CoreResearchRequest/Result`、PriorEvidence 注入和 Memory 投影；
+- [x] 隔离项目 Provider 配置，真实验证火山方舟和 Tavily；
+- [ ] 先迁移 CLI/Rubric 到 Headless Core 并复测质量/预算；
+- [ ] 指标不退化后再迁移 Web Research Wrapper；
 
 ### 0. 修正研究终止机制
 
@@ -43,6 +59,7 @@
 ### 2. 真实模型演示
 
 - [x] 使用真实模型、搜索和论文读取跑三题完整 ResearchBench 与 LLM Judge；
+- [x] 使用项目火山方舟模型验证 Conversation Router / Brief，并用 Tavily 验证 Quick Answer；
 - [ ] 验证一次服务重启恢复；
 - [ ] 在 Obsidian 中检查 Markdown 与 backlinks；
 - [ ] 验证 Memory 问答与继续研究；
@@ -62,3 +79,4 @@
 - 外部向量数据库、图数据库或 Evidence Graph；
 - 新的固定 Agent 角色；
 - 默认跨 Memory 检索和未经确认的自动写入。
+- 在 CLI/Rubric/Web 全部通过迁移门前删除现有稳定 Research Workflow。

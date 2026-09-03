@@ -1,8 +1,11 @@
 # PaperPilot 当前架构
 
+> 当前分支的实现、验证与迁移边界以
+> [`CURRENT_STATUS.md`](CURRENT_STATUS.md) 为准。本文件描述完整系统结构。
+
 ## 1. 目标
 
-PaperPilot 是一个面向个人深度研究的本地 Agent 系统。它把研究计划确认、递归研究、证据汇聚、Markdown 持久化、Obsidian 阅读和长期 Memory 继续研究串成一条可恢复链路。
+PaperPilot 是一个面向个人深度研究的本地 Agent 系统。统一对话层把普通聊天、Memory 问答、快速联网和深度研究分开；研究链再把计划确认、递归研究、证据汇聚、Markdown 持久化、Obsidian 阅读和长期 Memory 继续研究串成可恢复流程。
 
 系统优先保证：
 
@@ -18,10 +21,16 @@ PaperPilot 是一个面向个人深度研究的本地 Agent 系统。它把研�
 
 ```mermaid
 flowchart TB
-    UI[Web / CLI] --> RT[ResearchRuntime]
+    WEB[Web] --> CO[Conversation Orchestrator]
+    CO --> CHAT[Reply / Clarify]
+    CO --> MA[Memory Answer]
+    CO --> QA[Bounded Quick Answer]
+    CO --> RT[Research Wrapper / Runtime]
+    CLI[CLI / Rubric] --> CORE[Headless Core boundary]
     RT --> WF[Research Workflow]
     WF --> CP[(LangGraph SQLite Checkpointer)]
     WF --> AG[Homogeneous Research AgentGraph]
+    CORE --> AG
     AG --> AG
     AG --> TOOLS[Search / Paper / Browser / File / Calculator]
     WF --> REG[(Runtime Registry + SSE Outbox)]
@@ -33,7 +42,7 @@ flowchart TB
     IDX --> WF
 ```
 
-所有产品入口最终都通过 `src/research/runtime.py` 组装相同的 Workflow、AgentGraph、checkpointer、Memory Store 和 Writer，不维护第二条研究主链。
+Web 产品能力先通过 `src/conversation/` 编排，普通聊天与 Quick Answer 不进入 Research Workflow。当前稳定 Web 研究仍由 `src/research/runtime.py` 装配；Headless Core 合同已经抽出，但 CLI、Rubric 与 Web Wrapper 尚未全面迁移，不能把目标依赖图误写成已完成调用图。
 
 ## 3. 同质 Research AgentGraph
 
@@ -92,14 +101,15 @@ requirements、coverage、critical gaps、next actions、真实 strategy attempt
 
 外层 Workflow 负责 AgentGraph 不应承担的产品流程：
 
-1. 读取用户问题和选定 `memory_id`；
-2. 从当前 Memory 检索相关旧知识；
+1. 读取用户问题和可选 `memory_id`；
+2. 已选 Memory 时检索相关旧知识；
 3. 生成可编辑 Research Brief；
 4. 通过 LangGraph interrupt 等待用户修改或确认；
-5. 调用根 Research AgentGraph；
-6. 生成最终 Markdown 报告；
-7. 通过 Vault Writer 持久化；
-8. 结束并返回结果；Red/Blue 报告复核保持关闭，不接入当前产品基线。
+5. 确认时若会话未绑定 Memory，则确定性创建 managed Memory，并绑定 checkpoint、Registry 与 session；
+6. 调用根 Research AgentGraph；
+7. 生成最终 Markdown 报告；
+8. 通过 Vault Writer 持久化；
+9. 结束并返回结果；Red/Blue 报告复核保持关闭，不接入当前产品基线。
 
 保存问答笔记、导入资料和 legacy 迁移也使用独立的可恢复 Workflow，并保持“预览—确认—写入”边界。
 

@@ -2,13 +2,13 @@
 
 # 🔬 PaperPilot
 
-### 递归 Deep Research × LLM Wiki × Obsidian
+### 统一对话 × 递归 Deep Research × LLM Wiki × Obsidian
 
 把一次性研究，沉淀为可追溯、可问答、可继续生长的长期知识。
 
 [![Python](https://img.shields.io/badge/Python-3.10%2B-blue.svg)](https://python.org)
 [![LangGraph](https://img.shields.io/badge/Orchestration-LangGraph-1f6feb.svg)](https://www.langchain.com/langgraph)
-[![Tests](https://img.shields.io/badge/tests-1112%20passed-brightgreen.svg)](#测试)
+[![Tests](https://img.shields.io/badge/tests-1000%2B-brightgreen.svg)](#测试)
 [![License](https://img.shields.io/badge/license-MIT-green.svg)](LICENSE)
 
 </div>
@@ -19,17 +19,19 @@
 
 大多数研究 Agent 在交付报告后就结束了：下一次提问仍要从头搜索，历史证据散落在会话中，也很难在自己熟悉的知识管理工具里继续整理。
 
-**PaperPilot** 是一个基于 LangGraph 的个人深度研究系统。它让用户先确认研究计划，再由同质 Research Agent 递归拆解问题、并行检索和汇聚证据；研究结果会写入长期 Markdown Memory，并通过 **LLM Wiki** 与 **Obsidian** 进入后续的问答、笔记和继续研究流程。
+**PaperPilot** 是一个基于 LangGraph 的个人深度研究系统。统一对话入口先区分普通聊天、当前 Memory 问答、快速联网和深度研究；研究任务由用户确认计划后，再由同质 Research Agent 递归拆解问题、并行检索和汇聚证据。结果写入长期 Markdown Memory，并通过 **LLM Wiki** 与 **Obsidian** 进入后续问答、笔记和继续研究流程。
 
 ```text
-一次研究：问题 → 计划确认 → 递归研究 → 带来源的报告
+统一入口：消息 → 聊天 / Memory / Quick Web / 深度研究提案
+一次研究：Brief 确认 → 递归研究 → 带来源的报告
 长期积累：报告 → LLM Wiki → Memory 问答 → 新笔记 / 继续研究
 ```
 
-## ✨ 三项核心能力
+## ✨ 四项核心能力
 
 | 能力 | PaperPilot 做什么 | 解决的问题 |
 |---|---|---|
+| 💬 **统一对话编排** | 自动路由普通聊天、Memory 问答、最多三来源的快速联网和深度研究提案，并保留显式模式覆盖 | 每句话都误入昂贵研究流程 |
 | 🔎 **递归 Deep Research** | 同一种 Research Agent 按需 fork，搜索网页、论文和本地资料，汇聚可追溯证据 | 复杂问题难以一次检索完整 |
 | 🧠 **LLM Wiki** | 将报告、证据、来源和笔记组织为长期 Memory，支持检索问答与基于旧知识继续研究 | 研究结束后知识无法复用 |
 | 🗂️ **Obsidian 原生工作流** | 使用 Markdown、frontmatter 和 WikiLink 落盘，可直接在 Obsidian 中阅读、编辑和浏览双链 | 知识被锁在聊天界面或专有数据库中 |
@@ -37,6 +39,7 @@
 ### 1. 递归 Deep Research
 
 - 用户可以修改并确认 Research Brief，确认前不会启动正式研究；
+- 未选择 Memory 也能先审阅 Brief；确认启动时自动创建并绑定 managed Memory；
 - 根 Agent、子 Agent 和孙 Agent 运行同一个 AgentGraph，只在身份、深度和预算上不同；
 - Agent 根据证据缺口决定继续调用工具、停止或 fork，整棵执行树共享递归、线程、工具和时间预算；
 - 搜索、论文、网页、文件和计算结果最终汇聚为带来源的 Markdown 报告；
@@ -74,9 +77,13 @@ memory/
 
 ```mermaid
 flowchart LR
-    A[创建或选择 Memory] --> B[提出研究问题]
-    B --> C[修改并确认计划]
-    C --> D[Research Agent 递归研究]
+    A[统一对话入口] --> B{能力路由}
+    B -->|普通聊天| C1[直接回答]
+    B -->|快速联网| C2[最多 3 个来源]
+    B -->|Memory 问答| C3[当前 Memory 检索]
+    B -->|深度研究| C[修改并确认计划]
+    C --> C4[未绑定则自动创建 Memory]
+    C4 --> D[Research Agent 递归研究]
     D --> E[汇聚证据与来源]
     E --> F[生成 Markdown 报告]
     F --> G[Obsidian 阅读与双链]
@@ -152,8 +159,8 @@ python web/run.py
 ```
 
 打开 <http://127.0.0.1:8000>。默认输入框会自动区分普通对话、当前 Memory
-问答和深度研究提案；也可以显式选择“只查当前 Memory”或“深度研究”。深度
-研究执行和 Memory 写入仍需确认。
+问答、快速联网和深度研究提案；也可以显式选择“只查当前 Memory”“联网查一下”
+或“深度研究”。深度研究执行和 Memory 写入仍需确认。
 
 ### 3. 在 Obsidian 中打开
 
@@ -183,6 +190,7 @@ PaperPilot 保留了从原型到当前架构的完整 Git 提交历史，方便�
 | **2026.08.23–27** | PaperPilot 研究闭环 | 加入证据层、证据图、Web UI、动态 fork 和 Obsidian 导出探索 |
 | **2026.08.28** | LangGraph 主线重构 | 收敛为同质 Research AgentGraph，补齐确认、递归边界与 checkpoint 恢复 |
 | **2026.08.28–29** | LLM Wiki + Obsidian | 完成长期 Memory、受控笔记与导入、崩溃一致写入、全文与混合检索 |
+| **2026.09.03** | 统一对话与 Core 边界 | 接通聊天、Memory、Quick Web、研究提案与自动 Memory；抽出 Headless Core/PriorEvidence 合同 |
 
 当前方向与后续计划见 [路线图](docs/ROADMAP.md)。每一个功能阶段的具体变化也可以直接通过 Git 历史查看。
 
@@ -195,7 +203,7 @@ pytest -q
 当前确定性测试覆盖：
 
 ```text
-Evidence 闭环、L1–L5 上下文压缩、递归预算、checkpoint/Writer 崩溃恢复、Web/CLI 与 Memory 工作流
+Evidence 闭环、L1–L5 上下文压缩、递归预算、checkpoint/Writer 崩溃恢复、Conversation/Quick Answer、Web/CLI 与 Memory 工作流
 ```
 
 测试覆盖递归与预算、checkpoint 恢复、用户确认、多 Memory 隔离、Writer 崩溃恢复、并发冲突、Markdown/WikiLink 契约、导入、FTS5、语义降级以及 Web/CLI 入口。
@@ -221,6 +229,7 @@ paperpilot/
 ├── docs/             # 当前架构与路线图
 ├── evaluation/       # 固定离线评测
 ├── scripts/          # CLI、评测和模型准备工具
+├── src/conversation/ # 对话路由、Quick Answer、PriorEvidence 产品适配
 ├── src/research/     # Workflow、AgentGraph、Memory、Writer、Retrieval
 ├── src/tools/        # 搜索、论文、网页、文件与计算工具
 ├── tests/            # 确定性测试和故障注入
@@ -236,8 +245,13 @@ paperpilot/
 - [x] LLM Wiki 问答、受控笔记、导入与继续研究
 - [x] 单一 Vault Writer 与崩溃一致性
 - [x] FTS5 + 可选语义 + WikiLink 混合检索
+- [x] 统一对话、快速联网和确认时自动创建 Memory
+- [x] Headless Research Core 合同与 PriorEvidence 注入
+- [ ] 分阶段将 CLI/Rubric/Web Wrapper 迁移到 Headless Core
 - [ ] 完成一次真实模型、真实搜索与服务重启恢复的公开演示
 - [ ] 增加截图、样例报告与 60–90 秒演示视频
+
+最新分支、验证结果和迁移边界见 [当前状态](docs/CURRENT_STATUS.md)。
 
 ## 📄 License
 
