@@ -24,6 +24,12 @@ _CONFIRMATION_ACTIONS = {
     ConversationAction.PROPOSE_RESEARCH,
     ConversationAction.PROPOSE_MEMORY_WRITE,
 }
+_QUICK_MODE_COMMAND = re.compile(
+    r"^(?:先)?(?:帮我)?(?:快速)?(?:联网|网上)(?:查|搜|搜索)(?:一下)?[。.!！\s]*$"
+)
+_VAGUE_NARROWING_ANSWERS = frozenset(
+    {"不知道", "不确定", "随便", "都可以", "都行", "技术", "最新技术"}
+)
 
 
 def _router_prompt() -> str:
@@ -100,6 +106,75 @@ def _json_object(content: str) -> dict[str, Any]:
     if not isinstance(payload, dict):
         raise ValueError("conversation router must return a JSON object")
     return payload
+
+
+def _recent_user_goal(request: ConversationRequest) -> str:
+    parts = [
+        item.content.strip()
+        for item in request.recent_messages[-8:]
+        if item.role == "user"
+        and item.content.strip()
+        and not _QUICK_MODE_COMMAND.fullmatch(item.content.strip())
+    ]
+    return "；".join(dict.fromkeys(parts))
+
+
+def _shared_topic_fragment(answer: str, question: str) -> bool:
+    compact_answer = re.sub(r"[\s，。！？、,/：:；;]+", "", answer)
+    compact_question = re.sub(r"[\s，。！？、,/：:；;]+", "", question)
+    if len(compact_answer) < 2:
+        return False
+    ascii_words = re.findall(r"[A-Za-z0-9_-]{3,}", compact_answer)
+    if any(word.lower() in compact_question.lower() for word in ascii_words):
+        return True
+    return any(
+        compact_answer[index : index + 2] in compact_question
+        for index in range(len(compact_answer) - 1)
+    )
+
+
+def _continuation_decision(
+    request: ConversationRequest,
+) -> ConversationDecision | None:
+    """Resolve mode commands and concrete answers to the last narrowing turn."""
+
+    message = request.message.strip()
+    prior_goal = _recent_user_goal(request)
+    if _QUICK_MODE_COMMAND.fullmatch(message):
+        if not prior_goal:
+            return ConversationDecision(
+                ConversationAction.CLARIFY,
+                1.0,
+                response="你希望联网查什么主题？",
+                reason_code="quick_search_topic_required",
+            )
+        return ConversationDecision(
+            ConversationAction.QUICK_SEARCH,
+            1.0,
+            query=prior_goal,
+            reason_code="quick_search_continuation",
+        )
+
+    latest = request.recent_messages[-1] if request.recent_messages else None
+    if (
+        latest is None
+        or latest.role != "assistant"
+        or not ("?" in latest.content or "？" in latest.content)
+        or "?" in message
+        or "？" in message
+        or len(message) > 40
+        or message in _VAGUE_NARROWING_ANSWERS
+        or not prior_goal
+        or not _shared_topic_fragment(message, latest.content)
+    ):
+        return None
+    return ConversationDecision(
+        ConversationAction.PROPOSE_RESEARCH,
+        1.0,
+        query=f"{prior_goal}；重点：{message}",
+        reason_code="resolved_research_clarification",
+        requires_confirmation=True,
+    )
 
 
 def _decision(payload: dict[str, Any], request: ConversationRequest) -> ConversationDecision:
@@ -254,6 +329,9 @@ async def route_conversation(
     explicit = _explicit_decision(request)
     if explicit is not None:
         return explicit
+    continuation = _continuation_decision(request)
+    if continuation is not None:
+        return continuation
 
     messages = [
         {"role": "system", "content": _router_prompt()},

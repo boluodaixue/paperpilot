@@ -207,10 +207,7 @@ async def test_narrowing_answer_is_exposed_as_conversation_continuation() -> Non
 
 @pytest.mark.asyncio
 async def test_quick_search_mode_command_reconstructs_prior_topic() -> None:
-    policy = QueuePolicy(_payload(
-        "quick_search",
-        query="Agent 长程任务中的最新记忆机制技术",
-    ))
+    policy = QueuePolicy()
 
     decision = await route_conversation(
         ConversationRequest(
@@ -225,7 +222,33 @@ async def test_quick_search_mode_command_reconstructs_prior_topic() -> None:
     )
 
     assert decision.action is ConversationAction.QUICK_SEARCH
-    assert decision.query == "Agent 长程任务中的最新记忆机制技术"
+    assert policy.calls == 0
+    assert decision.query == "帮我查 Agent 长程任务；记忆机制"
+
+
+@pytest.mark.asyncio
+async def test_concrete_option_answer_does_not_trigger_repeated_clarification() -> None:
+    policy = QueuePolicy()
+
+    decision = await route_conversation(
+        ConversationRequest(
+            "记忆机制",
+            recent_messages=(
+                ConversationMessage("user", "帮查一些关于 Agent 长程任务的问题"),
+                ConversationMessage(
+                    "assistant",
+                    "你想了解评测基准、规划与记忆，还是应用场景？",
+                ),
+            ),
+        ),
+        policy,
+    )
+
+    assert policy.calls == 0
+    assert decision.action is ConversationAction.PROPOSE_RESEARCH
+    assert decision.reason_code == "resolved_research_clarification"
+    assert "Agent 长程任务" in decision.query
+    assert "记忆机制" in decision.query
 
 
 def test_orchestrator_has_no_research_or_persistence_imports() -> None:
