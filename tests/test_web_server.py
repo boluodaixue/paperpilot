@@ -50,6 +50,22 @@ class FixedPolicy:
         if assessment is not None:
             return assessment
         system = str(messages[0].get("content", ""))
+        if "Conversation Orchestrator" in system:
+            request = json.loads(messages[-1]["content"])
+            message = request["message"]
+            if "Memory" in message:
+                action, response, query = "memory_answer", "", message
+            elif "研究" in message:
+                action, response, query = "propose_research", "", message
+            else:
+                action, response, query = "reply", "我是 PaperPilot。", ""
+            return {"content": json.dumps({
+                "action": action,
+                "confidence": 0.95,
+                "response": response,
+                "query": query,
+                "reason_code": "fixture",
+            }), "tool_calls": []}
         if "before research begins" in system:
             self.alignment_calls += 1
             revision = max(0, self.alignment_calls - 1)
@@ -101,6 +117,46 @@ def _wait_result(client: TestClient, task_id: str) -> dict[str, Any]:
             return response.json()
         time.sleep(0.02)
     raise AssertionError("research task did not finish")
+
+
+def test_conversation_route_allows_casual_chat_without_memory(web_client):
+    client, runtime, policy, tool = web_client
+
+    response = client.post(
+        "/api/conversation/route",
+        json={"message": "你是什么？"},
+    )
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["action"] == "reply"
+    assert payload["memory_id"] is None
+    assert payload["response"] == "我是 PaperPilot。"
+    assert server._TASKS == {}
+    messages = server.get_chat_store().get_messages(payload["session_id"])
+    assert [item["role"] for item in messages] == ["user", "assistant"]
+
+
+def test_conversation_route_only_proposes_research(web_client):
+    client, runtime, policy, tool = web_client
+
+    response = client.post(
+        "/api/conversation/route",
+        json={
+            "message": "研究 Transformer 的发展",
+            "memory_id": _MEMORY_ID,
+            "explicit_action": "deep_research",
+        },
+    )
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["action"] == "propose_research"
+    assert payload["requires_confirmation"] is True
+    assert payload["memory_id"] == _MEMORY_ID
+    assert server._TASKS == {}
+    assert policy.alignment_calls == 0
+    assert policy.research_calls == 0
 
 
 def test_first_request_pauses_without_research_tools(web_client):

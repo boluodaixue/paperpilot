@@ -192,8 +192,10 @@ def test_memory_dialogue_rejects_empty_or_unknown_inputs(web_client):
 def test_static_page_requires_explicit_mode_preview_and_confirmation():
     source = (Path(server.STATIC_DIR) / "index.html").read_text(encoding="utf-8")
     for required in (
-        'value="research">基于此 Memory 研究',
-        'value="memory-answer">Memory 问答',
+        'value="auto">自动判断',
+        'value="research">深度研究',
+        'value="memory-answer">只查当前 Memory',
+        "/api/conversation/route",
         "sendMemoryQuestion()",
         "/answers`,",
         "/note-proposals`,",

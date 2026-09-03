@@ -151,7 +151,9 @@ Copy-Item .env.template .env
 python web/run.py
 ```
 
-打开 <http://127.0.0.1:8000>，创建或选择一个 Memory，然后开始研究。
+打开 <http://127.0.0.1:8000>。默认输入框会自动区分普通对话、当前 Memory
+问答和深度研究提案；也可以显式选择“只查当前 Memory”或“深度研究”。深度
+研究执行和 Memory 写入仍需确认。
 
 ### 3. 在 Obsidian 中打开
 
