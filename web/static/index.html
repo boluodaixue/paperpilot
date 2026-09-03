@@ -82,6 +82,8 @@
   #proposalCard textarea.focus { height: auto; }
   #briefMemoryContext { margin-bottom: 12px; padding: 10px 12px; border: 1px solid #c7d2fe; border-radius: 8px;
                         background: #f8faff; color: #374151; }
+  #autoMemoryNotice { margin-bottom: 12px; padding: 10px 12px; border: 1px solid #bfdbfe;
+                      border-radius: 8px; background: #eff6ff; color: #1e3a8a; font-size: 12px; }
   #briefMemoryContext .context-title { font-size: 12px; font-weight: 700; color: #3730a3; margin-bottom: 6px; }
   #briefMemoryContext .context-row { margin-top: 6px; font-size: 12px; }
   #briefMemoryContext .context-label { color: #6b7280; font-weight: 600; }
@@ -223,6 +225,7 @@
         <select id="interactionMode" aria-label="选择工作模式">
           <option value="auto">自动判断</option>
           <option value="memory-answer">只查当前 Memory</option>
+          <option value="quick-search">联网查一下</option>
           <option value="research">深度研究</option>
         </select>
         <select id="memorySelect" aria-label="选择 Memory"></select>
@@ -246,6 +249,9 @@
     <div id="proposalCard" style="display:none">
       <div class="head">📋 研究方案确认</div>
       <div class="body">
+        <div id="autoMemoryNotice" class="context-row" hidden>
+          尚未选择 Memory。确认开始时会自动新建一个 Memory，并把本次报告和证据保存进去。
+        </div>
         <div id="briefMemoryContext" hidden>
           <div class="context-title">Memory 研究上下文（只读）</div>
           <div class="context-row"><span class="context-label">目标 Memory：</span><span id="p_memory_id"></span></div>
@@ -626,6 +632,8 @@ function updateInputMode() {
     input.placeholder = selectedMemoryId
       ? '询问当前 Memory 中已有的内容…'
       : '请先选择一个 Memory';
+  } else if ($('interactionMode').value === 'quick-search') {
+    input.placeholder = '输入需要联网核实的一个具体问题…';
   } else if ($('interactionMode').value === 'research') {
     input.placeholder = '输入研究问题，例如：transformer 的来历与发展';
   } else {
@@ -1388,6 +1396,10 @@ async function sendMessage() {
     await sendMemoryQuestion();
     return;
   }
+  if (mode === 'quick-search') {
+    await sendQuickQuestion();
+    return;
+  }
   if (mode === 'research' || currentProposal) {
     await sendResearchRequest();
     return;
@@ -1440,8 +1452,7 @@ async function sendAutomaticMessage() {
       return;
     }
     if (decision.action === 'quick_search') {
-      showNotice('快速联网回答将在下一阶段接入；当前已转为需要确认的深度研究提案。');
-      await sendResearchRequest(text, false);
+      await sendQuickQuestion(text, false);
       return;
     }
     appendBubble('assistant', '请在需要保存的回答卡片上选择“保存回答为笔记”。');
@@ -1454,16 +1465,105 @@ async function sendAutomaticMessage() {
   }
 }
 
+async function sendQuickQuestion(questionOverride = null, renderUser = true) {
+  const input = $('msgInput');
+  const question = (
+    questionOverride === null ? input.value : String(questionOverride)
+  ).trim();
+  if (!question || sendLock) return;
+  input.value = '';
+  if (renderUser) appendBubble('user', question);
+  const thinking = document.createElement('div');
+  thinking.className = 'msg thinking';
+  thinking.textContent = '正在联网核实…';
+  $('messages').appendChild(thinking);
+  scrollToBottom();
+
+  sendLock = true;
+  try {
+    const response = await fetch('/api/conversation/quick-answer', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        session_id: currentSessionId,
+        memory_id: selectedMemoryId,
+        question,
+      }),
+    });
+    const answer = await response.json();
+    thinking.remove();
+    if (!response.ok) {
+      appendBubble('assistant', answer.detail || '快速联网回答失败');
+      return;
+    }
+    bindCurrentSession(answer.session_id, answer.memory_id);
+    renderQuickAnswer(answer);
+    loadSessions();
+  } catch (e) {
+    thinking.remove();
+    appendBubble('assistant', '快速联网请求失败，请重试');
+  } finally {
+    sendLock = false;
+  }
+}
+
+function renderQuickAnswer(answer) {
+  hideEmptyState();
+  const card = document.createElement('div');
+  card.className = 'memory-answer-card quick-answer-card';
+  const head = document.createElement('div');
+  head.className = 'answer-head';
+  head.textContent = `快速联网 · ${answer.source_count || 0} 个来源`;
+  card.appendChild(head);
+
+  const body = document.createElement('div');
+  body.className = 'answer-markdown';
+  body.innerHTML = renderSafeMarkdown(answer.markdown || '（无回答）');
+  card.appendChild(body);
+
+  const citations = document.createElement('ul');
+  citations.className = 'answer-citations';
+  for (const citation of answer.citations || []) {
+    const item = document.createElement('li');
+    const link = document.createElement('a');
+    link.href = citation.url;
+    link.target = '_blank';
+    link.rel = 'noopener noreferrer';
+    link.textContent = `${citation.source_id} · ${citation.title}`;
+    item.appendChild(link);
+    citations.appendChild(item);
+  }
+  if (citations.children.length) card.appendChild(citations);
+
+  const actions = document.createElement('div');
+  actions.className = 'answer-actions';
+  const done = document.createElement('button');
+  done.type = 'button';
+  done.className = 'btn btn-primary';
+  done.textContent = '完成';
+  done.addEventListener('click', () => card.remove());
+  const research = document.createElement('button');
+  research.type = 'button';
+  research.className = 'btn btn-ghost';
+  research.textContent = '升级为深度研究';
+  research.addEventListener('click', () => {
+    card.remove();
+    $('interactionMode').value = 'research';
+    updateInputMode();
+    $('msgInput').value = answer.question || '';
+    $('msgInput').focus();
+  });
+  actions.append(done, research);
+  card.appendChild(actions);
+  $('messages').appendChild(card);
+  scrollToBottom();
+}
+
 async function sendResearchRequest(textOverride = null, renderUser = true) {
   const input = $('msgInput');
   const text = (
     textOverride === null ? input.value : String(textOverride)
   ).trim();
   if (!text || sendLock) return;
-  if (!selectedMemoryId) {
-    appendBubble('assistant', '请先明确选择一个 managed Memory。');
-    return;
-  }
   const selected = memories.find(memory => memory.memory_id === selectedMemoryId);
   if (selected && selected.read_only) {
     appendBubble('assistant', '既有 Memory 为只读；请先显式迁移再发起研究。');
@@ -1540,6 +1640,7 @@ function renderBriefContextList(id, values) {
 function renderBriefMemoryContext(brief) {
   const context = $('briefMemoryContext');
   const managed = Boolean(brief.memory_id);
+  $('autoMemoryNotice').hidden = managed;
   context.hidden = !managed;
   if (!managed) return;
   $('p_memory_id').textContent = brief.memory_id;
@@ -1607,6 +1708,14 @@ async function startResearch() {
   });
   const data = await r.json();
   if (!r.ok) { appendProgress({ type: 'error', message: data.detail || '启动失败' }); return; }
+  bindCurrentSession(data.session_id, data.memory_id);
+  await loadMemories(data.memory_id);
+  if (data.auto_created_memory) {
+    appendProgress({
+      type: 'state',
+      state: `已自动创建 Memory：${data.memory_title || data.memory_id}`,
+    });
+  }
   runningTask = {
     task_id: data.task_id, session_id: currentSessionId,
     memory_id: data.memory_id || null, status: data.status,

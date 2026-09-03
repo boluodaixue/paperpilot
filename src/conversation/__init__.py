@@ -9,6 +9,8 @@ from .contracts import (
     MemorySelection,
 )
 from .orchestrator import route_conversation
+from .prior_evidence import PriorEvidenceProjection, memory_hits_to_prior_evidence
+from .quick_answer import QuickAnswer, QuickAnswerCitation, answer_quick_search
 
 __all__ = [
     "ActionOverride",
@@ -17,5 +19,10 @@ __all__ = [
     "ConversationMessage",
     "ConversationRequest",
     "MemorySelection",
+    "PriorEvidenceProjection",
+    "QuickAnswer",
+    "QuickAnswerCitation",
+    "answer_quick_search",
+    "memory_hits_to_prior_evidence",
     "route_conversation",
 ]

@@ -170,14 +170,15 @@ def test_modify_rejects_explicit_memory_switch_but_allows_omission(web_client):
     assert revised.json()["memory_id"] == first.memory_id
 
 
-def test_w6_web_entry_rejects_legacy_alignment_without_memory_id(web_client):
+def test_web_entry_allows_unbound_proposal_without_creating_legacy_work(web_client):
     client, _runtime = web_client
     aligned = client.post("/api/alignment", json={
         "session_id": "legacy-memory",
         "message": "Legacy research",
     })
-    assert aligned.status_code == 400
-    assert "managed Memory" in aligned.json()["detail"]
+    assert aligned.status_code == 200
+    assert aligned.json()["status"] == "waiting_confirmation"
+    assert aligned.json()["memory_id"] is None
     assert server.get_chat_store().get_memory_binding("legacy-memory") is None
-    assert server.get_chat_store().get_messages("legacy-memory") == []
-    assert not server._TASKS
+    assert len(server.get_chat_store().get_messages("legacy-memory")) == 2
+    assert len(server._TASKS) == 1

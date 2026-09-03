@@ -123,6 +123,116 @@ def test_register_is_idempotent_but_identity_and_session_switches_are_rejected(
         )
 
 
+def test_unbound_research_can_bind_memory_once_under_its_lease(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "unbound.db"
+    chat = ChatStore(str(path))
+    chat.set_meta("session-unbound", title="Unbound")
+    registry = RuntimeRegistry(path)
+    record = registry.register(
+        task_id="task-unbound",
+        thread_id="thread-unbound",
+        session_id="session-unbound",
+        memory_id=None,
+        workflow_type="research",
+    )
+    assert record.memory_id is None
+    with pytest.raises(ValueError, match="required"):
+        registry.register(
+            task_id="task-note",
+            thread_id="thread-note",
+            session_id="session-unbound",
+            memory_id=None,
+            workflow_type="memory_note",
+        )
+
+    token = registry.claim_lease("task-unbound", lease_seconds=60)
+    assert token is not None
+    with pytest.raises(ValueError, match="lease"):
+        registry.bind_memory(
+            "task-unbound", "M-new", lease_token="lease-wrong"
+        )
+    bound = registry.bind_memory(
+        "task-unbound", "M-new", lease_token=token
+    )
+    assert bound.memory_id == "M-new"
+    assert chat.get_memory_binding("session-unbound") == "M-new"
+    assert registry.bind_memory(
+        "task-unbound", "M-new", lease_token=token
+    ) == bound
+    with pytest.raises(ValueError, match="different"):
+        registry.bind_memory(
+            "task-unbound", "M-other", lease_token=token
+        )
+
+
+def test_existing_not_null_registry_is_migrated_without_losing_rows(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "migration.db"
+    chat = ChatStore(str(path))
+    chat.bind_memory("session-old", "M-old")
+    connection = sqlite3.connect(path)
+    try:
+        connection.executescript(
+            """
+            PRAGMA foreign_keys = ON;
+            CREATE TABLE runtime_workflows (
+                task_id TEXT PRIMARY KEY,
+                thread_id TEXT NOT NULL UNIQUE,
+                session_id TEXT NOT NULL,
+                memory_id TEXT NOT NULL,
+                workflow_type TEXT NOT NULL,
+                created_at REAL NOT NULL,
+                expires_at REAL,
+                lease_owner TEXT,
+                lease_until REAL,
+                FOREIGN KEY (session_id)
+                    REFERENCES session_meta(session_id) ON DELETE CASCADE
+            );
+            CREATE TABLE runtime_outbox (
+                event_id TEXT PRIMARY KEY,
+                thread_id TEXT NOT NULL,
+                sequence INTEGER NOT NULL,
+                event_type TEXT NOT NULL,
+                payload_json TEXT NOT NULL,
+                UNIQUE (thread_id, sequence),
+                FOREIGN KEY (thread_id)
+                    REFERENCES runtime_workflows(thread_id) ON DELETE CASCADE
+            );
+            INSERT INTO runtime_workflows VALUES (
+                'task-old', 'thread-old', 'session-old', 'M-old',
+                'research', 100, 200, NULL, NULL
+            );
+            INSERT INTO runtime_outbox VALUES (
+                'event-old', 'thread-old', 1, 'confirmed', '{}'
+            );
+            """
+        )
+        connection.commit()
+    finally:
+        connection.close()
+
+    registry = RuntimeRegistry(path)
+    assert registry.get("task-old") is not None
+    assert registry.list_events("thread-old")[0].event_id == "event-old"
+    connection = sqlite3.connect(path)
+    try:
+        memory_column = next(
+            row for row in connection.execute(
+                "PRAGMA table_info(runtime_workflows)"
+            ) if row[1] == "memory_id"
+        )
+        foreign_key_target = connection.execute(
+            "PRAGMA foreign_key_list(runtime_outbox)"
+        ).fetchone()[2]
+    finally:
+        connection.close()
+    assert memory_column[3] == 0
+    assert foreign_key_target == "runtime_workflows"
+
+
 def test_concurrent_lease_claim_has_one_winner_and_token_controls_renew_release(
     tmp_path: Path,
 ) -> None:

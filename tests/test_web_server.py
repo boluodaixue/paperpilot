@@ -40,6 +40,28 @@ class FixedTool:
         }]}
 
 
+class FixedAcquisitionTool:
+    name = "acquire_evidence"
+
+    def get_openai_tool_schema(self) -> dict[str, Any]:
+        return {"type": "function", "function": {
+            "name": self.name,
+            "description": "fixed bounded acquisition",
+            "parameters": {"type": "object", "properties": {}},
+        }}
+
+    async def execute(self, **kwargs) -> dict[str, Any]:
+        return {"documents": [{
+            "title": "Current official source",
+            "url": "https://example.test/current",
+            "blocks": [{
+                "heading": "Current status",
+                "locator": "section 1",
+                "text": "The current version supports the requested feature.",
+            }],
+        }]}
+
+
 class FixedPolicy:
     def __init__(self) -> None:
         self.alignment_calls = 0
@@ -50,6 +72,14 @@ class FixedPolicy:
         if assessment is not None:
             return assessment
         system = str(messages[0].get("content", ""))
+        if "Answer one narrow current question" in system:
+            return {"content": json.dumps({
+                "claims": [{
+                    "text": "The current version supports the feature.",
+                    "source_ids": ["S1"],
+                }],
+                "insufficient_evidence": [],
+            }), "tool_calls": []}
         if "Conversation Orchestrator" in system:
             request = json.loads(messages[-1]["content"])
             message = request["message"]
@@ -95,7 +125,7 @@ def web_client(tmp_path, monkeypatch):
     memory_store = MarkdownMemoryStore(tmp_path / "memory")
     memory_store.create_memory("Web regression", _MEMORY_ID)
     runtime = build_research_runtime(
-        config={}, policy=policy, tools=[tool],
+        config={}, policy=policy, tools=[tool, FixedAcquisitionTool()],
         memory_store=memory_store,
         checkpointer=InMemorySaver(),
     )
@@ -159,6 +189,25 @@ def test_conversation_route_only_proposes_research(web_client):
     assert policy.research_calls == 0
 
 
+def test_quick_answer_uses_bounded_web_service_without_research(web_client):
+    client, runtime, policy, tool = web_client
+
+    response = client.post(
+        "/api/conversation/quick-answer",
+        json={"question": "What is the current version?"},
+    )
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["memory_id"] is None
+    assert payload["source_count"] == 1
+    assert payload["citations"][0]["url"] == "https://example.test/current"
+    assert "[S1](https://example.test/current)" in payload["markdown"]
+    assert server._TASKS == {}
+    assert policy.alignment_calls == 0
+    assert policy.research_calls == 0
+
+
 def test_first_request_pauses_without_research_tools(web_client):
     client, runtime, policy, tool = web_client
     response = client.post(
@@ -175,6 +224,41 @@ def test_first_request_pauses_without_research_tools(web_client):
     assert tool.calls == []
     task = server._TASKS[data["task_id"]]
     assert task.status == "waiting_confirmation"
+
+
+def test_confirming_unbound_research_creates_and_binds_managed_memory(web_client):
+    client, runtime, policy, tool = web_client
+    paused_response = client.post(
+        "/api/alignment",
+        json={"session_id": "auto-memory", "message": "Research fixed topic"},
+    )
+    assert paused_response.status_code == 200, paused_response.text
+    paused = paused_response.json()
+    assert paused["memory_id"] is None
+    assert paused["brief"]["memory_id"] is None
+    assert server.get_chat_store().get_memory_binding("auto-memory") is None
+    assert policy.research_calls == 0
+
+    started_response = client.post(
+        "/api/research",
+        json={"task_id": paused["task_id"], "session_id": "auto-memory"},
+    )
+    assert started_response.status_code == 200, started_response.text
+    started = started_response.json()
+    assert started["auto_created_memory"] is True
+    assert started["memory_id"].startswith("M-")
+    assert server.get_chat_store().get_memory_binding(
+        "auto-memory"
+    ) == started["memory_id"]
+    assert server.get_runtime_registry().get(
+        paused["task_id"]
+    ).memory_id == started["memory_id"]
+
+    result = _wait_result(client, paused["task_id"])
+    assert result["memory_id"] == started["memory_id"]
+    assert result["manifest"]["report_path"].startswith(
+        f"Memories/{started['memory_id']}/"
+    )
 
 
 def test_modify_and_confirm_resume_same_root_thread(web_client):

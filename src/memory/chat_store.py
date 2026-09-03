@@ -190,6 +190,29 @@ class ChatStore:
             finally:
                 conn.close()
 
+    def ensure_session(self, session_id: str) -> None:
+        """Create empty session metadata without changing an existing session."""
+
+        if not isinstance(session_id, str) or not session_id.strip():
+            raise ValueError("session_id must be a non-empty string")
+        normalized_session_id = session_id.strip()
+        with self._lock:
+            conn = self._connect()
+            try:
+                conn.execute(
+                    """
+                    INSERT INTO session_meta (
+                        session_id, title, pinned, sort_order,
+                        memory_id, updated_at
+                    ) VALUES (?, '', 0, 0, NULL, ?)
+                    ON CONFLICT(session_id) DO NOTHING
+                    """,
+                    (normalized_session_id, time.time()),
+                )
+                conn.commit()
+            finally:
+                conn.close()
+
     def delete_session(self, session_id: str) -> int:
         """删除会话的聊天记录与元数据，返回删除的消息条数。"""
         with self._lock:
