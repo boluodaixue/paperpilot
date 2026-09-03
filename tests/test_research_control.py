@@ -118,6 +118,9 @@ def test_control_prompt_does_not_treat_one_requirement_as_indivisible() -> None:
         local_rounds_since_fork=1,
         remaining_total_agent_slots=15,
         delegable_token_budget=90000,
+        delegable_tool_budget=12,
+        minimum_child_token_budget=34000,
+        fundable_child_count=2,
     )
 
     prompt = messages[0]["content"]
@@ -129,6 +132,11 @@ def test_control_prompt_does_not_treat_one_requirement_as_indivisible() -> None:
     payload = json.loads(messages[-1]["content"])
     assert payload["remaining_total_agent_slots"] == 15
     assert payload["delegable_token_budget"] == 90000
+    assert payload["delegable_tool_budget"] == 12
+    assert payload["minimum_child_token_budget"] == 34000
+    assert payload["fundable_child_count"] == 2
+    assert "fundable_child_count is 0" in prompt
+    assert "never propose more candidates than" in prompt
 
 
 def test_initial_root_wave_assigns_each_external_requirement_to_one_child() -> None:

@@ -8,6 +8,9 @@
 <style>
   * { box-sizing: border-box; margin: 0; padding: 0; }
   body { font-family: "Microsoft YaHei", "PingFang SC", sans-serif; background: #f5f6fa; color: #222; }
+  button:focus-visible, a:focus-visible, input:focus-visible, textarea:focus-visible, select:focus-visible {
+    outline: 3px solid rgba(37,99,235,.35); outline-offset: 2px;
+  }
   .app { display: flex; height: 100vh; }
 
   /* ---------- 侧边栏 ---------- */
@@ -37,17 +40,27 @@
   #main { flex: 1; display: flex; flex-direction: column; min-width: 0; }
   #chatHeader { padding: 10px 20px; background: #fff; border-bottom: 1px solid #e5e7eb; font-size: 14px;
                 font-weight: 600; display: flex; align-items: center; justify-content: space-between; gap: 16px; }
-  #chatHeader .sub { font-size: 11px; color: #9ca3af; font-weight: 400; margin-left: 8px; }
+  #chatHeader .sub { font-size: 12px; color: #64748b; font-weight: 400; margin-left: 8px; }
   #memoryControls { display: flex; align-items: center; gap: 7px; min-width: 0; }
-  #memorySelect, #interactionMode { max-width: 240px; padding: 7px 9px; border: 1px solid #d1d5db; border-radius: 7px; background: #fff; }
+  #memorySelect, #interactionMode { max-width: 240px; min-height: 36px; padding: 7px 9px; border: 1px solid #d1d5db; border-radius: 7px; background: #fff; }
   #memoryIdBadge { max-width: 230px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
                    font: 11px Consolas, monospace; color: #475569; }
   .memory-action { padding: 7px 10px; border: 1px solid #d1d5db; border-radius: 7px; background: #fff;
-                   color: #374151; cursor: pointer; font-size: 12px; text-decoration: none; white-space: nowrap; }
+                   min-height: 36px; color: #374151; cursor: pointer; font-size: 12px; text-decoration: none; white-space: nowrap; }
   .memory-action:hover { border-color: #2563eb; color: #2563eb; }
   .memory-action:disabled, .memory-action.disabled { color: #9ca3af; cursor: not-allowed; border-color: #e5e7eb; }
 
+  #noticeBar { margin: 10px 22px 0; padding: 9px 12px; border-radius: 8px; font-size: 13px;
+               background: #eef2ff; color: #3730a3; border: 1px solid #c7d2fe; }
+  #noticeBar.error { background: #fef2f2; color: #991b1b; border-color: #fecaca; }
+  #noticeBar[hidden] { display: none; }
   #messages { flex: 1; overflow-y: auto; padding: 18px 22px; }
+  #emptyState { max-width: 620px; margin: 12vh auto 0; padding: 28px; text-align: center;
+                background: #fff; border: 1px solid #e5e7eb; border-radius: 14px;
+                box-shadow: 0 4px 18px rgba(15,23,42,.05); color: #475569; }
+  #emptyState h2 { margin-bottom: 8px; font-size: 20px; color: #0f172a; }
+  #emptyState p { margin: 6px 0; line-height: 1.65; }
+  #emptyState .hint { font-size: 12px; color: #64748b; }
   .msg { max-width: 72%; margin-bottom: 12px; border-radius: 10px; padding: 10px 14px; font-size: 14px; line-height: 1.65; }
   .msg.user { margin-left: auto; background: #2563eb; color: #fff; }
   .msg.assistant { margin-right: auto; background: #fff; border: 1px solid #e5e7eb; box-shadow: 0 1px 3px rgba(0,0,0,.05); white-space: pre-wrap; }
@@ -87,19 +100,25 @@
   .report-card .rc-head .btn-ghost { font-size: 12px; padding: 5px 12px; border: 1px solid #e5e7eb; border-radius: 6px; }
   .report-card .rc-filter { padding: 5px 8px; border: 1px solid #d1d5db; border-radius: 6px; font-size: 12px; }
   .report-card .tabs { display: flex; border-bottom: 2px solid #e5e7eb; background: #f9fafb; }
-  .report-card .tab { padding: 10px 18px; cursor: pointer; font-size: 13px; font-weight: 600; color: #6b7280; border-bottom: 3px solid transparent; }
+  .report-card .tab { padding: 10px 18px; cursor: pointer; font-size: 13px; font-weight: 600;
+                      color: #6b7280; border: 0; border-bottom: 3px solid transparent; background: transparent; }
   .report-card .tab.active { color: #2563eb; border-bottom-color: #2563eb; background: #fff; }
   .report-card .tabbody { padding: 18px; display: none; font-size: 14px; }
   .report-card .tabbody.active { display: block; }
-  #reportContent { line-height: 1.75; }
-  #reportContent h1, #reportContent h2, #reportContent h3 { margin: 16px 0 8px; }
-  #reportContent p { margin: 7px 0; }
-  #reportContent ul, #reportContent ol { margin: 7px 0 7px 24px; }
-  #reportContent table { border-collapse: collapse; margin: 8px 0; }
-  #reportContent th, #reportContent td { border: 1px solid #d1d5db; padding: 5px 9px; }
-  #reportContent a { color: #2563eb; }
-  #reportContent code { background: #f3f4f6; padding: 2px 5px; border-radius: 4px; }
-  #reportContent blockquote { border-left: 4px solid #e5e7eb; padding-left: 12px; color: #6b7280; }
+  .rc-report { line-height: 1.75; overflow-wrap: anywhere; }
+  .rc-report h1, .rc-report h2, .rc-report h3 { margin: 16px 0 8px; }
+  .rc-report p { margin: 7px 0; }
+  .rc-report ul, .rc-report ol { margin: 7px 0 7px 24px; }
+  .rc-report table { display: block; max-width: 100%; overflow-x: auto; border-collapse: collapse; margin: 8px 0; }
+  .rc-report th, .rc-report td { border: 1px solid #d1d5db; padding: 5px 9px; }
+  .rc-report a { color: #2563eb; }
+  .rc-report code { background: #f3f4f6; padding: 2px 5px; border-radius: 4px; }
+  .rc-report blockquote { border-left: 4px solid #e5e7eb; padding-left: 12px; color: #6b7280; }
+  .report-card .rc-head { justify-content: space-between; align-items: center; padding: 10px 14px; }
+  .report-status { display: inline-flex; align-items: center; padding: 4px 8px; border-radius: 999px;
+                   background: #ecfdf5; color: #047857; font-size: 12px; font-weight: 700; }
+  .report-status.partial { background: #fff7ed; color: #9a3412; }
+  .report-stop { margin-left: 10px; color: #64748b; font-size: 12px; overflow-wrap: anywhere; }
 
   table.data { width: 100%; border-collapse: collapse; font-size: 12px; }
   table.data th, table.data td { border: 1px solid #e5e7eb; padding: 6px 8px; text-align: left; vertical-align: top; }
@@ -115,12 +134,20 @@
   .memory-answer-card .answer-head { color: #3730a3; font-size: 12px; font-weight: 700; margin-bottom: 7px; }
   .memory-answer-card .answer-citations { margin: 10px 0; padding-left: 20px; font-size: 12px; }
   .memory-answer-card .answer-citations a { color: #2563eb; }
+  .memory-answer-card .answer-actions { display: flex; justify-content: flex-end; gap: 8px; margin-top: 10px; }
+  .memory-answer-card .answer-actions .btn-ghost { border: 1px solid #d1d5db; }
   #noteProposalCard { margin: 0 22px 10px; padding: 14px; background: #fff; border: 1px solid #f59e0b;
                       border-radius: 10px; box-shadow: 0 2px 8px rgba(0,0,0,.08); }
   #noteProposalCard .proposal-target { font-size: 12px; color: #6b7280; margin: 6px 0; }
   #noteProposalMarkdown { max-height: 300px; overflow: auto; padding: 10px; background: #f8fafc;
                           border: 1px solid #e5e7eb; border-radius: 7px; white-space: pre-wrap; font-size: 12px; }
   #noteProposalCard .actions { display: flex; justify-content: flex-end; gap: 8px; margin-top: 10px; }
+
+  #memoryCreateCard { margin: 0 22px 10px; padding: 14px; background: #fff; border: 1px solid #c7d2fe;
+                      border-radius: 10px; box-shadow: 0 2px 8px rgba(0,0,0,.08); }
+  #memoryCreateCard label { display: block; margin-bottom: 6px; color: #475569; font-size: 12px; }
+  #memoryCreateTitle { width: 100%; padding: 9px 10px; border: 1px solid #d1d5db; border-radius: 7px; }
+  #memoryCreateCard .actions { display: flex; justify-content: flex-end; gap: 8px; margin-top: 10px; }
 
   /* ---------- Memory 资料导入 ---------- */
   #memoryImportCard { margin: 0 22px 10px; padding: 14px; background: #fff; border: 1px solid #0ea5e9;
@@ -155,6 +182,28 @@
   #msgInput { flex: 1; padding: 11px 14px; border: 1px solid #d1d5db; border-radius: 10px; font-size: 14px; }
   #msgInput:focus { outline: none; border-color: #2563eb; }
   #sendBtn { padding: 0 26px; }
+
+  @media (max-width: 760px) {
+    .app { display: block; min-height: 100vh; height: auto; }
+    #sidebar { width: 100%; min-width: 0; height: auto; max-height: 180px; }
+    #sidebar .brand { padding-bottom: 6px; }
+    #newSessionBtn { margin-bottom: 8px; }
+    #sessionList { max-height: 82px; }
+    #main { min-height: calc(100vh - 150px); }
+    #chatHeader { align-items: stretch; flex-direction: column; padding: 10px 12px; }
+    #memoryControls { flex-wrap: wrap; }
+    #memorySelect, #interactionMode { flex: 1 1 160px; max-width: none; min-height: 40px; }
+    #memoryIdBadge { flex: 1 1 100%; max-width: none; }
+    .memory-action { min-height: 40px; }
+    #messages { padding: 12px; min-height: 45vh; }
+    #emptyState { margin-top: 5vh; padding: 20px 16px; }
+    .msg, .memory-answer-card { max-width: 100%; }
+    #proposalCard, #memoryCreateCard, #noteProposalCard, #memoryImportCard, #legacyMigrationCard {
+      margin-left: 12px; margin-right: 12px;
+    }
+    #inputBar { position: sticky; bottom: 0; padding: 10px 12px; background: #f5f6fa; }
+    #sendBtn { min-height: 42px; padding: 0 18px; }
+  }
 </style>
 </head>
 <body>
@@ -176,14 +225,21 @@
           <option value="memory-answer">Memory 问答</option>
         </select>
         <select id="memorySelect" aria-label="选择 Memory"></select>
-        <span id="memoryIdBadge">memory_id：未绑定</span>
+        <span id="memoryIdBadge">尚未选择 Memory</span>
         <button class="memory-action" id="createMemoryBtn" type="button">＋ 新建 Memory</button>
         <button class="memory-action" id="importMemoryBtn" type="button">导入资料</button>
         <button class="memory-action" id="migrateLegacyBtn" type="button" hidden>迁移既有 Memory</button>
         <a class="memory-action disabled" id="openObsidianBtn" aria-disabled="true">在 Obsidian 中打开</a>
       </div>
     </div>
-    <div id="messages"></div>
+    <div id="noticeBar" role="status" aria-live="polite" hidden></div>
+    <div id="messages" role="log" aria-live="polite">
+      <div id="emptyState">
+        <h2>从一个长期 Memory 开始</h2>
+        <p>选择已有 Memory，或者新建一个研究空间，然后选择“研究”或“Memory 问答”。</p>
+        <p class="hint">研究前会先展示方案；确认后才会检索并写入知识库。</p>
+      </div>
+    </div>
 
     <!-- 研究方案确认卡（位于输入框上方） -->
     <div id="proposalCard" style="display:none">
@@ -215,6 +271,16 @@
       <div class="actions">
         <button class="btn btn-ghost" type="button" id="cancelNoteProposalBtn">取消</button>
         <button class="btn btn-primary" type="button" id="confirmNoteProposalBtn">确认写入 Memory</button>
+      </div>
+    </div>
+
+    <div id="memoryCreateCard" hidden>
+      <strong>新建 Memory</strong>
+      <label for="memoryCreateTitle">名称</label>
+      <input id="memoryCreateTitle" type="text" maxlength="120" autocomplete="off" placeholder="例如：AI Agent 长期研究">
+      <div class="actions">
+        <button class="btn btn-ghost" type="button" id="cancelCreateMemoryBtn">取消</button>
+        <button class="btn btn-primary" type="button" id="confirmCreateMemoryBtn">创建并选择</button>
       </div>
     </div>
 
@@ -297,6 +363,37 @@ const MAX_IMPORT_TEXT_BYTES = 10 * 1024 * 1024;
 
 const $ = id => document.getElementById(id);
 
+function showNotice(message, kind = 'info') {
+  const notice = $('noticeBar');
+  notice.textContent = String(message || '');
+  notice.className = kind === 'error' ? 'error' : '';
+  notice.hidden = !notice.textContent;
+}
+
+function hideNotice() {
+  $('noticeBar').hidden = true;
+  $('noticeBar').textContent = '';
+}
+
+function resetMessages() {
+  $('messages').innerHTML = `
+    <div id="emptyState">
+      <h2>从一个长期 Memory 开始</h2>
+      <p>选择已有 Memory，或者新建一个研究空间，然后选择“研究”或“Memory 问答”。</p>
+      <p class="hint">研究前会先展示方案；确认后才会检索并写入知识库。</p>
+    </div>`;
+}
+
+function hideEmptyState() {
+  const empty = $('emptyState');
+  if (empty) empty.remove();
+}
+
+function setConversationInputLocked(locked) {
+  $('msgInput').disabled = Boolean(locked);
+  $('sendBtn').disabled = Boolean(locked);
+}
+
 // ------------------------------------------------------------------
 // Memory 选择与 Obsidian 打开
 // ------------------------------------------------------------------
@@ -340,8 +437,8 @@ function renderMemoryControls() {
   $('migrateLegacyBtn').hidden = !(selected && selected.can_migrate);
   $('migrateLegacyBtn').disabled = memorySelectionLocked;
   $('memoryIdBadge').textContent = sessionMemoryBound
-    ? `memory_id：${sessionMemoryId || 'legacy'}`
-    : 'memory_id：未绑定';
+    ? `已绑定：${sessionMemoryId || 'legacy'}`
+    : selectedMemoryId ? `待绑定：${selectedMemoryId}` : '尚未选择 Memory';
 
   const open = $('openObsidianBtn');
   if (selected && selected.obsidian_uri) {
@@ -380,17 +477,56 @@ async function loadMemories(preferredMemoryId = selectedMemoryId) {
   } catch (e) { /* 研究入口不依赖 Obsidian 可用性 */ }
 }
 
-async function createMemory() {
+function createMemory() {
   if (memorySelectionLocked) return;
-  const title = prompt('新 Memory 标题');
-  if (title === null || !title.trim()) return;
-  const r = await fetch('/api/memories', {
-    method: 'POST', headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ title: title.trim() }),
-  });
-  const data = await r.json();
-  if (!r.ok) { alert(data.detail || 'Memory 新建失败'); return; }
-  await loadMemories(data.memory_id);
+  hideNotice();
+  hideEmptyState();
+  $('memoryCreateCard').hidden = false;
+  $('memoryCreateTitle').value = '';
+  $('msgInput').disabled = true;
+  $('sendBtn').disabled = true;
+  $('memoryCreateTitle').focus();
+  memorySelectionLocked = true;
+  renderMemoryControls();
+}
+
+function cancelCreateMemory() {
+  $('memoryCreateCard').hidden = true;
+  $('memoryCreateTitle').value = '';
+  $('msgInput').disabled = false;
+  $('sendBtn').disabled = false;
+  memorySelectionLocked = false;
+  renderMemoryControls();
+  if ($('messages').children.length === 0) resetMessages();
+}
+
+async function confirmCreateMemory() {
+  const title = $('memoryCreateTitle').value.trim();
+  if (!title) {
+    showNotice('请输入 Memory 名称。', 'error');
+    $('memoryCreateTitle').focus();
+    return;
+  }
+  const button = $('confirmCreateMemoryBtn');
+  button.disabled = true;
+  try {
+    const r = await fetch('/api/memories', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ title }),
+    });
+    const data = await r.json();
+    if (!r.ok) {
+      showNotice(data.detail || 'Memory 新建失败', 'error');
+      return;
+    }
+    cancelCreateMemory();
+    await loadMemories(data.memory_id);
+    showNotice(`已创建并选择 Memory：${data.title}`);
+  } catch (error) {
+    showNotice('Memory 新建请求失败，请重试。', 'error');
+  } finally {
+    button.disabled = false;
+  }
 }
 
 async function openLegacyMigration() {
@@ -612,11 +748,14 @@ function hideMemoryWorkflowCards() {
 
 function newSession() {
   hideMemoryWorkflowCards();
+  $('memoryCreateCard').hidden = true;
+  memorySelectionLocked = false;
   currentSessionId = null; currentProposal = null; currentReportData = null; runningTask = null;
   if (eventSource) { eventSource.close(); eventSource = null; }
   sessionMemoryBound = false; sessionMemoryId = null;
   setMemorySelection(null, false);
-  $('messages').innerHTML = '';
+  resetMessages();
+  hideNotice();
   $('proposalCard').style.display = 'none';
   currentMemoryNoteProposal = null;
   $('noteProposalCard').hidden = true;
@@ -638,12 +777,14 @@ async function restoreMemoryWorkflows(sid) {
     for (const workflow of workflows) {
       const interrupt = workflow.interrupt || {};
       if (interrupt.kind === 'memory_answer_decision' && interrupt.answer) {
+        $('interactionMode').value = 'memory-answer';
         renderMemoryAnswer({
           ...interrupt.answer,
           session_id: sid,
           workflow_id: workflow.workflow_id,
         });
       } else if (interrupt.kind === 'memory_note_confirmation' && interrupt.proposal) {
+        $('interactionMode').value = 'memory-answer';
         currentMemoryNoteProposal = {
           ...interrupt.proposal,
           session_id: sid,
@@ -697,13 +838,15 @@ async function selectSession(sid, memoryBound = false, memoryId = null) {
   if (eventSource) { eventSource.close(); eventSource = null; }
   memorySelectionLocked = true;
   renderMemoryControls();
-  $('messages').innerHTML = '';
+  resetMessages();
+  hideNotice();
   $('proposalCard').style.display = 'none';
   $('chatHeaderSub').textContent = `会话 ${sid}`;
   const r = await fetch(`/api/sessions/${encodeURIComponent(sid)}/messages`);
   const msgs = await r.json();
-  $('messages').innerHTML = '';
+  resetMessages();
   const restoredMemoryWorkflow = await restoreMemoryWorkflows(sid);
+  setConversationInputLocked(restoredMemoryWorkflow);
   if (!msgs.length) {
     setMemorySelection(selectedMemoryId, restoredMemoryWorkflow);
     loadSessions();
@@ -729,6 +872,7 @@ async function selectSession(sid, memoryBound = false, memoryId = null) {
   }
   if (task && task.status === 'running') {
     $('interactionMode').value = 'research';
+    setConversationInputLocked(true);
     setMemorySelection(task.memory_id, true);
     appendProgress({ type: 'state', state: '研究进行中（已恢复连接）' });
     openEventStream(task.task_id);
@@ -751,7 +895,7 @@ async function selectSession(sid, memoryBound = false, memoryId = null) {
   // 按最后一条消息决定尾部状态：proposal → 恢复确认卡；report → 恢复报告卡
   const last = msgs[msgs.length - 1];
   // W6 deliberately ignores lastReport.memory_id: session metadata is authoritative.
-  setMemorySelection(sessionMemoryId, false);
+  setMemorySelection(sessionMemoryId, restoredMemoryWorkflow);
   if (last.kind === 'proposal') {
     showProposalFromHistory(msgs);
   } else if (last.kind === 'report') {
@@ -768,6 +912,7 @@ function renderStoredMessage(m) {
 }
 
 function appendBubble(role, text) {
+  hideEmptyState();
   const div = document.createElement('div');
   div.className = 'msg ' + role;
   div.textContent = text;
@@ -790,6 +935,11 @@ async function sendMemoryQuestion() {
     appendBubble('assistant', '请先选择一个 Memory。');
     return;
   }
+  const task = (
+    runningTask && runningTask.session_id === currentSessionId
+      ? runningTask
+      : null
+  );
   if (task && task.status === 'done') {
     runningTask = null;
     setMemorySelection(task.memory_id, false);
@@ -811,6 +961,7 @@ async function sendMemoryQuestion() {
   scrollToBottom();
 
   sendLock = true;
+  let keepLocked = false;
   setMemorySelection(memoryId, true);
   try {
     const r = await fetch(`/api/memories/${encodeURIComponent(memoryId)}/answers`, {
@@ -823,16 +974,19 @@ async function sendMemoryQuestion() {
     bindCurrentSession(answer.session_id, answer.memory_id);
     loadSessions();
     renderMemoryAnswer(answer);
+    keepLocked = true;
   } catch (e) {
     thinking.remove();
     appendBubble('assistant', 'Memory 问答请求失败，请重试');
   } finally {
     sendLock = false;
-    setMemorySelection(memoryId, false);
+    setConversationInputLocked(keepLocked);
+    setMemorySelection(memoryId, keepLocked);
   }
 }
 
 function renderMemoryAnswer(answer) {
+  hideEmptyState();
   const card = document.createElement('div');
   card.className = 'memory-answer-card';
   const head = document.createElement('div');
@@ -864,14 +1018,66 @@ function renderMemoryAnswer(answer) {
   save.className = 'btn btn-ghost save-memory-answer';
   const answerMemory = memories.find(memory => memory.memory_id === answer.memory_id);
   const readOnly = Boolean(answerMemory && answerMemory.read_only);
-  save.textContent = readOnly ? '只读 Memory：请先迁移' : '保存回答为笔记';
-  save.disabled = readOnly;
-  if (!readOnly) {
+  const canSave = !readOnly && Array.isArray(answer.citations) && answer.citations.length > 0;
+  save.textContent = readOnly
+    ? '只读 Memory：请先迁移'
+    : canSave ? '保存回答为笔记' : '没有可保存的证据回答';
+  save.disabled = !canSave;
+  if (canSave) {
     save.addEventListener('click', () => requestMemoryNoteProposal(answer));
   }
-  card.appendChild(save);
+  const dismiss = document.createElement('button');
+  dismiss.type = 'button';
+  dismiss.className = hasInsufficientEvidence
+    ? 'btn btn-ghost dismiss-memory-answer'
+    : 'btn btn-primary dismiss-memory-answer';
+  dismiss.textContent = '完成，不保存';
+  dismiss.addEventListener('click', () => dismissMemoryAnswer(answer, card));
+  const actions = document.createElement('div');
+  actions.className = 'answer-actions';
+  actions.append(save, dismiss);
+  if (hasInsufficientEvidence) {
+    const researchFromGapButton = document.createElement('button');
+    researchFromGapButton.type = 'button';
+    researchFromGapButton.className = 'btn btn-primary continue-memory-research';
+    researchFromGapButton.textContent = '基于缺口继续研究';
+    researchFromGapButton.addEventListener(
+      'click',
+      () => continueFromMemoryAnswer(answer, card),
+    );
+    actions.appendChild(researchFromGapButton);
+  }
+  card.appendChild(actions);
   $('messages').appendChild(card);
   scrollToBottom();
+}
+
+async function dismissMemoryAnswer(answer, card) {
+  const response = await fetch(
+    `/api/memory-answers/${encodeURIComponent(answer.answer_id)}` +
+    `?session_id=${encodeURIComponent(answer.session_id || currentSessionId || '')}` +
+    `&memory_id=${encodeURIComponent(answer.memory_id || '')}`,
+    { method: 'DELETE' },
+  );
+  if (!response.ok) {
+    const payload = await response.json();
+    showNotice(payload.detail || 'Memory 回答暂时无法结束', 'error');
+    return false;
+  }
+  card.remove();
+  setConversationInputLocked(false);
+  setMemorySelection(answer.memory_id, false);
+  showNotice('回答已结束，未写入 Memory。');
+  return true;
+}
+
+async function continueFromMemoryAnswer(answer, card) {
+  if (!await dismissMemoryAnswer(answer, card)) return;
+  $('interactionMode').value = 'research';
+  updateInputMode();
+  $('msgInput').value = answer.question || '';
+  $('msgInput').focus();
+  showNotice('已切换到研究模式。可直接发送，或先补充需要继续调查的范围。');
 }
 
 async function requestMemoryNoteProposal(answer) {
@@ -886,6 +1092,8 @@ async function requestMemoryNoteProposal(answer) {
     const proposal = await r.json();
     if (!r.ok) { alert(proposal.detail || '笔记提案生成失败'); return; }
     currentMemoryNoteProposal = proposal;
+    setConversationInputLocked(true);
+    setMemorySelection(proposal.memory_id, true);
     $('noteProposalTarget').textContent = `目标：${proposal.target_path}`;
     $('noteProposalMarkdown').textContent = proposal.markdown;
     $('noteProposalCard').hidden = false;
@@ -900,6 +1108,8 @@ async function cancelMemoryNoteProposal(notifyServer = true) {
   currentMemoryNoteProposal = null;
   $('noteProposalCard').hidden = true;
   $('noteProposalMarkdown').textContent = '';
+  setConversationInputLocked(false);
+  setMemorySelection(proposal ? proposal.memory_id : selectedMemoryId, false);
   if (proposal && notifyServer !== false) {
     await fetch(
       `/api/memory-note-proposals/${encodeURIComponent(proposal.proposal_id)}` +
@@ -931,6 +1141,8 @@ async function confirmMemoryNoteProposal() {
     const result = await r.json();
     if (!r.ok) { alert(result.detail || '笔记写入失败'); return; }
     await cancelMemoryNoteProposal(false);
+    setConversationInputLocked(false);
+    setMemorySelection(proposal.memory_id, false);
     appendBubble('assistant', `已写入 ${result.wikilink}（${result.target_path}）`);
   } catch (e) {
     alert('笔记写入请求失败，请重试');
@@ -1163,9 +1375,28 @@ async function confirmMemoryImport() {
 // ------------------------------------------------------------------
 // 发送消息 → 用户对齐
 // ------------------------------------------------------------------
+function productHelpResponse(text) {
+  const normalized = String(text || '').trim().replace(/[!！。.？?]+$/g, '').toLowerCase();
+  const greeting = /^(你好|您好|嗨|哈喽|hello|hi|hey)$/.test(normalized);
+  const capability = /^(你是谁|你是做什么的|你能做什么|这是做什么的|这是什么)$/.test(normalized) ||
+    /^(who are you|what (can|do) you do|what is this)$/.test(normalized);
+  if (!greeting && !capability) return null;
+  return '我是 PaperPilot，一个深度研究与长期知识库助手。选择或新建一个 Memory 后，输入明确的研究主题；我会先生成可编辑的研究方案，经你确认后再检索、写报告并保存证据。已有资料的问题可切换到“Memory 问答”。';
+}
+
 async function sendMessage() {
   if ($('interactionMode').value === 'memory-answer') {
     await sendMemoryQuestion();
+    return;
+  }
+  const input = $('msgInput');
+  const text = input.value.trim();
+  if (!text || sendLock) return;
+  const help = productHelpResponse(text);
+  if (help) {
+    input.value = '';
+    appendBubble('user', text);
+    appendBubble('assistant', help);
     return;
   }
   if (!selectedMemoryId) {
@@ -1177,9 +1408,6 @@ async function sendMessage() {
     appendBubble('assistant', '既有 Memory 为只读；请先显式迁移再发起研究。');
     return;
   }
-  const input = $('msgInput');
-  const text = input.value.trim();
-  if (!text || sendLock) return;
   input.value = '';
   appendBubble('user', text);
 
@@ -1322,6 +1550,7 @@ async function startResearch() {
     task_id: data.task_id, session_id: currentSessionId,
     memory_id: data.memory_id || null, status: data.status,
   };
+  setConversationInputLocked(true);
   setMemorySelection(runningTask.memory_id, true);
   openEventStream(data.task_id);
 }
@@ -1345,10 +1574,12 @@ function openEventStream(task_id) {
     if (completed) {
       eventSource.close(); eventSource = null;
       runningTask = null;
+      setConversationInputLocked(false);
       fetchResult(task_id);
     } else if (failed) {
       eventSource.close(); eventSource = null;
       runningTask = null;
+      setConversationInputLocked(false);
       setMemorySelection(selectedMemoryId, false);
     }
   };
@@ -1361,6 +1592,7 @@ function openEventStream(task_id) {
 }
 
 function appendProgress(ev) {
+  hideEmptyState();
   const div = document.createElement('div');
   div.className = 'progress-line ' + (ev.type || '');
   const t = new Date().toLocaleTimeString();
@@ -1408,6 +1640,7 @@ async function fetchResult(task_id) {
     return;
   }
   currentReportData = data;
+  setConversationInputLocked(false);
   setMemorySelection(data.memory_id, false);
   renderReportCard(data);
   loadSessions();
@@ -1425,33 +1658,72 @@ async function loadReportData(sid, reportMsg) {
     evidence: ev.evidence || [],
     session_id: sid,
     memory_id: reportMsg.memory_id || null,
+    research_status: reportMsg.research_status || null,
+    termination_reason: reportMsg.termination_reason || null,
+    output_status: reportMsg.output_status || null,
+    stop_reason: reportMsg.stop_reason || null,
   };
 }
 
 function renderReportCard(data) {
+  hideEmptyState();
   // 移除旧的报告卡片
   const oldCards = document.querySelectorAll('.report-card');
   oldCards.forEach(c => c.remove());
 
   const card = document.createElement('div');
   card.className = 'report-card';
+  const hasStatus = Boolean(data.research_status);
+  const partial = hasStatus && (
+    data.research_status !== 'completed' ||
+    data.termination_reason === 'budget_forced' ||
+    (data.output_status && data.output_status !== 'valid')
+  );
+  const statusLabel = !hasStatus ? '历史报告' : partial ? '部分完成' : '完整完成';
+  const terminationLabels = {
+    budget_forced: '达到预算边界',
+    coverage_complete: '覆盖完成',
+    evidence_exhausted: '可用证据已穷尽',
+    saturated: '研究已饱和',
+    tool_failure: '外部工具不可用',
+    user_cancelled: '用户取消',
+  };
+  const stopLabels = {
+    token_budget_exhausted: 'Token 预算耗尽',
+    time_budget_exhausted: '时间预算耗尽',
+  };
+  const stopLabel = [
+    terminationLabels[data.termination_reason] || data.termination_reason,
+    stopLabels[data.stop_reason] || data.stop_reason,
+  ].filter(Boolean).join(' · ');
   card.innerHTML = `
-    <div class="tabs">
-      <div class="tab active" data-tab="report" onclick="switchTab(this,'report')">报告</div>
-      <div class="tab" data-tab="evidence" onclick="switchTab(this,'evidence')">证据索引</div>
+    <div class="rc-head">
+      <span class="report-status${partial ? ' partial' : ''}">${statusLabel}</span>
+      <span class="report-stop"></span>
     </div>
-    <div class="tabbody active" data-name="report"><div class="rc-report"></div></div>
-    <div class="tabbody" data-name="evidence"><div class="rc-evidence"></div></div>`;
+    <div class="tabs" role="tablist" aria-label="报告内容">
+      <button class="tab active" type="button" role="tab" aria-selected="true" data-tab="report" onclick="switchTab(this,'report')">报告</button>
+      <button class="tab" type="button" role="tab" aria-selected="false" data-tab="evidence" onclick="switchTab(this,'evidence')">证据索引</button>
+    </div>
+    <div class="tabbody active" role="tabpanel" data-name="report"><div class="rc-report"></div></div>
+    <div class="tabbody" role="tabpanel" data-name="evidence"><div class="rc-evidence"></div></div>`;
   $('messages').appendChild(card);
 
-  card.querySelector('.rc-report').innerHTML = marked.parse(data.report_md || '（无报告内容）');
+  card.querySelector('.report-stop').textContent = stopLabel;
+  card.querySelector('.rc-report').innerHTML = renderSafeMarkdown(
+    stripFrontmatter(data.report_md || '（无报告内容）')
+  );
   renderEvidenceTable(card.querySelector('.rc-evidence'), data.evidence || [], data.report_md || '');
   scrollToBottom();
 }
 
 function switchTab(tabEl, name) {
   const card = tabEl.closest('.report-card');
-  card.querySelectorAll('.tab').forEach(t => t.classList.toggle('active', t.dataset.tab === name));
+  card.querySelectorAll('.tab').forEach(t => {
+    const selected = t.dataset.tab === name;
+    t.classList.toggle('active', selected);
+    t.setAttribute('aria-selected', String(selected));
+  });
   card.querySelectorAll('.tabbody').forEach(t => t.classList.toggle('active', t.dataset.name === name));
 }
 
@@ -1460,7 +1732,7 @@ function renderEvidenceTable(container, evidence, reportMd) {
   let html = '';
   for (const ev of evidence) {
     if (ev.markdown) {
-      html += `<div class="evidence-note"><small>${escapeHtml(ev.path||'')}</small>${marked.parse(ev.markdown)}</div>`;
+      html += `<div class="evidence-note"><small>${escapeHtml(ev.path||'')}</small>${renderSafeMarkdown(stripFrontmatter(ev.markdown))}</div>`;
     } else {
       html += `<div class="evidence-note"><b>${escapeHtml(ev.finding||ev.evidence_id||'Evidence')}</b>` +
         `<div>${escapeHtml(ev.title||'')} · ${escapeHtml(ev.source_ref||'')}</div>` +
@@ -1475,6 +1747,14 @@ function renderEvidenceTable(container, evidence, reportMd) {
 // ------------------------------------------------------------------
 function escapeHtml(s) {
   return String(s).replace(/[&<>"']/g, c => ({ '&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;' }[c]));
+}
+
+function stripFrontmatter(markdown) {
+  const value = String(markdown || '');
+  const lines = value.split(/\r?\n/);
+  if (lines[0] !== '---') return value;
+  const closing = lines.indexOf('---', 1);
+  return closing < 0 ? value : lines.slice(closing + 1).join('\n').trimStart();
 }
 
 function renderSafeMarkdown(markdown) {
@@ -1522,6 +1802,12 @@ let sendLock = false;
 
 // 初始化
 $('newSessionBtn').onclick = newSession;
+$('cancelCreateMemoryBtn').addEventListener('click', cancelCreateMemory);
+$('confirmCreateMemoryBtn').addEventListener('click', confirmCreateMemory);
+$('memoryCreateTitle').addEventListener('keydown', event => {
+  if (event.key === 'Enter') confirmCreateMemory();
+  if (event.key === 'Escape') cancelCreateMemory();
+});
 $('cancelNoteProposalBtn').addEventListener('click', cancelMemoryNoteProposal);
 $('confirmNoteProposalBtn').addEventListener('click', confirmMemoryNoteProposal);
 $('importMemoryBtn').addEventListener('click', openMemoryImport);

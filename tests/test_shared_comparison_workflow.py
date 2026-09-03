@@ -8,6 +8,7 @@ import pytest
 from langgraph.checkpoint.memory import InMemorySaver
 
 from src.research.memory import MarkdownMemoryStore
+from src.research.memory_dialogue import answer_memory as answer_from_memory
 from src.research.models import (
     AgentLimits,
     EvidenceItem,
@@ -17,7 +18,9 @@ from src.research.models import (
     ResearchStatus,
     TerminationReason,
 )
+from src.research.obsidian import build_obsidian_open_uri
 from src.research.research_blackboard import ResearchBlackboard
+from src.research.retrieval import MarkdownMemoryIndex
 from src.research.v2_contracts import (
     CoreQuestion,
     ResearchArchitecture,
@@ -105,6 +108,15 @@ class SharedPolicy:
                 "report_outline": ["Result"],
                 "source_guidance": ["Use primary sources"],
                 "work_hints": [],
+            })}
+        if "Answer only from the supplied selected-Memory notes" in system:
+            context = json.loads(content.split("MEMORY_CONTEXT_JSON:\n", 1)[1])
+            return {"content": json.dumps({
+                "claims": [{
+                    "text": "The stored research reports a measured result of 42 percent.",
+                    "source_paths": [context["hits"][0]["path"]],
+                }],
+                "insufficient_evidence": [],
             })}
         if "independent evidence-support verifier" in system:
             payload = json.loads(content)
@@ -261,10 +273,13 @@ async def test_legacy_and_supervisor_share_plan_composer_and_citation_path(tmp_p
 async def test_dynamic_legacy_plan_uses_root_agent_report_path(tmp_path) -> None:
     identity = ExecutionIdentity("root-dynamic-structured", None, "root-dynamic-structured", 0)
     policy = SharedPolicy()
+    memory_id = "M-current-baseline"
+    store = MarkdownMemoryStore(tmp_path / "dynamic" / "vault")
+    store.create_memory("Current baseline", memory_id)
     graph = build_research_workflow(
         policy,
         (FixedAcquireTool(),),
-        MarkdownMemoryStore(tmp_path / "dynamic" / "vault"),
+        store,
         checkpointer=InMemorySaver(),
         research_architecture=ResearchArchitecture.LEGACY,
         research_blackboard=ResearchBlackboard(
@@ -278,6 +293,7 @@ async def test_dynamic_legacy_plan_uses_root_agent_report_path(tmp_path) -> None
             "What is the official measured result?",
             identity,
             AgentLimits(max_elapsed_seconds=1200.0),
+            memory_id=memory_id,
         ),
         config=config,
     )
@@ -292,6 +308,7 @@ async def test_dynamic_legacy_plan_uses_root_agent_report_path(tmp_path) -> None
     assert final["workflow_result"].structured_report is True
     assert final["workflow_result"].root_agent_report is True
     assert final["workflow_result"].shared_comparison is False
+    assert final["workflow_result"].memory_id == memory_id
     assert final["result"].report_markdown
     assert "# Root report" in final["result"].report_markdown
     assert "## References" in final["report_markdown"]
@@ -304,10 +321,58 @@ async def test_dynamic_legacy_plan_uses_root_agent_report_path(tmp_path) -> None
         "evidence_lineage_count"
     ] == 0
 
+    manifest = final["workflow_result"].memory_manifest
+    assert manifest.report_path.startswith(f"Memories/{memory_id}/reports/")
+    assert len(manifest.evidence_paths) == len(manifest.source_paths) == 1
+    assert f"[[{manifest.evidence_paths[0][:-3]}|Evidence 1]]" in final["report_markdown"]
+    evidence_markdown = store.read_text(manifest.evidence_paths[0])
+    assert f"[[{manifest.source_paths[0][:-3]}|" in evidence_markdown
+    assert build_obsidian_open_uri(store.root, manifest.report_path).startswith(
+        "obsidian://open?"
+    )
+
+    hits = MarkdownMemoryIndex(store).search(memory_id, "measured result 42 percent")
+    assert hits
+    answer = await answer_from_memory(
+        store,
+        policy,
+        memory_id,
+        "What measured result is stored?",
+    )
+    assert answer.citations
+    assert answer.citations[0].relative_path.startswith(f"Memories/{memory_id}/")
+
+    continued_identity = ExecutionIdentity(
+        "root-dynamic-continued",
+        None,
+        "root-dynamic-continued",
+        0,
+    )
+    continued_config = {
+        "configurable": {"thread_id": continued_identity.thread_id}
+    }
+    continued = await graph.ainvoke(
+        create_research_workflow_state(
+            "Continue researching the official measured result.",
+            continued_identity,
+            AgentLimits(max_elapsed_seconds=1200.0),
+            memory_id=memory_id,
+        ),
+        config=continued_config,
+    )
+    assert continued["retrieved_memory"]
+    continued_final = await resume_research_workflow(
+        graph,
+        thread_id=continued_identity.thread_id,
+        action="confirm",
+    )
+    assert continued_final["workflow_result"].memory_id == memory_id
+    assert continued_final["workflow_result"].memory_manifest.report_path != manifest.report_path
+
 
 def test_root_report_drops_only_unknown_evidence_markers() -> None:
     item = EvidenceItem(
-        evidence_id="known-id",
+        evidence_id="evidence-known-id",
         finding="The official measured result is 42 percent.",
         source_type="primary",
         title="Official report",
@@ -315,13 +380,15 @@ def test_root_report_drops_only_unknown_evidence_markers() -> None:
         locator="section:result",
     )
     markdown = (
-        "Supported [[EVIDENCE:known-id]]. "
+        "Supported [[EVIDENCE:evidence-known-id]]. "
+        "Bare hash [[EVIDENCE:known-id]]. "
         "Uncited statement [[EVIDENCE:missing-id]]."
     )
 
     cleaned = _drop_unknown_root_evidence_markers(markdown, (item,))
 
-    assert "[[EVIDENCE:known-id]]" in cleaned
+    assert cleaned.count("[[EVIDENCE:evidence-known-id]]") == 2
+    assert "[[EVIDENCE:known-id]]" not in cleaned
     assert "missing-id" not in cleaned
     assert "Uncited statement" in cleaned
 

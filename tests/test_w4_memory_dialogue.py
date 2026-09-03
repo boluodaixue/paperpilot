@@ -194,9 +194,9 @@ async def test_no_hits_returns_insufficient_without_policy_or_writes(
 
     assert answer.citations == ()
     assert answer.insufficient_evidence == (
-        "No relevant notes were found in the selected Memory.",
+        "当前 Memory 中没有找到与问题相关的内容。",
     )
-    assert "Insufficient evidence" in answer.markdown
+    assert "证据不足" in answer.markdown
     assert policy.calls == 0
     assert _vault_files(tmp_path) == before
 

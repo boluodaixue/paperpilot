@@ -15,7 +15,7 @@ from enum import Enum
 from pathlib import PurePosixPath
 from typing import Any, Literal, Mapping
 
-from .memory import MarkdownMemoryStore
+from .memory import MarkdownMemoryStore, update_memory_home_with_report
 from .models import (
     ExecutionIdentity,
     MemoryDescriptor,
@@ -39,6 +39,7 @@ from .report_review import validate_revised_report
 from .vault import (
     LEGACY_MEMORY_ID,
     build_attachment_wikilink,
+    build_wikilink,
     memory_relative_path,
     validate_memory_descriptor,
     validate_memory_id,
@@ -344,6 +345,20 @@ def _snapshot_markdown(
     return _file(path, desired_bytes, expected_mode="hash", expected_hash=current_hash)
 
 
+def _immutable_markdown(
+    memory_store: MarkdownMemoryStore,
+    path: str,
+    desired: str,
+) -> dict[str, object]:
+    """Create generated knowledge once and preserve later Obsidian edits."""
+
+    try:
+        existing = memory_store.read_bytes(path)
+    except FileNotFoundError:
+        return _file(path, desired, expected_mode="absent")
+    return _file(path, existing, expected_mode="reuse")
+
+
 def build_create_memory_plan(
     *,
     memory_id: str,
@@ -440,7 +455,7 @@ def build_research_bundle_plan(
         path = f"{prefix}sources/{source_note}.md"
         source_paths.append(path)
         targets.append(
-            _snapshot_markdown(
+            _immutable_markdown(
                 memory_store,
                 path,
                 render_source_note(
@@ -458,7 +473,7 @@ def build_research_bundle_plan(
         path = f"{prefix}evidence/{note_id}.md"
         evidence_paths.append(path)
         targets.append(
-            _snapshot_markdown(
+            _immutable_markdown(
                 memory_store,
                 path,
                 render_evidence_note(
@@ -496,6 +511,24 @@ def build_research_bundle_plan(
             report_markdown,
         )
     )
+    home_path, home_markdown, home_hash = memory_store.memory_home_snapshot(memory_id)
+    report_wikilink = build_wikilink(report_path)
+    if report_wikilink in home_markdown:
+        targets.append(_file(home_path, home_markdown, expected_mode="reuse"))
+    else:
+        updated_home = update_memory_home_with_report(
+            home_markdown,
+            report_wikilink,
+            created_at,
+        )
+        targets.append(
+            _file(
+                home_path,
+                updated_home,
+                expected_mode="hash",
+                expected_hash=home_hash,
+            )
+        )
     idempotency_key = f"research-bundle:{memory_id}:{identity.root_thread_id}"
     command = build_file_bundle_command(
         operation_type="research_bundle",

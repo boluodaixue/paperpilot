@@ -17,7 +17,6 @@ from dataclasses import asdict
 from pathlib import Path
 from typing import Any
 
-from langgraph.checkpoint.memory import InMemorySaver
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 if str(PROJECT_ROOT) not in sys.path:
@@ -29,6 +28,7 @@ from evaluation.benchmarks.research_bench import ResearchBench
 from evaluation.judge import LLMJudge
 from evaluation.report import EvaluationReport
 from src.models.model_router import ModelRouter
+from src.research.checkpoint_serde import paperpilot_in_memory_saver
 from src.research.models import ResearchWorkflowResult
 from src.research.runtime import (
     build_research_runtime,
@@ -148,9 +148,18 @@ def configured_token_budget(config: dict[str, Any]) -> int:
 
 
 def configured_elapsed_budget(config: dict[str, Any]) -> float:
-    """Resolve the per-question wall-clock budget recorded in evaluation output."""
+    """Resolve the per-question research wall-clock budget."""
     return float(
         config.get("research", {}).get("limits", {}).get("max_elapsed_seconds", 300.0)
+    )
+
+
+def configured_finalization_grace(config: dict[str, Any]) -> float:
+    """Resolve the Root-only time added after the research deadline."""
+    return float(
+        config.get("research", {})
+        .get("limits", {})
+        .get("root_finalization_grace_seconds", 0.0)
     )
 
 
@@ -207,7 +216,10 @@ async def evaluation_runtime(
         ) as runtime:
             yield runtime
         return
-    runtime = build_research_runtime(config=config, checkpointer=InMemorySaver())
+    runtime = build_research_runtime(
+        config=config,
+        checkpointer=paperpilot_in_memory_saver(),
+    )
     try:
         yield runtime
     finally:
@@ -526,6 +538,7 @@ def researchbench_summary(
     local_budget: int,
     token_budget: int,
     elapsed_budget: float = 300.0,
+    finalization_grace: float = 0.0,
 ) -> dict[str, Any]:
     """Aggregate comparison-ready ResearchBench metrics without inventing data."""
     details = report.details
@@ -544,6 +557,7 @@ def researchbench_summary(
         "local_tool_budget": local_budget,
         "token_budget": token_budget,
         "elapsed_budget_seconds": elapsed_budget,
+        "root_finalization_grace_seconds": finalization_grace,
         "average_composite": sum(scores) / len(scores) if scores else 0.0,
         "average_rule_composite": sum(scores) / len(scores) if scores else 0.0,
         "average_judge": (
@@ -627,6 +641,7 @@ async def _evaluate_research_bench(
     local_budget = configured_local_tool_budget(config)
     token_budget = configured_token_budget(config)
     elapsed_budget = configured_elapsed_budget(config)
+    finalization_grace = configured_finalization_grace(config)
     judge = (
         LLMJudge(
             backend=judge_backend(config),
@@ -660,6 +675,7 @@ async def _evaluate_research_bench(
                 detail["local_tool_budget"] = local_budget
                 detail["token_budget"] = token_budget
                 detail["elapsed_budget_seconds"] = elapsed_budget
+                detail["root_finalization_grace_seconds"] = finalization_grace
                 detail["checkpoint_thread_id"] = thread_id
                 detail["checkpoint_db_path"] = checkpoint_db_path
                 if judge is not None:
@@ -689,6 +705,7 @@ async def _evaluate_research_bench(
                         "local_tool_budget": local_budget,
                         "token_budget": token_budget,
                         "elapsed_budget_seconds": elapsed_budget,
+                        "root_finalization_grace_seconds": finalization_grace,
                         "research_elapsed_seconds": research_elapsed,
                         "rule_evaluation_elapsed_seconds": rule_elapsed,
                         "judge_elapsed_seconds": judge_elapsed,
@@ -703,6 +720,7 @@ async def _evaluate_research_bench(
                         local_budget=local_budget,
                         token_budget=token_budget,
                         elapsed_budget=elapsed_budget,
+                        finalization_grace=finalization_grace,
                     )
                 )
                 report.save(
@@ -717,6 +735,7 @@ async def _evaluate_research_bench(
             local_budget=local_budget,
             token_budget=token_budget,
             elapsed_budget=elapsed_budget,
+            finalization_grace=finalization_grace,
         )
     )
     return report
@@ -760,7 +779,10 @@ async def _evaluate_hotpotqa(
     local_budget = configured_local_tool_budget(config)
     token_budget = configured_token_budget(config)
     predictions: list[dict[str, Any]] = []
-    runtime = build_research_runtime(config=config, checkpointer=InMemorySaver())
+    runtime = build_research_runtime(
+        config=config,
+        checkpointer=paperpilot_in_memory_saver(),
+    )
     try:
         for index, question in enumerate(questions, 1):
             query = question["query"]

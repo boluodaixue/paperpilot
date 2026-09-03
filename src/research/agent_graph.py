@@ -287,6 +287,12 @@ _CHILD_FINALIZATION_TOKEN_MINIMUM = 8000
 _FINALIZATION_TOKEN_RESERVE_PERCENT = 15
 _FINALIZATION_COMPLEXITY_TOKEN_CAP = 20000
 _FINALIZATION_TIME_RESERVE_FRACTION = 0.1
+_MIN_FORK_RESEARCH_TOOL_CALLS = 1
+_MIN_FORK_RESEARCH_TOKEN_BUDGET = (
+    _ASSESSMENT_INPUT_TOKEN_RESERVE
+    + _ASSESSMENT_OUTPUT_TOKEN_RESERVE
+    + _FINALIZATION_OUTPUT_TOKEN_RESERVE
+)
 
 
 def _event(
@@ -305,11 +311,152 @@ def _remaining_seconds(state: ResearchAgentState) -> float:
     return state["deadline_at"] - time.time()
 
 
+def _remaining_finalization_seconds(state: ResearchAgentState) -> float:
+    """Give only the Root an additional post-research synthesis window."""
+    grace = (
+        state["limits"].root_finalization_grace_seconds
+        if state["identity"].depth == 0
+        else 0.0
+    )
+    return _remaining_seconds(state) + grace
+
+
 def _remaining_research_seconds(state: ResearchAgentState) -> float:
-    """Leave each recursive level time to synthesize and return upstream."""
+    """Let Root use the full research budget while descendants return earlier."""
     per_level_reserve = state["limits"].max_elapsed_seconds * _FINALIZATION_TIME_RESERVE_FRACTION
-    reserve = per_level_reserve * (state["identity"].depth + 1)
+    # Preserve the legacy in-budget Root reserve when no separate grace window
+    # is configured.  An explicit grace window makes the research deadline a
+    # true research-only budget instead of silently shortening it.
+    root_reserve = (
+        0.0
+        if state["limits"].root_finalization_grace_seconds > 0
+        else per_level_reserve
+    )
+    reserve = root_reserve + per_level_reserve * state["identity"].depth
     return _remaining_seconds(state) - reserve
+
+
+def _child_research_seconds_after_fork(state: ResearchAgentState) -> float:
+    """Return research time a newly dispatched child would actually receive."""
+
+    per_level_reserve = (
+        state["limits"].max_elapsed_seconds
+        * _FINALIZATION_TIME_RESERVE_FRACTION
+    )
+    root_reserve = (
+        0.0
+        if state["limits"].root_finalization_grace_seconds > 0
+        else per_level_reserve
+    )
+    child_depth = state["identity"].depth + 1
+    return _remaining_seconds(state) - root_reserve - per_level_reserve * child_depth
+
+
+def _minimum_fork_token_budget(fork_settings: HomogeneousForkConfig) -> int:
+    """Keep enough tokens for control, acquisition/reading, and a scoped memo."""
+
+    if not fork_settings.budget_leases_enabled:
+        return _MIN_FORK_RESEARCH_TOKEN_BUDGET
+    return max(_MIN_FORK_RESEARCH_TOKEN_BUDGET, fork_settings.initial_child_lease_tokens)
+
+
+def _fork_resource_allocations(
+    state: ResearchAgentState,
+    candidates: list[ForkCandidate],
+    *,
+    fork_settings: HomogeneousForkConfig,
+    check_token_budget: bool,
+) -> tuple[list[ForkCandidate], list[int], list[int], list[ForkCandidate]]:
+    """Select the largest stable prefix able to complete one research loop.
+
+    The normal equal-split allocation is preserved whenever it is sufficient.
+    When it is not, lower-priority candidates stay with the current Agent rather
+    than becoming zero-output child Assignments.
+    """
+
+    if not candidates:
+        return [], [], [], []
+    minimum_seconds = (
+        state["limits"].max_elapsed_seconds * _FINALIZATION_TIME_RESERVE_FRACTION
+    )
+    if _child_research_seconds_after_fork(state) < minimum_seconds:
+        return [], [], [], list(candidates)
+
+    delegable_tokens = _delegable_token_budget(state)
+    minimum_tokens = _minimum_fork_token_budget(fork_settings)
+    for count in range(len(candidates), 0, -1):
+        selected = candidates[:count]
+        tool_budgets = _split_budget(
+            _delegable_tool_budget(state, count),
+            count,
+        )
+        if any(
+            allocated
+            < max(
+                _MIN_FORK_RESEARCH_TOOL_CALLS,
+                candidate.estimated_tool_calls,
+            )
+            for candidate, allocated in zip(selected, tool_budgets)
+        ):
+            continue
+        token_budgets = (
+            _split_budget(delegable_tokens, count)
+            if check_token_budget
+            else [minimum_tokens] * count
+        )
+        if check_token_budget and any(
+            allocated < minimum_tokens for allocated in token_budgets
+        ):
+            continue
+        return (
+            selected,
+            tool_budgets,
+            token_budgets,
+            candidates[count:],
+        )
+    return [], [], [], list(candidates)
+
+
+def _fundable_child_count(
+    state: ResearchAgentState,
+    max_children: int,
+    *,
+    fork_settings: HomogeneousForkConfig,
+    available_lease_tokens: int | None = None,
+) -> int:
+    """Return how many minimally complete children can be funded right now."""
+
+    if max_children <= 0:
+        return 0
+    minimum_seconds = (
+        state["limits"].max_elapsed_seconds * _FINALIZATION_TIME_RESERVE_FRACTION
+    )
+    if _child_research_seconds_after_fork(state) < minimum_seconds:
+        return 0
+    token_pool = (
+        max(0, int(available_lease_tokens or 0))
+        if fork_settings.budget_leases_enabled
+        else _delegable_token_budget(state)
+    )
+    token_capacity = token_pool // _minimum_fork_token_budget(fork_settings)
+    for count in range(min(max_children, token_capacity), 0, -1):
+        tool_budgets = _split_budget(
+            _delegable_tool_budget(state, count),
+            count,
+        )
+        if all(item >= _MIN_FORK_RESEARCH_TOOL_CALLS for item in tool_budgets):
+            return count
+    return 0
+
+
+def _remaining_child_slots(state: ResearchAgentState) -> int:
+    """Count only real direct Child results against this Agent's limit."""
+
+    return max(
+        0,
+        state["limits"].effective_max_children_per_agent
+        - len(state.get("child_results", [])),
+    )
 
 
 def _finalization_token_reserve(state: ResearchAgentState) -> int:
@@ -469,8 +616,9 @@ def _system_prompt(identity: ExecutionIdentity, limits: AgentLimits) -> str:
         "When final synthesis is requested, return only the complete Markdown "
         "report, not JSON and not a fenced code block. Synthesize the Child "
         "research memos, preserve important gaps, and cite only known sources "
-        "with [[EVIDENCE:evidence-id]] markers. Do not write a References section; "
-        "the runtime renders it."
+        "with [[EVIDENCE:evidence-id]] markers. Copy every complete Evidence ID "
+        "exactly as supplied, including the evidence- prefix; never shorten it "
+        "to a bare hash. Do not write a References section; the runtime renders it."
         if identity.depth == 0
         else
         "When the task is complete, stop calling tools and return one JSON object:\n"
@@ -484,8 +632,9 @@ def _system_prompt(identity: ExecutionIdentity, limits: AgentLimits) -> str:
         "}\n"
         "Write a concise report only about your assigned direction in "
         "research_memo. Select the material you judge useful and cite it with "
-        "[[EVIDENCE:evidence-id]] markers. Do not attempt the global report or "
-        "wrap the final JSON in commentary."
+        "[[EVIDENCE:evidence-id]] markers. Copy every complete Evidence ID exactly "
+        "as supplied, including the evidence- prefix; never shorten it to a bare "
+        "hash. Do not attempt the global report or wrap the final JSON in commentary."
     )
     return f"""You are a PaperPilot Research Agent at depth {identity.depth}.
 Every Research Agent uses this same research loop. {fork_instruction}
@@ -875,13 +1024,16 @@ def _bounded_finalization_messages(
         "fenced code block. Use the Child research_memo fields as the primary "
         "research input. Resolve overlaps, cover every required direction, "
         "disclose material gaps, and reuse only the supplied "
-        "[[EVIDENCE:id]] markers. Do not write a References section."
+        "[[EVIDENCE:id]] markers. Copy every complete ID exactly, including its "
+        "evidence- prefix; never use only the hash suffix. Do not write a "
+        "References section."
         if state["identity"].depth == 0
         else
         "Return one JSON object with status, summary, findings, unresolved, a "
         "concise research_memo about only this assigned direction, and an empty "
         "report_markdown. In the memo, choose and cite the Evidence you judge "
-        "useful with supplied [[EVIDENCE:id]] markers; disclose remaining gaps."
+        "useful with supplied [[EVIDENCE:id]] markers; copy every complete ID "
+        "exactly, including its evidence- prefix, and disclose remaining gaps."
     )
     return [
         *identity_messages,
@@ -1879,7 +2031,11 @@ def build_research_agent_graph(
                 "stop_reason": "max_iterations_exhausted",
                 "termination_reason": TerminationReason.BUDGET_FORCED,
             }
-        available_seconds = _remaining_seconds(state) if finalization_requested else _remaining_research_seconds(state)
+        available_seconds = (
+            _remaining_finalization_seconds(state)
+            if finalization_requested
+            else _remaining_research_seconds(state)
+        )
         if available_seconds <= 0:
             update: dict[str, Any] = {
                 "pending_tool_calls": [],
@@ -1963,7 +2119,11 @@ def build_research_agent_graph(
                     error=str(exc),
                 )
         remaining_tokens = max(0, remaining_tokens - compaction_token_charge)
-        available_seconds = _remaining_seconds(state) if finalization_requested else _remaining_research_seconds(state)
+        available_seconds = (
+            _remaining_finalization_seconds(state)
+            if finalization_requested
+            else _remaining_research_seconds(state)
+        )
         board_view: dict[str, Any] = {}
         if coordination_board is not None and not finalization_requested:
             try:
@@ -2030,11 +2190,7 @@ def build_research_agent_graph(
             and allow_fork_tool
             and not finalization_requested
         ):
-            remaining_child_slots = max(
-                0,
-                state["limits"].effective_max_children_per_agent
-                - len(set(state["completed_fork_fingerprints"])),
-            )
+            remaining_child_slots = _remaining_child_slots(state)
             remaining_total_slots = (
                 max(
                     0,
@@ -2047,8 +2203,37 @@ def build_research_agent_graph(
                     state["subtree_thread_budget"] - state["total_threads_used"],
                 )
             )
+            available_lease_tokens: int | None = None
+            if fork_settings.budget_leases_enabled and coordination_board is not None:
+                try:
+                    available_lease_tokens = coordination_board.metrics(
+                        state["identity"].root_thread_id
+                    ).get("budget_available_tokens", 0)
+                except Exception:
+                    available_lease_tokens = 0
+            fundable_children = _fundable_child_count(
+                state,
+                min(remaining_child_slots, remaining_total_slots),
+                fork_settings=fork_settings,
+                available_lease_tokens=available_lease_tokens,
+            )
+            displayed_delegable_tokens = (
+                available_lease_tokens
+                if fork_settings.budget_leases_enabled
+                else _delegable_token_budget(state)
+            )
             has_research_basis = _has_owned_research_basis(state, board_view)
-            decision: ResearchControlDecision | None = None
+            decision: ResearchControlDecision | None = (
+                ResearchControlDecision(
+                    ResearchControlAction.LOCAL_RESEARCH,
+                    "No complete Child research loop can be funded from the current "
+                    "time, token, tool, and Agent capacity; retain the work locally.",
+                    _owned_requirement_ids(state),
+                    (),
+                )
+                if fundable_children <= 0
+                else None
+            )
             root_baseline_decision: ResearchControlDecision | None = None
             if (
                 state["identity"].depth == 0
@@ -2058,7 +2243,7 @@ def build_research_agent_graph(
             ):
                 root_baseline_decision = initial_root_requirement_decision(
                     state["research_requirements"],
-                    max_children=remaining_child_slots,
+                    max_children=fundable_children,
                     remaining_total_agent_slots=remaining_total_slots,
                 )
             if decision is None:
@@ -2093,7 +2278,15 @@ def build_research_agent_graph(
                         fork_settings.reconsider_after_local_rounds
                     ),
                     remaining_total_agent_slots=remaining_total_slots,
-                    delegable_token_budget=_delegable_token_budget(state),
+                    delegable_token_budget=displayed_delegable_tokens,
+                    delegable_tool_budget=_delegable_tool_budget(
+                        state,
+                        max(1, fundable_children),
+                    ),
+                    minimum_child_token_budget=_minimum_fork_token_budget(
+                        fork_settings
+                    ),
+                    fundable_child_count=fundable_children,
                     fork_evidence_basis=has_research_basis,
                 )
                 try:
@@ -2393,7 +2586,7 @@ def build_research_agent_graph(
                 while (
                     finish_reason == "length"
                     and output_tokens_used < fork_settings.root_final_output_token_budget
-                    and _remaining_seconds(state) > 0
+                    and _remaining_finalization_seconds(state) > 0
                 ):
                     remaining_output = (
                         fork_settings.root_final_output_token_budget
@@ -2427,7 +2620,7 @@ def build_research_agent_graph(
                     ]
                     next_response = await asyncio.wait_for(
                         call_policy(continuation_policy, continuation_messages, []),
-                        timeout=max(0.001, _remaining_seconds(state)),
+                        timeout=max(0.001, _remaining_finalization_seconds(state)),
                     )
                     next_content = str(next_response.get("content") or "").strip()
                     if not next_content:
@@ -3694,8 +3887,7 @@ def build_research_agent_graph(
         remaining_children = max(
             0,
             min(
-                state["limits"].effective_max_children_per_agent
-                - len(set(state["completed_fork_fingerprints"])),
+                _remaining_child_slots(state),
                 remaining_thread_slots,
             ),
         )
@@ -3719,9 +3911,67 @@ def build_research_agent_graph(
         )
         if not candidates:
             rejected.append("fork request contained no valid candidates")
-        if _remaining_seconds(state) <= 0:
-            rejected.extend(f"{candidate.objective}: time budget exhausted" for candidate in accepted)
-            accepted = []
+
+        accepted, _, token_budgets, resource_rejected = _fork_resource_allocations(
+            state,
+            accepted,
+            fork_settings=fork_settings,
+            check_token_budget=not fork_settings.budget_leases_enabled,
+        )
+        for candidate in resource_rejected:
+            rejected.append(
+                f"{candidate.objective}: resource preflight failed; the allocated "
+                "time/token/tool budget cannot complete control -> search/read -> "
+                "memo, so retain this task locally"
+            )
+            terminal_rejected_fingerprints.append(candidate_fingerprint(candidate))
+
+        if fork_settings.budget_leases_enabled and coordination_board is not None:
+            funded_candidates: list[ForkCandidate] = []
+            funded_token_budgets: list[int] = []
+            minimum_tokens = _minimum_fork_token_budget(fork_settings)
+            for candidate in accepted:
+                child_identity = _child_identity(state["identity"], candidate)
+                try:
+                    granted = coordination_board.grant_budget_lease(
+                        state["identity"].root_thread_id,
+                        thread_id=child_identity.thread_id,
+                        parent_thread_id=state["identity"].thread_id,
+                        requested_tokens=fork_settings.initial_child_lease_tokens,
+                        max_tokens=fork_settings.max_child_lease_tokens,
+                    )
+                except Exception as exc:
+                    rejected.append(
+                        f"{candidate.objective}: child budget lease unavailable "
+                        f"({type(exc).__name__}); retain this task locally"
+                    )
+                    terminal_rejected_fingerprints.append(
+                        candidate_fingerprint(candidate)
+                    )
+                    continue
+                if granted < minimum_tokens:
+                    rejected.append(
+                        f"{candidate.objective}: resource preflight failed; child "
+                        f"token lease {granted} is below the {minimum_tokens} tokens "
+                        "needed for control -> search/read -> memo, so retain this "
+                        "task locally"
+                    )
+                    terminal_rejected_fingerprints.append(
+                        candidate_fingerprint(candidate)
+                    )
+                    try:
+                        coordination_board.release_budget_lease(
+                            state["identity"].root_thread_id,
+                            thread_id=child_identity.thread_id,
+                            used_tokens=0,
+                        )
+                    except Exception:
+                        pass
+                    continue
+                funded_candidates.append(candidate)
+                funded_token_budgets.append(granted)
+            accepted = funded_candidates
+            token_budgets = funded_token_budgets
 
         assignment_ids = [
             _candidate_assignment_id(_own_assignment_id(state), candidate)
@@ -3753,7 +4003,12 @@ def build_research_agent_graph(
             )
             scoped_candidates: list[ForkCandidate] = []
             scoped_assignment_ids: list[str] = []
-            for candidate, assignment_id in zip(accepted, assignment_ids):
+            scoped_token_budgets: list[int] = []
+            for candidate, assignment_id, token_budget in zip(
+                accepted,
+                assignment_ids,
+                token_budgets,
+            ):
                 claim = outcomes[assignment_id]
                 if not claim.acquired:
                     rejected.append(
@@ -3768,47 +4023,25 @@ def build_research_agent_graph(
                         terminal_rejected_fingerprints.append(
                             candidate_fingerprint(candidate)
                         )
+                    if fork_settings.budget_leases_enabled:
+                        child_identity = _child_identity(state["identity"], candidate)
+                        try:
+                            coordination_board.release_budget_lease(
+                                state["identity"].root_thread_id,
+                                thread_id=child_identity.thread_id,
+                                used_tokens=0,
+                            )
+                        except Exception:
+                            pass
                     continue
                 scoped_candidates.append(candidate)
                 scoped_assignment_ids.append(assignment_id)
+                scoped_token_budgets.append(token_budget)
             accepted = scoped_candidates
             assignment_ids = scoped_assignment_ids
+            token_budgets = scoped_token_budgets
 
-        if fork_settings.budget_leases_enabled and coordination_board is not None:
-            funded_candidates: list[ForkCandidate] = []
-            funded_assignment_ids: list[str] = []
-            token_budgets: list[int] = []
-            for candidate, assignment_id in zip(accepted, assignment_ids):
-                child_identity = _child_identity(state["identity"], candidate)
-                try:
-                    granted = coordination_board.grant_budget_lease(
-                        state["identity"].root_thread_id,
-                        thread_id=child_identity.thread_id,
-                        parent_thread_id=state["identity"].thread_id,
-                        requested_tokens=fork_settings.initial_child_lease_tokens,
-                        max_tokens=fork_settings.max_child_lease_tokens,
-                    )
-                except Exception as exc:
-                    rejected.append(
-                        f"{candidate.objective}: child budget lease unavailable "
-                        f"({type(exc).__name__})"
-                    )
-                    try:
-                        coordination_board.update_assignment_node(
-                            state["identity"].root_thread_id,
-                            assignment_id,
-                            owner_thread_id=child_identity.thread_id,
-                            status="blocked",
-                        )
-                    except Exception:
-                        pass
-                    continue
-                funded_candidates.append(candidate)
-                funded_assignment_ids.append(assignment_id)
-                token_budgets.append(granted)
-            accepted = funded_candidates
-            assignment_ids = funded_assignment_ids
-        else:
+        if not fork_settings.budget_leases_enabled:
             token_budgets = _split_budget(
                 _delegable_token_budget(state),
                 len(accepted),
@@ -4078,7 +4311,10 @@ def build_research_agent_graph(
                         for item in retry_messages
                     ) // 4,
                 )
-                if _remaining_seconds(state) > 0 and remaining_tokens > retry_input_tokens:
+                if (
+                    _remaining_finalization_seconds(state) > 0
+                    and remaining_tokens > retry_input_tokens
+                ):
                     try:
                         retry_policy = _root_final_policy_instance(
                             policy,
@@ -4086,7 +4322,7 @@ def build_research_agent_graph(
                         )
                         response = await asyncio.wait_for(
                             call_policy(retry_policy, retry_messages, []),
-                            timeout=max(0.001, _remaining_seconds(state)),
+                            timeout=max(0.001, _remaining_finalization_seconds(state)),
                         )
                         token_charge = _estimate_tokens(retry_messages, response)
                         draft = _root_markdown_draft(
@@ -4138,11 +4374,14 @@ def build_research_agent_graph(
                     1,
                     sum(len(str(item.get("content") or "")) for item in repair_messages) // 4,
                 )
-                if _remaining_seconds(state) > 0 and remaining_tokens > repair_input_tokens:
+                if (
+                    _remaining_finalization_seconds(state) > 0
+                    and remaining_tokens > repair_input_tokens
+                ):
                     try:
                         response = await asyncio.wait_for(
                             call_policy(policy, repair_messages, []),
-                            timeout=max(0.001, _remaining_seconds(state)),
+                            timeout=max(0.001, _remaining_finalization_seconds(state)),
                         )
                         token_charge = _estimate_tokens(repair_messages, response)
                         draft = _parse_final_draft(str(response.get("content") or ""))

@@ -52,7 +52,7 @@ root depth=0
     └── grandchild depth=2  # 禁止继续 fork
 ```
 
-fork 必须同时满足可并行、需要上下文隔离和预计存在足够工具链深度。全树共享最大线程、工具调用、时间、token 和重试预算；达到限制后返回明确 `stop_reason`。
+fork 必须同时满足可并行、需要上下文隔离和预计存在足够工具链深度。全树共享最大线程、工具调用、研究时间、token 和重试预算；达到限制后返回明确 `stop_reason`。Root 可通过 `root_finalization_grace_seconds` 获得研究截止后的独立最终合成窗口；该窗口不能用于检索、Fork 或 Child/Grandchild 工作。
 
 ### 研究充分性与终止机制
 
@@ -99,7 +99,7 @@ requirements、coverage、critical gaps、next actions、真实 strategy attempt
 5. 调用根 Research AgentGraph；
 6. 生成最终 Markdown 报告；
 7. 通过 Vault Writer 持久化；
-8. 可选执行一次默认关闭的 Red/Blue 报告复核。
+8. 结束并返回结果；Red/Blue 报告复核保持关闭，不接入当前产品基线。
 
 保存问答笔记、导入资料和 legacy 迁移也使用独立的可恢复 Workflow，并保持“预览—确认—写入”边界。
 

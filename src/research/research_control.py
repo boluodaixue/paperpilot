@@ -254,6 +254,9 @@ def research_control_prompt(
     reconsider_after_local_rounds: int = 2,
     remaining_total_agent_slots: int | None = None,
     delegable_token_budget: int | None = None,
+    delegable_tool_budget: int | None = None,
+    minimum_child_token_budget: int | None = None,
+    fundable_child_count: int | None = None,
     fork_evidence_basis: bool = False,
 ) -> list[dict[str, str]]:
     """Ask the same Agent to explicitly consider Fork before using tools."""
@@ -277,6 +280,9 @@ def research_control_prompt(
         "remaining_child_slots": max_children,
         "remaining_total_agent_slots": remaining_total_agent_slots,
         "delegable_token_budget": delegable_token_budget,
+        "delegable_tool_budget": delegable_tool_budget,
+        "minimum_child_token_budget": minimum_child_token_budget,
+        "fundable_child_count": fundable_child_count,
         "fork_evidence_basis": bool(fork_evidence_basis),
         "local_rounds_since_fork": local_rounds_since_fork,
         "fork_reconsideration_due": (
@@ -311,7 +317,11 @@ def research_control_prompt(
                 "Every Grandchild must stay within one Requirement and name a concrete "
                 "clause, jurisdiction, primary document, or tool chain with a precise "
                 "non-overlapping scope_signature. Never Fork when remaining "
-                "total-agent or delegable-token capacity is insufficient, and never "
+                "total-agent or delegable-token capacity is insufficient. When "
+                "fundable_child_count is 0, choose local_research and do not propose "
+                "Fork candidates. Otherwise never propose more candidates than "
+                "fundable_child_count, and keep their estimated tool calls within "
+                "the displayed delegable tool budget. Never "
                 "repeat a sibling's queued, active, or completed scope.\n\n"
                 "Fork retains exactly three approved strategies:\n"
                 f"- {ForkReason.PARALLEL.value}: at least two independent tasks can run in parallel;\n"

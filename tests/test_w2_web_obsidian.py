@@ -198,6 +198,9 @@ def test_static_page_uses_memory_selector_and_plain_obsidian_link_only():
     for required in (
         'id="memorySelect"',
         'id="createMemoryBtn"',
+        'id="memoryCreateCard"',
+        'id="memoryCreateTitle"',
+        'id="confirmCreateMemoryBtn"',
         'id="openObsidianBtn"',
         "fetch('/api/memories')",
         "memory_id: selectedMemoryId",
@@ -213,6 +216,7 @@ def test_static_page_uses_memory_selector_and_plain_obsidian_link_only():
         "/api/memories/tree",
         "/api/memories/notes",
         "save-note",
+        "prompt('新 Memory 标题')",
     ):
         assert forbidden not in source
     for forbidden in ("os.startfile", "subprocess", "webbrowser.open"):

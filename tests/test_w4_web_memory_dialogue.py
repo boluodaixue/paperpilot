@@ -80,6 +80,29 @@ def test_answer_is_read_only_cited_and_does_not_start_research_or_write_chat(web
     assert files_after == files_before
 
 
+def test_answer_can_finish_without_creating_a_note(web_client):
+    client, runtime, _policy = web_client
+    answer = _answer(client)
+
+    dismissed = client.delete(
+        f"/api/memory-answers/{answer['answer_id']}",
+        params={
+            "session_id": answer["session_id"],
+            "memory_id": answer["memory_id"],
+        },
+    )
+
+    assert dismissed.status_code == 200
+    assert dismissed.json()["status"] == "cancelled"
+    state = asyncio.run(
+        checkpoint_values(runtime, "memory_note", answer["workflow_id"])
+    )
+    assert state["workflow_status"] == "cancelled"
+    assert client.delete(
+        f"/api/memory-answers/{answer['answer_id']}"
+    ).status_code == 409
+
+
 def test_proposal_is_transient_until_confirm_then_writes_and_is_consumed(web_client):
     client, runtime, _policy = web_client
     answer = _answer(client)
@@ -177,10 +200,24 @@ def test_static_page_requires_explicit_mode_preview_and_confirmation():
         "/confirm`,",
         "link.href = citation.obsidian_uri",
         "body.innerHTML = renderSafeMarkdown(answer.markdown",
+        "card.querySelector('.rc-report').innerHTML = renderSafeMarkdown(",
+        "renderSafeMarkdown(stripFrontmatter(ev.markdown))",
+        "stripFrontmatter(data.report_md",
+        "stripFrontmatter(ev.markdown)",
+        'role="tablist"',
+        'role="tab"',
         "const allowedTags = new Set([",
         "isSafeMarkdownLink(attribute.value)",
         "answer.insufficient_evidence.length > 0",
         "保存回答为笔记",
+        "完成，不保存",
+        "基于缺口继续研究",
+        "continueFromMemoryAnswer",
+        "没有可保存的证据回答",
+        "/api/memory-answers/",
+        "report-status",
+        "termination_reason",
+        "@media (max-width: 760px)",
         "Markdown 完整预览",
         "$('noteProposalMarkdown').textContent = proposal.markdown",
         "cancelMemoryNoteProposal",
@@ -195,6 +232,8 @@ def test_static_page_requires_explicit_mode_preview_and_confirmation():
         "autoSave",
         "window.open(",
         "body.innerHTML = marked.parse(answer.markdown",
+        "marked.parse(data.report_md",
+        "marked.parse(ev.markdown",
     ):
         assert forbidden not in source
 

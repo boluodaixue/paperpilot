@@ -122,7 +122,8 @@ class AgentLimits:
     max_total_threads: int = 24
     max_total_tool_calls: int = 96
     max_elapsed_seconds: float = 900.0
-    max_total_tokens: int = 500000
+    root_finalization_grace_seconds: float = 0.0
+    max_total_tokens: int = 700000
     max_retries_per_action: int = 2
     max_total_retries: int = 12
 
@@ -190,6 +191,8 @@ class AgentLimits:
             raise ValueError("max_total_tool_calls cannot be negative")
         if self.max_elapsed_seconds <= 0:
             raise ValueError("max_elapsed_seconds must be positive")
+        if self.root_finalization_grace_seconds < 0:
+            raise ValueError("root_finalization_grace_seconds cannot be negative")
         if self.max_total_tokens < 0:
             raise ValueError("max_total_tokens cannot be negative")
         if self.max_retries_per_action < 0:

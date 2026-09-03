@@ -490,11 +490,20 @@ def _proposal_pointer(task: ResearchTask, brief: dict[str, Any]) -> str:
 
 
 def _report_pointer(task: ResearchTask, result: ResearchWorkflowResult) -> dict[str, Any]:
+    research_result = result.research_result
     return {
         "task_id": task.task_id,
         "thread_id": task.thread_id,
         "memory_id": result.memory_id,
         "manifest": asdict(result.memory_manifest),
+        "research_status": research_result.status.value,
+        "termination_reason": (
+            research_result.termination_reason.value
+            if research_result.termination_reason is not None
+            else None
+        ),
+        "output_status": research_result.output_status.value,
+        "stop_reason": research_result.stop_reason,
     }
 
 
@@ -971,6 +980,13 @@ def _expanded_messages(session_id: str) -> list[dict[str, Any]]:
             message["manifest"] = manifest
             message["thread_id"] = pointer.get("thread_id")
             message["memory_id"] = pointer.get("memory_id")
+            for key in (
+                "research_status",
+                "termination_reason",
+                "output_status",
+                "stop_reason",
+            ):
+                message[key] = pointer.get(key)
         except (KeyError, TypeError, ValueError, OSError, json.JSONDecodeError):
             message["content"] = "报告文件暂时不可读取。"
     return messages
@@ -2192,6 +2208,57 @@ async def answer_memory(
     payload = _answer_response(runtime, answer)
     payload.update({"session_id": session_id, **_workflow_response_identity(record)})
     return payload
+
+
+@app.delete("/api/memory-answers/{answer_id}")
+async def dismiss_memory_answer(
+    answer_id: str,
+    session_id: str | None = None,
+    memory_id: str | None = None,
+) -> dict[str, Any]:
+    """Finish one read-only Memory answer without creating a note proposal."""
+
+    record, values = await _find_memory_workflow(
+        "memory_note",
+        value_key="answer",
+        identity_key="answer_id",
+        identity_value=answer_id,
+    )
+    answer = values["answer"]
+    if not isinstance(answer, MemoryAnswer):
+        raise RuntimeError("Memory answer checkpoint 内容无效")
+    _validate_optional_decision_identity(
+        MemoryOperationDecisionRequest(
+            session_id=session_id,
+            memory_id=memory_id,
+            answer_id=answer_id,
+        ),
+        record,
+        answer_id=answer_id,
+    )
+    if answer.memory_id != record.memory_id:
+        raise HTTPException(status_code=409, detail="answer 与 memory 不匹配")
+    state = await _resume_registered_memory_workflow(
+        record,
+        values,
+        {
+            "action": "cancel",
+            "session_id": record.session_id,
+            "memory_id": record.memory_id,
+            "answer_id": answer_id,
+        },
+    )
+    status = str(state.get("workflow_status") or "")
+    if status != "cancelled":
+        _raise_for_workflow_status(status)
+        raise RuntimeError("Memory answer workflow 未结束")
+    return {
+        "status": "cancelled",
+        "answer_id": answer_id,
+        "memory_id": record.memory_id,
+        "session_id": record.session_id,
+        **_workflow_response_identity(record),
+    }
 
 
 @app.post("/api/memories/{memory_id}/note-proposals")

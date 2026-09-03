@@ -73,6 +73,7 @@ AGENT_LIMIT_FIELDS = {
     "max_total_agents",
     "max_total_tool_calls",
     "max_elapsed_seconds",
+    "root_finalization_grace_seconds",
     "max_total_tokens",
     "max_retries_per_action",
     "max_total_retries",
@@ -125,10 +126,66 @@ def test_default_config_contains_only_active_runtime_sections() -> None:
     assert set(config["model"]["backend_mapping"]) == {"research", "judge"}
     assert set(config["model"]["backend_sampling"]["modules"]) == {"research", "judge"}
     assert set(config["research"]["limits"]) == AGENT_LIMIT_FIELDS
+    assert config["research"]["limits"]["max_total_tokens"] == 700000
+    assert config["research"]["structured_report"]["enabled"] is True
+    assert config["research"]["homogeneous_fork"] == {
+        "enabled": True,
+        "explicit_control_decision": True,
+        "budget_leases_enabled": True,
+        "reconsider_after_local_rounds": 2,
+        "parent_merge_reserve_tokens": 50000,
+        "root_final_max_tokens": 32768,
+        "root_final_output_token_budget": 50000,
+        "initial_child_lease_tokens": 60000,
+        "child_topup_tokens": 25000,
+        "max_child_lease_tokens": 125000,
+    }
+    assert config["research"]["supervisor_v2"]["red_review_enabled"] is False
+    assert config["research"]["supervisor_v2"]["max_red_review_rounds"] == 0
+    assert config["research"]["report_review"]["enabled"] is False
     assert config["research"]["vault_root"]
     assert "memory_root" not in config["research"]
     assert config["chat"]["db_path"]
+    assert config["runtime"]["retrieval_db_path"]
+    assert config["content_extraction"]["mode"] == "structured"
+    assert config["tools"]["enabled"] == [
+        "acquire_evidence",
+        "arxiv_reader",
+        "file_reader",
+        "calculator",
+        "notepad",
+    ]
     assert "execution" not in config["tools"]
+
+
+def test_product_default_reuses_baseline_core_without_evaluation_storage() -> None:
+    product = yaml.safe_load(
+        (ROOT / "configs/default.yaml").read_text(encoding="utf-8")
+    )
+    baseline = yaml.safe_load(
+        (ROOT / "configs/researchbench-r8-tech.yaml").read_text(encoding="utf-8")
+    )
+
+    assert product["model"] == baseline["model"]
+    assert product["research"]["architecture"] == baseline["research"]["architecture"]
+    assert product["research"]["structured_report"] == baseline["research"]["structured_report"]
+    assert product["research"]["homogeneous_fork"] == baseline["research"]["homogeneous_fork"]
+    assert product["research"]["limits"] == baseline["research"]["limits"]
+    assert product["content_extraction"] == baseline["content_extraction"]
+    assert product["tools"] == baseline["tools"]
+    assert product["research"]["vault_root"] == "memory"
+    assert product["runtime"]["retrieval_db_path"] == "data/retrieval.db"
+    assert product["research"]["vault_root"] != baseline["research"]["vault_root"]
+    assert product["runtime"]["retrieval_db_path"] != baseline["runtime"]["retrieval_db_path"]
+
+
+def test_tech_evaluation_uses_global_leases_and_700k_budget() -> None:
+    config = yaml.safe_load(
+        (ROOT / "configs/researchbench-r8-tech.yaml").read_text(encoding="utf-8")
+    )
+
+    assert config["research"]["homogeneous_fork"]["budget_leases_enabled"] is True
+    assert config["research"]["limits"]["max_total_tokens"] == 700000
 
 
 def test_packaging_has_no_removed_dependencies_or_entrypoints() -> None:

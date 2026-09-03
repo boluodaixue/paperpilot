@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import time
 from typing import Any
 
 import langfuse
@@ -19,6 +20,10 @@ from src.research.agent_graph import (
     _delegable_tool_budget,
     _finalization_token_reserve,
     _extract_evidence,
+    _fundable_child_count,
+    _fork_resource_allocations,
+    _remaining_child_slots,
+    _remaining_finalization_seconds,
     _remaining_research_seconds,
     _runtime_exhaustion_assessment,
     _semantic_tool_error,
@@ -32,6 +37,7 @@ from src.research.models import (
     CriticalGap,
     EvidenceItem,
     ExecutionIdentity,
+    ForkCandidate,
     NextResearchAction,
     OutputStatus,
     ResearchDecision,
@@ -41,6 +47,7 @@ from src.research.models import (
     StrategyAttempt,
     TerminationReason,
 )
+from src.research.research_control import HomogeneousForkConfig
 from src.research.research_sufficiency import active_next_actions
 from src.tools.web_search import MockWebSearchTool
 
@@ -195,6 +202,30 @@ def test_deeper_agents_stop_research_earlier_to_leave_upstream_synthesis_time() 
     )
 
 
+def test_root_gets_final_synthesis_time_after_the_research_deadline() -> None:
+    limits = AgentLimits(
+        max_elapsed_seconds=1200.0,
+        root_finalization_grace_seconds=300.0,
+    )
+    root_identity = _root_identity("root-long-final-reserve")
+    child_identity = ExecutionIdentity(
+        "child-long-final-reserve",
+        root_identity.thread_id,
+        root_identity.root_thread_id,
+        1,
+    )
+    task = ResearchTask("long-final-reserve", "Add 300 seconds for Root synthesis.")
+    root = _state(task, root_identity, limits)
+    child = _state(task, child_identity, limits)
+    root["deadline_at"] = time.time() + 1200.0
+    child["deadline_at"] = root["deadline_at"]
+
+    assert _remaining_research_seconds(root) == pytest.approx(1200.0, abs=0.05)
+    assert _remaining_research_seconds(child) == pytest.approx(1080.0, abs=0.05)
+    assert _remaining_finalization_seconds(root) == pytest.approx(1500.0, abs=0.05)
+    assert _remaining_finalization_seconds(child) == pytest.approx(1200.0, abs=0.05)
+
+
 def test_fork_budget_keeps_parent_tool_and_token_capacity() -> None:
     limits = AgentLimits(
         max_tool_calls=20,
@@ -216,6 +247,106 @@ def test_fork_budget_keeps_parent_tool_and_token_capacity() -> None:
     assert state["subtree_tool_budget"] - state["total_tool_calls_used"] - delegated_tools == 18
     assert delegated_tokens < (state["subtree_token_budget"] - state["estimated_tokens_used"])
     assert delegated_tokens > 0
+
+
+def test_fork_resource_preflight_checks_time_tokens_and_tools() -> None:
+    candidate = ForkCandidate(
+        objective="Scoped direction",
+        expected_output="Direction memo",
+        estimated_tool_calls=2,
+    )
+    settings = HomogeneousForkConfig()
+
+    low_time = _state(
+        ResearchTask("low-time", "Retain time-starved work locally."),
+        _root_identity("root-low-time"),
+        AgentLimits(max_elapsed_seconds=300.0),
+    )
+    low_time["deadline_at"] = time.time() + 50.0
+    low_tokens = _state(
+        ResearchTask("low-tokens", "Retain token-starved work locally."),
+        _root_identity("root-low-tokens"),
+        AgentLimits(max_total_tokens=70000),
+    )
+    low_tools = _state(
+        ResearchTask("low-tools", "Retain tool-starved work locally."),
+        _root_identity("root-low-tools"),
+        AgentLimits(max_total_tool_calls=1),
+    )
+
+    for state in (low_time, low_tokens, low_tools):
+        accepted, tool_budgets, token_budgets, retained = _fork_resource_allocations(
+            state,
+            [candidate],
+            fork_settings=settings,
+            check_token_budget=True,
+        )
+        assert accepted == []
+        assert tool_budgets == []
+        assert token_budgets == []
+        assert retained == [candidate]
+
+
+def test_fork_resource_preflight_preserves_sufficient_equal_split() -> None:
+    candidate = ForkCandidate(
+        objective="Scoped direction",
+        expected_output="Direction memo",
+        estimated_tool_calls=2,
+    )
+    state = _state(
+        ResearchTask("enough", "Dispatch sufficiently funded work."),
+        _root_identity("root-enough"),
+        AgentLimits(max_total_tokens=120000, max_total_tool_calls=4),
+    )
+
+    accepted, tool_budgets, token_budgets, retained = _fork_resource_allocations(
+        state,
+        [candidate],
+        fork_settings=HomogeneousForkConfig(),
+        check_token_budget=True,
+    )
+
+    assert accepted == [candidate]
+    assert tool_budgets == [2]
+    assert token_budgets == [_delegable_token_budget(state)]
+    assert retained == []
+
+
+def test_resource_rejections_do_not_consume_logical_child_slots() -> None:
+    state = _state(
+        ResearchTask("rejected", "Keep rejected scopes local."),
+        _root_identity("root-rejected-slots"),
+        AgentLimits(max_children=3),
+    )
+    state["completed_fork_fingerprints"] = ["rejected-a", "rejected-b"]
+
+    assert _remaining_child_slots(state) == 3
+
+
+def test_fundable_child_count_uses_global_lease_pool_when_enabled() -> None:
+    state = _state(
+        ResearchTask("lease", "Fund children from the shared pool."),
+        _root_identity("root-lease-capacity"),
+        AgentLimits(max_children=5, max_total_tool_calls=30),
+    )
+    settings = HomogeneousForkConfig(
+        enabled=True,
+        explicit_control_decision=True,
+        budget_leases_enabled=True,
+    )
+
+    assert _fundable_child_count(
+        state,
+        5,
+        fork_settings=settings,
+        available_lease_tokens=180000,
+    ) == 3
+    assert _fundable_child_count(
+        state,
+        5,
+        fork_settings=settings,
+        available_lease_tokens=59999,
+    ) == 0
 
 
 def test_parent_token_reserve_grows_with_assessment_state_complexity() -> None:

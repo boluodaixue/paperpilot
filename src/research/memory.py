@@ -65,6 +65,8 @@ _MEMORY_DIRECTORIES = (
 )
 _HOME_NOTES_HEADING = re.compile(r"^## Notes\s*$")
 _HOME_IMPORTS_HEADING = re.compile(r"^## Imports\s*$")
+_HOME_REPORTS_HEADING = re.compile(r"^## Reports\s*$")
+_HOME_LAST_UPDATED_HEADING = re.compile(r"^## Last updated\s*$")
 _HOME_SECTION_HEADING = re.compile(r"^##\s+")
 _WIKILINK = re.compile(r"\[\[([^\]\r\n]+)\]\]")
 _SHA256 = re.compile(r"^[0-9a-f]{64}$")
@@ -357,6 +359,12 @@ def update_memory_home_with_note(
             core.append(newline)
         section = [*core, f"- {wikilink}{newline}", *trailing]
     lines[heading + 1 : section_end] = section
+    _replace_home_last_updated(
+        lines,
+        closing=closing,
+        updated_at=updated_at,
+        newline=newline,
+    )
     return "".join(lines)
 
 
@@ -407,6 +415,83 @@ def _append_home_section_link(
     lines[heading + 1 : section_end] = section
 
 
+def _replace_home_last_updated(
+    lines: list[str],
+    *,
+    closing: int,
+    updated_at: str,
+    newline: str,
+) -> None:
+    headings = [
+        index
+        for index, line in enumerate(lines[closing + 1 :], start=closing + 1)
+        if _HOME_LAST_UPDATED_HEADING.fullmatch(line.rstrip("\r\n"))
+    ]
+    if len(headings) != 1:
+        raise ValueError("Home.md must contain exactly one ## Last updated section")
+    heading = headings[0]
+    section_end = len(lines)
+    for index in range(heading + 1, len(lines)):
+        if _HOME_SECTION_HEADING.match(lines[index].rstrip("\r\n")):
+            section_end = index
+            break
+    lines[heading + 1 : section_end] = [newline, f"{updated_at}{newline}"]
+
+
+def update_memory_home_with_report(
+    home_markdown: str,
+    report_wikilink: str,
+    updated_at: str,
+) -> str:
+    """Update Home time and append one unique managed report link."""
+
+    if not isinstance(home_markdown, str) or not home_markdown:
+        raise ValueError("home_markdown must be a non-empty string")
+    lines, closing, frontmatter = _frontmatter_parts(home_markdown, label="Home.md")
+    if frontmatter["type"] != "home":
+        raise ValueError("Home.md frontmatter type must be 'home'")
+    current_updated_at = str(frontmatter["updated_at"])
+    effective_updated_at = (
+        current_updated_at
+        if datetime.fromisoformat(updated_at) < datetime.fromisoformat(current_updated_at)
+        else updated_at
+    )
+    validate_frontmatter({**frontmatter, "updated_at": effective_updated_at})
+    updated_lines = [
+        index
+        for index, line in enumerate(lines[1:closing], start=1)
+        if line.startswith("updated_at:")
+    ]
+    if len(updated_lines) != 1:
+        raise ValueError("Home.md must contain exactly one updated_at property")
+
+    newline = "\r\n" if "\r\n" in home_markdown else "\n"
+    updated_index = updated_lines[0]
+    updated_ending = (
+        "\r\n"
+        if lines[updated_index].endswith("\r\n")
+        else "\n" if lines[updated_index].endswith("\n") else ""
+    )
+    lines[updated_index] = (
+        f"updated_at: {json.dumps(effective_updated_at, ensure_ascii=False)}{updated_ending}"
+    )
+    _append_home_section_link(
+        lines,
+        closing=closing,
+        heading_pattern=_HOME_REPORTS_HEADING,
+        section_name="Reports",
+        wikilink=report_wikilink,
+        newline=newline,
+    )
+    _replace_home_last_updated(
+        lines,
+        closing=closing,
+        updated_at=effective_updated_at,
+        newline=newline,
+    )
+    return "".join(lines)
+
+
 def update_memory_home_with_import(
     home_markdown: str,
     import_wikilink: str,
@@ -452,6 +537,12 @@ def update_memory_home_with_import(
         heading_pattern=_HOME_NOTES_HEADING,
         section_name="Notes",
         wikilink=note_wikilink,
+        newline=newline,
+    )
+    _replace_home_last_updated(
+        lines,
+        closing=closing,
+        updated_at=updated_at,
         newline=newline,
     )
     return "".join(lines)
@@ -819,6 +910,18 @@ class MarkdownMemoryStore:
         updated_at: str,
     ) -> str:
         return update_memory_home_with_note(home_markdown, wikilink, updated_at)
+
+    @staticmethod
+    def update_memory_home_with_report(
+        home_markdown: str,
+        report_wikilink: str,
+        updated_at: str,
+    ) -> str:
+        return update_memory_home_with_report(
+            home_markdown,
+            report_wikilink,
+            updated_at,
+        )
 
     @staticmethod
     def _file_snapshot(path: Path) -> tuple[bytes, str]:
@@ -2463,40 +2566,59 @@ class MarkdownMemoryStore:
         base_path = f"Memories/{memory_id}/" if memory_id is not None else ""
 
         with self._lock:
+            updated_home: tuple[str, str] | None = None
+            if memory_id is not None:
+                home_path = f"{base_path}Home.md"
+                home_markdown = self.read_text(home_path)
+                report_path = f"{base_path}reports/{report_note}.md"
+                report_target = build_wikilink(report_path)
+                if report_target not in home_markdown:
+                    updated_home = (
+                        home_path,
+                        update_memory_home_with_report(
+                            home_markdown,
+                            report_target,
+                            str(timestamp),
+                        ),
+                    )
             for source_ref, source_note in source_note_by_ref.items():
                 evidence = next(item for item in unique_evidence if item.source_ref == source_ref)
                 relative_path = f"{base_path}sources/{source_note}.md"
-                self._write_atomic(
-                    relative_path,
-                    render_source_note(
-                        source_note,
-                        evidence,
-                        memory_id=memory_id,
-                        created_at=timestamp,
-                        updated_at=timestamp,
-                    ),
-                )
+                if memory_id is None or not self._resolve(relative_path).exists():
+                    self._write_atomic(
+                        relative_path,
+                        render_source_note(
+                            source_note,
+                            evidence,
+                            memory_id=memory_id,
+                            created_at=timestamp,
+                            updated_at=timestamp,
+                        ),
+                    )
                 source_paths.append(relative_path)
 
             for evidence in unique_evidence:
                 evidence_note = evidence_note_by_id[evidence.evidence_id]
                 source_note = source_note_by_ref[evidence.source_ref]
                 relative_path = f"{base_path}evidence/{evidence_note}.md"
-                self._write_atomic(
-                    relative_path,
-                    render_evidence_note(
-                        evidence,
-                        evidence_note=evidence_note,
-                        source_note=source_note,
-                        memory_id=memory_id,
-                        created_at=timestamp,
-                        updated_at=timestamp,
-                    ),
-                )
+                if memory_id is None or not self._resolve(relative_path).exists():
+                    self._write_atomic(
+                        relative_path,
+                        render_evidence_note(
+                            evidence,
+                            evidence_note=evidence_note,
+                            source_note=source_note,
+                            memory_id=memory_id,
+                            created_at=timestamp,
+                            updated_at=timestamp,
+                        ),
+                    )
                 evidence_paths.append(relative_path)
 
             report_path = f"{base_path}reports/{report_note}.md"
             self._write_atomic(report_path, report_markdown)
+            if updated_home is not None:
+                self._write_atomic(*updated_home)
 
         manifest = MemoryManifest(
             report_path=report_path,
@@ -2507,6 +2629,11 @@ class MarkdownMemoryStore:
 
     def read_text(self, relative_path: str) -> str:
         return self._resolve(relative_path).read_text(encoding="utf-8")
+
+    def read_bytes(self, relative_path: str) -> bytes:
+        """Read exact managed bytes without newline normalization."""
+
+        return self._resolve(relative_path).read_bytes()
 
     def replace_report(self, report_path: str, markdown: str) -> None:
         """Atomically replace one existing report without touching its bundle."""
@@ -2550,4 +2677,5 @@ __all__ = [
     "MemoryWriteConflictError",
     "update_memory_home_with_import",
     "update_memory_home_with_note",
+    "update_memory_home_with_report",
 ]
