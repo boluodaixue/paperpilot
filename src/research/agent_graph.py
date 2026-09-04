@@ -25,11 +25,11 @@ from ..tools.notepad import NotepadTool
 from ..utils.tracing import trace_block, trace_context
 from .context_compaction import (
     ContextCompactionError,
-    apply_semantic_compaction,
     collapse_verified_working_context,
-    microcompact_control_messages,
-    semantic_compaction_messages,
-    snip_consumed_tool_artifacts,
+    context_consolidation_manifest,
+    deterministic_context_cleanup,
+    semantic_memo_messages,
+    validate_semantic_memo,
 )
 from .agent_scheduler import (
     FairAgentScheduler,
@@ -145,6 +145,8 @@ class ResearchAgentState(TypedDict):
     duplicate_source_count: int
     acquisition_call_count: int
     execution_events: list[dict[str, Any]]
+    compression_manifests: list[dict[str, Any]]
+    semantic_memos: list[dict[str, Any]]
     lineage_objectives: list[str]
     draft: dict[str, Any] | None
     draft_raw: str
@@ -648,6 +650,8 @@ summarization are all your own responsibilities.
 Work on only the scoped task. Use tools when evidence is required. Search
 snippets are leads, not complete proof; preserve source identifiers and
 locators. Never invent a source.
+When an artifact receipt is present, you may recover its bounded original
+content with file_reader root "artifact" and path "<artifact_id>.json".
 
 {final_contract}
 After tool or child results, the same policy performs a checkpointed structured
@@ -1580,6 +1584,8 @@ def create_research_agent_state(
         duplicate_source_count=0,
         acquisition_call_count=0,
         execution_events=[],
+        compression_manifests=[],
+        semantic_memos=[],
         lineage_objectives=(list(lineage_objectives) if lineage_objectives is not None else [task.objective]),
         draft=None,
         draft_raw="",
@@ -1938,6 +1944,8 @@ def build_research_agent_graph(
                     "output_status": state.get("output_status", OutputStatus.VALID),
                     "draft_raw": state.get("draft_raw", ""),
                     "last_assessed_evidence_count": int(state.get("last_assessed_evidence_count", 0)),
+                    "compression_manifests": list(state.get("compression_manifests", [])),
+                    "semantic_memos": list(state.get("semantic_memos", [])),
                     "source_candidate_count": int(state.get("source_candidate_count", 0)),
                     "source_open_count": int(state.get("source_open_count", 0)),
                     "duplicate_source_count": int(state.get("duplicate_source_count", 0)),
@@ -2053,41 +2061,37 @@ def build_research_agent_graph(
             for attempt in state.get("strategy_attempts", [])[: state.get("last_assessed_strategy_attempt_count", 0)]
             for artifact_id in attempt.artifact_ids
         }
-        working_messages = microcompact_control_messages(
-            snip_consumed_tool_artifacts(
-                state["messages"],
-                consumed_artifact_ids=consumed_artifact_ids,
-            )
+        working_messages = deterministic_context_cleanup(
+            state["messages"],
+            consumed_artifact_ids=consumed_artifact_ids,
         )
-        working_messages = collapse_verified_working_context(
+        state_projection = {
+            "coverage": [asdict(item) for item in state.get("coverage", [])],
+            "critical_gaps": [asdict(item) for item in state.get("critical_gaps", [])],
+            "next_actions": [asdict(item) for item in active_next_actions(state.get("next_actions", []))],
+            "evidence": [
+                {
+                    "evidence_id": item.evidence_id,
+                    "requirement_id": item.requirement_id,
+                    "artifact_id": item.artifact_id,
+                    "finding": item.finding[:300],
+                    "source_ref": item.source_ref[:300],
+                }
+                for item in state.get("observed_evidence", [])[-12:]
+            ],
+            "strategy_attempts": list(aggregate_strategy_attempts(state.get("strategy_attempts", [])))[-12:],
+        }
+        deterministic_consolidation = collapse_verified_working_context(
             working_messages,
-            state_projection={
-                "coverage": [asdict(item) for item in state.get("coverage", [])],
-                "critical_gaps": [asdict(item) for item in state.get("critical_gaps", [])],
-                "next_actions": [asdict(item) for item in active_next_actions(state.get("next_actions", []))],
-                "evidence": [
-                    {
-                        "evidence_id": item.evidence_id,
-                        "requirement_id": item.requirement_id,
-                        "artifact_id": item.artifact_id,
-                        "finding": item.finding[:300],
-                        "source_ref": item.source_ref[:300],
-                    }
-                    for item in state.get("observed_evidence", [])[-12:]
-                ],
-                "strategy_attempts": list(aggregate_strategy_attempts(state.get("strategy_attempts", [])))[-12:],
-            },
+            state_projection=state_projection,
         )
         compaction_token_charge = 0
         compaction_event: dict[str, Any] | None = None
-        if (
-            not finalization_requested
-            and sum(len(str(message.get("content") or "")) for message in working_messages) > 48000
-        ):
+        if not finalization_requested and deterministic_consolidation != working_messages:
             try:
-                compaction_messages = semantic_compaction_messages(
+                compaction_messages = semantic_memo_messages(
                     working_messages,
-                    keep_recent=4,
+                    state_projection=state_projection,
                 )
                 compaction_response = await asyncio.wait_for(
                     call_policy(policy, compaction_messages, []),
@@ -2097,28 +2101,48 @@ def build_research_agent_graph(
                     compaction_messages,
                     compaction_response,
                 )
-                working_messages = apply_semantic_compaction(
-                    working_messages,
+                semantic_memo = validate_semantic_memo(
                     str(compaction_response.get("content") or ""),
-                    keep_recent=4,
+                    request_messages=compaction_messages,
+                )
+                working_messages = collapse_verified_working_context(
+                    working_messages,
+                    state_projection=state_projection,
+                    semantic_memo=semantic_memo,
                 )
                 compaction_event = _event(
-                    "working_context_semantically_compacted",
+                    "working_context_consolidated",
                     state["identity"],
-                    input_messages=len(compaction_messages),
+                    semantic_memo=True,
                 )
             except ContextCompactionError as exc:
+                working_messages = deterministic_consolidation
                 compaction_event = _event(
-                    "working_context_semantic_compaction_skipped",
+                    "working_context_consolidated",
                     state["identity"],
+                    semantic_memo=False,
                     error=str(exc),
                 )
             except Exception as exc:
+                working_messages = deterministic_consolidation
                 compaction_event = _event(
-                    "working_context_semantic_compaction_failed",
+                    "working_context_consolidated",
                     state["identity"],
+                    semantic_memo=False,
                     error=str(exc),
                 )
+        else:
+            working_messages = deterministic_consolidation
+        consolidation_manifest = context_consolidation_manifest(working_messages)
+        compression_manifests = list(state.get("compression_manifests", []))
+        semantic_memos = list(state.get("semantic_memos", []))
+        if consolidation_manifest is not None:
+            manifest_id = str(consolidation_manifest.get("manifest_id") or "")
+            if manifest_id and not any(item.get("manifest_id") == manifest_id for item in compression_manifests):
+                compression_manifests.append(consolidation_manifest)
+                memo = consolidation_manifest.get("semantic_memo")
+                if isinstance(memo, dict):
+                    semantic_memos.append({"manifest_id": manifest_id, **memo})
         remaining_tokens = max(0, remaining_tokens - compaction_token_charge)
         available_seconds = (
             _remaining_finalization_seconds(state)
@@ -2493,6 +2517,9 @@ def build_research_agent_graph(
                 "stop_reason": "token_budget_exhausted",
                 "termination_reason": TerminationReason.BUDGET_FORCED,
                 "estimated_tokens_used": (state["estimated_tokens_used"] + compaction_token_charge),
+                "messages": working_messages,
+                "compression_manifests": compression_manifests,
+                "semantic_memos": semantic_memos,
             }
             if compaction_event is not None:
                 update["execution_events"] = [
@@ -2554,6 +2581,9 @@ def build_research_agent_graph(
                         "termination_reason": TerminationReason.BUDGET_FORCED,
                         "iteration": state["iteration"] + 1,
                         "retries_used": state["retries_used"] + action_retries,
+                        "messages": working_messages,
+                        "compression_manifests": compression_manifests,
+                        "semantic_memos": semantic_memos,
                     }
                     if finalization_requested:
                         update["finalization_requested"] = False
@@ -2572,6 +2602,9 @@ def build_research_agent_graph(
                             "termination_reason": TerminationReason.TOOL_FAILURE,
                             "iteration": state["iteration"] + 1,
                             "retries_used": state["retries_used"] + action_retries,
+                            "messages": working_messages,
+                            "compression_manifests": compression_manifests,
+                            "semantic_memos": semantic_memos,
                         }
                         if finalization_requested:
                             update["finalization_requested"] = False
@@ -2691,6 +2724,8 @@ def build_research_agent_graph(
                 "finalization_requested": False,
                 "estimated_tokens_used": (state["estimated_tokens_used"] + compaction_token_charge + token_charge),
                 "retries_used": state["retries_used"] + action_retries,
+                "compression_manifests": compression_manifests,
+                "semantic_memos": semantic_memos,
             }
             if control_action_value is not None:
                 update.update({
@@ -3456,6 +3491,14 @@ def build_research_agent_graph(
                         ],
                     }
                 artifact_id = _tool_artifact_id(tool_name, arguments, result)
+                artifact_reread = (
+                    tool_name == "file_reader"
+                    and arguments.get("root") == "artifact"
+                    and isinstance(arguments.get("path"), str)
+                    and re.fullmatch(r"artifact-[0-9a-f]{16}\.json", str(arguments["path"])) is not None
+                )
+                if artifact_reread:
+                    artifact_id = str(arguments["path"])[:-5]
                 if (
                     coordination_board is not None
                     and board_query
@@ -3624,7 +3667,21 @@ def build_research_agent_graph(
                     default=str,
                 )
                 tool_message_content: str
-                if tool_artifact_store is not None and tool_name != "notepad":
+                if artifact_reread and isinstance(result, dict):
+                    tool_message_content = json.dumps(
+                        {
+                            "status": "artifact_reread",
+                            "artifact_id": artifact_id,
+                            "artifact_path": str(result.get("path") or ""),
+                            "artifact_read_root": "artifact",
+                            "artifact_read_path": str(arguments["path"]),
+                            "content_hash": str(result.get("content_hash") or ""),
+                            "preview": str(result.get("content") or ""),
+                            "truncated": bool(result.get("truncated", False)),
+                        },
+                        ensure_ascii=False,
+                    )
+                elif tool_artifact_store is not None and tool_name != "notepad":
                     try:
                         receipt = await asyncio.to_thread(
                             tool_artifact_store.persist_tool_artifact,
@@ -3633,6 +3690,7 @@ def build_research_agent_graph(
                             arguments=arguments,
                             result=result,
                             origin_thread_id=state["identity"].thread_id,
+                            artifact_scope_id=state["identity"].root_thread_id,
                         )
                         required_receipt = (
                             receipt.get("artifact_id") == artifact_id
@@ -3651,6 +3709,8 @@ def build_research_agent_graph(
                                 "status": "offloaded",
                                 "artifact_id": artifact_id,
                                 "artifact_path": receipt["artifact_path"],
+                                "artifact_read_root": "artifact",
+                                "artifact_read_path": f"{artifact_id}.json",
                                 "content_hash": receipt["content_hash"],
                                 "size_bytes": receipt["size_bytes"],
                                 "evidence_ids": list(new_ids),

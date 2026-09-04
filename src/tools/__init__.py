@@ -16,7 +16,7 @@ from .evidence_acquisition import (
     EvidenceAcquisitionTool,
     canonicalize_source_url,
 )
-from .file_reader import FileReaderError, FileReaderTool, file_reader_scope
+from .file_reader import FileReaderError, FileReaderTool, ScopedFileRoot, file_reader_scope
 from .calculator import CalculatorTool
 from .notepad import NotepadTool, NotepadEntry
 
@@ -39,6 +39,7 @@ __all__ = [
     "canonicalize_source_url",
     "FileReaderTool",
     "FileReaderError",
+    "ScopedFileRoot",
     "file_reader_scope",
     # 计算与执行
     "CodeSandboxTool",

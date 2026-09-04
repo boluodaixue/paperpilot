@@ -93,7 +93,7 @@ requirements、coverage、critical gaps、next actions、真实 strategy attempt
 
 研究运行时明确分离四类数据：用户确认后的 Task 永久定义完成契约；checkpointed Research State 保存 coverage、critical gaps、Claim/Evidence 映射、策略、预算与终止；Knowledge Store 保存完整工具 artifact、Evidence 和来源；Working Context 只是在每次 policy 调用前按当前 requirement 生成的有界临时投影。
 
-工具结果不能先截断再保存。完整 artifact 必须先通过现有持久写队列交给单一 Vault Writer，以内容哈希和幂等键原子发布到 `Artifacts/<thread-scope>/`；并行子 Agent 只能提交写入意图。确认 artifact 可恢复后，Working Context 才能按 L1 offload、L2 history snip、L3 microcompact、L4 deterministic collapse、L5 same-policy auto-compact 的顺序压缩。L4 manifest 保存被折叠消息哈希、artifact ID 和有界 Research State；L5 必须逐项回报 requirement、Evidence 和 artifact ID，否则回退到 L4。任何 artifact 写入或复核失败都保留完整 raw payload。压缩不得丢失 Research Brief、requirement、coverage、Claim↔Evidence、来源定位、冲突、策略、动作、预算、错误与 termination state。
+工具结果不能先截断再保存。完整 artifact 必须先通过现有持久写队列交给单一 Vault Writer，以内容哈希和幂等键原子发布到 root-thread 隔离的 `Artifacts/<thread-scope>/`；并行子 Agent 只能提交写入意图。Working Context 使用三层管理：L1 Artifact Offload、L2 确定性清理、L3 State Projection + Semantic Memo。L3 在替换旧对话的同一次操作中保存结构化状态和有引用约束的语义 Memo；Memo 失败时只回退到确定性 State Projection。当前执行树可通过 FileReader 的 `artifact` 虚拟根按 ID 回读父子 Agent 的原始 artifact。任何 artifact 写入或复核失败都保留完整 raw payload。
 
 详细数据契约、水位、滞回、恢复和分级验收见 `docs/RESEARCH_SUFFICIENCY_TERMINATION_DESIGN.md` 第 13 节。
 

@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -162,3 +163,21 @@ async def test_web_stream_confirmation_uses_runtime_scope_facade(
 
     assert calls == ["web-thread"]
     assert state["thread_id"] == "web-thread"
+
+
+@pytest.mark.asyncio
+async def test_runtime_exposes_only_root_thread_artifacts(tmp_path: Path) -> None:
+    store = MarkdownMemoryStore(tmp_path / "Vault")
+    store.create_memory("Alpha", "M-A")
+    graph = _ScopedReadGraph(FileReaderTool())
+    runtime = _runtime(store, graph)
+    thread_id = "root-artifact-scope"
+    scope = hashlib.sha256(thread_id.encode("utf-8")).hexdigest()[:20]
+    artifact_dir = store.root / "Artifacts" / scope
+    artifact_dir.mkdir(parents=True)
+    (artifact_dir / "artifact-one.json").write_text('{"result":"scoped"}', encoding="utf-8")
+
+    with runtime._research_file_scope("M-A", thread_id):
+        result = await graph.reader.execute(root="artifact", path="artifact-one.json")
+
+    assert "scoped" in result["content"]

@@ -8,8 +8,12 @@ from src.research.context_compaction import (
     ContextCompactionError,
     apply_semantic_compaction,
     collapse_verified_working_context,
+    context_consolidation_manifest,
+    deterministic_context_cleanup,
     microcompact_control_messages,
+    semantic_memo_messages,
     snip_consumed_tool_artifacts,
+    validate_semantic_memo,
 )
 
 
@@ -51,6 +55,8 @@ def test_l2_snips_only_consumed_verified_artifacts() -> None:
         "status": "offloaded_consumed",
         "artifact_id": "artifact-old",
         "artifact_path": "Artifacts/root/artifact-old.json",
+        "artifact_read_root": "artifact",
+        "artifact_read_path": "artifact-old.json",
         "content_hash": "a" * 64,
     }
     assert current["preview"] == "y" * 1200
@@ -97,7 +103,24 @@ def test_l3_keeps_only_the_latest_superseded_control_message() -> None:
     assert microcompact_control_messages(compacted) == compacted
 
 
-def test_l4_collapses_verified_old_history_into_a_hashed_state_manifest() -> None:
+def test_l2_cleanup_combines_consumed_artifact_and_control_cleanup() -> None:
+    messages = [
+        {"role": "system", "content": "system"},
+        {"role": "user", "content": "task"},
+        _offloaded("artifact-old", "preview"),
+        {"role": "user", "content": "RESEARCH_STATE_DECISION\nold"},
+        {"role": "user", "content": "RESEARCH_STATE_DECISION\ncurrent"},
+    ]
+    compacted = deterministic_context_cleanup(messages, consumed_artifact_ids={"artifact-old"})
+    assert json.loads(compacted[2]["content"])["status"] == "offloaded_consumed"
+    assert [
+        item["content"]
+        for item in compacted
+        if str(item.get("content", "")).startswith("RESEARCH_STATE_DECISION")
+    ] == ["RESEARCH_STATE_DECISION\ncurrent"]
+
+
+def test_l3_collapses_verified_old_history_into_a_hashed_state_manifest() -> None:
     messages: list[dict[str, object]] = [
         {"role": "system", "content": "system"},
         {"role": "user", "content": "confirmed task"},
@@ -157,7 +180,7 @@ def test_l4_collapses_verified_old_history_into_a_hashed_state_manifest() -> Non
     )
 
 
-def test_l4_does_not_drop_an_unverified_raw_tool_payload() -> None:
+def test_l3_does_not_drop_an_unverified_raw_tool_payload() -> None:
     messages = [
         {"role": "system", "content": "system"},
         {"role": "user", "content": "task"},
@@ -176,7 +199,60 @@ def test_l4_does_not_drop_an_unverified_raw_tool_payload() -> None:
     assert any("UNVERIFIED-RAW" in str(item.get("content")) for item in compacted)
 
 
-def test_l5_requires_lossless_id_acknowledgement_before_replacement() -> None:
+def test_l3_state_projection_and_semantic_memo_are_consolidated_together() -> None:
+    messages: list[dict[str, object]] = [
+        {"role": "system", "content": "system"},
+        {"role": "user", "content": "task"},
+    ]
+    for index in range(8):
+        messages.extend(
+            [
+                {"role": "assistant", "content": "reasoning " + ("x" * 80)},
+                {
+                    "role": "tool",
+                    "content": json.dumps(
+                        {
+                            "status": "offloaded_consumed",
+                            "artifact_id": f"artifact-{index}",
+                            "artifact_path": f"Artifacts/root/artifact-{index}.json",
+                            "content_hash": "a" * 64,
+                        }
+                    ),
+                },
+            ]
+        )
+    projection = {
+        "coverage": [{"requirement_id": "R1", "status": "weak"}],
+        "evidence": [{"requirement_id": "R1", "evidence_id": "E1", "artifact_id": "artifact-0"}],
+    }
+    request = semantic_memo_messages(messages, state_projection=projection, max_chars=500, keep_recent=2)
+    memo = validate_semantic_memo(
+        json.dumps(
+            {
+                "summary": "E1 supports R1 weakly; comparison remains unresolved.",
+                "requirement_ids": ["R1"],
+                "evidence_ids": ["E1"],
+                "artifact_ids": [f"artifact-{index}" for index in range(7)],
+            }
+        ),
+        request_messages=request,
+    )
+    compacted = collapse_verified_working_context(
+        messages,
+        state_projection=projection,
+        semantic_memo=memo,
+        max_chars=500,
+        keep_recent=2,
+    )
+    manifest = context_consolidation_manifest(compacted)
+    assert manifest is not None
+    assert manifest["layer"] == "L3"
+    assert manifest["research_state"] == projection
+    assert manifest["semantic_memo"]["evidence_ids"] == ["E1"]
+    assert manifest["manifest_id"].startswith("compression-")
+
+
+def test_legacy_semantic_helper_requires_lossless_id_acknowledgement() -> None:
     messages = [
         {"role": "system", "content": "system"},
         {"role": "user", "content": "task"},

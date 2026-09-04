@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import threading
 import time
@@ -920,3 +921,19 @@ def test_tool_artifact_is_published_by_the_single_writer_and_reused_by_hash(
     jobs = queue.list(status="succeeded")
     assert len(jobs) == 1
     assert jobs[0].operation_type == "tool_artifact"
+
+
+def test_child_tool_artifact_uses_the_root_execution_scope(tmp_path: Path) -> None:
+    store, _queue, service = _service(tmp_path)
+    receipt = service.persist_tool_artifact(
+        "artifact-child",
+        tool_name="browser",
+        arguments={"url": "https://example.test"},
+        result="child evidence",
+        origin_thread_id="root.child.one",
+        artifact_scope_id="root",
+    )
+
+    expected_scope = hashlib.sha256(b"root").hexdigest()[:20]
+    assert receipt["artifact_path"] == f"Artifacts/{expected_scope}/artifact-child.json"
+    assert (store.root / receipt["artifact_path"]).exists()

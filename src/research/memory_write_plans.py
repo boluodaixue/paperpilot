@@ -189,16 +189,18 @@ def build_tool_artifact_plan(
     arguments: Mapping[str, Any],
     result: Any,
     origin_thread_id: str,
+    artifact_scope_id: str | None = None,
 ) -> MemoryWritePlan:
     """Build a content-addressed raw tool-result publication command."""
     thread = _required_text(origin_thread_id, field_name="origin_thread_id")
+    scope = _required_text(artifact_scope_id or origin_thread_id, field_name="artifact_scope_id")
     content = tool_artifact_content(
         artifact_id,
         tool_name=tool_name,
         arguments=arguments,
         result=result,
     )
-    thread_scope = hashlib.sha256(thread.encode("utf-8")).hexdigest()[:20]
+    thread_scope = hashlib.sha256(scope.encode("utf-8")).hexdigest()[:20]
     memory_id = f"M-artifacts-{thread_scope}"
     artifact_path = f"Artifacts/{thread_scope}/{artifact_id}.json"
     content_hash = _sha256(content)
@@ -207,6 +209,7 @@ def build_tool_artifact_plan(
             "artifact_id": artifact_id,
             "content_hash": content_hash,
             "origin_thread_id": thread,
+            "artifact_scope_id": scope,
         }
     )
     command = build_file_bundle_command(

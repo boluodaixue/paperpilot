@@ -8,7 +8,7 @@
 |---|---|---|
 | 同质 Research AgentGraph | ✅ | 根、子、孙复用同一图，fork 与全树预算可恢复 |
 | 研究充分性与终止机制 | ✅ | 固定完成门已替换；真实三题完整运行到 LLM Judge，确认不再第 4 轮强停，并诚实披露预算收束 |
-| 证据闭环与有界上下文 | ✅ | requirement/action/artifact lineage、语义工具错误门、Single Writer artifact offload、L2–L5 分级压缩与动态父预算 |
+| 证据闭环与有界上下文 | ✅ | requirement/action/artifact lineage、Single Writer artifact offload、L1–L3 上下文管理、Semantic Memo 与受控回读 |
 | Research Workflow | ✅ | Brief 修改/确认、interrupt、SQLite checkpoint 和重启恢复 |
 | Markdown Memory | ✅ | 多 `memory_id`、报告/证据/来源/笔记/导入和 WikiLink |
 | Obsidian 接入 | ✅ | 安全打开 Memory、报告和引用，不写 `.obsidian/` |
@@ -46,7 +46,7 @@
 - [x] 将 RCS 接入最终评测，而不是运行时停止阈值；
 - [x] 运行专项、全量回归和相同三题真实验收；三题分别按轮次、token、时间边界 `budget_forced` 诚实停止，完整 LLM Judge 均成功，后续需改善 requirement/证据匹配与语义收敛。
 - [x] 补齐 requirement/action/artifact 证据归属、语义工具错误识别、跨 requirement 覆盖拒绝和同策略族无进展上限；
-- [x] 完成 L1–L5 有界上下文、Single Writer artifact 恢复、动态父 assessment/finalization 预算和失败保真回退；
+- [x] 完成 L1–L3 有界上下文、State Projection + Semantic Memo、Single Writer artifact 恢复与当前执行树受控回读；
 - [x] 用隔离 `tech_001` canary 校准 requirement 广度优先、不可侵蚀父级 token 预留和三策略族无进展熔断；第二轮输出有效且资源显著下降，但因外部检索失败仍在墙钟边界停止，故未放行三题扩展；
 
 ### 1. 作品集发布

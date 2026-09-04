@@ -141,6 +141,8 @@ class ResearchWorkflowState(TypedDict, total=False):
     estimated_tokens_used: int
     retries_used: int
     execution_events: list[dict[str, Any]]
+    compression_manifests: list[dict[str, Any]]
+    semantic_memos: list[dict[str, Any]]
     lineage_objectives: list[str]
     draft: dict[str, Any] | None
     draft_raw: str

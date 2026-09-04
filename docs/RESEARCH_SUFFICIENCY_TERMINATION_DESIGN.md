@@ -381,7 +381,7 @@ Working Context 是每次 policy 调用前动态构建的最小投影，只包�
 - 与当前 requirement 相关的少量 Evidence/Claim；
 - 最近一轮操作、当前工具调用配对和必要错误信息；
 - 父级综合所需的有界 child result 摘要；
-- 最近有效的 Context Collapse/Auto-Compact 投影。
+- 最近有效的 L3 State Projection 与 Semantic Memo。
 
 Working Context 不拥有事实。任何被裁剪的信息都必须能从 Research State 或 Knowledge Store 恢复；LLM 消息列表不再承担长期记忆职责。
 
@@ -402,49 +402,37 @@ Working Context 不拥有事实。任何被裁剪的信息都必须能从 Resear
 
 父子汇聚只传递显式映射后的 Evidence/Claim/attempt，不传播子 coverage status。子本地 requirement ID 不得因同名 `R1` 自动映射父 `R1`。父 assessment 重新判断根 Brief；结构修复或 deterministic fallback 只能保留最后一次已验证 coverage，不能用初始 coverage 覆盖已验证状态。
 
-### 13.4 Five-Level Compression Pipeline
+### 13.4 Three-Layer Context Management
 
-压缩严格按 L1→L5 逐级执行。每一级都必须幂等、可恢复，并在 checkpoint 写入 manifest 后才对后续 policy 调用生效。
+上下文管理严格按 L1→L3 执行。每一层都必须可恢复；语义信息只辅助连续推理，不得覆盖结构化事实。
 
-#### L1 Tool Result Budget Trimming / Offload
+#### L1 Artifact Offload
 
-- 对每个超过单结果预览预算或会使下一次 Context 越过 L1 水位的工具结果先执行完整 artifact offload；
-- Context 仅保留受控预览、内容哈希、artifact/Evidence ID、来源、执行状态和取回 handle；
-- 预览长度包含截断标记本身，必须严格满足声明上界；
-- 未确认落盘、哈希不一致或取回验证失败时禁止裁剪。
+- 每个真实工具结果先完整写入 root-thread 隔离的 artifact 目录；
+- Context 只保留受控预览、内容哈希、artifact/Evidence ID、执行状态和回读参数；
+- 未确认落盘、哈希不一致或取回失败时禁止裁剪原始结果；
+- 根 Agent 与子 Agent 使用同一 root-thread artifact scope，使父级能够回读子级资料。
 
-#### L2 History Snip
+#### L2 Deterministic Context Cleanup
 
-- 裁剪较旧 Tool Result 正文；
-- 保留消息 ID、tool-call 配对、参数摘要、执行/错误状态、artifact refs、Evidence IDs 和必要预览；
-- 最近正在使用的调用与结果不裁剪；重复执行 L2 产生相同结果。
+- 已被 assessment 消费的 verified artifact 删除预览，仅保留 receipt；
+- 删除被新版 `RESEARCH_STATE_DECISION` 取代的旧控制投影；
+- 保持 assistant tool-call 与 tool-result 配对，不处理未持久化 raw payload；
+- 整个清理过程不调用模型，并保证幂等。
 
-#### L3 Microcompact
+#### L3 State Projection + Semantic Memo
 
-- 以完整 assistant tool-call + tool-result 对为单位移除更老正文和重复往返；
-- 将结果状态、错误类别、attempt outcome、Evidence IDs 和引用写入结构化 Research State 投影；
-- 不得产生孤立 tool message，不得改变 active action、预算计数或恢复幂等键；
-- 保留最近一个完整研究循环用于局部连贯性。
-
-#### L4 Context Collapse
-
-- 将更早研究过程确定性折叠为短 Research State 表示；
-- 保留 requirement 覆盖变化、关键决策、已失败 strategy family、未解决问题、冲突、错误、child 汇聚和 budget/termination 状态；
-- collapse 前后结构化 State 哈希与 Claim↔Evidence 关系必须等价；
-- 不调用模型，不通过自然语言摘要重新解释事实。
-
-#### L5 Auto-Compact
-
-- 仅当前四级仍无法满足输入与最终综合预留时触发；
-- 使用同一 Research Agent policy 做一次无工具结构化总结，不增加固定 Summarizer Agent；
-- 输出只能引用已存在的 requirement、Claim、Evidence 和 artifact ID；程序执行 schema、ID、状态与引用完整性校验；
-- 失败时使用确定性 L4 fallback；模型摘要只作为 Working Context 投影版本，绝不覆盖真实 Task、Research State 或 Evidence。
+- Context 超过折叠水位时，在同一次 consolidation 中用结构化 Research State 替换旧对话；
+- 同一 Research Agent policy 对被替换区段生成一次无工具 Semantic Memo，保留推理关系、来源冲突、拒绝理由、不确定性和待验证线索；
+- Memo 必须逐项回报已有 requirement、Evidence 和 artifact ID，不能创建新事实；
+- State Projection 是权威控制面，Semantic Memo 只用于保持模型推理连续性；Memo 失败时仍提交确定性 State Projection；
+- consolidation manifest 与 semantic memo 均进入 checkpoint，原始资料可通过 FileReader 的受控 `artifact` 虚拟根回读。
 
 ### 13.5 Token 水位、类别预算与滞回
 
 触发依据是下一次调用的估算输入 token、消息类别预算、模型 context window、当前 subtree 剩余 token 与动态最终综合预留，不以固定对话轮数为唯一条件。
 
-定义 `usable_input_budget` 为模型可用输入上界与扣除当前输出/最终综合预留后的剩余预算两者较小值。初始可配置水位为：L1 60%、L2 70%、L3 78%、L4 86%、L5 92%；各级压缩目标分别回落到 55%、62%、68%、72%、78% 以下。相同级别只有在 Context 再次跨越其水位、出现新的大结果或取回集合发生实质变化时才能重跑，避免每轮抖动。这些比例是可观测配置，不是研究完成规则，必须通过专项和 canary 校准。
+定义 `usable_input_budget` 为模型可用输入上界与扣除当前输出/最终综合预留后的剩余预算两者较小值。L1 按单结果大小执行，L2 在每次 policy 调用前幂等执行，L3 只在 Working Context 越过折叠水位时执行。相同 manifest 不重复生成 Memo，避免每轮抖动。这些水位是可观测配置，不是研究完成规则。
 
 Working Context 还应按类别分配上限：Task/固定控制信息、Research State、Evidence、最近操作/错误、child projection 和输出预留分别计量。任何类别超限先压缩自身，不能借用最终综合预留。父 fork 前必须根据预计 child artifact/evidence 回流重算 assessment 与 synthesis 预留，而不是使用固定常数。
 
@@ -457,7 +445,7 @@ token accounting 分开记录：policy planning、Evidence ingest、assessment/r
 ```yaml
 manifest_id: stable hash
 schema_version: 1
-level: L1 | L2 | L3 | L4 | L5
+level: L1 | L2 | L3
 source_checkpoint_id: ...
 replaced_message_ids: []
 replaced_message_hashes: []
@@ -476,7 +464,7 @@ error: null
 
 ### 13.7 不可丢失不变量
 
-所有五级压缩与父子汇聚必须保持：
+所有三层上下文处理与父子汇聚必须保持：
 
 - Research Brief、全部必要 requirement 与 expected output；
 - coverage、critical gaps、Claim↔Evidence IDs 和来源定位；
@@ -491,18 +479,16 @@ error: null
 
 ### 13.8 分阶段验收门
 
-实现顺序固定为：Evidence 闭环 → L1 → L2 → L3 → L4 → L5 → 语义终止与 fork 校准。每一级先写专项测试再实现；不得一次混改五级，也不得用反复完整 ResearchBench 替代确定性验证。
+实现顺序固定为：Evidence 闭环 → L1 Artifact Offload → L2 确定性清理 → L3 State Projection + Semantic Memo → artifact 回读 → 语义终止与 fork 校准。每一级先写专项测试再实现，不得用反复完整 ResearchBench 替代确定性验证。
 
 ### 13.12 当前实现参数与降级
 
-当前 policy 接口没有暴露模型 context-window 元数据，因此运行时在百分比水位之外使用保守的字符下限：完整工具 artifact 每次都先写；超过 4,000 字符的当前结果立即缩为 receipt + preview；L4 在 Working Context 超过 32,000 字符时保留最近 8 条消息并折叠可恢复旧区段；只有 L4 后仍超过 48,000 字符才触发 L5，并保留最近 4 条。以后模型适配器提供可靠窗口大小时，可把这些下限与本节 60%/70%/78%/86%/92% 水位取更早触发者。
+当前 policy 接口没有暴露模型 context-window 元数据，因此运行时使用保守字符下限：完整工具 artifact 每次都先写；超过 4,000 字符的当前结果立即缩为 receipt + preview；L3 在 Working Context 超过 32,000 字符时保留最近 8 条消息，并同时生成 State Projection 和 Semantic Memo。Memo 的 JSON、长度或 ID 完整性验证失败时，只使用确定性 State Projection。Writer/receipt/落盘字节任一失败时，checkpoint 保留完整原始结果。
 
-L2 只裁剪已由 assessment 消费的 verified artifact；L3 只删除被新控制投影取代的旧 `RESEARCH_STATE_DECISION`；L4 遇到任何未持久化 raw tool payload 就停止在其前方；L5 的 JSON、summary 长度或 ID 完整性验证失败时原样使用 L4 结果。Writer/receipt/落盘字节任一失败时，checkpoint 消息保留完整原始工具结果，不执行截断。
-
-进入真实 canary 前，至少证明：错误 payload 不生成 Evidence；每个研究调用有唯一 action 绑定；完整大结果可恢复；tool-call 配对在压缩后合法；collapse 前后 State 等价；L5 不覆盖真实状态；父子隔离与单一 Writer 所有权成立；恢复不重复执行工具动作。
+进入真实 canary 前，至少证明：错误 payload 不生成 Evidence；每个研究调用有唯一 action 绑定；完整大结果可恢复；tool-call 配对在处理后合法；State Projection 前后事实状态等价；Memo 不覆盖真实状态；父子共享 root-thread artifact scope 但不能跨任务读取；恢复不重复执行工具动作。
 
 真实 `tech_001` canary 进一步校准了三个运行时约束：fork 候选先覆盖不同 requirement，再把剩余名额用于同一 requirement 的细分；父级 token 预留以原始 subtree 预算的 15%（并受固定/状态复杂度预留与 60,000 上限共同约束）作为不可被多轮 fork 侵蚀的下限；同一未闭环 requirement 只有在三个不同 strategy family 都产生 `no_progress` 时，运行时才可保守地判为 `evidence_exhausted`。这三个约束均不把工具错误当 Evidence，也不替代一般语义充分性判断。
 
-第二次隔离 canary 的确定性前置门为 `792 passed, 2 skipped`。真实运行从首轮的 31 次工具调用、200,000 token、`fallback`、Judge 3.2，改善为 12 次工具调用、56,248 token、`valid`、Judge 5.8；但 9/12 调用仍因搜索配额、403、证书或 OpenAlex 标识错误失败，最终为 `time_budget_exhausted → budget_forced`，RCS objective coverage/evidence sufficiency 仍为 0。Working Context 最大单消息约 2.3K 字符，L4/L5 未触发，证明该样本的剩余瓶颈是外部检索可用性与墙钟时限，而不是 Context 膨胀。按阶段门禁，未启动三题扩展回归。
+第二次隔离 canary 的确定性前置门为 `792 passed, 2 skipped`。真实运行从首轮的 31 次工具调用、200,000 token、`fallback`、Judge 3.2，改善为 12 次工具调用、56,248 token、`valid`、Judge 5.8；但 9/12 调用仍因搜索配额、403、证书或 OpenAlex 标识错误失败，最终为 `time_budget_exhausted → budget_forced`，RCS objective coverage/evidence sufficiency 仍为 0。该样本未达到 L3 consolidation 水位，说明当时的瓶颈是外部检索可用性与墙钟时限，而不是 Context 膨胀。
 
 该 canary 暴露的外部检索故障现在作为一等运行时异常处理：可行动的服务不可用事件会立即通过 SSE 提醒用户并写入 checkpoint；工具级故障打开熔断，来源级故障只隔离目标来源；重复无效调用会被跳过。最终 `ResearchResult.tool_alerts` 和报告保留服务、异常类别、影响范围、目标来源及恢复动作，因此此类失败不再隐藏在调用统计或笼统的 `budget_forced` 说明中。

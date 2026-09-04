@@ -236,7 +236,7 @@ Windows 下 Vault Writer 的 `60ms` heartbeat 时序用例，当前作为已知 
 当前确定性测试覆盖：
 
 ```text
-Evidence 闭环、L1–L5 上下文压缩、递归预算、checkpoint/Writer 崩溃恢复、Conversation/Quick Answer、Web/CLI 与 Memory 工作流
+Evidence 闭环、L1–L3 上下文管理、递归预算、checkpoint/Writer 崩溃恢复、Conversation/Quick Answer、Web/CLI 与 Memory 工作流
 ```
 
 测试覆盖递归与预算、checkpoint 恢复、用户确认、多 Memory 隔离、Writer 崩溃恢复、并发冲突、Markdown/WikiLink 契约、导入、FTS5、语义降级以及 Web/CLI 入口。

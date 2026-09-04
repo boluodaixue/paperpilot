@@ -654,6 +654,7 @@ class VaultWriteService:
         arguments: Mapping[str, Any],
         result: Any,
         origin_thread_id: str,
+        artifact_scope_id: str | None = None,
     ) -> dict[str, object]:
         """Publish one full raw tool result through the fenced Vault Writer."""
         plan = build_tool_artifact_plan(
@@ -662,6 +663,7 @@ class VaultWriteService:
             arguments=arguments,
             result=result,
             origin_thread_id=origin_thread_id,
+            artifact_scope_id=artifact_scope_id,
         )
         expected = tool_artifact_content(
             artifact_id,

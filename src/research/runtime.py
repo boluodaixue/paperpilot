@@ -35,6 +35,7 @@ from ..tools import (
     MockBrowserTool,
     MockWebSearchTool,
     NotepadTool,
+    ScopedFileRoot,
     WebSearchTool,
     file_reader_scope,
 )
@@ -724,13 +725,8 @@ class ResearchRuntime:
         return f"{workflow_type.replace('_', '-')}-{uuid.uuid4().hex}"
 
     @contextmanager
-    def _research_file_scope(self, memory_id: str | None):
-        """Authorize FileReader only for one explicitly selected managed Memory."""
-        if memory_id is None or memory_id == LEGACY_MEMORY_ID:
-            with file_reader_scope(None):
-                yield
-            return
-
+    def _research_file_scope(self, memory_id: str | None, root_thread_id: str | None = None):
+        """Authorize one Memory plus only the current execution tree's artifacts."""
         # Some embedding callers construct a deliberately minimal Runtime around a
         # custom graph. Missing store authority must disable FileReader rather than
         # widening access or breaking the unrelated graph operation.
@@ -739,15 +735,21 @@ class ResearchRuntime:
                 yield
             return
 
-        descriptor = self.get_memory(memory_id)
         vault_root = Path(self.memory_store.root).resolve(strict=True)
-        lexical_root = vault_root.joinpath(*Path(descriptor.relative_path).parts)
-        memory_root = lexical_root.resolve(strict=True)
-        if memory_root == vault_root or not memory_root.is_relative_to(vault_root):
-            raise ValueError("selected Memory file scope escapes the configured Vault")
-        if memory_root != lexical_root:
-            raise ValueError("selected Memory file scope cannot traverse a linked path")
-        with file_reader_scope({"memory": memory_root}):
+        authorized_roots: dict[str, Any] = {}
+        if memory_id is not None and memory_id != LEGACY_MEMORY_ID:
+            descriptor = self.get_memory(memory_id)
+            lexical_root = vault_root.joinpath(*Path(descriptor.relative_path).parts)
+            memory_root = lexical_root.resolve(strict=True)
+            if memory_root == vault_root or not memory_root.is_relative_to(vault_root):
+                raise ValueError("selected Memory file scope escapes the configured Vault")
+            if memory_root != lexical_root:
+                raise ValueError("selected Memory file scope cannot traverse a linked path")
+            authorized_roots["memory"] = memory_root
+        if root_thread_id:
+            thread_scope = hashlib.sha256(root_thread_id.encode("utf-8")).hexdigest()[:20]
+            authorized_roots["artifact"] = ScopedFileRoot(vault_root, f"Artifacts/{thread_scope}")
+        with file_reader_scope(authorized_roots or None):
             yield
 
     async def start(
@@ -772,7 +774,7 @@ class ResearchRuntime:
             depth=0,
         )
         with _memory_trace("paperpilot.research.start", memory_id) as observation:
-            with self._research_file_scope(memory_id):
+            with self._research_file_scope(memory_id, root_thread_id):
                 result = await self.graph.ainvoke(
                     create_research_workflow_state(
                         question,
@@ -818,7 +820,7 @@ class ResearchRuntime:
         ):
             raise TimeoutError("research confirmation has expired")
         with _memory_trace("paperpilot.research.review", state_memory_id) as observation:
-            with self._research_file_scope(state_memory_id):
+            with self._research_file_scope(state_memory_id, thread_id):
                 result = await resume_research_workflow(
                     self.graph,
                     thread_id=thread_id,
@@ -865,7 +867,7 @@ class ResearchRuntime:
         with _memory_trace(
             "paperpilot.research.confirm", state.get("memory_id")
         ) as observation:
-            with self._research_file_scope(state.get("memory_id")):
+            with self._research_file_scope(state.get("memory_id"), thread_id):
                 result = await self.graph.ainvoke(
                     Command(resume={"action": "confirm"}),
                     config=config,
@@ -929,7 +931,7 @@ class ResearchRuntime:
                 },
                 as_node="draft_brief",
             )
-            with self._research_file_scope(descriptor.memory_id):
+            with self._research_file_scope(descriptor.memory_id, thread_id):
                 await self.graph.ainvoke(None, config=config)
             rebound = await self.get_snapshot(thread_id)
             values = dict(rebound.values)
@@ -952,7 +954,7 @@ class ResearchRuntime:
         memory_id = state.get("memory_id")
         config = {"configurable": {"thread_id": thread_id}}
         with _memory_trace("paperpilot.research.review", memory_id) as observation:
-            with self._research_file_scope(memory_id):
+            with self._research_file_scope(memory_id, thread_id):
                 async for update in self.graph.astream(
                     Command(resume={"action": "confirm"}),
                     config=config,
@@ -985,7 +987,7 @@ class ResearchRuntime:
         state = await self.get_state(thread_id)
         memory_id = state.get("memory_id")
         with _memory_trace("paperpilot.research.continue", memory_id):
-            with self._research_file_scope(memory_id):
+            with self._research_file_scope(memory_id, thread_id):
                 return await self.graph.ainvoke(
                     None,
                     config={"configurable": {"thread_id": thread_id}},
