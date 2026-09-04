@@ -18,22 +18,6 @@ from .memory_import import (
     prepare_memory_text_import,
     prepare_memory_url_import,
 )
-from .obsidian import build_obsidian_open_uri
-from .retrieval import MarkdownMemoryIndex, MemorySearchHit
-from .runtime import (
-    ResearchRuntime,
-    build_research_runtime,
-    build_research_tools,
-    limits_from_config,
-    load_config,
-    setup_logging,
-    vault_root_from_config,
-)
-from .workflow import (
-    build_research_workflow,
-    create_research_workflow_state,
-    resume_research_workflow,
-)
 from .models import (
     AgentLimits,
     CriticalGap,
@@ -64,6 +48,21 @@ from .models import (
     ResearchWorkflowResult,
     StrategyAttempt,
     TerminationReason,
+    ToolAvailabilityAlert,
+    WikiClaim,
+    WikiDraft,
+    WikiSection,
+)
+from .obsidian import build_obsidian_open_uri
+from .retrieval import MarkdownMemoryIndex, MemorySearchHit
+from .runtime import (
+    ResearchRuntime,
+    build_research_runtime,
+    build_research_tools,
+    limits_from_config,
+    load_config,
+    setup_logging,
+    vault_root_from_config,
 )
 from .vault import (
     LEGACY_MEMORY_ID,
@@ -75,12 +74,18 @@ from .vault import (
     memory_relative_path,
     resolve_memory_attachment_path,
     resolve_vault_markdown_path,
-    validate_memory_attachment_path,
     validate_frontmatter,
+    validate_memory_attachment_path,
     validate_memory_descriptor,
     validate_memory_id,
     validate_wikilink_target,
 )
+from .workflow import (
+    build_research_workflow,
+    create_research_workflow_state,
+    resume_research_workflow,
+)
+from .wiki import generate_wiki_draft, list_wiki_pages, validate_wiki_draft
 
 __all__ = [
     "AgentLimits",
@@ -120,6 +125,10 @@ __all__ = [
     "ResearchWorkflowResult",
     "StrategyAttempt",
     "TerminationReason",
+    "ToolAvailabilityAlert",
+    "WikiClaim",
+    "WikiDraft",
+    "WikiSection",
     "build_obsidian_open_uri",
     "build_attachment_wikilink",
     "answer_memory",
@@ -152,4 +161,7 @@ __all__ = [
     "validate_memory_attachment_path",
     "validate_wikilink_target",
     "vault_root_from_config",
+    "generate_wiki_draft",
+    "list_wiki_pages",
+    "validate_wiki_draft",
 ]

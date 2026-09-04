@@ -8,7 +8,7 @@
 
 [![Python](https://img.shields.io/badge/Python-3.10%2B-blue.svg)](https://python.org)
 [![LangGraph](https://img.shields.io/badge/Orchestration-LangGraph-1f6feb.svg)](https://www.langchain.com/langgraph)
-[![Tests](https://img.shields.io/badge/tests-747%20passed-brightgreen.svg)](#测试)
+[![Tests](https://img.shields.io/badge/tests-836%20passed-brightgreen.svg)](#测试)
 [![License](https://img.shields.io/badge/license-MIT-green.svg)](LICENSE)
 
 </div>
@@ -23,7 +23,7 @@
 
 ```text
 一次研究：问题 → 计划确认 → 递归研究 → 带来源的报告
-长期积累：报告 → LLM Wiki → Memory 问答 → 新笔记 / 继续研究
+长期积累：报告 → 用户确认整理为 Wiki → Memory 问答 → 新笔记 / 继续研究
 ```
 
 ## ✨ 三项核心能力
@@ -31,7 +31,7 @@
 | 能力 | PaperPilot 做什么 | 解决的问题 |
 |---|---|---|
 | 🔎 **递归 Deep Research** | 同一种 Research Agent 按需 fork，搜索网页、论文和本地资料，汇聚可追溯证据 | 复杂问题难以一次检索完整 |
-| 🧠 **LLM Wiki** | 将报告、证据、来源和笔记组织为长期 Memory，支持检索问答与基于旧知识继续研究 | 研究结束后知识无法复用 |
+| 🧠 **LLM Wiki** | 将报告整理为持续更新、逐条引用 Evidence 的 Wiki 专题页，支持 Wiki 优先问答与基于旧知识继续研究 | 多份研究难以融合为当前知识 |
 | 🗂️ **Obsidian 原生工作流** | 使用 Markdown、frontmatter 和 WikiLink 落盘，可直接在 Obsidian 中阅读、编辑和浏览双链 | 知识被锁在聊天界面或专有数据库中 |
 
 ### 1. 递归 Deep Research
@@ -44,14 +44,27 @@
 
 ### 2. LLM Wiki：让研究成为长期记忆
 
-PaperPilot 的 LLM Wiki 不是另一个 Markdown 编辑器，而是建立在 Markdown Vault 之上的智能层：
+PaperPilot 的 LLM Wiki 不是另一个 Markdown 编辑器，而是建立在可追溯 Research Memory 之上的知识层：
 
 - 一个 Vault 可以包含多个稳定的 `memory_id`，Memory 不依赖某次 session 或 thread；
-- 报告、证据、来源、笔记和导入资料通过 WikiLink 形成知识网络；
-- 可以针对当前 Memory 提问，回答附带实际命中的文件引用；
+- 报告、Wiki、证据、来源、笔记和导入资料通过 WikiLink 形成知识网络；
+- 已完成报告可以由用户手动创建或更新为 Wiki 专题页，不自动触发第二次模型整理；
+- Wiki 整理只调用一次模型；模型输出结构化 Claim，路径、frontmatter 和 WikiLink 由程序生成；
+- 用户预览后才保存；保存时重新校验报告哈希、页面哈希和 Evidence ID；
+- Memory 问答优先检索 Wiki，尚未建立或没有命中 Wiki 时兼容检索原有报告、Evidence 与笔记；
 - 可以把回答整理为笔记，或导入 PDF、文本和网页；所有写入都先预览、再确认；
 - 新研究会读取已有结论与知识缺口，在同一 Memory 中继续扩展；
 - SQLite FTS5、可选本地语义召回和 WikiLink 邻居组成混合检索，索引可随时从 Markdown 重建。
+
+#### LLM Wiki 三层
+
+```text
+Raw / Source：原始附件、工具 Artifact 和来源定位，不由 Wiki 生成过程改写
+Evidence / Report：可定位的原子证据与单次研究快照
+Wiki：用户触发、LLM 辅助维护的当前专题知识
+```
+
+Schema/Governance 横跨三层，约束页面身份、路径、引用和写入边界。Report 保留历史，Wiki 持续更新；两者共享 Evidence，但研究完成时不会自动修改 Wiki。
 
 ### 3. Obsidian 原生，而不是自建编辑器
 
@@ -65,6 +78,7 @@ memory/
         ├── reports/
         ├── evidence/
         ├── sources/
+        ├── wiki/
         ├── notes/
         ├── imports/
         └── attachments/
@@ -80,7 +94,11 @@ flowchart LR
     D --> E[汇聚证据与来源]
     E --> F[生成 Markdown 报告]
     F --> G[Obsidian 阅读与双链]
-    F --> H[LLM Wiki 问答]
+    F --> K[用户选择新建或更新 Wiki]
+    K --> L[一次模型生成结构化草稿]
+    L --> M[校验 Evidence 并预览保存]
+    M --> H[Wiki 优先的 Memory 问答]
+    F --> H
     H --> I[确认保存笔记]
     H --> J[基于知识缺口继续研究]
     J --> D
@@ -99,10 +117,13 @@ flowchart TB
     AG -->|按需 fork| AG
     AG --> TOOLS[Search / Paper / Web / File / Compute]
     WF --> WRITER[Durable Queue + Single Vault Writer]
+    UI --> WIKI[Report → Wiki Preview]
+    WIKI --> WRITER
     WRITER --> VAULT[(Markdown Vault)]
     VAULT --> OBS[Obsidian]
     VAULT --> RETRIEVAL[FTS5 / Semantic / WikiLink Retrieval]
     RETRIEVAL --> WF
+    RETRIEVAL --> UI
 ```
 
 几个关键设计：
@@ -110,7 +131,7 @@ flowchart TB
 - **工作流可恢复**：LangGraph checkpoint 持久化研究阶段和 interrupt，服务重启后可继续等待中的流程；
 - **写入可恢复**：持久队列与单一 Vault Writer 串行提交，通过 staging、journal、内容哈希和原子发布处理崩溃与重复请求；
 - **知识不锁定**：SQLite 检索数据只是可重建索引，不能反向覆盖 Markdown；
-- **人在回路中**：研究计划、保存笔记、导入资料和 legacy 迁移均需要用户确认。
+- **人在回路中**：研究计划、Wiki 更新、保存笔记、导入资料和 legacy 迁移均需要用户确认。
 
 更完整的设计说明见 [架构文档](docs/ARCHITECTURE.md)。
 
@@ -153,7 +174,18 @@ python web/run.py
 
 打开 <http://127.0.0.1:8000>，创建或选择一个 Memory，然后开始研究。
 
-### 3. 在 Obsidian 中打开
+### 3. 整理报告到 Wiki
+
+在 Web 中完成一份绑定到 managed Memory 的研究后：
+
+1. 点击报告下方的“整理到 Wiki”；
+2. 选择“新建 Wiki 页面”或一个已有页面；
+3. 生成并检查完整 Markdown 预览；
+4. 点击“保存到 Wiki”。
+
+系统会自动沿报告中的 WikiLink 读取相关 Evidence。模型不能自行创建 Evidence ID；报告或目标 Wiki 在预览后发生变化时，保存会被拒绝，避免覆盖 Obsidian 中的并发编辑。
+
+### 4. 在 Obsidian 中打开
 
 把 `configs/default.yaml` 中 `research.vault_root` 指向的目录作为 Obsidian Vault 打开。默认目录是项目下的 `memory/`。
 
@@ -181,6 +213,7 @@ PaperPilot 保留了从原型到当前架构的完整 Git 提交历史，方便�
 | **2026.08.23–27** | PaperPilot 研究闭环 | 加入证据层、证据图、Web UI、动态 fork 和 Obsidian 导出探索 |
 | **2026.08.28** | LangGraph 主线重构 | 收敛为同质 Research AgentGraph，补齐确认、递归边界与 checkpoint 恢复 |
 | **2026.08.28–29** | LLM Wiki + Obsidian | 完成长期 Memory、受控笔记与导入、崩溃一致写入、全文与混合检索 |
+| **2026.09** | 用户驱动 Wiki | 增加 Report → Wiki 单次模型整理、Claim 级 Evidence 引用、预览保存与 Wiki 优先问答 |
 
 当前方向与后续计划见 [路线图](docs/ROADMAP.md)。每一个功能阶段的具体变化也可以直接通过 Git 历史查看。
 
@@ -196,7 +229,7 @@ pytest -q
 Evidence 闭环、L1–L3 上下文管理、递归预算、checkpoint/Writer 崩溃恢复、Web/CLI 与 Memory 工作流
 ```
 
-测试覆盖递归与预算、checkpoint 恢复、用户确认、多 Memory 隔离、Writer 崩溃恢复、并发冲突、Markdown/WikiLink 契约、导入、FTS5、语义降级以及 Web/CLI 入口。
+测试覆盖递归与预算、checkpoint 恢复、用户确认、多 Memory 隔离、Writer 崩溃恢复、并发冲突、Markdown/WikiLink 契约、Wiki 创建与更新、Evidence 引用校验、导入、FTS5、语义降级以及 Web/CLI 入口。当前全量结果为 **836 passed, 2 skipped**。
 
 ## 🛠️ 技术栈
 
@@ -219,7 +252,7 @@ paperpilot/
 ├── docs/             # 当前架构与路线图
 ├── evaluation/       # 固定离线评测
 ├── scripts/          # CLI、评测和模型准备工具
-├── src/research/     # Workflow、AgentGraph、Memory、Writer、Retrieval
+├── src/research/     # Workflow、AgentGraph、Memory、Wiki、Writer、Retrieval
 ├── src/tools/        # 搜索、论文、网页、文件与计算工具
 ├── tests/            # 确定性测试和故障注入
 └── web/              # FastAPI + 本地 Web UI
@@ -232,6 +265,7 @@ paperpilot/
 - [x] Research Brief 确认与 SQLite checkpoint 恢复
 - [x] 多 Memory Markdown Vault 与 Obsidian 工作流
 - [x] LLM Wiki 问答、受控笔记、导入与继续研究
+- [x] 用户触发的 Report → Wiki 整理、Evidence 引用校验与并发写入保护
 - [x] 单一 Vault Writer 与崩溃一致性
 - [x] FTS5 + 可选语义 + WikiLink 混合检索
 - [ ] 完成一次真实模型、真实搜索与服务重启恢复的公开演示

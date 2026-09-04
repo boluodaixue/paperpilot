@@ -40,6 +40,7 @@ VAULT_WRITE_OPERATION_TYPES = frozenset(
         "memory_import",
         "legacy_copy",
         "tool_artifact",
+        "wiki_page",
     }
 )
 VAULT_WRITE_JOB_STATUSES = frozenset({"queued", "running", "succeeded", "conflict", "failed"})
@@ -211,7 +212,7 @@ class VaultWriteQueue:
                                 'create_memory', 'research_bundle',
                                 'report_review', 'memory_note',
                                 'memory_import', 'legacy_copy'
-                                , 'tool_artifact'
+                                , 'tool_artifact', 'wiki_page'
                             )
                         ),
                         memory_id TEXT NOT NULL,
@@ -295,7 +296,7 @@ class VaultWriteQueue:
             "SELECT sql FROM sqlite_master " "WHERE type = 'table' AND name = 'vault_write_jobs'"
         ).fetchone()
         sql = "" if row is None else str(row[0] or "")
-        if "tool_artifact" in sql:
+        if "tool_artifact" in sql and "wiki_page" in sql:
             return
         connection.execute("BEGIN IMMEDIATE")
         try:
@@ -311,7 +312,7 @@ class VaultWriteQueue:
                             'create_memory', 'research_bundle',
                             'report_review', 'memory_note',
                             'memory_import', 'legacy_copy',
-                            'tool_artifact'
+                            'tool_artifact', 'wiki_page'
                         )
                     ),
                     memory_id TEXT NOT NULL,

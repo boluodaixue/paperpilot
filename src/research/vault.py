@@ -30,8 +30,9 @@ _FRONTMATTER_REQUIRED = frozenset(
     }
 )
 _PROPERTY_VALUE = re.compile(r"^[a-z][a-z0-9_-]*$")
-_ORIGINS = frozenset({"user", "research", "import", "conversation"})
-_STATUSES = frozenset({"draft", "confirmed"})
+_ORIGINS = frozenset({"user", "research", "import", "conversation", "wiki_generation"})
+_STATUSES = frozenset({"draft", "confirmed", "current", "conflicted", "stale"})
+_FRONTMATTER_STRING_LISTS = frozenset({"tags", "evidence_ids", "integrated_report_ids"})
 _INVALID_WIKILINK_CHARACTERS = frozenset("[]|#^\r\n")
 _INVALID_WINDOWS_PATH_CHARACTERS = frozenset('<>:"|?*')
 _WINDOWS_RESERVED_NAMES = frozenset(
@@ -155,7 +156,9 @@ def validate_frontmatter(frontmatter: Mapping[str, object]) -> dict[str, object]
         raise ValueError("frontmatter tags must be a list of strings")
 
     for key, value in frontmatter.items():
-        if key == "tags":
+        if key in _FRONTMATTER_STRING_LISTS:
+            if not isinstance(value, list) or any(not isinstance(item, str) for item in value):
+                raise ValueError(f"frontmatter field {key!r} must be a list of strings")
             continue
         _validate_flat_frontmatter_value(key, value)
     return dict(frontmatter)
