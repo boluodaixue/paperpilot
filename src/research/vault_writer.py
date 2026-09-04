@@ -221,6 +221,10 @@ def _validate_command_paths(
             or relative_anchor.suffix.lower() != ".md"
         ):
             raise VaultWriteCommandError("research/report-review anchor must be a report")
+    if operation_type == "wiki_page":
+        relative_anchor = anchor_path.relative_to(memory_root)
+        if relative_anchor.parts != ("wiki", "Index.md"):
+            raise VaultWriteCommandError("wiki-page anchor must be wiki/Index.md")
 
     allowed_roots = {
         "research_bundle": {"reports", "evidence", "sources"},
@@ -230,6 +234,7 @@ def _validate_command_paths(
         "create_memory": set(),
         "legacy_copy": {"reports", "evidence", "sources"},
         "tool_artifact": set(),
+        "wiki_page": {"wiki"},
     }[operation_type]
     non_home: list[PurePosixPath] = []
     for value in target_paths:
@@ -245,6 +250,12 @@ def _validate_command_paths(
         raise VaultWriteCommandError("report_review may replace only its anchor report")
     if operation_type == "memory_note" and (len(non_home) != 1 or non_home[0].suffix.lower() != ".md"):
         raise VaultWriteCommandError("memory_note must create exactly one Markdown note")
+    if operation_type == "wiki_page":
+        if len(non_home) != 2 or any(path.suffix.lower() != ".md" for path in non_home):
+            raise VaultWriteCommandError("wiki_page must publish one page and its Markdown index")
+        topic_pages = [path for path in non_home if path.parts != ("wiki", "Index.md")]
+        if len(topic_pages) != 1 or len(topic_pages[0].parts) != 2:
+            raise VaultWriteCommandError("wiki_page topic target is invalid")
 
 
 def _target_payload(

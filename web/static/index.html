@@ -179,6 +179,16 @@
                             border-radius: 7px; white-space: pre-wrap; font-size: 12px; }
   #legacyMigrationCard .actions { display: flex; justify-content: flex-end; gap: 8px; margin-top: 10px; }
 
+  /* ---------- Wiki 整理 ---------- */
+  #wikiCard { margin: 0 22px 10px; padding: 14px; background: #fff; border: 1px solid #8b5cf6;
+              border-radius: 10px; box-shadow: 0 2px 8px rgba(0,0,0,.05); }
+  #wikiCard label { display: block; margin: 8px 0 4px; color: #475569; font-size: 12px; }
+  #wikiTargetSelect { width: 100%; padding: 8px; border: 1px solid #d1d5db; border-radius: 7px; background: #fff; }
+  #wikiPreview { max-height: 340px; overflow: auto; padding: 10px; margin-top: 10px;
+                 border: 1px solid #e5e7eb; border-radius: 7px; white-space: pre-wrap; font-size: 12px; }
+  #wikiCard .actions { display: flex; justify-content: flex-end; gap: 8px; margin-top: 10px; }
+  .wiki-report-action { margin-top: 12px; }
+
   /* ---------- 输入栏 ---------- */
   #inputBar { display: flex; gap: 10px; padding: 12px 22px 16px; }
   #msgInput { flex: 1; padding: 11px 14px; border: 1px solid #d1d5db; border-radius: 10px; font-size: 14px; }
@@ -339,6 +349,19 @@
       </div>
     </div>
 
+    <div id="wikiCard" hidden>
+      <strong>整理报告到 Wiki</strong>
+      <label for="wikiTargetSelect">保存方式</label>
+      <select id="wikiTargetSelect"><option value="">新建 Wiki 页面</option></select>
+      <div id="wikiStatus"></div>
+      <pre id="wikiPreview" hidden></pre>
+      <div class="actions">
+        <button class="btn btn-ghost" type="button" onclick="closeWikiCard()">取消</button>
+        <button class="btn btn-ghost" type="button" id="generateWikiBtn" onclick="generateWikiPreview()">生成预览</button>
+        <button class="btn btn-primary" type="button" id="saveWikiBtn" onclick="saveWikiPage()" hidden>保存到 Wiki</button>
+      </div>
+    </div>
+
     <div id="inputBar">
       <input type="text" id="msgInput" placeholder="聊天、询问 Memory，或提出研究问题…" autocomplete="off">
       <button class="btn btn-primary" id="sendBtn" onclick="sendMessage()">发送</button>
@@ -353,6 +376,7 @@
 let currentSessionId = null;   // 当前会话
 let currentProposal = null;    // {brief, task_id} 待确认说明
 let currentReportData = null;  // 当前报告数据
+let currentWikiDraft = null;   // 浏览器持有的 Wiki 预览
 let runningTask = null;        // {task_id, session_id} 正在运行的研究
 let eventSource = null;
 const eventCursors = {};
@@ -755,6 +779,7 @@ function hideMemoryWorkflowCards() {
   void cancelMemoryNoteProposal(false);
   void cancelMemoryImport(false);
   void cancelLegacyMigration(false);
+  closeWikiCard();
 }
 
 function newSession() {
@@ -1832,6 +1857,7 @@ async function loadReportData(sid, reportMsg) {
     termination_reason: reportMsg.termination_reason || null,
     output_status: reportMsg.output_status || null,
     stop_reason: reportMsg.stop_reason || null,
+    manifest: reportMsg.manifest || null,
   };
 }
 
@@ -1875,7 +1901,7 @@ function renderReportCard(data) {
       <button class="tab active" type="button" role="tab" aria-selected="true" data-tab="report" onclick="switchTab(this,'report')">报告</button>
       <button class="tab" type="button" role="tab" aria-selected="false" data-tab="evidence" onclick="switchTab(this,'evidence')">证据索引</button>
     </div>
-    <div class="tabbody active" role="tabpanel" data-name="report"><div class="rc-report"></div></div>
+    <div class="tabbody active" role="tabpanel" data-name="report"><div class="rc-report"></div><div class="wiki-report-action"></div></div>
     <div class="tabbody" role="tabpanel" data-name="evidence"><div class="rc-evidence"></div></div>`;
   $('messages').appendChild(card);
 
@@ -1883,6 +1909,16 @@ function renderReportCard(data) {
   card.querySelector('.rc-report').innerHTML = renderSafeMarkdown(
     stripFrontmatter(data.report_md || '（无报告内容）')
   );
+  const wikiAction = card.querySelector('.wiki-report-action');
+  const reportPath = data.manifest && data.manifest.report_path;
+  if (data.memory_id && data.memory_id !== 'M-legacy' && reportPath) {
+    const button = document.createElement('button');
+    button.type = 'button';
+    button.className = 'btn btn-ghost';
+    button.textContent = '整理到 Wiki';
+    button.addEventListener('click', () => openWikiCard(data));
+    wikiAction.appendChild(button);
+  }
   renderEvidenceTable(card.querySelector('.rc-evidence'), data.evidence || [], data.report_md || '');
   scrollToBottom();
 }
@@ -1910,6 +1946,110 @@ function renderEvidenceTable(container, evidence, reportMd) {
     }
   }
   container.innerHTML = html;
+}
+
+// ------------------------------------------------------------------
+// 用户触发的 Wiki 整理：浏览器持有预览，保存时后端重新校验
+// ------------------------------------------------------------------
+async function openWikiCard(reportData) {
+  const reportPath = reportData && reportData.manifest && reportData.manifest.report_path;
+  if (!reportData || !reportData.memory_id || !reportPath) {
+    alert('当前报告没有可用的 Memory 路径。');
+    return;
+  }
+  currentReportData = reportData;
+  currentWikiDraft = null;
+  $('wikiPreview').hidden = true;
+  $('wikiPreview').textContent = '';
+  $('wikiStatus').textContent = '';
+  $('saveWikiBtn').hidden = true;
+  $('generateWikiBtn').hidden = false;
+  const select = $('wikiTargetSelect');
+  select.replaceChildren();
+  const create = document.createElement('option');
+  create.value = '';
+  create.textContent = '新建 Wiki 页面';
+  select.appendChild(create);
+  try {
+    const response = await fetch(`/api/memories/${encodeURIComponent(reportData.memory_id)}/wiki-pages`);
+    const pages = await response.json();
+    if (!response.ok) throw new Error(pages.detail || 'Wiki 页面读取失败');
+    for (const page of pages) {
+      const option = document.createElement('option');
+      option.value = page.path;
+      option.textContent = `更新：${page.title}`;
+      select.appendChild(option);
+    }
+  } catch (error) {
+    alert(error.message || 'Wiki 页面读取失败');
+    return;
+  }
+  $('wikiCard').hidden = false;
+  $('wikiCard').scrollIntoView({ behavior: 'smooth', block: 'nearest' });
+}
+
+function closeWikiCard() {
+  currentWikiDraft = null;
+  $('wikiCard').hidden = true;
+  $('wikiPreview').hidden = true;
+  $('wikiStatus').textContent = '';
+}
+
+async function generateWikiPreview() {
+  const data = currentReportData;
+  const reportPath = data && data.manifest && data.manifest.report_path;
+  if (!data || !data.memory_id || !reportPath) return;
+  $('generateWikiBtn').disabled = true;
+  $('wikiStatus').textContent = '正在基于报告和 Evidence 整理…';
+  try {
+    const targetPath = $('wikiTargetSelect').value || null;
+    const response = await fetch(`/api/memories/${encodeURIComponent(data.memory_id)}/wiki/generate`, {
+      method: 'POST', headers: {'Content-Type':'application/json'},
+      body: JSON.stringify({
+        session_id: currentSessionId,
+        source_report_path: reportPath,
+        target_path: targetPath,
+      }),
+    });
+    const draft = await response.json();
+    if (!response.ok) throw new Error(draft.detail || 'Wiki 生成失败');
+    currentWikiDraft = draft;
+    $('wikiPreview').textContent = draft.markdown || '';
+    $('wikiPreview').hidden = false;
+    $('wikiStatus').textContent = `已生成${draft.action === 'update' ? '更新' : '新建'}预览，引用 ${draft.evidence_ids.length} 条 Evidence。`;
+    $('saveWikiBtn').hidden = false;
+  } catch (error) {
+    currentWikiDraft = null;
+    $('saveWikiBtn').hidden = true;
+    $('wikiStatus').textContent = error.message || 'Wiki 生成失败';
+  } finally {
+    $('generateWikiBtn').disabled = false;
+  }
+}
+
+async function saveWikiPage() {
+  if (!currentWikiDraft) return;
+  $('saveWikiBtn').disabled = true;
+  $('wikiStatus').textContent = '正在校验并写入 Wiki…';
+  try {
+    const draft = {...currentWikiDraft};
+    delete draft.can_save;
+    delete draft.session_id;
+    const response = await fetch(`/api/memories/${encodeURIComponent(draft.memory_id)}/wiki/save`, {
+      method: 'POST', headers: {'Content-Type':'application/json'},
+      body: JSON.stringify({...draft, session_id: currentSessionId}),
+    });
+    const result = await response.json();
+    if (!response.ok) throw new Error(result.detail || 'Wiki 保存失败');
+    $('wikiStatus').textContent = `已保存：${result.target_path}`;
+    currentWikiDraft = null;
+    $('saveWikiBtn').hidden = true;
+    $('generateWikiBtn').hidden = true;
+  } catch (error) {
+    $('wikiStatus').textContent = error.message || 'Wiki 保存失败';
+  } finally {
+    $('saveWikiBtn').disabled = false;
+  }
 }
 
 // ------------------------------------------------------------------

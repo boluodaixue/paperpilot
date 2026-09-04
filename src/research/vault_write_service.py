@@ -24,6 +24,7 @@ from .memory_write_plans import (
     build_report_review_plan,
     build_research_bundle_plan,
     build_tool_artifact_plan,
+    build_wiki_page_plan,
     create_memory_request_hash,
     report_review_request_hash,
     research_bundle_request_hash,
@@ -37,6 +38,7 @@ from .models import (
     MemoryNoteProposal,
     ResearchBrief,
     ResearchResult,
+    WikiDraft,
 )
 from .vault import LEGACY_MEMORY_ID, validate_memory_id
 from .vault_write_queue import VaultWriteJob, VaultWriteQueue, VaultWriterLease
@@ -767,6 +769,33 @@ class VaultWriteService:
         required = ("memory_id", "target_path", "home_path", "wikilink")
         if any(not isinstance(value.get(key), str) for key in required):
             raise RuntimeError("Vault Writer returned an invalid note result")
+        return {key: str(value[key]) for key in required}
+
+    def commit_wiki_page(
+        self,
+        draft: WikiDraft,
+        *,
+        origin_thread_id: str | None = None,
+    ) -> dict[str, str]:
+        value = self._submit(
+            build_wiki_page_plan(
+                self.memory_store,
+                draft,
+                origin_thread_id=origin_thread_id,
+            )
+        )
+        required = (
+            "action",
+            "content_hash",
+            "index_path",
+            "memory_id",
+            "request_hash",
+            "target_path",
+            "wiki_id",
+            "wikilink",
+        )
+        if any(not isinstance(value.get(key), str) for key in required):
+            raise RuntimeError("Vault Writer returned an invalid Wiki page result")
         return {key: str(value[key]) for key in required}
 
     def commit_memory_import(

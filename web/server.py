@@ -50,6 +50,7 @@ from src.research.models import (  # noqa: E402
     MemoryImportProposal,
     MemoryNoteProposal,
     ResearchWorkflowResult,
+    WikiDraft,
 )
 from src.research.obsidian import build_obsidian_open_uri  # noqa: E402
 from src.research.runtime import (  # noqa: E402
@@ -296,6 +297,33 @@ class MemoryOperationDecisionRequest(BaseModel):
     memory_id: str | None = None
     answer_id: str | None = None
     proposal_id: str | None = None
+
+
+class WikiGenerateRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    source_report_path: str
+    target_path: str | None = None
+    session_id: str | None = None
+
+
+class WikiSaveRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    session_id: str | None = None
+    memory_id: str
+    action: str
+    wiki_id: str
+    target_path: str
+    title: str
+    markdown: str
+    source_report_path: str
+    source_report_hash: str
+    evidence_ids: list[str]
+    integrated_report_ids: list[str]
+    expected_target_hash: str | None = None
+    created_at: str
+    generated_at: str
 
 
 class SessionRename(BaseModel):
@@ -2363,6 +2391,72 @@ async def cancel_memory_import(
         "session_id": record.session_id,
         **_workflow_response_identity(record),
     }
+
+
+@app.get("/api/memories/{memory_id}/wiki-pages")
+async def list_memory_wiki_pages(memory_id: str) -> list[dict[str, str]]:
+    runtime = get_research_runtime()
+    try:
+        return list(await asyncio.to_thread(runtime.list_wiki_pages, memory_id))
+    except (FileNotFoundError, ValueError) as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@app.post("/api/memories/{memory_id}/wiki/generate")
+async def generate_memory_wiki(
+    memory_id: str,
+    req: WikiGenerateRequest,
+) -> dict[str, Any]:
+    _require_writable_memory(memory_id)
+    session_id = _session_id(req.session_id)
+    if _session_memory(session_id, memory_id) != memory_id:
+        raise HTTPException(status_code=409, detail="session 与 memory 不匹配")
+    try:
+        draft = await get_research_runtime().generate_wiki_draft(
+            memory_id,
+            req.source_report_path,
+            target_path=req.target_path,
+        )
+    except MemoryWriteConflictError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    except (FileNotFoundError, ValueError) as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return {**asdict(draft), "session_id": session_id, "can_save": True}
+
+
+@app.post("/api/memories/{memory_id}/wiki/save")
+async def save_memory_wiki(
+    memory_id: str,
+    req: WikiSaveRequest,
+) -> dict[str, Any]:
+    _require_writable_memory(memory_id)
+    if req.memory_id != memory_id:
+        raise HTTPException(status_code=409, detail="Wiki draft 与 memory 不匹配")
+    session_id = _session_id(req.session_id)
+    if _session_memory(session_id, memory_id) != memory_id:
+        raise HTTPException(status_code=409, detail="session 与 memory 不匹配")
+    draft = WikiDraft(
+        memory_id=memory_id,
+        action=req.action,
+        wiki_id=req.wiki_id,
+        target_path=req.target_path,
+        title=req.title,
+        markdown=req.markdown,
+        source_report_path=req.source_report_path,
+        source_report_hash=req.source_report_hash,
+        evidence_ids=tuple(req.evidence_ids),
+        integrated_report_ids=tuple(req.integrated_report_ids),
+        expected_target_hash=req.expected_target_hash,
+        created_at=req.created_at,
+        generated_at=req.generated_at,
+    )
+    try:
+        result = await asyncio.to_thread(get_research_runtime().save_wiki_draft, draft)
+    except MemoryWriteConflictError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    except (FileNotFoundError, ValueError) as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return {**result, "session_id": session_id}
 
 
 @app.post("/api/memories/{memory_id}/answers")

@@ -1098,6 +1098,8 @@ class MarkdownMemoryIndex:
         memory_id: str,
         query: str,
         limit: int = 5,
+        *,
+        path_prefix: str | None = None,
     ) -> tuple[MemorySearchHit, ...]:
         """Search current Markdown, then add directly linked notes and backlinks."""
         if not isinstance(query, str):
@@ -1108,7 +1110,18 @@ class MarkdownMemoryIndex:
             or not 1 <= limit <= 10
         ):
             raise ValueError("limit must be an integer between 1 and 10")
+        if path_prefix is not None:
+            expected = f"Memories/{memory_id}/"
+            if (
+                not isinstance(path_prefix, str)
+                or not path_prefix.startswith(expected)
+                or "\\" in path_prefix
+                or ".." in PurePosixPath(path_prefix).parts
+            ):
+                raise ValueError("path_prefix must stay inside the selected Memory")
         trace_metadata = {"memory_id": memory_id, "limit": limit}
+        if path_prefix is not None:
+            trace_metadata["path_prefix"] = path_prefix
         with trace_context(
             trace_name="paperpilot.memory.retrieval",
             tags=["paperpilot", "memory", "retrieval"],
@@ -1125,9 +1138,10 @@ class MarkdownMemoryIndex:
                 results: tuple[MemorySearchHit, ...] = ()
                 retrieval_mode = "fts5"
                 fallback_reason: str | None = None
+                rank_limit = max(limit, 200) if path_prefix is not None else limit
                 if self.semantic_enabled and query.strip():
                     try:
-                        results = self._hybrid_rank(memory_id, query, terms, limit)
+                        results = self._hybrid_rank(memory_id, query, terms, rank_limit)
                         retrieval_mode = "hybrid"
                     except Exception as exc:
                         retrieval_mode = "fts5_fallback"
@@ -1138,17 +1152,19 @@ class MarkdownMemoryIndex:
                             fallback_reason,
                             memory_id,
                         )
-                        results = self._rank(memory_id, terms, limit) if terms else ()
+                        results = self._rank(memory_id, terms, rank_limit) if terms else ()
                 elif terms:
-                    results = self._rank(memory_id, terms, limit)
+                    results = self._rank(memory_id, terms, rank_limit)
+                if path_prefix is not None:
+                    results = tuple(hit for hit in results if hit.relative_path.startswith(path_prefix))[:limit]
                 if results:
                     if any(not self._valid_hit(memory_id, hit) for hit in results):
                         self.sync(memory_id, force_hash=True)
                         try:
                             reranked = (
-                                self._hybrid_rank(memory_id, query, terms, limit)
+                                self._hybrid_rank(memory_id, query, terms, rank_limit)
                                 if retrieval_mode == "hybrid"
-                                else self._rank(memory_id, terms, limit) if terms else ()
+                                else self._rank(memory_id, terms, rank_limit) if terms else ()
                             )
                         except Exception as exc:
                             retrieval_mode = "fts5_fallback"
@@ -1159,7 +1175,11 @@ class MarkdownMemoryIndex:
                                 fallback_reason,
                                 memory_id,
                             )
-                            reranked = self._rank(memory_id, terms, limit) if terms else ()
+                            reranked = self._rank(memory_id, terms, rank_limit) if terms else ()
+                        if path_prefix is not None:
+                            reranked = tuple(
+                                hit for hit in reranked if hit.relative_path.startswith(path_prefix)
+                            )[:limit]
                         results = tuple(
                             hit for hit in reranked if self._valid_hit(memory_id, hit)
                         )[:limit]

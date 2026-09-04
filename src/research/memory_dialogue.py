@@ -112,11 +112,20 @@ async def answer_memory(
     if not isinstance(question, str) or not question.strip():
         raise ValueError("question must be a non-empty string")
     clean_question = question.strip()
-    hits = MarkdownMemoryIndex(memory_store).search(
+    index = MarkdownMemoryIndex(memory_store)
+    hits = index.search(
         memory_id,
         clean_question,
         limit=5,
+        path_prefix=(
+            f"Memories/{memory_id}/wiki/"
+            if memory_id != LEGACY_MEMORY_ID
+            else None
+        ),
     )
+    if not hits:
+        # Existing Memories remain useful before their first user-curated Wiki page.
+        hits = index.search(memory_id, clean_question, limit=5)
     answer_id = f"Answer-{uuid.uuid4().hex}"
     if not hits:
         reason = "当前 Memory 中没有找到与问题相关的内容。"

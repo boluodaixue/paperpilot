@@ -417,6 +417,41 @@ class MemoryNoteProposal:
 
 
 @dataclass(frozen=True)
+class WikiClaim:
+    """One Wiki statement grounded in existing Evidence notes."""
+
+    text: str
+    evidence_ids: tuple[str, ...]
+
+
+@dataclass(frozen=True)
+class WikiSection:
+    """A titled group of grounded Wiki claims."""
+
+    heading: str
+    claims: tuple[WikiClaim, ...]
+
+
+@dataclass(frozen=True)
+class WikiDraft:
+    """Client-held Wiki preview that is revalidated before publication."""
+
+    memory_id: str
+    action: str
+    wiki_id: str
+    target_path: str
+    title: str
+    markdown: str
+    source_report_path: str
+    source_report_hash: str
+    evidence_ids: tuple[str, ...]
+    integrated_report_ids: tuple[str, ...]
+    expected_target_hash: str | None
+    created_at: str
+    generated_at: str
+
+
+@dataclass(frozen=True)
 class MemoryImportDuplicate:
     """Existing import returned without extraction, policy, or writes."""
 

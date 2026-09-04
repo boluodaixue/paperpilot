@@ -72,6 +72,19 @@ class FixedPolicy:
         if assessment is not None:
             return assessment
         system = str(messages[0].get("content", ""))
+        if "durable Wiki topic page" in system:
+            context = json.loads(str(messages[-1]["content"]).split("\n", 1)[1])
+            evidence_id = context["evidence"][0]["evidence_id"]
+            return {"content": json.dumps({
+                "title": "Fixed Wiki",
+                "sections": [{
+                    "heading": "Current understanding",
+                    "claims": [{
+                        "text": "A source-locatable fixed finding.",
+                        "evidence_ids": [evidence_id],
+                    }],
+                }],
+            }), "tool_calls": []}
         if "Answer one narrow current question" in system:
             return {"content": json.dumps({
                 "claims": [{
@@ -369,6 +382,38 @@ def test_chat_stores_manifest_pointer_and_history_reads_markdown(web_client):
     assert "Fixed summary" in expanded["content"]
     evidence = client.get("/api/sessions/history/evidence").json()["evidence"]
     assert evidence and "Fixed source" in evidence[0]["markdown"]
+
+
+def test_report_can_be_previewed_and_saved_as_a_wiki_page(web_client):
+    client, runtime, *_ = web_client
+    paused = client.post("/api/alignment", json={
+        "session_id": "wiki-web", "memory_id": _MEMORY_ID, "message": "Q",
+    }).json()
+    client.post("/api/research", json={"task_id": paused["task_id"], "session_id": "wiki-web"})
+    result = _wait_result(client, paused["task_id"])
+    report_path = result["manifest"]["report_path"]
+
+    preview_response = client.post(
+        f"/api/memories/{_MEMORY_ID}/wiki/generate",
+        json={"session_id": "wiki-web", "source_report_path": report_path},
+    )
+    assert preview_response.status_code == 200, preview_response.text
+    preview = preview_response.json()
+    assert preview["can_save"] is True
+    assert "Fixed Wiki" in preview["markdown"]
+
+    payload = {key: value for key, value in preview.items() if key not in {"can_save", "session_id"}}
+    payload["session_id"] = "wiki-web"
+    save_response = client.post(
+        f"/api/memories/{_MEMORY_ID}/wiki/save",
+        json=payload,
+    )
+    assert save_response.status_code == 200, save_response.text
+    saved = save_response.json()
+    assert runtime.read_memory(saved["target_path"]) == preview["markdown"]
+    pages = client.get(f"/api/memories/{_MEMORY_ID}/wiki-pages").json()
+    assert len(pages) == 1
+    assert pages[0]["title"] == "Fixed Wiki"
 
 
 def test_session_delete_only_removes_chat_not_shared_memory(web_client):

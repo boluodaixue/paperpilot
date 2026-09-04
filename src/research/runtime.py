@@ -74,6 +74,7 @@ from .memory_workflows import (
 from .retrieval import configure_persistent_retrieval
 from .research_blackboard import ResearchBlackboard
 from .research_control import HomogeneousForkConfig
+from .wiki import generate_wiki_draft as generate_wiki_from_report, list_wiki_pages
 from .models import (
     AgentLimits,
     ExecutionIdentity,
@@ -84,6 +85,7 @@ from .models import (
     MemoryNoteProposal,
     ResearchBrief,
     ResearchWorkflowResult,
+    WikiDraft,
 )
 from .workflow import (
     build_research_workflow,
@@ -735,7 +737,12 @@ class ResearchRuntime:
                 yield
             return
 
-        vault_root = Path(self.memory_store.root).resolve(strict=True)
+        configured_vault_root = Path(self.memory_store.root)
+        if not configured_vault_root.exists():
+            with file_reader_scope(None):
+                yield
+            return
+        vault_root = configured_vault_root.resolve(strict=True)
         authorized_roots: dict[str, Any] = {}
         if memory_id is not None and memory_id != LEGACY_MEMORY_ID:
             descriptor = self.get_memory(memory_id)
@@ -1377,6 +1384,43 @@ class ResearchRuntime:
                 }
             )
             return answer
+
+    def list_wiki_pages(self, memory_id: str) -> tuple[dict[str, str], ...]:
+        with _memory_trace("paperpilot.wiki.list", memory_id, run_type="retriever") as observation:
+            pages = list_wiki_pages(self.memory_store, memory_id)
+            observation.add_output({"memory_id": memory_id, "page_count": len(pages)})
+            return pages
+
+    async def generate_wiki_draft(
+        self,
+        memory_id: str,
+        source_report_path: str,
+        *,
+        target_path: str | None = None,
+    ) -> WikiDraft:
+        with _memory_trace("paperpilot.wiki.generate", memory_id) as observation:
+            draft = await generate_wiki_from_report(
+                self.memory_store,
+                self.policy,
+                memory_id,
+                source_report_path,
+                target_path=target_path,
+            )
+            observation.add_output(
+                {
+                    "memory_id": memory_id,
+                    "action": draft.action,
+                    "target_path": draft.target_path,
+                    "evidence_count": len(draft.evidence_ids),
+                }
+            )
+            return draft
+
+    def save_wiki_draft(self, draft: WikiDraft) -> dict[str, str]:
+        with _memory_trace("paperpilot.wiki.save", draft.memory_id) as observation:
+            result = self.vault_write_service.commit_wiki_page(draft)
+            observation.add_output(result)
+            return result
 
     async def propose_memory_note(
         self,

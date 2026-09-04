@@ -64,6 +64,7 @@ def test_schema_has_explicit_operations_statuses_and_per_vault_keys(
         "memory_import",
         "legacy_copy",
         "tool_artifact",
+        "wiki_page",
     }
     assert VAULT_WRITE_JOB_STATUSES == {
         "queued",

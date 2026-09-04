@@ -24,6 +24,7 @@ from .models import (
     MemoryNoteProposal,
     ResearchBrief,
     ResearchResult,
+    WikiDraft,
 )
 from .rendering import (
     managed_note_id,
@@ -36,6 +37,7 @@ from .rendering import (
     source_note_id,
 )
 from .report_review import validate_revised_report
+from .wiki import render_wiki_index, validate_wiki_draft
 from .vault import (
     LEGACY_MEMORY_ID,
     build_attachment_wikilink,
@@ -59,6 +61,7 @@ WriteOperation = Literal[
     "memory_import",
     "legacy_copy",
     "tool_artifact",
+    "wiki_page",
 ]
 _MEMORY_DIRECTORIES = (
     "reports",
@@ -669,6 +672,56 @@ def build_memory_note_plan(
     )
 
 
+def build_wiki_page_plan(
+    memory_store: MarkdownMemoryStore,
+    draft: WikiDraft,
+    *,
+    origin_thread_id: str | None = None,
+) -> MemoryWritePlan:
+    """Build one Wiki topic publication followed by its deterministic index."""
+    if not isinstance(draft, WikiDraft):
+        raise TypeError("draft must be a WikiDraft")
+    draft = replace(
+        draft,
+        evidence_ids=tuple(draft.evidence_ids),
+        integrated_report_ids=tuple(draft.integrated_report_ids),
+    )
+    validate_wiki_draft(memory_store, draft)
+    index_path = f"{memory_relative_path(draft.memory_id)}wiki/Index.md"
+    index_markdown = render_wiki_index(memory_store, draft)
+    request_hash = _value_hash(draft)
+    command = build_file_bundle_command(
+        operation_type="wiki_page",
+        memory_id=draft.memory_id,
+        anchor_path=index_path,
+        targets=[
+            _snapshot_markdown(memory_store, draft.target_path, draft.markdown),
+            _snapshot_markdown(memory_store, index_path, index_markdown),
+        ],
+        input_hashes={
+            "draft": request_hash,
+            "source_report": draft.source_report_hash,
+        },
+        result={
+            "action": draft.action,
+            "content_hash": _sha256(draft.markdown.encode("utf-8")),
+            "index_path": index_path,
+            "memory_id": draft.memory_id,
+            "request_hash": request_hash,
+            "target_path": draft.target_path,
+            "wiki_id": draft.wiki_id,
+            "wikilink": build_wikilink(draft.target_path, draft.title),
+        },
+    )
+    return _plan(
+        idempotency_key=f"wiki-page:{draft.memory_id}:{draft.target_path}:{request_hash}",
+        operation_type="wiki_page",
+        memory_id=draft.memory_id,
+        origin_thread_id=origin_thread_id,
+        command_blob=command,
+    )
+
+
 def build_memory_import_plan(
     memory_store: MarkdownMemoryStore,
     proposal: MemoryImportProposal,
@@ -823,6 +876,7 @@ plan_create_memory = build_create_memory_plan
 plan_research_bundle = build_research_bundle_plan
 plan_report_review = build_report_review_plan
 plan_memory_note = build_memory_note_plan
+plan_wiki_page = build_wiki_page_plan
 plan_memory_import = build_memory_import_plan
 plan_legacy_copy = build_legacy_copy_plan
 
@@ -833,6 +887,7 @@ __all__ = [
     "build_legacy_copy_plan",
     "build_memory_import_plan",
     "build_memory_note_plan",
+    "build_wiki_page_plan",
     "build_report_review_plan",
     "build_research_bundle_plan",
     "create_memory_request_hash",
@@ -840,6 +895,7 @@ __all__ = [
     "plan_legacy_copy",
     "plan_memory_import",
     "plan_memory_note",
+    "plan_wiki_page",
     "plan_report_review",
     "plan_research_bundle",
     "report_review_request_hash",

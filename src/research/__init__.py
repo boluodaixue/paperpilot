@@ -57,6 +57,9 @@ from .models import (
     StrategyAttempt,
     TerminationReason,
     ToolAvailabilityAlert,
+    WikiClaim,
+    WikiDraft,
+    WikiSection,
 )
 from .obsidian import build_obsidian_open_uri
 from .retrieval import MarkdownMemoryIndex, MemorySearchHit
@@ -150,6 +153,7 @@ from .workflow import (
     create_research_workflow_state,
     resume_research_workflow,
 )
+from .wiki import generate_wiki_draft, list_wiki_pages, validate_wiki_draft
 
 __all__ = [
     "AgentLimits",
@@ -226,6 +230,9 @@ __all__ = [
     "TerminationReason",
     "ToolAvailabilityAlert",
     "WorkPacket",
+    "WikiClaim",
+    "WikiDraft",
+    "WikiSection",
     "build_obsidian_open_uri",
     "audit_citations",
     "build_attachment_wikilink",
@@ -282,4 +289,7 @@ __all__ = [
     "EVIDENCE_MARKER",
     "adjudicate_research_challenges",
     "review_research_package",
+    "generate_wiki_draft",
+    "list_wiki_pages",
+    "validate_wiki_draft",
 ]

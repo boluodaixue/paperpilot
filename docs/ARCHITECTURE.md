@@ -143,10 +143,13 @@ Memories/M-.../
 ├── reports/
 ├── evidence/
 ├── sources/
+├── wiki/          # 用户确认后创建或更新的证据约束专题页
 ├── notes/
 ├── imports/
 └── attachments/
 ```
+
+研究流程仍只发布不可变来源、Evidence 和报告，不自动改写 Wiki。用户可在报告完成后明确选择新建或更新一个 `wiki/` 专题页；系统用报告及其 Evidence 做一次无工具模型整理，程序接管路径、frontmatter 和 WikiLink，并在用户预览保存时重新校验来源报告哈希、目标页面哈希和 Evidence ID。最终页面与 `wiki/Index.md` 通过同一 Vault Writer 原子发布。Memory 问答优先检索 Wiki；尚未建立或没有命中 Wiki 时兼容检索已有报告、Evidence 与笔记。
 
 Markdown frontmatter 保存最小身份和来源元数据；报告通过完整 Vault 相对 WikiLink 指向证据，证据再指向来源。关系由 WikiLink 和 Obsidian backlinks 表达，不维护 Evidence Graph。
 
