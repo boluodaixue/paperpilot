@@ -1,9 +1,10 @@
-"""Pure S2 plans for the six product-level managed Vault mutations.
+"""Pure S2 plans for product-level managed Vault mutations and artifacts.
 
 Planners may read canonical bytes to capture optimistic hashes. They never
 write, rename, remove, or stage a Vault path. Command encoding has exactly one
 owner: :mod:`src.research.vault_writer`.
 """
+
 from __future__ import annotations
 
 import base64
@@ -48,7 +49,6 @@ from .vault_writer import (
     canonical_command_hash,
 )
 
-
 WriteOperation = Literal[
     "create_memory",
     "research_bundle",
@@ -56,6 +56,7 @@ WriteOperation = Literal[
     "memory_note",
     "memory_import",
     "legacy_copy",
+    "tool_artifact",
 ]
 _MEMORY_DIRECTORIES = (
     "reports",
@@ -147,6 +148,93 @@ def report_review_request_hash(
             "report_path": report_path,
             "revised_report": _sha256(revised_markdown.encode("utf-8")),
         }
+    )
+
+
+def tool_artifact_content(
+    artifact_id: str,
+    *,
+    tool_name: str,
+    arguments: Mapping[str, Any],
+    result: Any,
+) -> bytes:
+    """Encode the exact durable envelope used for one raw tool result."""
+    artifact = _required_text(artifact_id, field_name="artifact_id")
+    tool = _required_text(tool_name, field_name="tool_name")
+    if not isinstance(arguments, Mapping):
+        raise TypeError("tool artifact arguments must be a mapping")
+    return json.dumps(
+        {
+            "artifact_id": artifact,
+            "arguments": _jsonable(dict(arguments)),
+            "result": _jsonable(result),
+            "tool_name": tool,
+        },
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+
+
+def build_tool_artifact_plan(
+    artifact_id: str,
+    *,
+    tool_name: str,
+    arguments: Mapping[str, Any],
+    result: Any,
+    origin_thread_id: str,
+    artifact_scope_id: str | None = None,
+) -> MemoryWritePlan:
+    """Build a content-addressed raw tool-result publication command."""
+    thread = _required_text(origin_thread_id, field_name="origin_thread_id")
+    scope = _required_text(
+        artifact_scope_id or origin_thread_id,
+        field_name="artifact_scope_id",
+    )
+    content = tool_artifact_content(
+        artifact_id,
+        tool_name=tool_name,
+        arguments=arguments,
+        result=result,
+    )
+    thread_scope = hashlib.sha256(scope.encode("utf-8")).hexdigest()[:20]
+    memory_id = f"M-artifacts-{thread_scope}"
+    artifact_path = f"Artifacts/{thread_scope}/{artifact_id}.json"
+    content_hash = _sha256(content)
+    request_hash = _value_hash(
+        {
+            "artifact_id": artifact_id,
+            "content_hash": content_hash,
+            "origin_thread_id": thread,
+            "artifact_scope_id": scope,
+        }
+    )
+    command = build_file_bundle_command(
+        operation_type="tool_artifact",
+        memory_id=memory_id,
+        anchor_path=artifact_path,
+        targets=(
+            _file(
+                artifact_path,
+                content,
+                expected_mode="reuse",
+            ),
+        ),
+        input_hashes={"request": request_hash},
+        result={
+            "artifact_id": artifact_id,
+            "artifact_path": artifact_path,
+            "content_hash": content_hash,
+            "request_hash": request_hash,
+            "size_bytes": len(content),
+        },
+    )
+    return _plan(
+        idempotency_key=f"tool-artifact:{thread_scope}:{artifact_id}",
+        operation_type="tool_artifact",
+        memory_id=memory_id,
+        origin_thread_id=thread,
+        command_blob=command,
     )
 
 
@@ -337,10 +425,7 @@ def build_research_bundle_plan(
     created_at = _required_text(created_at, field_name="created_at")
 
     unique_evidence = list({item.evidence_id: item for item in result.evidence}.values())
-    evidence_notes = {
-        item.evidence_id: managed_note_id("Evidence", item.evidence_id)
-        for item in unique_evidence
-    }
+    evidence_notes = {item.evidence_id: managed_note_id("Evidence", item.evidence_id) for item in unique_evidence}
     source_notes: dict[str, str] = {}
     for item in unique_evidence:
         source_notes.setdefault(item.source_ref, source_note_id(item))
@@ -645,9 +730,7 @@ def build_legacy_copy_plan(
             raise ValueError("legacy retirement preview fields do not match the contract")
         path_mapping = retirement.get("path_mapping")
         expected_mapping = {
-            str(item["source_path"]): str(item["target_path"])
-            for item in normalized_files
-            if isinstance(item, Mapping)
+            str(item["source_path"]): str(item["target_path"]) for item in normalized_files if isinstance(item, Mapping)
         }
         if not isinstance(path_mapping, Mapping) or dict(path_mapping) != expected_mapping:
             raise ValueError("legacy retirement path mapping differs from migration files")

@@ -6,6 +6,7 @@ import json
 import re
 from typing import Mapping
 
+from .evidence_selection import select_representative_evidence
 from .models import EvidenceItem, ResearchBrief, ResearchResult
 from .vault import build_wikilink
 
@@ -211,10 +212,15 @@ def render_report(
             "Evidence",
         )
 
+    report_evidence = select_representative_evidence(
+        result.evidence,
+        result.coverage,
+        limit=32,
+    )
     all_links = [
-        evidence_link(note)
-        for evidence_id, note in evidence_notes.items()
-        if any(item.evidence_id == evidence_id for item in result.evidence)
+        evidence_link(evidence_notes[item.evidence_id])
+        for item in report_evidence[:12]
+        if item.evidence_id in evidence_notes
     ]
     summary_suffix = f" {' '.join(all_links)}" if all_links else ""
 
@@ -248,15 +254,31 @@ def render_report(
         finding_lines = ["- No completed findings."]
 
     evidence_lines: list[str] = []
-    for evidence in result.evidence:
+    for evidence in report_evidence:
         note = evidence_notes[evidence.evidence_id]
         evidence_lines.append(
             f"- {evidence.finding} {evidence_link(note)}"
         )
     if not evidence_lines:
         evidence_lines = ["- No source-locatable evidence was collected."]
+    elif len(report_evidence) < len(result.evidence):
+        evidence_lines.append(
+            f"- Showing {len(report_evidence)} of {len(result.evidence)} collected evidence items; "
+            "the complete evidence inventory remains stored in the Vault."
+        )
 
     unresolved = "\n".join(f"- {item}" for item in result.unresolved) or "- None"
+    availability = ""
+    if result.tool_alerts:
+        availability_lines = "\n".join(
+            f"- **{item.category} / {item.tool} / {item.target or 'unknown'}:** "
+            f"{item.message} {item.action_required}"
+            for item in result.tool_alerts
+        )
+        availability = (
+            "## External Information Availability\n\n"
+            f"{availability_lines}\n\n"
+        )
     findings_text = "\n".join(finding_lines)
     evidence_text = "\n".join(evidence_lines)
     if memory_id is None:
@@ -291,6 +313,7 @@ def render_report(
         f"## Summary\n\n{result.summary or 'No summary was produced.'}{summary_suffix}\n\n"
         f"## Findings\n\n{findings_text}\n\n"
         f"## Evidence-backed Details\n\n{evidence_text}\n\n"
+        f"{availability}"
         f"## Unresolved\n\n{unresolved}\n\n"
         f"## Execution\n\n"
         f"- Research status: {result.status.value}\n"

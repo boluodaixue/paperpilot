@@ -172,6 +172,25 @@ def _validate_command_paths(
     directories: Sequence[str],
     target_paths: Sequence[str],
 ) -> None:
+    if operation_type == "tool_artifact":
+        try:
+            selected = validate_memory_id(memory_id)
+        except ValueError as exc:
+            raise VaultWriteCommandError("writer artifact scope is invalid") from exc
+        paths = tuple(target_paths)
+        anchor_path = PurePosixPath(anchor)
+        if (
+            publish != "file_bundle"
+            or directories
+            or not selected.startswith("M-artifacts-")
+            or len(paths) != 1
+            or paths[0] != anchor
+            or len(anchor_path.parts) != 3
+            or anchor_path.parts[0] != "Artifacts"
+            or anchor_path.suffix.lower() != ".json"
+        ):
+            raise VaultWriteCommandError("tool artifact path contract is invalid")
+        return
     try:
         selected = validate_memory_id(memory_id)
     except ValueError as exc:
@@ -210,6 +229,7 @@ def _validate_command_paths(
         "memory_import": {"attachments", "imports", "notes"},
         "create_memory": set(),
         "legacy_copy": {"reports", "evidence", "sources"},
+        "tool_artifact": set(),
     }[operation_type]
     non_home: list[PurePosixPath] = []
     for value in target_paths:
@@ -1924,7 +1944,9 @@ class VaultWriter:
             metadata = (target / ".paperpilot-archive.json").read_bytes()
         except FileNotFoundError:
             return False
-        return metadata == self._archive_metadata(job, spec) and self._tree_inventory(target) == spec["archive_inventory"]
+        return (
+            metadata == self._archive_metadata(job, spec) and self._tree_inventory(target) == spec["archive_inventory"]
+        )
 
     def _prepare_legacy_archive(
         self,
@@ -2082,9 +2104,7 @@ class VaultWriter:
         anchor = self._canonical(str(manifest["anchor"]))
         tree = job_root / "tree"
         if not anchor.exists():
-            tree = self._prepare_retirement_tree(
-                job, lease, job_root, manifest, manifest_hash
-            )
+            tree = self._prepare_retirement_tree(job, lease, job_root, manifest, manifest_hash)
         archive = self._prepare_legacy_archive(job, lease, job_root, spec, manifest_hash)
         if anchor.exists():
             if not self._directory_matches(anchor, manifest):
@@ -2147,11 +2167,7 @@ class VaultWriter:
         manifest_hash: str,
     ) -> VaultWriteJob:
         self._write_marker(lease, job.job_id, job_root, "COMPLETED", manifest_hash)
-        public_result = {
-            key: value
-            for key, value in command.result.items()
-            if key != "_legacy_retirement"
-        }
+        public_result = {key: value for key, value in command.result.items() if key != "_legacy_retirement"}
         completed = self.queue.complete(job.job_id, lease, public_result)
         self._fail("after_db_success")
         self._cleanup_terminal(job_root, completed, lease)

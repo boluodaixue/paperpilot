@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import asyncio
 import csv
+import hashlib
 import io
 import json
 import os
@@ -23,7 +24,7 @@ from types import MappingProxyType
 from typing import Any
 
 
-__all__ = ["FileReaderError", "FileReaderTool", "file_reader_scope"]
+__all__ = ["FileReaderError", "FileReaderTool", "ScopedFileRoot", "file_reader_scope"]
 
 _SUPPORTED_EXTS = frozenset(
     {".txt", ".md", ".markdown", ".pdf", ".csv", ".json", ".docx"}
@@ -59,6 +60,15 @@ _WINDOWS_RESERVED_NAMES = frozenset(
 class _AuthorizedRoot:
     path: Path
     identity: tuple[int, int, int]
+    prefix_parts: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True)
+class ScopedFileRoot:
+    """Trusted host root with a fixed virtual subdirectory boundary."""
+
+    path: str | os.PathLike[str]
+    prefix: str = ""
 
 
 _EMPTY_ROOTS: Mapping[str, _AuthorizedRoot] = MappingProxyType({})
@@ -89,7 +99,7 @@ def _is_reparse_point(path: Path) -> bool:
 
 
 def _normalize_roots(
-    allowed_roots: Mapping[str, str | os.PathLike[str]] | None,
+    allowed_roots: Mapping[str, str | os.PathLike[str] | ScopedFileRoot] | None,
 ) -> Mapping[str, _AuthorizedRoot]:
     if allowed_roots is None:
         return _EMPTY_ROOTS
@@ -97,11 +107,15 @@ def _normalize_roots(
         raise TypeError("allowed_roots must be a mapping or None")
 
     normalized: dict[str, _AuthorizedRoot] = {}
-    for raw_name, raw_path in allowed_roots.items():
+    for raw_name, raw_spec in allowed_roots.items():
         if not isinstance(raw_name, str) or not _ROOT_NAME.fullmatch(raw_name):
             raise ValueError("file reader root names must be safe lowercase identifiers")
+        raw_path = raw_spec.path if isinstance(raw_spec, ScopedFileRoot) else raw_spec
         if not isinstance(raw_path, (str, os.PathLike)):
             raise TypeError("file reader roots must be path-like")
+        prefix_parts: tuple[str, ...] = ()
+        if isinstance(raw_spec, ScopedFileRoot) and raw_spec.prefix:
+            _, prefix_parts = _validate_relative_path(raw_spec.prefix)
         lexical_root = Path(raw_path)
         if not lexical_root.exists() or not lexical_root.is_dir():
             raise FileReaderError(f"authorized root {raw_name!r} is unavailable")
@@ -117,13 +131,14 @@ def _normalize_roots(
         normalized[raw_name] = _AuthorizedRoot(
             path=resolved_root,
             identity=_identity(details),
+            prefix_parts=prefix_parts,
         )
     return MappingProxyType(dict(sorted(normalized.items()))) if normalized else _EMPTY_ROOTS
 
 
 @contextmanager
 def file_reader_scope(
-    allowed_roots: Mapping[str, str | os.PathLike[str]] | None,
+    allowed_roots: Mapping[str, str | os.PathLike[str] | ScopedFileRoot] | None,
 ) -> Iterator[None]:
     """Bind immutable named roots to the current synchronous/async context.
 
@@ -226,7 +241,11 @@ def _read_bounded_snapshot(
     """Read one identity-checked byte snapshot from one OS descriptor."""
     _check_authorized_root(authorized_root, virtual)
     root = authorized_root.path
-    component_snapshots = _snapshot_components(root, parts, virtual)
+    component_snapshots = _snapshot_components(
+        root,
+        (*authorized_root.prefix_parts, *parts),
+        virtual,
+    )
     target = component_snapshots[-1][0]
     try:
         resolved = target.resolve(strict=True)
@@ -491,6 +510,7 @@ class FileReaderTool:
         "a relative POSIX path. Absolute paths and path traversal are forbidden. "
         "For root 'memory', omit the Vault 'Memories/<memory-id>/' prefix (for "
         "example, use 'notes/N-example.md'). "
+        "For root 'artifact', provide the artifact filename from a receipt. "
         "Supports: .txt, .md, .markdown, .pdf, .csv, .json, .docx."
     )
 
@@ -544,7 +564,8 @@ class FileReaderTool:
                             "type": "string",
                             "description": (
                                 "Relative POSIX path inside the selected virtual root; "
-                                "for root 'memory', omit the Memories/<memory-id>/ prefix"
+                                "for root 'memory', omit the Memories/<memory-id>/ prefix; "
+                                "for root 'artifact', use the receipt filename"
                             ),
                         },
                     },
@@ -571,18 +592,27 @@ class FileReaderTool:
             virtual,
             self.max_file_size,
         )
-        content, truncated = await asyncio.to_thread(
-            self._parse,
-            payload,
-            extension,
-            virtual,
-        )
-        return {
+        if root == "artifact" and extension == ".json":
+            content, truncated = _truncate(
+                _decode_utf8(payload, virtual),
+                self.max_output_chars,
+            )
+        else:
+            content, truncated = await asyncio.to_thread(
+                self._parse,
+                payload,
+                extension,
+                virtual,
+            )
+        result = {
             "path": virtual,
             "format": _FORMAT_BY_EXT[extension],
             "content": content,
             "truncated": truncated,
         }
+        if root == "artifact":
+            result["content_hash"] = hashlib.sha256(payload).hexdigest()
+        return result
 
     def _parse(
         self,

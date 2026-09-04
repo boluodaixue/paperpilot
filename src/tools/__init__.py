@@ -5,7 +5,7 @@ from .web_search import WebSearchTool, MockWebSearchTool, BaseWebSearchTool
 from .arxiv_reader import ArxivReaderTool
 from .code_sandbox import CodeSandboxTool
 from .browser import BrowserTool, MockBrowserTool, BaseBrowserTool, get_browser_tool
-from .file_reader import FileReaderError, FileReaderTool, file_reader_scope
+from .file_reader import FileReaderError, FileReaderTool, ScopedFileRoot, file_reader_scope
 from .calculator import CalculatorTool
 from .notepad import NotepadTool, NotepadEntry
 
@@ -21,6 +21,7 @@ __all__ = [
     "get_browser_tool",
     "FileReaderTool",
     "FileReaderError",
+    "ScopedFileRoot",
     "file_reader_scope",
     # 计算与执行
     "CodeSandboxTool",

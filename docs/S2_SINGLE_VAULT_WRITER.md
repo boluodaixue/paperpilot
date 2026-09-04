@@ -53,6 +53,7 @@ anchor 发布后、数据库 success 前还会复核整个 manifest。外部修�
 - 保存 Memory 问答笔记；
 - PDF/text/URL 导入 bundle；
 - legacy 迁移和安全归档。
+- Research Agent 原始工具 artifact；以 thread scope 和内容哈希幂等发布，receipt 复核成功后才允许裁剪 Working Context。
 
 ## 可见性边界
 

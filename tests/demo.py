@@ -73,7 +73,7 @@ def create_tools(mock_mode: bool = USE_MOCK):
     if mock_mode:
         tools["web_search"] = MockWebSearchTool()
     else:
-        # 真实模式：WebSearchTool 自动从 .env / .env.local 读取 SERPAPI_KEY
+        # 真实模式：WebSearchTool 从环境配置读取首选和备用搜索服务。
         tools["web_search"] = WebSearchTool()
 
     # 2. browser
@@ -538,7 +538,7 @@ async def main() -> None:
         for err in errors:
             print(f"   - {err}")
         print("\n提示:")
-        print("   · 如果缺少 API Key，请设置环境变量（如 SERPAPI_KEY）")
+        print("   · 如果缺少 API Key，请配置 Tavily、秘塔或 Exa 等搜索服务")
         print("   · 或修改 USE_MOCK = False 切换到 Mock 模式")
     else:
         print("✅ 全部 7 个工具运行正常！")

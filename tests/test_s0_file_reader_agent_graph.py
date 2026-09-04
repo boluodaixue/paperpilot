@@ -9,7 +9,7 @@ import pytest
 
 from src.research.agent_graph import build_research_agent_graph, create_research_agent_state
 from src.research.models import AgentLimits, ExecutionIdentity, ResearchResult, ResearchTask
-from src.tools.file_reader import FileReaderError, FileReaderTool, file_reader_scope
+from src.tools.file_reader import FileReaderError, FileReaderTool, ScopedFileRoot, file_reader_scope
 
 
 def _tool_call(path: str) -> dict[str, Any]:
@@ -228,3 +228,22 @@ async def test_graph_built_deny_all_exposes_reader_in_later_runtime_scope(
     assert final["result"].evidence[0].source_ref == "memory/notes/N-approved.md"
     assert "Runtime-scoped evidence." in final["result"].evidence[0].finding
     assert tool.is_available() is False
+
+
+@pytest.mark.asyncio
+async def test_scoped_artifact_root_reads_only_its_execution_tree(tmp_path: Path) -> None:
+    vault = tmp_path / "Vault"
+    own = vault / "Artifacts" / "root-a"
+    other = vault / "Artifacts" / "root-b"
+    own.mkdir(parents=True)
+    other.mkdir(parents=True)
+    (own / "artifact-own.json").write_text('{"result":"own"}', encoding="utf-8")
+    (other / "artifact-other.json").write_text('{"result":"other"}', encoding="utf-8")
+    reader = FileReaderTool()
+
+    with file_reader_scope({"artifact": ScopedFileRoot(vault, "Artifacts/root-a")}):
+        result = await reader.execute(root="artifact", path="artifact-own.json")
+        assert result["content"] == '{"result":"own"}'
+        assert len(result["content_hash"]) == 64
+        with pytest.raises(FileReaderError):
+            await reader.execute(root="artifact", path="../root-b/artifact-other.json")

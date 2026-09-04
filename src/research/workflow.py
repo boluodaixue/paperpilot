@@ -1,4 +1,5 @@
 """Root workflow: align, confirm, run the homogeneous graph, and persist."""
+
 from __future__ import annotations
 
 import asyncio
@@ -29,8 +30,8 @@ from .models import (
     OutputStatus,
     ReportReviewOutcome,
     RequirementCoverage,
-    ResearchDecision,
     ResearchBrief,
+    ResearchDecision,
     ResearchRequirement,
     ResearchResult,
     ResearchTask,
@@ -49,10 +50,10 @@ from .rendering import (
     source_note_id,
 )
 from .report_review import review_final_report
+from .research_sufficiency import atomic_requirement_descriptions
 from .retrieval import MarkdownMemoryIndex, MemorySearchHit
 from .vault import validate_frontmatter, validate_memory_id
 from .vault_write_service import VaultWriteService
-
 
 __all__ = [
     "ResearchWorkflowState",
@@ -102,6 +103,8 @@ class ResearchWorkflowState(TypedDict, total=False):
     estimated_tokens_used: int
     retries_used: int
     execution_events: list[dict[str, Any]]
+    compression_manifests: list[dict[str, Any]]
+    semantic_memos: list[dict[str, Any]]
     lineage_objectives: list[str]
     draft: dict[str, Any] | None
     draft_raw: str
@@ -139,21 +142,13 @@ def _managed_research_timestamp(
     """Recover the one timestamp used by an already-published managed bundle."""
     lines = report_markdown.splitlines(keepends=True)
     if not lines or lines[0].rstrip("\r\n") != "---":
-        raise MemoryWriteConflictError(
-            "research persist replay conflict: existing report has no frontmatter"
-        )
+        raise MemoryWriteConflictError("research persist replay conflict: existing report has no frontmatter")
     closing = next(
-        (
-            index
-            for index, line in enumerate(lines[1:], start=1)
-            if line.rstrip("\r\n") == "---"
-        ),
+        (index for index, line in enumerate(lines[1:], start=1) if line.rstrip("\r\n") == "---"),
         None,
     )
     if closing is None:
-        raise MemoryWriteConflictError(
-            "research persist replay conflict: existing report frontmatter is not closed"
-        )
+        raise MemoryWriteConflictError("research persist replay conflict: existing report frontmatter is not closed")
     try:
         raw_frontmatter = yaml.safe_load("".join(lines[1:closing]))
         if not isinstance(raw_frontmatter, dict):
@@ -174,9 +169,7 @@ def _managed_research_timestamp(
     created_at = frontmatter.get("created_at")
     updated_at = frontmatter.get("updated_at")
     if not isinstance(created_at, str) or updated_at != created_at:
-        raise MemoryWriteConflictError(
-            "research persist replay conflict: existing report timestamp is not stable"
-        )
+        raise MemoryWriteConflictError("research persist replay conflict: existing report timestamp is not stable")
     return created_at
 
 
@@ -206,9 +199,7 @@ def _reuse_existing_research_commit(
         if memory_id is not None
         else None
     )
-    unique_evidence = list(
-        {item.evidence_id: item for item in result.evidence}.values()
-    )
+    unique_evidence = list({item.evidence_id: item for item in result.evidence}.values())
     evidence_note_by_id = {
         evidence.evidence_id: (
             managed_note_id("Evidence", evidence.evidence_id)
@@ -281,9 +272,7 @@ def _reuse_existing_research_commit(
                 f"research persist replay conflict: committed bundle is missing {path}"
             ) from exc
         if existing_markdown != expected_markdown:
-            raise MemoryWriteConflictError(
-                f"research persist replay conflict: committed content changed at {path}"
-            )
+            raise MemoryWriteConflictError(f"research persist replay conflict: committed content changed at {path}")
     return existing_report, MemoryManifest(
         report_path=report_path,
         evidence_paths=tuple(evidence_paths),
@@ -305,9 +294,7 @@ def _validate_root_state(
     state["limits"].validate()
     checkpoint_thread_id = config.get("configurable", {}).get("thread_id")
     if checkpoint_thread_id != identity.thread_id:
-        raise ValueError(
-            "LangGraph configurable.thread_id must match identity.thread_id"
-        )
+        raise ValueError("LangGraph configurable.thread_id must match identity.thread_id")
     if state.get("thread_id", identity.thread_id) != identity.thread_id:
         raise ValueError("workflow thread_id must match identity.thread_id")
 
@@ -433,11 +420,7 @@ def _parse_brief(
     if not expected_output:
         raise ValueError("research brief expected_output cannot be empty")
     fixed_memory = tuple(retrieved_memory) if memory_id is not None else ()
-    memory_paths = tuple(
-        str(item["path"])
-        for item in fixed_memory
-        if str(item.get("path") or "").strip()
-    )
+    memory_paths = tuple(str(item["path"]) for item in fixed_memory if str(item.get("path") or "").strip())
     if memory_id is None:
         known_information: tuple[str, ...] = ()
         research_gaps: tuple[str, ...] = ()
@@ -448,15 +431,9 @@ def _parse_brief(
             known_information = _as_string_tuple(payload.get("known_information"))
         else:
             known_information = tuple(
-                str(item["summary"]).strip()
-                for item in fixed_memory
-                if str(item.get("summary") or "").strip()
+                str(item["summary"]).strip() for item in fixed_memory if str(item.get("summary") or "").strip()
             )
-        research_gaps = (
-            _as_string_tuple(payload.get("research_gaps"))
-            if "research_gaps" in payload
-            else directions
-        )
+        research_gaps = _as_string_tuple(payload.get("research_gaps")) if "research_gaps" in payload else directions
     return ResearchBrief(
         question=question,
         objective=objective,
@@ -575,14 +552,13 @@ def build_research_workflow(
 ) -> Any:
     """Build the root workflow around the same homogeneous Research AgentGraph."""
     tool_list = list(tools)
-    effective_checkpointer = (
-        checkpointer if checkpointer is not None else InMemorySaver()
-    )
+    effective_checkpointer = checkpointer if checkpointer is not None else InMemorySaver()
     research_agent_graph = build_research_agent_graph(
         policy,
         tool_list,
         inherit_checkpointer=True,
         child_checkpointer=effective_checkpointer,
+        tool_artifact_store=vault_write_service,
     )
     memory_index = MarkdownMemoryIndex(memory_store)
 
@@ -617,11 +593,7 @@ def build_research_workflow(
             retrieved_memory = _bounded_memory_hits(hits)
         messages = [
             {"role": "system", "content": _alignment_system_prompt()},
-            *(
-                [_memory_alignment_message(memory_id, retrieved_memory)]
-                if memory_id is not None
-                else []
-            ),
+            *([_memory_alignment_message(memory_id, retrieved_memory)] if memory_id is not None else []),
             {"role": "user", "content": state["question"]},
         ]
         with _workflow_trace("draft_brief", state) as observation:
@@ -663,11 +635,7 @@ def build_research_workflow(
             "workflow_status": (
                 "cancelled"
                 if action == "cancel"
-                else "expired"
-                if action == "expire"
-                else "running"
-                if action == "confirm"
-                else "revising"
+                else "expired" if action == "expire" else "running" if action == "confirm" else "revising"
             ),
         }
 
@@ -734,14 +702,19 @@ def build_research_workflow(
                     "research_gaps": list(brief.research_gaps),
                 }
             )
-        requirement_descriptions = list(
-            dict.fromkeys([*brief.directions, *brief.research_gaps])
+        evidence_work_items = (
+            brief.research_gaps if brief.memory_id is not None and brief.research_gaps else brief.directions
         )
+        requirement_descriptions = atomic_requirement_descriptions(evidence_work_items)
+        deliverable = f"Deliverable: {brief.expected_output.strip()}" if brief.expected_output.strip() else None
+        if deliverable:
+            requirement_descriptions.append(deliverable)
+        requirement_descriptions = list(dict.fromkeys(requirement_descriptions))
         task_context["research_requirements"] = [
             {
                 "requirement_id": f"R{index}",
                 "description": description,
-                "required": True,
+                "required": description != deliverable,
             }
             for index, description in enumerate(
                 requirement_descriptions or [brief.objective],
@@ -979,9 +952,7 @@ def build_research_workflow(
                     "issue_count": 0 if final_outcome is None else len(final_outcome.issues),
                     "edit_count": 0 if final_outcome is None else len(final_outcome.edits),
                     "fallback": bool(final_outcome and final_outcome.fallback_reason),
-                    "fallback_reason": (
-                        None if final_outcome is None else final_outcome.fallback_reason
-                    ),
+                    "fallback_reason": (None if final_outcome is None else final_outcome.fallback_reason),
                 }
             )
             return {

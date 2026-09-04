@@ -144,7 +144,7 @@ def configured_local_tool_budget(config: dict[str, Any]) -> int:
 
 def configured_token_budget(config: dict[str, Any]) -> int:
     """Resolve the global token budget recorded in evaluation output."""
-    return int(config.get("research", {}).get("limits", {}).get("max_total_tokens", 120000))
+    return int(config.get("research", {}).get("limits", {}).get("max_total_tokens", 300000))
 
 
 def configured_elapsed_budget(config: dict[str, Any]) -> float:

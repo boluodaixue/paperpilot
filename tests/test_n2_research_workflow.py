@@ -1,4 +1,5 @@
 """N2 acceptance tests for user confirmation and Markdown Memory Store."""
+
 from __future__ import annotations
 
 import json
@@ -72,8 +73,71 @@ class WorkflowPolicy:
         self.research_calls = 0
 
     def __call__(self, messages, *, tools=None):
-        assessment = assessment_response(messages)
-        if assessment is not None:
+        content = str(messages[-1].get("content") or "")
+        if content.startswith("ASSESS_RESEARCH_STATE"):
+            state = json.loads(content.split("STATE:\n", 1)[1])
+            evidence_by_requirement = {
+                requirement["requirement_id"]: [
+                    item["evidence_id"]
+                    for item in state["evidence"]
+                    if not item.get("requirement_id") or item.get("requirement_id") == requirement["requirement_id"]
+                ]
+                for requirement in state["requirements"]
+            }
+            missing = [
+                requirement
+                for requirement in state["requirements"]
+                if not evidence_by_requirement[requirement["requirement_id"]]
+            ]
+            if missing:
+                target = missing[0]
+                return {
+                    "content": json.dumps(
+                        {
+                            "decision": "continue",
+                            "coverage": [
+                                {
+                                    "requirement_id": requirement["requirement_id"],
+                                    "status": (
+                                        "supported"
+                                        if evidence_by_requirement[requirement["requirement_id"]]
+                                        else "unsupported"
+                                    ),
+                                    "evidence_ids": evidence_by_requirement[requirement["requirement_id"]],
+                                    "rationale": "Scoped fixture coverage.",
+                                    "remaining_gap": (
+                                        None
+                                        if evidence_by_requirement[requirement["requirement_id"]]
+                                        else "Evidence is missing."
+                                    ),
+                                }
+                                for requirement in state["requirements"]
+                            ],
+                            "critical_gaps": [
+                                {
+                                    "requirement_id": target["requirement_id"],
+                                    "reason": "Evidence is missing.",
+                                    "impact": "high",
+                                }
+                            ],
+                            "next_actions": [
+                                {
+                                    "requirement_id": target["requirement_id"],
+                                    "strategy": "primary_document",
+                                    "query": target["description"],
+                                    "expected_value": "high",
+                                    "expected_improvement": "Support the missing requirement.",
+                                }
+                            ],
+                            "termination_reason": None,
+                            "replan_reason": None,
+                            "exhaustion_reason": None,
+                        }
+                    ),
+                    "tool_calls": [],
+                }
+            assessment = assessment_response(messages)
+            assert assessment is not None
             return assessment
         system = str(messages[0].get("content", ""))
         if "before research begins" in system:
@@ -104,9 +168,7 @@ class WorkflowPolicy:
                     {
                         "status": "completed",
                         "summary": "Attention replaced recurrence in the Transformer.",
-                        "findings": [
-                            "The original Transformer architecture is attention-based."
-                        ],
+                        "findings": ["The original Transformer architecture is attention-based."],
                         "unresolved": [],
                     }
                 ),
@@ -205,7 +267,7 @@ async def test_user_can_modify_then_confirm_the_same_root_workflow(tmp_path) -> 
     workflow_result = final["workflow_result"]
     assert workflow_result.brief.revision == 2
     assert workflow_result.research_result.status == ResearchStatus.COMPLETED
-    assert len(tool.calls) == 1
+    assert len(tool.calls) == 2
     assert policy.alignment_calls == 3
 
 
@@ -310,7 +372,7 @@ async def test_confirmation_can_resume_from_a_rebuilt_graph(tmp_path) -> None:
     )
 
     assert final["workflow_result"].research_result.status == ResearchStatus.COMPLETED
-    assert len(tool.calls) == 1
+    assert len(tool.calls) == 2
 
 
 @pytest.mark.asyncio
@@ -331,11 +393,11 @@ async def test_retry_after_persist_failure_does_not_repeat_research(tmp_path) ->
             thread_id=identity.thread_id,
             action="confirm",
         )
-    assert len(tool.calls) == 1
+    assert len(tool.calls) == 2
 
     final = await graph.ainvoke(None, config=_config(identity.thread_id))
     assert final["workflow_result"].research_result.status == ResearchStatus.COMPLETED
-    assert len(tool.calls) == 1
+    assert len(tool.calls) == 2
     assert store.attempts == 2
 
 

@@ -36,6 +36,7 @@ dependencies = [
     "fastapi>=0.110",
     "uvicorn>=0.27",
     "beautifulsoup4>=4.12",
+    "certifi>=2024.2.2",
     "pypdf>=5.0,<7.0",
     "sentence-transformers",
     "datasets",

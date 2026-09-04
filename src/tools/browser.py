@@ -16,15 +16,19 @@
   - 自动截断超长页面（保留前 N 个段落，防止 token 爆炸）
   - 支持重试和错误降级
 """
+
 from __future__ import annotations
 
 import asyncio
+import io
 import re
 from abc import ABC, abstractmethod
 from typing import Any
+from urllib.parse import urlparse
 
 import aiohttp
 
+from .http_client import trusted_connector
 
 __all__ = ["BrowserTool", "MockBrowserTool"]
 
@@ -120,6 +124,17 @@ class BrowserTool(BaseBrowserTool):
 
             return text if text else "[Browser Warning] No meaningful content extracted from the page."
 
+        except aiohttp.ClientResponseError as e:
+            if e.status == 403:
+                alternative = await self._fetch_safe_alternative(url, max_chars)
+                if alternative is not None:
+                    alternative_url, alternative_text = alternative
+                    return (
+                        f"[ALTERNATIVE_SOURCE: {alternative_url}]\n"
+                        f"[ORIGINAL_SOURCE_BLOCKED: {url}]\n\n"
+                        f"{alternative_text}"
+                    )
+            return f"[Browser Error] Network error: {type(e).__name__}: {e}"
         except aiohttp.ClientError as e:
             return f"[Browser Error] Network error: {type(e).__name__}: {e}"
         except Exception as e:
@@ -130,12 +145,62 @@ class BrowserTool(BaseBrowserTool):
         async with aiohttp.ClientSession(
             timeout=aiohttp.ClientTimeout(total=self.timeout),
             headers={"User-Agent": self.user_agent},
+            connector=trusted_connector(),
         ) as session:
             async with session.get(url, allow_redirects=True) as resp:
                 resp.raise_for_status()
+                if resp.content_type == "application/pdf" or urlparse(str(resp.url)).path.lower().endswith(".pdf"):
+                    return self._extract_pdf_text(await resp.read())
                 # 尝试自动检测编码
                 charset = resp.charset or "utf-8"
                 return await resp.text(encoding=charset)
+
+    async def _fetch_safe_alternative(
+        self,
+        url: str,
+        max_chars: int,
+    ) -> tuple[str, str] | None:
+        for alternative_url in self._alternative_urls(url):
+            try:
+                content = await self._fetch(alternative_url)
+                text = self._clean_text(self._extract_text(content))
+                if not text:
+                    continue
+                if len(text) > max_chars:
+                    text = text[:max_chars] + (
+                        f"\n\n[CONTENT_TRUNCATED: {len(text)} chars total, " f"showing first {max_chars}]"
+                    )
+                return alternative_url, text
+            except (aiohttp.ClientError, ValueError):
+                continue
+        return None
+
+    @staticmethod
+    def _alternative_urls(url: str) -> tuple[str, ...]:
+        parsed = urlparse(url)
+        host = (parsed.hostname or "").lower()
+        path = parsed.path.rstrip("/")
+        if host in {"openai.com", "www.openai.com"}:
+            if path.lower() == "/index/hello-gpt-4o":
+                return ("https://cdn.openai.com/gpt-4o-system-card.pdf",)
+            match = re.fullmatch(r"/(?:index/)?([^/]*system-card[^/]*)", path, re.I)
+            if match:
+                return (f"https://cdn.openai.com/{match.group(1)}.pdf",)
+        if host in {"arxiv.org", "www.arxiv.org"}:
+            match = re.fullmatch(r"/abs/(.+)", path, re.I)
+            if match:
+                return (f"https://arxiv.org/pdf/{match.group(1)}.pdf",)
+        return ()
+
+    @staticmethod
+    def _extract_pdf_text(payload: bytes) -> str:
+        try:
+            from pypdf import PdfReader
+
+            reader = PdfReader(io.BytesIO(payload))
+            return "\n\n".join((page.extract_text() or "") for page in reader.pages)
+        except Exception as exc:
+            raise ValueError(f"unable to extract PDF text: {exc}") from exc
 
     def _extract_text(self, html: str) -> str:
         """从 HTML 中提取正文。"""

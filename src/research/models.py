@@ -1,4 +1,5 @@
 """Minimal contracts shared by every homogeneous Research Agent execution."""
+
 from __future__ import annotations
 
 from dataclasses import dataclass, field
@@ -116,7 +117,7 @@ class AgentLimits:
     max_total_threads: int = 7
     max_total_tool_calls: int = 36
     max_elapsed_seconds: float = 300.0
-    max_total_tokens: int = 120000
+    max_total_tokens: int = 300000
     max_retries_per_action: int = 1
     max_total_retries: int = 6
 
@@ -171,6 +172,24 @@ class EvidenceItem:
     excerpt: str = ""
     excerpt_type: str = "paraphrase"
     limitations: str = ""
+    requirement_id: str = ""
+    action_id: str = ""
+    artifact_id: str = ""
+
+
+@dataclass(frozen=True)
+class ToolAvailabilityAlert:
+    """Checkpoint-derived warning that an external information path is unavailable."""
+
+    alert_id: str
+    tool: str
+    category: str
+    scope: str
+    target: str
+    message: str
+    action_required: str
+    circuit_open: bool = False
+    error: str = ""
 
 
 @dataclass(frozen=True)
@@ -211,6 +230,7 @@ class NextResearchAction:
     query: str
     expected_value: str
     expected_improvement: str
+    action_id: str = ""
 
 
 @dataclass(frozen=True)
@@ -222,6 +242,8 @@ class StrategyAttempt:
     query: str
     outcome: str
     evidence_ids: tuple[str, ...] = ()
+    action_id: str = ""
+    artifact_ids: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -234,6 +256,7 @@ class ResearchResult:
     findings: tuple[str, ...] = ()
     evidence: tuple[EvidenceItem, ...] = ()
     unresolved: tuple[str, ...] = ()
+    tool_alerts: tuple[ToolAvailabilityAlert, ...] = ()
     child_result_refs: tuple[str, ...] = ()
     stop_reason: str | None = None
     termination_reason: TerminationReason | None = None
