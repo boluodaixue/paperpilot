@@ -1,0 +1,207 @@
+{
+  "seed": "paperpilot-drbench2-pilot-20260906-v1",
+  "upstream": {
+    "repository": "https://github.com/SawyerCooper/DeepResearchBench2",
+    "commit": "440bdc33728438d317ca7860809942b5a1e40256",
+    "files": {
+      "README.md": "ccef75b3dc552c474d93ce1f1d2cf7b5cf1243c377953ceaee2f00cabbe1fa51",
+      "tasks_and_rubrics.jsonl": "85a416a69b7bf6b1607fc927c0459789f4f59a3f495a5e8bee7e2e5a53c7db6f",
+      "run_evaluation.py": "67cf49cb68c57cec91d262f687c2dd39836f7c7621d6d86bf925aa972d7050b2",
+      "aggregate_scores.py": "11270962fa69c220f90e100bbcbebf5183f87d8f25c18b1c49d13363c1a542de",
+      "gemini_client.py": "c41b5d853a37c671290feb9580ad33dc89c354fe547e05f91e48bc912048606e"
+    }
+  },
+  "dataset_size": 132,
+  "themes": [
+    "Science & Technology",
+    "Finance & Business",
+    "Software Development",
+    "Health",
+    "Education & Jobs",
+    "Hardware"
+  ],
+  "selection_rule": "six largest themes (alphabetical tie break), minimum SHA256(seed:idx) per theme/language; first theme zh and second theme en reserved for debug",
+  "judge_prompt_sha256": "9e0d86bd04a9834eae78db8a0c1feaf6583d4a4292518d1e92a86bd9279cb6e9",
+  "cases": [
+    {
+      "idx": 25,
+      "id": "task11",
+      "language": "zh",
+      "theme": "Science & Technology",
+      "description": "Performance Investigation of Organic Corrosion Inhibitors for Carbon Steel",
+      "split": "debug",
+      "research_sha256": "8e7fde3f1e0f3ac76979d1048d0f40654a99bfacf80bba33f149548ae34ab8fe",
+      "judge_sha256": "a26c9662f18654c187608a731073055f806c443d53d44a018207be9ceb5d7d67",
+      "rubric_counts": {
+        "info_recall": 79,
+        "analysis": 16,
+        "presentation": 7
+      }
+    },
+    {
+      "idx": 16,
+      "id": "task8",
+      "language": "en",
+      "theme": "Science & Technology",
+      "description": "Research on Materials Inverse Design Technology and Databases",
+      "split": "holdout",
+      "research_sha256": "f7859f49db1910cea76218995e2792f30d3652db51c132cf05b047545731c0f1",
+      "judge_sha256": "a61e6121de51c4e924825d602683ea668727310ca3f91d3bc4f1467b86793086",
+      "rubric_counts": {
+        "info_recall": 37,
+        "analysis": 12,
+        "presentation": 3
+      }
+    },
+    {
+      "idx": 11,
+      "id": "task5+",
+      "language": "zh",
+      "theme": "Finance & Business",
+      "description": "A Literature Review of Systemic Financial Risk",
+      "split": "holdout",
+      "research_sha256": "7f3fd4895b6ea2b73e697f34ff425d710b4f03ae1f9239343eebc54b504e5a0b",
+      "judge_sha256": "f69e2362fed135570a68f9f6e22a987c9ca15bf5d006a069d5d6cb87838515b0",
+      "rubric_counts": {
+        "info_recall": 46,
+        "analysis": 8,
+        "presentation": 6
+      }
+    },
+    {
+      "idx": 12,
+      "id": "task55",
+      "language": "en",
+      "theme": "Finance & Business",
+      "description": "Research Report on AI-Enhanced Portfolio Management",
+      "split": "debug",
+      "research_sha256": "6c1d922494a2e445c716c267ffe0e0980e263ed56fe08a918c8eaa02d3c7bc1b",
+      "judge_sha256": "f017acad27daaabe2a39ebe104232c4ea8326f126e8aebe17c3e37f604d76591",
+      "rubric_counts": {
+        "info_recall": 43,
+        "analysis": 7,
+        "presentation": 6
+      }
+    },
+    {
+      "idx": 49,
+      "id": "task20",
+      "language": "zh",
+      "theme": "Software Development",
+      "description": "A Technical Survey of HTTP Adaptive Streaming Video Encoding and Consumption-side Algorithms",
+      "split": "holdout",
+      "research_sha256": "141a8bd6679cc070e73bf4f82ca86bcab7c84a49e74f0c2b10cac5b6a01f1736",
+      "judge_sha256": "3855272784de8562ed1b4df8dff6db154650481fa3fcedd33f4ed2062059b4e7",
+      "rubric_counts": {
+        "info_recall": 59,
+        "analysis": 13,
+        "presentation": 7
+      }
+    },
+    {
+      "idx": 42,
+      "id": "task17+",
+      "language": "en",
+      "theme": "Software Development",
+      "description": "Survey on the Impact of Low-Code Platforms and Their Applications (2025)",
+      "split": "holdout",
+      "research_sha256": "fce269eb8ef6b3a527dab04cf662c1f8b78c13f6c4cd6e0f91f8df155c2cd858",
+      "judge_sha256": "a62fea2b21497914e0645053a01ef2e6aec1405247a832cd7af5756713f58063",
+      "rubric_counts": {
+        "info_recall": 47,
+        "analysis": 21,
+        "presentation": 7
+      }
+    },
+    {
+      "idx": 69,
+      "id": "task27",
+      "language": "zh",
+      "theme": "Health",
+      "description": "Research on Artificial Intelligence in the Field of Mental Health",
+      "split": "holdout",
+      "research_sha256": "eb8737f26b3dd6e84f0e27dbf930b9d6c940aefc9e36e3e415e27c4c5fb79458",
+      "judge_sha256": "c5a609587c81dbeba3b0f776cb4ec32e4c3e17046bde185201382b385ea4efb1",
+      "rubric_counts": {
+        "info_recall": 45,
+        "analysis": 12,
+        "presentation": 9
+      }
+    },
+    {
+      "idx": 72,
+      "id": "task78",
+      "language": "en",
+      "theme": "Health",
+      "description": "Temporal Evolution of Parkinson's Diagnostic Criteria",
+      "split": "holdout",
+      "research_sha256": "3f7fec8a7049019bc02c31bc4ae27a13c2a14f5ca5305687a2ff4c55916e2b70",
+      "judge_sha256": "423a476107f1a4f99d1415288116fa55e468833bc6e9ea187570695be2452406",
+      "rubric_counts": {
+        "info_recall": 47,
+        "analysis": 9,
+        "presentation": 6
+      }
+    },
+    {
+      "idx": 57,
+      "id": "task72+",
+      "language": "zh",
+      "theme": "Education & Jobs",
+      "description": "Research on the Impact of Industry 4.0 on the Labor Market in South Asia",
+      "split": "holdout",
+      "research_sha256": "a9a69f5fc800a4e7ead22642656ac7239fde06380b38886d7579d0df0a06791f",
+      "judge_sha256": "aa8af692a405a00c2e5743cab9d52672e60be11bce9ce8c7bbaefaeadb9879ba",
+      "rubric_counts": {
+        "info_recall": 39,
+        "analysis": 10,
+        "presentation": 6
+      }
+    },
+    {
+      "idx": 54,
+      "id": "task71",
+      "language": "en",
+      "theme": "Education & Jobs",
+      "description": "An Overview of AI Tools Providing Writing Scaffolds for K-12 English Students",
+      "split": "holdout",
+      "research_sha256": "b0c7662ba067e9165c9fb4aaf68de80db988326dd82ab5efef0418be45674134",
+      "judge_sha256": "e96c09211ab27abf746b821786d3bd9171a15b954024a8cfb4bbaef48b98463f",
+      "rubric_counts": {
+        "info_recall": 49,
+        "analysis": 11,
+        "presentation": 8
+      }
+    },
+    {
+      "idx": 87,
+      "id": "task33",
+      "language": "zh",
+      "theme": "Hardware",
+      "description": "New Advances in Interconnect Technology for Semiconductor Chips",
+      "split": "holdout",
+      "research_sha256": "267e8e6b608887db395ea2ac3474f75288f43a3a281f95c971319faac32349d7",
+      "judge_sha256": "d0ef9d9d0ed4ced6fb546330154f8cfb1a1cfdfb277855d38a7b80852599213c",
+      "rubric_counts": {
+        "info_recall": 41,
+        "analysis": 12,
+        "presentation": 6
+      }
+    },
+    {
+      "idx": 86,
+      "id": "task33+",
+      "language": "en",
+      "theme": "Hardware",
+      "description": "Technology Survey Report on Alternative Metals for Advanced Semiconductor Interconnects",
+      "split": "holdout",
+      "research_sha256": "a772043ebe3cd5eac258005ef1d27d72d72b04b7516ad93c480629b990868244",
+      "judge_sha256": "29b617829beb60d3180f61b9fc15424b3acda1ddf9da264aec9366a6b7143552",
+      "rubric_counts": {
+        "info_recall": 51,
+        "analysis": 7,
+        "presentation": 5
+      }
+    }
+  ]
+}

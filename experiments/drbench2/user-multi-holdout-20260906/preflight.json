@@ -1,0 +1,89 @@
+{
+  "arm": "multi",
+  "benchmark": {
+    "commit": "440bdc33728438d317ca7860809942b5a1e40256",
+    "name": "DeepResearch Bench II",
+    "repository": "https://github.com/SawyerCooper/DeepResearchBench2"
+  },
+  "judge": {
+    "aggregation": "fraction(score==1); score 0 and -1 remain in denominator",
+    "batch_attempts_max": 2,
+    "chunk_size": 12,
+    "max_output_tokens_per_batch": 8192,
+    "missing_score": null,
+    "model": "deepseek-v4-flash",
+    "offline_dimension_weights": "none; total weighted by item counts",
+    "protocol": "upstream rubric and prompt; project DeepSeek Judge, non-official",
+    "report_truncation": false,
+    "sdk_max_retries": 2,
+    "temperature": 0.1,
+    "timeout": {
+      "connect": 5.0,
+      "pool": 600,
+      "read": 600,
+      "write": 600
+    },
+    "top_p": 1.0
+  },
+  "limits": {
+    "max_children_per_agent": 5,
+    "max_concurrent_agents": 10,
+    "max_elapsed_seconds": 1200.0,
+    "max_fork_depth": 2,
+    "max_iterations": 18,
+    "max_retries_per_action": 2,
+    "max_tool_calls": 30,
+    "max_tool_output_chars": 24000,
+    "max_total_agents": 10,
+    "max_total_retries": 12,
+    "max_total_tokens": 700000,
+    "max_total_tool_calls": 96,
+    "root_finalization_grace_seconds": 300.0
+  },
+  "network_calls": 0,
+  "order": [
+    16,
+    11,
+    49,
+    42,
+    69,
+    72,
+    57,
+    54,
+    87,
+    86
+  ],
+  "paperpilot_source_commit": "9e81efed413b86152cfcff372e379b350bfa9e38",
+  "research_model": {
+    "client_class": "openai.OpenAI",
+    "credential_present": true,
+    "default_max_tokens": 4096,
+    "endpoint_sha256": "ced2a2c88043737cdada95c7dde9e04909c12abdb29441345103db32d87f6f0c",
+    "max_input_chars": 60000,
+    "model": "deepseek-v4-flash",
+    "request_timeout": {
+      "connect": 5.0,
+      "pool": 600,
+      "read": 600,
+      "write": 600
+    },
+    "sdk_max_retries": 2,
+    "temperature": 0.3,
+    "top_p": 1.0
+  },
+  "runner_sha256": "26b5d257338b46d7ff751fcccf03fe1f6f91a6ef8bdbda2c93f98515703f5a31",
+  "runtime_path_differences": [
+    "chat.db_path",
+    "research.legacy_archive_root",
+    "research.vault_root",
+    "runtime.retrieval_db_path"
+  ],
+  "status": "passed",
+  "tools": [
+    "acquire_evidence",
+    "arxiv_reader",
+    "file_reader",
+    "calculator",
+    "notepad"
+  ]
+}

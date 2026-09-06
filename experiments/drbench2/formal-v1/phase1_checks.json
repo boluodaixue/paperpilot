@@ -1,0 +1,11 @@
+{
+  "phase": 1,
+  "checked_at": "2026-09-05T21:01:53.979950+00:00",
+  "freeze_verification": "passed",
+  "offline_tests_passed": 5,
+  "model_calls": 0,
+  "search_calls": 0,
+  "production_runner_ready": false,
+  "next_gate": "production-path adapter offline acceptance and adapter source sealing",
+  "document_links": "passed"
+}

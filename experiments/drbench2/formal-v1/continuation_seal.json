@@ -1,0 +1,15 @@
+{
+  "accepted_at": "2026-09-06T07:24:49.247460+00:00",
+  "files": {
+    "build_continuation.py": "c571edcbefa8a1af79f55ea531f489c391b3d1431889a456a01667d152ff9afb",
+    "continuation_runtime.py": "5cdb677b9823b53f1c640b40dac04d438988c80ab8ac8277df1b0f8d7e1ee9f4",
+    "continuation_score.py": "4caf4fd1153331749951ac22bf66778332c490289d66959a7fb5ca1d591be884",
+    "formal_continue.py": "13cdc62cedf396d7ea04745df459ce39ac7ea9b77bc5ab9685aa9026ffa3b1bd",
+    "test_continuation_adapter.py": "304ff020eda124ef557697477557ce7f65da65dd76718508a1d2490cf998cc9a",
+    "test_continuation_schedule.py": "1a27ed7244d06a6be1293de144ed2f3269545963a30612d920a7371318b9e268"
+  },
+  "offline_acceptance": "passed",
+  "offline_tests_passed": 17,
+  "scope": "launch-only implementation of already frozen phases 3 and 4; no research or grading changes",
+  "test_log_sha256": "86ce2e6b9290b071bd72e62d9ba6d72d98b3bd405a2d2b05ed636f663e1460ba"
+}

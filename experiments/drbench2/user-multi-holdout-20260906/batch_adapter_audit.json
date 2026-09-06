@@ -1,0 +1,35 @@
+{
+  "batch_id": "user-multi-holdout-20260906",
+  "authorization": {
+    "date": "2026-09-06",
+    "scope": [
+      "16-multi",
+      "11-multi",
+      "49-multi",
+      "42-multi",
+      "69-multi",
+      "72-multi",
+      "57-multi",
+      "54-multi",
+      "87-multi",
+      "86-multi"
+    ],
+    "single_runs_authorized": false,
+    "calibration_reruns_authorized": false
+  },
+  "benchmark": {
+    "name": "DeepResearch Bench II",
+    "repository": "https://github.com/SawyerCooper/DeepResearchBench2",
+    "commit": "440bdc33728438d317ca7860809942b5a1e40256"
+  },
+  "paperpilot_source_commit": "9e81efed413b86152cfcff372e379b350bfa9e38",
+  "adapter": {
+    "file": "holdout_multi_runner.py",
+    "sha256": "26b5d257338b46d7ff751fcccf03fe1f6f91a6ef8bdbda2c93f98515703f5a31",
+    "research_body": "unchanged continuation_runtime.research",
+    "scoring_body": "unchanged continuation_score.judge",
+    "runtime_change": "redirect SPEC/output root to this isolated batch and restrict schedule to ten holdout multi cases"
+  },
+  "result_policy": "preserve every trajectory and score; no replacement or best-of selection",
+  "old_results_preserved_at": "../formal-v1/runs"
+}

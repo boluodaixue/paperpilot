@@ -1,0 +1,11 @@
+{
+  "repository": "https://github.com/SawyerCooper/DeepResearchBench2",
+  "commit": "440bdc33728438d317ca7860809942b5a1e40256",
+  "files": {
+    "README.md": "ccef75b3dc552c474d93ce1f1d2cf7b5cf1243c377953ceaee2f00cabbe1fa51",
+    "tasks_and_rubrics.jsonl": "85a416a69b7bf6b1607fc927c0459789f4f59a3f495a5e8bee7e2e5a53c7db6f",
+    "run_evaluation.py": "67cf49cb68c57cec91d262f687c2dd39836f7c7621d6d86bf925aa972d7050b2",
+    "aggregate_scores.py": "11270962fa69c220f90e100bbcbebf5183f87d8f25c18b1c49d13363c1a542de",
+    "gemini_client.py": "c41b5d853a37c671290feb9580ad33dc89c354fe547e05f91e48bc912048606e"
+  }
+}

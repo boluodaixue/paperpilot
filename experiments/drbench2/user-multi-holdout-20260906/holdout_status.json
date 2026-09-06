@@ -1,0 +1,127 @@
+{
+  "action": "stopped_after_ten_holdouts",
+  "arm": null,
+  "authorization": "user confirmed run remaining test set; multi-Agent only",
+  "benchmark": "DeepResearch Bench II",
+  "benchmark_commit": "440bdc33728438d317ca7860809942b5a1e40256",
+  "benchmark_repository": "https://github.com/SawyerCooper/DeepResearchBench2",
+  "completed": [
+    {
+      "arm": "multi",
+      "delivery_issues": [],
+      "judge_status": "valid",
+      "status": "returned",
+      "task": 16
+    },
+    {
+      "arm": "multi",
+      "delivery_issues": [],
+      "judge_status": "valid",
+      "status": "returned",
+      "task": 11
+    },
+    {
+      "arm": "multi",
+      "delivery_issues": [],
+      "judge_status": "valid",
+      "status": "returned",
+      "task": 49
+    },
+    {
+      "arm": "multi",
+      "delivery_issues": [],
+      "judge_status": "valid",
+      "status": "returned",
+      "task": 42
+    },
+    {
+      "arm": "multi",
+      "delivery_issues": [],
+      "judge_status": "valid",
+      "status": "returned",
+      "task": 69
+    },
+    {
+      "arm": "multi",
+      "delivery_issues": [],
+      "judge_status": "valid",
+      "status": "returned",
+      "task": 72
+    },
+    {
+      "arm": "multi",
+      "delivery_issues": [],
+      "judge_status": "valid",
+      "status": "returned",
+      "task": 57
+    },
+    {
+      "arm": "multi",
+      "delivery_issues": [],
+      "judge_status": "valid",
+      "status": "returned",
+      "task": 54
+    },
+    {
+      "arm": "multi",
+      "delivery_issues": [],
+      "judge_status": "valid",
+      "status": "returned",
+      "task": 87
+    },
+    {
+      "arm": "multi",
+      "delivery_issues": [],
+      "judge_status": "valid",
+      "status": "returned",
+      "task": 86
+    }
+  ],
+  "elapsed_seconds": 4148.1075694561005,
+  "planned": [
+    {
+      "arm": "multi",
+      "task": 16
+    },
+    {
+      "arm": "multi",
+      "task": 11
+    },
+    {
+      "arm": "multi",
+      "task": 49
+    },
+    {
+      "arm": "multi",
+      "task": 42
+    },
+    {
+      "arm": "multi",
+      "task": 69
+    },
+    {
+      "arm": "multi",
+      "task": 72
+    },
+    {
+      "arm": "multi",
+      "task": 57
+    },
+    {
+      "arm": "multi",
+      "task": 54
+    },
+    {
+      "arm": "multi",
+      "task": 87
+    },
+    {
+      "arm": "multi",
+      "task": 86
+    }
+  ],
+  "scope": "ten fixed holdout tasks, frozen default multi-Agent only; no single runs",
+  "started_at": 1788706568.7062023,
+  "status": "completed",
+  "task": null
+}
