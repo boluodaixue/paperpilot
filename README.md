@@ -8,7 +8,7 @@
 
 [![Python](https://img.shields.io/badge/Python-3.10%2B-blue.svg)](https://python.org)
 [![LangGraph](https://img.shields.io/badge/Orchestration-LangGraph-1f6feb.svg)](https://www.langchain.com/langgraph)
-[![Tests](https://img.shields.io/badge/tests-836%20passed-brightgreen.svg)](#测试)
+[![Tests](https://img.shields.io/badge/tests-pytest-blue.svg)](#-测试)
 [![License](https://img.shields.io/badge/license-MIT-green.svg)](LICENSE)
 
 </div>
@@ -106,35 +106,6 @@ flowchart LR
 
 这条链路的重点不是“生成一篇报告”，而是让报告进入一个可以持续检索、验证和扩展的个人研究空间。
 
-## 🏗️ 架构概览
-
-```mermaid
-flowchart TB
-    UI[Web / CLI] --> RT[Research Runtime]
-    RT --> WF[LangGraph Research Workflow]
-    WF --> CP[(SQLite Checkpointer)]
-    WF --> AG[Homogeneous Research AgentGraph]
-    AG -->|按需 fork| AG
-    AG --> TOOLS[Search / Paper / Web / File / Compute]
-    WF --> WRITER[Durable Queue + Single Vault Writer]
-    UI --> WIKI[Report → Wiki Preview]
-    WIKI --> WRITER
-    WRITER --> VAULT[(Markdown Vault)]
-    VAULT --> OBS[Obsidian]
-    VAULT --> RETRIEVAL[FTS5 / Semantic / WikiLink Retrieval]
-    RETRIEVAL --> WF
-    RETRIEVAL --> UI
-```
-
-几个关键设计：
-
-- **工作流可恢复**：LangGraph checkpoint 持久化研究阶段和 interrupt，服务重启后可继续等待中的流程；
-- **写入可恢复**：持久队列与单一 Vault Writer 串行提交，通过 staging、journal、内容哈希和原子发布处理崩溃与重复请求；
-- **知识不锁定**：SQLite 检索数据只是可重建索引，不能反向覆盖 Markdown；
-- **人在回路中**：研究计划、Wiki 更新、保存笔记、导入资料和 legacy 迁移均需要用户确认。
-
-更完整的设计说明见 [架构文档](docs/ARCHITECTURE.md)。
-
 ## 🚀 快速开始
 
 推荐 Python 3.11。
@@ -189,33 +160,87 @@ python web/run.py
 
 把 `configs/default.yaml` 中 `research.vault_root` 指向的目录作为 Obsidian Vault 打开。默认目录是项目下的 `memory/`。
 
-### CLI
+## 💻 命令行使用（可选）
+
+除 Web 界面外，也可以从终端发起研究。先在 Web 中创建 Memory，再将下面的 `M-your-memory` 替换为实际 ID；运行后按提示确认研究提案。
 
 ```bash
-python scripts/run_single.py \
-  --memory-id M-your-memory \
-  --query "分析 AI Agent Memory 的演进、评测方法与关键证据"
+python scripts/run_single.py --memory-id M-your-memory --query "分析 AI Agent Memory 的演进、评测方法与关键证据"
 ```
 
-交互式入口：
+交互式终端支持连续使用，输入 `new-memory 专题名称` 可创建并选择 Memory：
 
 ```bash
 python scripts/run_repl.py
 ```
 
+## 📊 Benchmark 与评测
+
+先完成模型与搜索服务配置；真实评测会调用模型和检索服务，可能产生费用。以下命令在项目根目录执行，结果默认保存到 `outputs/evaluation/`。
+
+### 自建 ResearchBench
+
+用于跨领域研究质量回归，记录覆盖度、引用等规则指标；加上 `--llm-judge` 可启用模型评分。
+
+```bash
+python scripts/run_eval.py --benchmark research_bench --num-questions 2 --llm-judge
+```
+
+题目及预期主题、关键事实见 [ResearchBench 题集](evaluation/benchmarks/research_bench.py)。可在题集中添加题目，或用 `--question-ids` 指定题目 ID。若要用自己的问题对比单轮 LLM 与完整 Agent，将问题按每行一题保存后运行：
+
+```bash
+python scripts/run_benchmark.py --queries_file my_queries.txt
+```
+
+对比结果保存到 `outputs/benchmark_results.json`。
+
+### 公开 benchmark
+
+- **HotpotQA**：多跳问答评测，运行 `python scripts/run_eval.py --benchmark hotpotqa --num-questions 2`。
+- **DeepResearch Bench II**：使用公开任务与 Rubric，按独立的 [formal-v1 实验方案](experiments/drbench2/formal-v1/完整实验方案.md) 和 [后续执行说明](experiments/drbench2/formal-v1/后续执行说明.md) 运行；产物位于 `experiments/drbench2/formal-v1/`。历史 `pilot.py` 命令不适用于该方案。
+
+DeepResearch Bench II 当前使用选定子集与项目 Judge，属于自定义评测，**不是官方榜单成绩**。已执行与未完成的病例见 [评测进度与结果](experiments/drbench2/formal-v1/剩余评测结果.md)。
+
+## 🏗️ 架构概览
+
+```mermaid
+flowchart TB
+    UI[Web / CLI] --> RT[Research Runtime]
+    RT --> WF[LangGraph Research Workflow]
+    WF --> CP[(SQLite Checkpointer)]
+    WF --> AG[Homogeneous Research AgentGraph]
+    AG -->|按需 fork| AG
+    AG --> TOOLS[Search / Paper / Web / File / Compute]
+    WF --> WRITER[Durable Queue + Single Vault Writer]
+    UI --> WIKI[Report → Wiki Preview]
+    WIKI --> WRITER
+    WRITER --> VAULT[(Markdown Vault)]
+    VAULT --> OBS[Obsidian]
+    VAULT --> RETRIEVAL[FTS5 / Semantic / WikiLink Retrieval]
+    RETRIEVAL --> WF
+    RETRIEVAL --> UI
+```
+
+几个关键设计：
+
+- **工作流可恢复**：LangGraph checkpoint 持久化研究阶段和 interrupt，服务重启后可继续等待中的流程；
+- **写入可恢复**：持久队列与单一 Vault Writer 串行提交，通过 staging、journal、内容哈希和原子发布处理崩溃与重复请求；
+- **知识不锁定**：SQLite 检索数据只是可重建索引，不能反向覆盖 Markdown；
+- **人在回路中**：研究计划、Wiki 更新、保存笔记、导入资料和 legacy 迁移均需要用户确认。
+
+更完整的设计说明见 [架构文档](docs/ARCHITECTURE.md)。
+
 ## 🧭 项目演进
 
-PaperPilot 保留了从原型到当前架构的完整 Git 提交历史，方便查看每次真实迭代，而不是把开发过程压缩成一次“最终版提交”。
-
-| 时间 | 阶段 | 主要变化 |
-|---|---|---|
-| **2026.05** | DeepResearch Agent 原型 | 建立规划、检索、Memory、报告与评测基础 |
-| **2026.08.23–27** | PaperPilot 研究闭环 | 加入证据层、证据图、Web UI、动态 fork 和 Obsidian 导出探索 |
-| **2026.08.28** | LangGraph 主线重构 | 收敛为同质 Research AgentGraph，补齐确认、递归边界与 checkpoint 恢复 |
-| **2026.08.28–29** | LLM Wiki + Obsidian | 完成长期 Memory、受控笔记与导入、崩溃一致写入、全文与混合检索 |
-| **2026.09** | 用户驱动 Wiki | 增加 Report → Wiki 单次模型整理、Claim 级 Evidence 引用、预览保存与 Wiki 优先问答 |
-
-当前方向与后续计划见 [路线图](docs/ROADMAP.md)。每一个功能阶段的具体变化也可以直接通过 Git 历史查看。
+| 阶段 | 主要变化 |
+|---|---|
+| DeepResearch Agent 原型 | 建立规划、检索、Memory、报告与评测基础 |
+| PaperPilot 研究闭环 | 加入证据层、证据图、Web UI、动态 fork 和 Obsidian 导出探索 |
+| LangGraph 主线重构 | 收敛为同质 Research AgentGraph，补齐确认、递归边界与 checkpoint 恢复 |
+| LLM Wiki + Obsidian | 完成长期 Memory、受控笔记与导入、崩溃一致写入、全文与混合检索 |
+| 研究充分性与终止机制 | 根据研究要求、已有证据与下一步价值决定继续、重规划或停止，分别记录研究状态、停止原因与报告状态 |
+| 三层研究上下文 | 加入 L1–L3 上下文管理、语义摘要与原始资料受控回读，控制长任务上下文规模 |
+| 用户驱动 Wiki | 增加 Report → Wiki 单次模型整理、Claim 级 Evidence 引用、预览保存与 Wiki 优先问答 |
 
 ## 🧪 测试
 
@@ -223,13 +248,7 @@ PaperPilot 保留了从原型到当前架构的完整 Git 提交历史，方便�
 pytest -q
 ```
 
-当前确定性测试覆盖：
-
-```text
-Evidence 闭环、L1–L3 上下文管理、递归预算、checkpoint/Writer 崩溃恢复、Web/CLI 与 Memory 工作流
-```
-
-测试覆盖递归与预算、checkpoint 恢复、用户确认、多 Memory 隔离、Writer 崩溃恢复、并发冲突、Markdown/WikiLink 契约、Wiki 创建与更新、Evidence 引用校验、导入、FTS5、语义降级以及 Web/CLI 入口。当前全量结果为 **836 passed, 2 skipped**。
+测试覆盖研究流程与预算、故障恢复、知识库读写与检索，以及网页和命令行入口；结果以当前版本的实际运行输出为准。
 
 ## 🛠️ 技术栈
 
@@ -250,26 +269,14 @@ Evidence 闭环、L1–L3 上下文管理、递归预算、checkpoint/Writer 崩
 paperpilot/
 ├── configs/          # 模型、工具、Runtime 与检索配置
 ├── docs/             # 当前架构与路线图
-├── evaluation/       # 固定离线评测
+├── evaluation/       # 评测题集、评分与结果汇总
+├── experiments/      # 公开基准实验适配与运行记录
 ├── scripts/          # CLI、评测和模型准备工具
 ├── src/research/     # Workflow、AgentGraph、Memory、Wiki、Writer、Retrieval
 ├── src/tools/        # 搜索、论文、网页、文件与计算工具
 ├── tests/            # 确定性测试和故障注入
 └── web/              # FastAPI + 本地 Web UI
 ```
-
-## 🗺️ Roadmap
-
-- [x] 同质递归 Research AgentGraph
-- [x] 基于必要要求、证据和下一步价值的研究充分性与终止机制
-- [x] Research Brief 确认与 SQLite checkpoint 恢复
-- [x] 多 Memory Markdown Vault 与 Obsidian 工作流
-- [x] LLM Wiki 问答、受控笔记、导入与继续研究
-- [x] 用户触发的 Report → Wiki 整理、Evidence 引用校验与并发写入保护
-- [x] 单一 Vault Writer 与崩溃一致性
-- [x] FTS5 + 可选语义 + WikiLink 混合检索
-- [ ] 完成一次真实模型、真实搜索与服务重启恢复的公开演示
-- [ ] 增加截图、样例报告与 60–90 秒演示视频
 
 ## 📄 License
 
