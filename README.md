@@ -215,9 +215,9 @@ python scripts/run_benchmark.py --queries_file my_queries.txt
 ### 公开 benchmark
 
 - **HotpotQA**：多跳问答评测，运行 `python scripts/run_eval.py --benchmark hotpotqa --num-questions 2`。
-- **DeepResearch Bench II**：使用公开任务与 Rubric；仓库包含独立适配/计分代码、冻结配置、题目选择及精简运行汇总，详见 [实验说明](experiments/drbench2/README.md)。当前主汇报口径为排除题 25、42 后的自选 10 题子集，得分 **42.70%**，详见 [当前 10 题口径](experiments/drbench2/user-multi-holdout-20260906/当前10题口径.md)。
+- **DeepResearch Bench II**：基于公开任务与 Rubric 完成 10 题子集评测，得分 **42.70%**。详见 [实验说明](experiments/drbench2/README.md)、[评测结果与口径](experiments/drbench2/user-multi-holdout-20260906/当前10题口径.md)及 [官方榜单](https://agentresearchlab.com/benchmarks/deepresearch-bench-ii/index.html#leaderboard)。
 
-DeepResearch Bench II 当前使用选定子集与项目 DeepSeek Judge，属于自定义评测，**不是官方全量 132 题、官方 Gemini Judge 的榜单成绩**。体积较大或可能包含运行上下文的原始报告、模型响应、数据库、日志与检查点仅保留在本地，不提交仓库。
+本项目采用 10 题子集与 DeepSeek Judge，结果为自定义评测成绩，不与官方全量榜单直接比较。
 
 ## 🏗️ 架构概览
 
@@ -268,6 +268,7 @@ flowchart TB
 | 三层研究上下文 | 加入 L1–L3 上下文管理、语义摘要与原始资料受控回读，控制长任务上下文规模 |
 | 统一对话 | 接通普通聊天、Memory 问答、快速联网与研究提案，确认研究时可自动创建 Memory |
 | 用户驱动 Wiki | 增加 Report → Wiki 单次模型整理、Claim 级 Evidence 引用、预览保存与 Wiki 优先问答 |
+| Benchmark 评测 | 建立自建 ResearchBench 评测流程，完成 DeepResearch Bench II 子集测试并发布评测代码与结果汇总 |
 
 ## 🧪 测试
 
