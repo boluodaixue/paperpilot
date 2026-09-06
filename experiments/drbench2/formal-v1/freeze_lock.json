@@ -1,0 +1,10 @@
+{
+  "files": {
+    "freeze_protocol.py": "2e00cee25b84d540541f150ed402543efb8887f56f7e59d64e16e04f31d10dee",
+    "test_freeze_protocol.py": "4be534884e4f3e6367b73cd47950ba5543c739b9d7f4668081385b8f06b49bf1",
+    "formal-v1/manifest.json": "1692328260bf8a6a11855c43d1f8ce81bc498810285170a981a2ac73c74c3bec",
+    "formal-v1/multi.config.json": "7741758ac255abe54053463f179f8424ba8432f27ca38764a56183c1a7796b20",
+    "formal-v1/single.config.json": "337c45b553c6b0c613bb8682a13acf38c06bc74d637ba6b8f9451fbc4c4627bd",
+    "formal-v1/完整实验方案.md": "c2a8a3b89d7a86d45f7715744a9c2f2026c6c10049386f28db074ab0c6556fa1"
+  }
+}

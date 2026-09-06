@@ -1,0 +1,42 @@
+{
+  "configuration_and_adapter_seal": "passed",
+  "rubric_validation": "passed",
+  "results": [
+    {
+      "task": 25,
+      "counts": {
+        "info_recall": {
+          "passed": 0,
+          "total": 79
+        },
+        "analysis": {
+          "passed": 0,
+          "total": 16
+        },
+        "presentation": {
+          "passed": 4,
+          "total": 7
+        }
+      },
+      "research_seconds": 1197.2799677848816
+    },
+    {
+      "task": 12,
+      "counts": {
+        "info_recall": {
+          "passed": 40,
+          "total": 43
+        },
+        "analysis": {
+          "passed": 7,
+          "total": 7
+        },
+        "presentation": {
+          "passed": 4,
+          "total": 6
+        }
+      },
+      "research_seconds": 1305.910385131836
+    }
+  ]
+}

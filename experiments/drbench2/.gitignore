@@ -1,0 +1,11 @@
+upstream/
+paperpilot_snapshot/
+paperpilot-*.zip
+research_inputs/
+judge_inputs/
+runs/
+__pycache__/
+test_artifacts/
+tmp*/
+formal_offline_tests/
+formal_test.log

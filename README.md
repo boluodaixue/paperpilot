@@ -198,7 +198,7 @@ python scripts/run_repl.py
 
 ### 自建 ResearchBench
 
-用于跨领域研究质量回归，记录覆盖度、引用等规则指标；加上 `--llm-judge` 可启用模型评分。
+内置 **35 道**跨领域深度研究题，用于研究质量回归，记录覆盖度、引用等规则指标；加上 `--llm-judge` 可启用模型评分。
 
 ```bash
 python scripts/run_eval.py --benchmark research_bench --num-questions 2 --llm-judge
@@ -215,9 +215,9 @@ python scripts/run_benchmark.py --queries_file my_queries.txt
 ### 公开 benchmark
 
 - **HotpotQA**：多跳问答评测，运行 `python scripts/run_eval.py --benchmark hotpotqa --num-questions 2`。
-- **DeepResearch Bench II**：已进行独立子集试评，使用公开任务与 Rubric；实验适配器与运行记录尚未包含在本仓库中，暂不提供仓库内运行入口。
+- **DeepResearch Bench II**：使用公开任务与 Rubric；仓库包含独立适配/计分代码、冻结配置、题目选择及精简运行汇总，详见 [实验说明](experiments/drbench2/README.md)。当前主汇报口径为排除题 25、42 后的自选 10 题子集，得分 **42.70%**，详见 [当前 10 题口径](experiments/drbench2/user-multi-holdout-20260906/当前10题口径.md)。
 
-DeepResearch Bench II 当前使用选定子集与项目 Judge，属于自定义评测，**不是官方榜单成绩**。
+DeepResearch Bench II 当前使用选定子集与项目 DeepSeek Judge，属于自定义评测，**不是官方全量 132 题、官方 Gemini Judge 的榜单成绩**。体积较大或可能包含运行上下文的原始报告、模型响应、数据库、日志与检查点仅保留在本地，不提交仓库。
 
 ## 🏗️ 架构概览
 

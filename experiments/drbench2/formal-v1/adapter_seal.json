@@ -1,0 +1,13 @@
+{
+  "offline_acceptance": "passed",
+  "offline_tests_passed": 11,
+  "accepted_at": "2026-09-05T21:19:09.437628+00:00",
+  "execution_environment": "normal Windows file permissions required for ReplaceFile; offline model/tool fixtures denied network",
+  "files": {
+    "formal_runtime.py": "ed8e7047bf62a93ceb562703b1ace656335d06d704d55387429b23edb2bb1950",
+    "formal_score.py": "f634b76ed7b2a5bf95905108e5ed4b8cac92f7ca062bc83c0c1fe8a32df36e10",
+    "formal_support.py": "077626f6eb6092e7945208826fcdc615c843647c4a7957adf2eb0f8d3138f59e",
+    "formal_phase2.py": "0911ba2ea09ea71d175b98332b2fe69015a78c12980b4e4db631cd79930aa14f",
+    "test_formal_adapter.py": "27131135107ec3cf1c2d094dc4a95d4e38c6205f40d86b56e546371b1ccbd716"
+  }
+}
