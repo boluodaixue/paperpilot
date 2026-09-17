@@ -147,13 +147,28 @@ python -m pip install -r requirements.txt
 Copy-Item .env.template .env
 ```
 
-在 `.env` 中填写模型和检索服务所需的 API Key。项目支持 DeepSeek、OpenAI、MiMo 和本地 OpenAI-compatible vLLM。
+### 2. 配置环境和 API
+
+编辑项目根目录的 `.env`。按默认的 [模型配置](configs/default.yaml)完成网页研究前，把以下两个占位值替换为真实 Key：
+
+| 用途 | `.env` 变量 | 默认选择 |
+|---|---|---|
+| 研究模型 | `DEEPSEEK_API_KEY` | `configs/default.yaml` 中的 `model.backend_mapping.research: deepseek` |
+| 网页搜索 | `TAVILY_API_KEY` | `SEARCH_BACKEND=tavily` |
+
+部分服务的 Key 申请入口和完整变量示例见 [`.env.template`](.env.template)。`your_..._key_here` 只是占位值，不能直接用于调用 API。模型名、Base URL 和搜索源的默认值已写在模板中；使用默认 DeepSeek 与 Tavily 时通常只需替换上述两个 Key。
+
+想使用其他模型时，在 `.env` 中填写对应的 `OPENAI_*`、`MIMO_*` 或 `VLLM_*` 连接信息，并将 `configs/default.yaml` 的 `model.backend_mapping.research` 改为 `openai`、`mimo` 或 `vllm`。本地 vLLM 还需要先启动与所填 `VLLM_BASE_URL` 对应的服务。`DEFAULT_LLM_BACKEND` 只影响没有显式指定后端的调用；正常研究流程会优先采用 `model.backend_mapping.research`。运行带模型评分的评测时，可另行调整 `model.backend_mapping.judge`。
+
+其他 API 均为可选：`METASO_API_KEY`、`EXA_API_KEY`、`BOCHA_API_KEY`、`SERPAPI_KEY` 用作网页搜索备用源；`SEMANTIC_SCHOLAR_API_KEY` 和 `OPENALEX_API_KEY` 可用于论文检索；`LANGFUSE_PUBLIC_KEY` 与 `LANGFUSE_SECRET_KEY` 仅在开启 `LANGFUSE_TRACING=true` 时用于追踪。`OPENALEX_EMAIL` 是可选联系邮箱，并非 API Key。不使用这些服务时，保持相应变量注释即可。
+
+程序从当前工作目录依次读取 `.env`、`.env.local`，后者的同名变量优先。两者都被 Git 忽略；如需本机覆盖，可另外创建 `.env.local`。启动命令应在项目根目录执行。
 
 网页搜索默认使用 `Tavily → 秘塔 → Exa → 博查 → SerpAPI` 回退链，只调用已配置 Key 的备用源，无需部署 SearXNG 或其他常驻服务。Quick Web 最多打开三个可读来源；没有获得可用文档时返回证据不足，不会转入深度研究或写入 Memory。
 
 论文检索把 `ARXIV_READER_BACKEND` 作为首选项，并在失败或空结果时自动在 arXiv、Semantic Scholar 和 OpenAlex 之间回退。裸 arXiv ID 会先按 arXiv 标识符查询，不会再误拼为 OpenAlex Work ID。外部 HTTPS 工具统一使用平台信任库与 Mozilla CA；网页返回 403 时，只会尝试同一发布方可验证的官方 PDF，不关闭证书校验或绕过访问控制。
 
-### 2. 启动 Web
+### 3. 启动 Web
 
 ```bash
 python web/run.py
@@ -163,7 +178,7 @@ python web/run.py
 问答、快速联网和深度研究提案；也可以显式选择“只查当前 Memory”“联网查一下”
 或“深度研究”。深度研究执行和 Memory 写入仍需确认。
 
-### 3. 整理报告到 Wiki
+### 4. 整理报告到 Wiki
 
 在 Web 中完成一份绑定到 managed Memory 的研究后：
 
@@ -174,7 +189,7 @@ python web/run.py
 
 系统会自动沿报告中的 WikiLink 读取相关 Evidence。模型不能自行创建 Evidence ID；报告或目标 Wiki 在预览后发生变化时，保存会被拒绝，避免覆盖 Obsidian 中的并发编辑。
 
-### 4. 在 Obsidian 中打开
+### 5. 在 Obsidian 中打开
 
 把 `configs/default.yaml` 中 `research.vault_root` 指向的目录作为 Obsidian Vault 打开。默认目录是项目下的 `memory/`。
 
@@ -195,22 +210,6 @@ python scripts/run_repl.py
 ## 📊 Benchmark 与评测
 
 先完成模型与搜索服务配置；真实评测会调用模型和检索服务，可能产生费用。以下命令在项目根目录执行，结果默认保存到 `outputs/evaluation/`。
-
-### 自建 ResearchBench
-
-内置 **35 道**跨领域深度研究题，用于研究质量回归，记录覆盖度、引用等规则指标；加上 `--llm-judge` 可启用模型评分。
-
-```bash
-python scripts/run_eval.py --benchmark research_bench --num-questions 2 --llm-judge
-```
-
-题目及预期主题、关键事实见 [ResearchBench 题集](evaluation/benchmarks/research_bench.py)。可在题集中添加题目，或用 `--question-ids` 指定题目 ID。若要用自己的问题对比单轮 LLM 与完整 Agent，将问题按每行一题保存后运行：
-
-```bash
-python scripts/run_benchmark.py --queries_file my_queries.txt
-```
-
-对比结果保存到 `outputs/benchmark_results.json`。
 
 ### 公开 benchmark
 
@@ -268,7 +267,7 @@ flowchart TB
 | 三层研究上下文 | 加入 L1–L3 上下文管理、语义摘要与原始资料受控回读，控制长任务上下文规模 |
 | 统一对话 | 接通普通聊天、Memory 问答、快速联网与研究提案，确认研究时可自动创建 Memory |
 | 用户驱动 Wiki | 增加 Report → Wiki 单次模型整理、Claim 级 Evidence 引用、预览保存与 Wiki 优先问答 |
-| Benchmark 评测 | 建立自建 ResearchBench 评测流程，完成 DeepResearch Bench II 子集测试并发布评测代码与结果汇总 |
+| Benchmark 评测 | 完成 DeepResearch Bench II 公开基准子集测试，发布评测适配代码与结果汇总 |
 
 ## 🧪 测试
 
